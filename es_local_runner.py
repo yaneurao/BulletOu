@@ -1,30 +1,34 @@
 #!/usr/bin/env python3
-"""Local ES-style runner for BulletOu fine-tuning experiments.
+"""Beam-style ES runner for BulletOu local fine-tuning.
 
-This script does not change BulletOu's training algorithm.  It repeatedly
-branches from a checkpoint, runs a small population of short trials with
-randomly perturbed factorizer hyperparameters, selects the lowest-loss trial,
-and moves the hyperparameters partway toward that winner.
-The model weights are continued from the selected trial checkpoint.
+This runner is intentionally simple:
+
+* `parameters.json` owns the current hyperparameters and ES settings.
+* Each generation creates a population of randomized candidates.
+* Candidates are trained for the configured beam stages.
+* At each stage, candidates are ranked by the configured metric and pruned.
+* The final survivor's NN weights and hyperparameters become the next current
+  state.
+
+There is no gradient estimate and no partial parameter update.  The selected
+candidate itself survives.
 
 Typical use:
 
     python es_local_runner.py ^
-      --exe .\target\release\examples\bulletou.exe ^
-      --base-checkpoint C:\...\0033 ^
-      --teacher D:\sojoteam_datasets ^
-      --test-teacher C:\shogi\teacher\test\test.hcpe ^
+      --exe .\\target\\release\\examples\\bulletou.exe ^
+      --parameters-file .\\parameters.json ^
+      --base-checkpoint C:\\...\\0256 ^
+      --teacher D:\\sojoteam_datasets ^
+      --test-teacher C:\\shogi\\teacher\\test\\test.hcpe ^
       --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 ^
-      --bucket-counts D:\sojo_counts\...\count-all.bin ^
-      --output-folder D:\BulletOu-snapshots\20260820 ^
-      --tag-prefix es-hp4 ^
-      --iterations 20 ^
-      --sb-per-trial 8 ^
-      --theta shared=1,axis=1,pair=0.3,residual_count=1,axis_count=1,pair_count=10,king_axis_count=4 ^
-      --positions-per-superbatch 40000000 ^
-      -- --wrm-in-offset 0 --wrm-target-offset 0 --lr 0.000300 --lr-min 0.000300
+      --bucket-counts D:\\sojo_counts\\count-all.bin ^
+      --output-folder D:\\BulletOu-snapshots\\20260820 ^
+      --temp-folder C:\\BulletOu-es-temp ^
+      --tag-prefix pair2-qloss ^
+      -- --lr 0.000030 --lr-min 0.000010 --wrm-in-offset 0 --wrm-target-offset 0
 
-Arguments after `--` are passed through to bulletou.exe.
+Arguments after `--` are passed through to `bulletou.exe`.
 """
 
 from __future__ import annotations
@@ -35,411 +39,266 @@ import json
 import math
 import os
 import random
-import re
 import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_STEP_SCALE = 1.005
+PARAMETER_VERSION = 1
+STATE_VERSION = 1
 
 
-DEFAULT_THETA: dict[str, float] = {
-    "shared_alpha": 1.0,
-    "king_axis_alpha": 1.0,
-    "hand_axis_alpha": 1.0,
-    "progress_axis_alpha": 1.0,
-    "pair_alpha": 1.0,
-    "residual_count_confidence": 0.0,
-    "king_axis_count_confidence": 0.0,
-    "hand_axis_count_confidence": 0.0,
-    "progress_axis_count_confidence": 0.0,
-    "king_hand_pair_count_confidence": 0.0,
-    "king_progress_pair_count_confidence": 0.0,
-    "hand_progress_pair_count_confidence": 0.0,
+ALPHA_PARAMETERS = {
+    "shared": "shared",
+    "king_axis": "king_axis",
+    "hand_axis": "hand_axis",
+    "progress_axis": "progress_axis",
+    "pair": "pair",
 }
 
 
-AXIS_ALPHA_KEYS = [
-    "king_axis_alpha",
-    "hand_axis_alpha",
-    "progress_axis_alpha",
+CONFIDENCE_FLAGS = {
+    "residual_count": "--sfnn-residual-count-confidence",
+    "axis_count": "--sfnn-axis-count-confidence",
+    "king_axis_count": "--sfnn-king-axis-count-confidence",
+    "hand_axis_count": "--sfnn-hand-axis-count-confidence",
+    "progress_axis_count": "--sfnn-progress-axis-count-confidence",
+    "pair_count": "--sfnn-pair-count-confidence",
+    "king_hand_pair_count": "--sfnn-king-hand-pair-count-confidence",
+    "king_progress_pair_count": "--sfnn-king-progress-pair-count-confidence",
+    "hand_progress_pair_count": "--sfnn-hand-progress-pair-count-confidence",
+}
+
+
+KNOWN_PARAMETERS = set(ALPHA_PARAMETERS) | set(CONFIDENCE_FLAGS)
+
+
+DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
+    "shared": {"current": 1.0, "tune": False, "step": 0.0, "min": 0.0, "max": 10.0},
+    "king_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
+    "hand_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
+    "progress_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
+    "pair": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
+    "residual_count": {"current": 0.0, "tune": False, "step": 0.25, "min": 0.0, "max": 20.0},
+    "axis_count": {"current": 0.0, "tune": False, "step": 0.25, "min": 0.0, "max": 100.0},
+    "king_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
+    "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
+    "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.50, "min": 0.0, "max": 100.0},
+    "pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
+    "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
+    "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
+    "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 1.00, "min": 0.0, "max": 200.0},
+}
+
+
+RUNNER_CONTROLLED_FLAGS = {
+    "--backend",
+    "--teacher",
+    "--test-teacher",
+    "--arch",
+    "--initial-state",
+    "--initial-dataloader-pos",
+    "--output",
+    "--output-folder",
+    "--tag",
+    "--resume",
+    "--no-resume",
+    "--positions-per-superbatch",
+    "--superbatches",
+    "--max-epochs",
+    "--save-rate",
+    "--validation-rate",
+    "--quantized-validation-rate",
+    "--sfnn-factorizer",
+    "--sfnn-factorizer-alpha",
+    "--sfnn-bucket-counts",
+    *CONFIDENCE_FLAGS.values(),
+}
+
+
+SUMMARY_FIELDS = [
+    "generation",
+    "stage_sbs",
+    "candidate",
+    "status",
+    "rank",
+    "score",
+    "quantized_value_loss",
+    "quantized_value_accuracy",
+    "test_value_loss",
+    "test_value_accuracy",
+    "checkpoint",
+    "output_dir",
+    "parameters_json",
 ]
 
 
-AXIS_COUNT_KEYS = [
-    "king_axis_count_confidence",
-    "hand_axis_count_confidence",
-    "progress_axis_count_confidence",
+ACCEPTED_FIELDS = [
+    "generation",
+    "accepted_sbs",
+    "score",
+    "quantized_value_loss",
+    "quantized_value_accuracy",
+    "test_value_loss",
+    "test_value_accuracy",
+    "stage_sbs",
+    "saved_checkpoint",
+    "current_checkpoint",
+    "parameters_json",
 ]
 
 
-PAIR_COUNT_KEYS = [
-    "king_hand_pair_count_confidence",
-    "king_progress_pair_count_confidence",
-    "hand_progress_pair_count_confidence",
-]
-
-
-ANSI_COLORS = {
+ANSI = {
     "reset": "\x1b[0m",
     "bold": "\x1b[1m",
+    "red": "\x1b[31m",
     "green": "\x1b[32m",
     "yellow": "\x1b[33m",
     "cyan": "\x1b[36m",
+    "magenta": "\x1b[35m",
 }
 
 
-DEFAULT_BOUNDS: dict[str, tuple[float, float]] = {
-    "shared_alpha": (0.05, 10.0),
-    "king_axis_alpha": (0.05, 10.0),
-    "hand_axis_alpha": (0.0, 10.0),
-    "progress_axis_alpha": (0.0, 10.0),
-    "pair_alpha": (0.0, 10.0),
-    "residual_count_confidence": (0.0, 20.0),
-    "king_axis_count_confidence": (0.0, 100.0),
-    "hand_axis_count_confidence": (0.0, 100.0),
-    "progress_axis_count_confidence": (0.0, 100.0),
-    "king_hand_pair_count_confidence": (0.0, 200.0),
-    "king_progress_pair_count_confidence": (0.0, 200.0),
-    "hand_progress_pair_count_confidence": (0.0, 200.0),
-}
-
-
-ALPHA_KEYS = [
-    "shared_alpha",
-    "king_axis_alpha",
-    "hand_axis_alpha",
-    "progress_axis_alpha",
-    "pair_alpha",
-]
-
-
-CONFIDENCE_FLAG_BY_KEY = {
-    "residual_count_confidence": "--sfnn-residual-count-confidence",
-    "king_axis_count_confidence": "--sfnn-king-axis-count-confidence",
-    "hand_axis_count_confidence": "--sfnn-hand-axis-count-confidence",
-    "progress_axis_count_confidence": "--sfnn-progress-axis-count-confidence",
-    "king_hand_pair_count_confidence": "--sfnn-king-hand-pair-count-confidence",
-    "king_progress_pair_count_confidence": "--sfnn-king-progress-pair-count-confidence",
-    "hand_progress_pair_count_confidence": "--sfnn-hand-progress-pair-count-confidence",
-}
-
-
-QUANTIZED_TEST_VALUE_FLAGS = {
-    "--test-positions",
-    "--test-sample",
-    "--test-seed",
-    "--score-drop-abs",
-    "--fv-scale",
-    "--sfnn-ft-shift",
-    "--lambda",
-    "--scale",
-    "--loss-pow-exp",
-    "--wrm-nnue2score",
-    "--wrm-in-offset",
-    "--wrm-in-scaling",
-    "--wrm-target-offset",
-    "--wrm-target-scaling",
-    "--loader-threads",
-    "--batch-queue-size",
-    "--teacher-shuffle-buffer-batches",
-    "--teacher-shuffle-seed",
-}
-
-
-QUANTIZED_TEST_BOOL_FLAGS = {
-    "--win-rate-model",
-    "--loss-sigmoid-mse",
-}
-
-
-TRIAL_NO_INTERVAL_SAVE_RATE = 9999
-
-
-ACCEPTED_SUMMARY_FIELDS = [
-    "iteration",
-    "accepted_sbs",
-    "quantized_value_accuracy",
-    "quantized_value_loss",
-    "test_value_accuracy",
-    "test_value_loss",
-    "saved_checkpoint",
-    "selected_trial",
-    "population_size",
-    "step_scale",
-    "move_ratio",
-    "theta_change",
-    "theta_before_json",
-    "theta_delta_json",
-    "theta_json",
-    "reason",
-]
-
-
-HISTORY_FIELDS = [
-    "iteration",
-    "reason",
-    "base_score_before",
-    "population_size",
-    "best_trial",
-    "best_trial_score",
-    "new_base_score",
-    "new_base_checkpoint",
-    "accepted_sbs",
-    "public_checkpoint",
-    "step_scale",
-    "move_ratio",
-    "theta_change",
-    "theta_before_json",
-    "theta_delta_json",
-    "theta_json",
-    "winner_theta_json",
-    "directions_json",
-    "trial_scores_json",
-]
-
-
-TRIAL_SUMMARY_FIELDS = [
-    "iteration",
-    "trial",
-    "result",
-    "reason",
-    "accepted_sbs",
-    "quantized_value_accuracy",
-    "quantized_value_loss",
-    "test_value_accuracy",
-    "test_value_loss",
-    "trial_tag",
-    "trial_output_dir",
-    "checkpoint",
-    "saved_checkpoint",
-    "population_size",
-    "step_scale",
-    "move_ratio",
-    "theta_change",
-    "theta_json",
-]
-
-
-@dataclass(frozen=True)
+@dataclass
 class Metric:
-    qloss: float | None
-    qacc: float | None
-    test_loss: float | None
-    test_acc: float | None
+    qloss: float | None = None
+    qacc: float | None = None
+    test_loss: float | None = None
+    test_acc: float | None = None
 
     def score(self, metric_name: str) -> float:
+        value: float | None
         if metric_name == "quantized_value_loss":
-            if self.qloss is not None:
-                return self.qloss
-            if self.test_loss is not None:
-                return self.test_loss
+            value = self.qloss
+        elif metric_name == "quantized_value_accuracy":
+            value = self.qacc
         elif metric_name == "test_value_loss":
-            if self.test_loss is not None:
-                return self.test_loss
-            if self.qloss is not None:
-                return self.qloss
-        raise ValueError(f"metric {metric_name!r} is unavailable in summary row")
+            value = self.test_loss
+        elif metric_name == "test_value_accuracy":
+            value = self.test_acc
+        else:
+            raise ValueError(f"unsupported metric {metric_name!r}")
+        if value is None:
+            raise ValueError(f"metric {metric_name!r} was not written by the candidate run")
+        return value
 
 
-@dataclass(frozen=True)
-class TrialResult:
-    side: str
-    tag: str
-    output_dir: Path
-    checkpoint_dir: Path
-    metric: Metric
-    score: float
-    summary_row: dict[str, str]
+@dataclass
+class ParameterSpec:
+    current: float
+    tune: bool
+    step: float
+    minimum: float
+    maximum: float
+
+    def clamp(self, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("parameter value must be finite")
+        return min(max(value, self.minimum), self.maximum)
+
+
+@dataclass
+class BeamStage:
+    after_sbs: int
+    keep: int
+
+
+@dataclass
+class EsSettings:
+    generations: int
+    population: int
+    beam: list[BeamStage]
+    metric: str
+    lower_is_better: bool
+    seed: int
+    save_rate: int
+    candidate_validation_rate: int
+    candidate_quantized_validation_rate: int
+
+
+@dataclass
+class Candidate:
+    index: int
+    params: dict[str, float]
+    checkpoint: Path
+    output_dir: Path | None = None
+    metric: Metric | None = None
+    score: float | None = None
+    stage_sbs: int = 0
+    transient_dirs: list[Path] = field(default_factory=list)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run population randomized BulletOu trials and tune factorizer hyperparameters."
+        description="Run a beam-style ES search for BulletOu factorizer/count hyperparameters."
     )
-    parser.add_argument("--exe", required=True, help="Path to bulletou.exe")
-    parser.add_argument("--base-checkpoint", type=Path, default=None, help="Checkpoint directory containing state.bin")
+    parser.add_argument("--exe", required=True, type=Path, help="Path to bulletou.exe")
+    parser.add_argument("--parameters-file", type=Path, default=Path("parameters.json"))
+    parser.add_argument("--base-checkpoint", type=Path, default=None, help="Initial checkpoint directory containing state.bin")
     parser.add_argument("--teacher", required=True)
     parser.add_argument("--test-teacher", required=True)
     parser.add_argument("--arch", required=True)
     parser.add_argument("--bucket-counts", type=Path, default=None)
-    parser.add_argument("--output-folder", required=True, type=Path, help="Root folder for runner outputs")
-    parser.add_argument("--runner-dir", type=Path, default=None, help="Exact runner directory. Default: output-folder/es-<tag-prefix>")
-    parser.add_argument(
-        "--resume",
-        "--resume-runner",
-        dest="resume_runner",
-        action="store_true",
-        help="Resume an existing runner resolved from --output-folder and --tag-prefix, or from --runner-dir if specified.",
-    )
+    parser.add_argument("--output-folder", required=True, type=Path)
+    parser.add_argument("--temp-folder", type=Path, default=None, help="Temporary candidate checkpoint root. Default: runner temp/ under output-folder.")
     parser.add_argument("--tag-prefix", required=True)
     parser.add_argument("--factorizer", default="pair")
-    parser.add_argument("--iterations", type=int, default=20)
-    parser.add_argument("--sb-per-trial", type=int, default=8)
-    parser.add_argument("--population-size", type=int, default=4, help="Number of randomized trials per iteration. Default: 4.")
-    parser.add_argument(
-        "--epoch-sbs",
-        type=int,
-        default=32,
-        help="Number of accepted superbatches treated as one runner epoch. Used for accepted checkpoint names.",
-    )
-    parser.add_argument(
-        "--save-rate",
-        type=int,
-        default=None,
-        help="Save the accepted path every N accepted trials. 1 saves after every accept; 0 disables public checkpoints.",
-    )
-    parser.add_argument(
-        "--accepted-save-rate-sbs",
-        type=int,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--keep-trials",
-        action="store_true",
-        help="Keep trial output directories. Default deletes trial outputs after the decision.",
-    )
-    parser.add_argument(
-        "--trial-validation-rate-sbs",
-        type=int,
-        default=1,
-        help="Run normal validation every N sb inside each trial. Default: 1, so stdout shows loss every sb.",
-    )
-    parser.add_argument(
-        "--trial-quantized-validation-rate-sbs",
-        type=int,
-        default=1,
-        help="Run quantized validation every N sb inside each trial. Default: 1, so stdout shows qloss every sb.",
-    )
     parser.add_argument("--positions-per-superbatch", type=int, default=40_000_000)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--base-score", type=float, default=None, help="Base score override. Lower is better.")
-    parser.add_argument("--metric", choices=["quantized_value_loss", "test_value_loss"], default="quantized_value_loss")
+    parser.add_argument("--generations", type=int, default=None, help="Override es.generations from parameters.json")
+    parser.add_argument("--save-rate", type=int, default=None, help="Override es.save_rate. N=1 saves every accepted generation.")
     parser.add_argument(
-        "--base-metric-source",
-        choices=["quantized-test", "summary"],
-        default="quantized-test",
-        help="How to obtain the initial base metric. Default runs bulletou quantized-test on base nn.bin.",
-    )
-    parser.add_argument(
-        "--base-quantized-test-mode",
-        choices=["gpu", "cpu-exact"],
-        default="gpu",
-        help="quantized-test mode used for the initial base metric.",
-    )
-    parser.add_argument(
-        "--theta",
-        action="append",
-        default=[],
-        help=(
-            "Initial parameter override list, e.g. "
-            "shared=1,axis=1,pair=0.3,residual_count=1,axis_count=1,pair_count=10,king_axis_count=4. "
-            "Repeatable."
-        ),
-    )
-    parser.add_argument("--theta-json", type=Path, default=None, help="Initial theta JSON file")
-    parser.add_argument("--bounds-json", type=Path, default=None, help="Bounds JSON file: {name:[min,max], ...}")
-    parser.add_argument(
-        "--tune",
-        action="append",
+        "--metric",
+        choices=["quantized_value_loss", "quantized_value_accuracy", "test_value_loss", "test_value_accuracy"],
         default=None,
-        help=(
-            "Parameter or group to tune. Repeatable. Groups: alpha, axis, pair, count, "
-            "axis_count, pair_count. `pair` means pair_alpha only; `pair_count` means "
-            "king_hand/king_progress/hand_progress pair count confidences. Default: "
-            "non-zero parameters except shared_alpha."
-        ),
+        help="Override es.metric",
     )
-    parser.add_argument("--fixed", action="append", default=[], help="Parameter to keep fixed. Repeatable.")
-    parser.add_argument(
-        "--step-scale",
-        type=float,
-        default=None,
-        help="Fixed multiplicative perturbation scale. Default: 1.005. 1.005 moves 0.300 to about 0.3015/0.2985.",
-    )
-    parser.add_argument(
-        "--move-ratio",
-        type=float,
-        default=0.25,
-        help=(
-            "Fraction of the winner direction used for the theta update. "
-            "Default 0.25 means move theta 25%% toward the best trial theta."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--resume", action="store_true", help="Resume from output-folder/es-<tag-prefix>/runner-state.json")
+    parser.add_argument("--keep-temp", action="store_true", help="Keep candidate temp directories for debugging")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--no-stream-child-output",
         action="store_true",
-        help="Do not mirror bulletou.exe stdout to the console. Logs are still saved.",
+        help="Do not mirror bulletou.exe stdout to console; logs are still written under runner logs/.",
     )
-    parser.add_argument(
-        "--color",
-        choices=["auto", "always", "never"],
-        default="auto",
-        help="Color runner event lines. Default: auto.",
-    )
-    parser.add_argument(
-        "--use-worker",
-        action="store_true",
-        help=(
-            "Run one GPU-resident bulletou.exe worker session. Probe trials use GPU snapshot/restore "
-            "and do not write trial checkpoints; accepted states are saved only at runner --save-rate boundaries."
-        ),
-    )
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to bulletou.exe")
     args = parser.parse_args()
     if args.extra_args and args.extra_args[0] == "--":
         args.extra_args = args.extra_args[1:]
-    if not args.resume_runner and args.base_checkpoint is None:
-        parser.error("--base-checkpoint is required unless --resume is specified")
-    if args.iterations <= 0:
-        parser.error("--iterations must be > 0")
-    if args.sb_per_trial <= 0:
-        parser.error("--sb-per-trial must be > 0")
-    if args.population_size <= 0:
-        parser.error("--population-size must be > 0")
-    if args.epoch_sbs <= 0:
-        parser.error("--epoch-sbs must be > 0")
-    if args.epoch_sbs % args.sb_per_trial != 0:
-        parser.error("--epoch-sbs must be divisible by --sb-per-trial")
-    if args.save_rate is not None and args.accepted_save_rate_sbs is not None:
-        parser.error("use runner --save-rate, not both --save-rate and --accepted-save-rate-sbs")
-    if args.accepted_save_rate_sbs is not None:
-        if args.accepted_save_rate_sbs < 0:
-            parser.error("--accepted-save-rate-sbs must be >= 0")
-        if args.accepted_save_rate_sbs and args.accepted_save_rate_sbs % args.sb_per_trial != 0:
-            parser.error("--accepted-save-rate-sbs must be divisible by --sb-per-trial")
-        args.save_rate = 0 if args.accepted_save_rate_sbs == 0 else args.accepted_save_rate_sbs // args.sb_per_trial
-        print(
-            "WARN: --accepted-save-rate-sbs is deprecated; use "
-            f"--save-rate {args.save_rate} instead.",
-            flush=True,
-        )
-    if args.save_rate is None:
-        args.save_rate = 4
-    if args.save_rate < 0:
-        parser.error("--save-rate must be >= 0")
-    if args.trial_validation_rate_sbs <= 0:
-        parser.error("--trial-validation-rate-sbs must be > 0")
-    if args.trial_quantized_validation_rate_sbs <= 0:
-        parser.error("--trial-quantized-validation-rate-sbs must be > 0")
     if args.positions_per_superbatch <= 0:
         parser.error("--positions-per-superbatch must be > 0")
-    if args.step_scale is not None:
-        if not math.isfinite(args.step_scale) or args.step_scale <= 0:
-            parser.error("--step-scale must be finite and > 0")
-        if args.step_scale <= 1.0:
-            parser.error("--step-scale should be > 1")
-    if not math.isfinite(args.move_ratio) or args.move_ratio < 0.0:
-        parser.error("--move-ratio must be finite and >= 0")
+    if args.generations is not None and args.generations <= 0:
+        parser.error("--generations must be > 0")
+    if args.save_rate is not None and args.save_rate < 0:
+        parser.error("--save-rate must be >= 0")
+    if not args.resume and args.base_checkpoint is None:
+        parser.error("--base-checkpoint is required unless --resume is specified")
+    for token in args.extra_args:
+        if token in RUNNER_CONTROLLED_FLAGS:
+            parser.error(f"{token} is controlled by es_local_runner.py; remove it from arguments after --")
     return args
+
+
+def color_enabled(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def paint(enabled: bool, text: str, color: str) -> str:
+    if not enabled:
+        return text
+    return f"{ANSI[color]}{text}{ANSI['reset']}"
+
+
+def event(enabled: bool, label: str, message: str, color: str = "cyan") -> None:
+    print(f"{paint(enabled, label, color)} {message}", flush=True)
 
 
 def load_json_object(path: Path) -> dict[str, Any]:
@@ -450,321 +309,319 @@ def load_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def metric_to_json(metric: Metric) -> dict[str, float | None]:
-    return {
-        "qloss": metric.qloss,
-        "qacc": metric.qacc,
-        "test_loss": metric.test_loss,
-        "test_acc": metric.test_acc,
-    }
+def atomic_write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="\n") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
-def metric_from_json(raw: Any) -> Metric:
-    if not isinstance(raw, dict):
-        raise ValueError("metric state must be an object")
-    return Metric(
-        qloss=parse_float(str(raw["qloss"])) if raw.get("qloss") is not None else None,
-        qacc=parse_float(str(raw["qacc"])) if raw.get("qacc") is not None else None,
-        test_loss=parse_float(str(raw["test_loss"])) if raw.get("test_loss") is not None else None,
-        test_acc=parse_float(str(raw["test_acc"])) if raw.get("test_acc") is not None else None,
-    )
-
-
-def split_assignments(text: str) -> list[tuple[str, float]]:
-    out: list[tuple[str, float]] = []
-    for part in text.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "=" not in part:
-            raise ValueError(f"expected key=value in {text!r}, got {part!r}")
-        key, value = part.split("=", 1)
-        key = key.strip().lower().replace("-", "_")
-        try:
-            parsed = float(value.strip())
-        except ValueError as exc:
-            raise ValueError(f"invalid numeric value in {part!r}") from exc
-        if not math.isfinite(parsed):
-            raise ValueError(f"value for {key!r} must be finite")
-        out.append((key, parsed))
-    return out
-
-
-def apply_theta_alias(theta: dict[str, float], key: str, value: float) -> None:
-    direct = {
-        "shared_alpha": ["shared_alpha", "shared"],
-        "king_axis_alpha": ["king_axis_alpha", "king_axis", "king", "k"],
-        "hand_axis_alpha": ["hand_axis_alpha", "hand_axis", "hand", "h"],
-        "progress_axis_alpha": ["progress_axis_alpha", "progress_axis", "progress", "prog", "p"],
-        "pair_alpha": ["pair_alpha", "pair"],
-        "residual_count_confidence": [
-            "residual_count_confidence",
-            "residual_count",
-            "residual_confidence",
-            "residual",
-        ],
-        "king_axis_count_confidence": [
-            "king_axis_count_confidence",
-            "king_axis_count",
-            "king_count",
-            "k_count",
-        ],
-        "hand_axis_count_confidence": [
-            "hand_axis_count_confidence",
-            "hand_axis_count",
-            "hand_count",
-            "h_count",
-        ],
-        "progress_axis_count_confidence": [
-            "progress_axis_count_confidence",
-            "progress_axis_count",
-            "progress_count",
-            "prog_count",
-            "p_count",
-        ],
-        "king_hand_pair_count_confidence": [
-            "king_hand_pair_count_confidence",
-            "king_hand_pair_count",
-            "king_hand_count",
-            "kh_pair_count",
-            "kh_count",
-        ],
-        "king_progress_pair_count_confidence": [
-            "king_progress_pair_count_confidence",
-            "king_progress_pair_count",
-            "king_progress_count",
-            "kp_pair_count",
-            "kp_count",
-        ],
-        "hand_progress_pair_count_confidence": [
-            "hand_progress_pair_count_confidence",
-            "hand_progress_pair_count",
-            "hand_progress_count",
-            "hp_pair_count",
-            "hp_count",
-        ],
-    }
-    alias_to_key = {alias: canonical for canonical, aliases in direct.items() for alias in aliases}
-    if key in alias_to_key:
-        theta[alias_to_key[key]] = value
-        return
-    if key in ("all_alpha", "all"):
-        for name in ALPHA_KEYS:
-            theta[name] = value
-        return
-    if key == "axis":
-        for name in AXIS_ALPHA_KEYS:
-            theta[name] = value
-        return
-    if key in ("axis_count", "axis_confidence"):
-        for name in AXIS_COUNT_KEYS:
-            theta[name] = value
-        return
-    if key in ("pair_count", "pair_confidence"):
-        for name in PAIR_COUNT_KEYS:
-            theta[name] = value
-        return
-    if key in ("count", "count_confidence"):
-        theta["residual_count_confidence"] = value
-        for name in AXIS_COUNT_KEYS:
-            theta[name] = value
-        for name in PAIR_COUNT_KEYS:
-            theta[name] = value
-        return
-    raise ValueError(f"unknown theta key or alias {key!r}")
-
-
-def load_theta(path: Path | None, overrides: list[str]) -> dict[str, float]:
-    theta = dict(DEFAULT_THETA)
-    if path is not None:
-        raw = load_json_object(path)
-        for key, value in raw.items():
-            if key not in theta:
-                raise ValueError(f"unknown theta key {key!r} in {path}")
-            theta[key] = float(value)
-    for override in overrides:
-        for key, value in split_assignments(override):
-            apply_theta_alias(theta, key, value)
-    return theta
-
-
-def load_bounds(path: Path | None) -> dict[str, tuple[float, float]]:
-    bounds = dict(DEFAULT_BOUNDS)
-    if path is not None:
-        raw = load_json_object(path)
-        for key, value in raw.items():
-            if key not in bounds:
-                raise ValueError(f"unknown bounds key {key!r} in {path}")
-            if not isinstance(value, (list, tuple)) or len(value) != 2:
-                raise ValueError(f"bounds for {key!r} must be [min, max]")
-            lo, hi = float(value[0]), float(value[1])
-            if not (math.isfinite(lo) and math.isfinite(hi) and 0.0 <= lo <= hi):
-                raise ValueError(f"invalid bounds for {key!r}: {value!r}")
-            bounds[key] = (lo, hi)
-    return bounds
-
-
-def clamp_theta(theta: dict[str, float], bounds: dict[str, tuple[float, float]]) -> dict[str, float]:
-    out = {}
-    for key, value in theta.items():
-        if key not in bounds:
-            raise ValueError(f"no bounds for theta key {key!r}")
-        lo, hi = bounds[key]
-        if not math.isfinite(value):
-            raise ValueError(f"theta {key!r} must be finite")
-        out[key] = min(max(value, lo), hi)
-    return out
-
-
-def expand_tune_name(name: str, theta: dict[str, float]) -> list[str]:
-    key = name.strip().lower().replace("-", "_")
-    if key in theta:
-        return [key]
-    groups = {
-        "alpha": ALPHA_KEYS,
-        "all_alpha": ALPHA_KEYS,
-        "axis": AXIS_ALPHA_KEYS,
-        "pair": ["pair_alpha"],
-        "count": ["residual_count_confidence", *AXIS_COUNT_KEYS, *PAIR_COUNT_KEYS],
-        "axis_count": AXIS_COUNT_KEYS,
-        "pair_count": PAIR_COUNT_KEYS,
-        "shared": ["shared_alpha"],
-        "king_axis": ["king_axis_alpha"],
-        "hand_axis": ["hand_axis_alpha"],
-        "progress_axis": ["progress_axis_alpha"],
-        "king_axis_count": ["king_axis_count_confidence"],
-        "hand_axis_count": ["hand_axis_count_confidence"],
-        "progress_axis_count": ["progress_axis_count_confidence"],
-        "king_hand_pair_count": ["king_hand_pair_count_confidence"],
-        "king_progress_pair_count": ["king_progress_pair_count_confidence"],
-        "hand_progress_pair_count": ["hand_progress_pair_count_confidence"],
-    }
-    if key not in groups:
-        raise ValueError(f"unknown tune key or group {name!r}")
-    return list(groups[key])
-
-
-def expand_key_list(names: list[str], theta: dict[str, float]) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    for name in names:
-        for key in expand_tune_name(name, theta):
-            if key not in seen:
-                out.append(key)
-                seen.add(key)
-    return out
-
-
-def tuned_keys(args: argparse.Namespace, theta: dict[str, float]) -> list[str]:
-    if args.tune:
-        keys = expand_key_list(args.tune, theta)
+def parse_parameter_spec(name: str, value: Any) -> ParameterSpec:
+    defaults = DEFAULT_PARAMETER_SPECS[name]
+    if isinstance(value, (int, float)):
+        raw: dict[str, Any] = {"current": float(value)}
+    elif isinstance(value, dict):
+        raw = dict(value)
     else:
-        keys = [key for key in theta if key != "shared_alpha" and theta[key] != 0.0]
-    fixed = set(expand_key_list(args.fixed, theta))
-    return [key for key in keys if key not in fixed]
+        raise ValueError(f"parameters.{name} must be a number or object")
+
+    current = float(raw.get("current", defaults["current"]))
+    tune = bool(raw.get("tune", defaults["tune"]))
+    step = float(raw.get("step", defaults["step"]))
+    minimum = float(raw.get("min", defaults["min"]))
+    maximum = float(raw.get("max", defaults["max"]))
+
+    if minimum > maximum:
+        raise ValueError(f"parameters.{name}: min must be <= max")
+    if step < 0.0 or not math.isfinite(step):
+        raise ValueError(f"parameters.{name}: step must be finite and >= 0")
+    spec = ParameterSpec(current=current, tune=tune, step=step, minimum=minimum, maximum=maximum)
+    spec.current = spec.clamp(spec.current)
+    if spec.tune and spec.step == 0.0:
+        raise ValueError(f"parameters.{name}: tune=true requires step > 0")
+    return spec
 
 
-def theta_log_offset(lo: float, hi: float) -> float:
-    return max(1.0e-6, min(0.01, (hi - lo) * 1.0e-4))
+def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec], EsSettings]:
+    root = load_json_object(path)
+    version = int(root.get("version", PARAMETER_VERSION))
+    if version != PARAMETER_VERSION:
+        raise ValueError(f"{path}: unsupported version {version}; expected {PARAMETER_VERSION}")
+
+    params_obj = root.get("parameters")
+    if not isinstance(params_obj, dict):
+        raise ValueError(f"{path}: `parameters` object is required")
+
+    unknown = sorted(set(params_obj) - KNOWN_PARAMETERS)
+    if unknown:
+        raise ValueError(f"{path}: unknown parameter(s): {', '.join(unknown)}")
+
+    specs: dict[str, ParameterSpec] = {}
+    for name in sorted(KNOWN_PARAMETERS):
+        specs[name] = parse_parameter_spec(name, params_obj.get(name, DEFAULT_PARAMETER_SPECS[name]))
+
+    es_obj = root.get("es")
+    if not isinstance(es_obj, dict):
+        raise ValueError(f"{path}: `es` object is required")
+
+    generations = int(es_obj.get("generations", 1))
+    population = int(es_obj.get("population", 4))
+    metric = str(es_obj.get("metric", "quantized_value_loss"))
+    if metric not in {
+        "quantized_value_loss",
+        "quantized_value_accuracy",
+        "test_value_loss",
+        "test_value_accuracy",
+    }:
+        raise ValueError(f"{path}: unsupported es.metric {metric!r}")
+    lower_is_better = bool(es_obj.get("lower_is_better", "loss" in metric))
+    seed = int(es_obj.get("seed", 1))
+    save_rate = int(es_obj.get("save_rate", 1))
+    candidate_validation_rate = int(es_obj.get("candidate_validation_rate", 1))
+    candidate_quantized_validation_rate = int(es_obj.get("candidate_quantized_validation_rate", 1))
+
+    if generations <= 0:
+        raise ValueError("es.generations must be > 0")
+    if population <= 0:
+        raise ValueError("es.population must be > 0")
+    if save_rate < 0:
+        raise ValueError("es.save_rate must be >= 0")
+    if candidate_validation_rate <= 0:
+        raise ValueError("es.candidate_validation_rate must be > 0")
+    if candidate_quantized_validation_rate <= 0:
+        raise ValueError("es.candidate_quantized_validation_rate must be > 0")
+
+    beam_raw = es_obj.get("beam")
+    if beam_raw is None:
+        candidate_sbs = int(es_obj.get("candidate_sbs", 8))
+        beam = [BeamStage(after_sbs=candidate_sbs, keep=1)]
+    elif isinstance(beam_raw, list):
+        beam = []
+        for i, item in enumerate(beam_raw):
+            if not isinstance(item, dict):
+                raise ValueError(f"es.beam[{i}] must be an object")
+            beam.append(BeamStage(after_sbs=int(item["after_sbs"]), keep=int(item["keep"])))
+    else:
+        raise ValueError("es.beam must be a list")
+
+    if not beam:
+        raise ValueError("es.beam must not be empty")
+    prev_after = 0
+    prev_keep = population
+    for stage in beam:
+        if stage.after_sbs <= prev_after:
+            raise ValueError("es.beam after_sbs must be strictly increasing")
+        if stage.keep <= 0 or stage.keep > prev_keep:
+            raise ValueError("es.beam keep must be > 0 and <= previous live candidate count")
+        prev_after = stage.after_sbs
+        prev_keep = stage.keep
+    if beam[-1].keep != 1:
+        raise ValueError("final es.beam stage must keep exactly 1 candidate")
+
+    settings = EsSettings(
+        generations=generations,
+        population=population,
+        beam=beam,
+        metric=metric,
+        lower_is_better=lower_is_better,
+        seed=seed,
+        save_rate=save_rate,
+        candidate_validation_rate=candidate_validation_rate,
+        candidate_quantized_validation_rate=candidate_quantized_validation_rate,
+    )
+    return root, specs, settings
 
 
-def theta_to_log(value: float, lo: float, hi: float) -> float:
-    return math.log(max(value, lo) + theta_log_offset(lo, hi))
+def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, ParameterSpec]) -> None:
+    params_obj: dict[str, Any] = {}
+    for name in sorted(KNOWN_PARAMETERS):
+        original = root.get("parameters", {}).get(name, {})
+        if isinstance(original, dict):
+            obj = dict(original)
+        else:
+            obj = {}
+        spec = specs[name]
+        obj["current"] = spec.current
+        obj["tune"] = spec.tune
+        obj["step"] = spec.step
+        obj["min"] = spec.minimum
+        obj["max"] = spec.maximum
+        params_obj[name] = obj
+    root["parameters"] = params_obj
+    root["version"] = PARAMETER_VERSION
+    atomic_write_json(path, root)
 
 
-def theta_from_log(value: float, lo: float, hi: float) -> float:
-    return min(max(math.exp(value) - theta_log_offset(lo, hi), lo), hi)
+def current_values(specs: dict[str, ParameterSpec]) -> dict[str, float]:
+    return {name: specs[name].current for name in sorted(KNOWN_PARAMETERS)}
 
 
-def perturb_value(value: float, sign: int, step_scale: float, lo: float, hi: float) -> float:
-    if lo == hi:
-        return lo
-    y = theta_to_log(value, lo, hi)
-    y += sign * math.log(step_scale)
-    return theta_from_log(y, lo, hi)
+def set_current_values(specs: dict[str, ParameterSpec], values: dict[str, float]) -> None:
+    for name, value in values.items():
+        specs[name].current = specs[name].clamp(float(value))
 
 
-def make_variant(
-    theta: dict[str, float],
-    bounds: dict[str, tuple[float, float]],
-    delta: dict[str, int],
-    side_sign: int,
-    step_scale: float,
-) -> dict[str, float]:
-    out = dict(theta)
-    for key, direction in delta.items():
-        lo, hi = bounds[key]
-        out[key] = perturb_value(theta[key], side_sign * direction, step_scale, lo, hi)
+def perturb_parameters(specs: dict[str, ParameterSpec], rng: random.Random) -> dict[str, float]:
+    out = current_values(specs)
+    for name, spec in specs.items():
+        if spec.tune:
+            delta = rng.uniform(-spec.step, spec.step)
+            out[name] = spec.clamp(spec.current + delta)
     return out
 
 
-def trial_direction(seed: int, iteration: int, trial_number: int, keys: list[str]) -> dict[str, int]:
-    mixed = (
-        (seed & 0xFFFFFFFFFFFFFFFF)
-        ^ ((iteration * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF)
-        ^ ((trial_number * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF)
-    )
-    rng = random.Random(mixed)
-    return {key: rng.choice([-1, 1]) for key in keys}
+def alpha_arg(params: dict[str, float]) -> str:
+    parts = []
+    for name, cli_name in ALPHA_PARAMETERS.items():
+        if name in params:
+            parts.append(f"{cli_name}={params[name]:.9g}")
+    return ",".join(parts)
 
 
-def move_theta_toward(
-    theta: dict[str, float],
-    bounds: dict[str, tuple[float, float]],
-    keys: list[str],
-    winner_theta: dict[str, float],
-    move_ratio: float,
-) -> tuple[dict[str, float], dict[str, float]]:
-    if not math.isfinite(move_ratio) or move_ratio < 0.0:
-        raise ValueError("--move-ratio must be finite and >= 0")
-    next_theta = dict(theta)
-    log_update: dict[str, float] = {}
-    for key in keys:
-        lo, hi = bounds[key]
-        z = theta_to_log(theta[key], lo, hi)
-        winner_z = theta_to_log(winner_theta[key], lo, hi)
-        update = (winner_z - z) * move_ratio
-        next_theta[key] = theta_from_log(z + update, lo, hi)
-        log_update[key] = update
-    return next_theta, log_update
-
-
-def alpha_arg(theta: dict[str, float]) -> str:
-    return ",".join(
-        [
-            f"shared={theta['shared_alpha']:.9g}",
-            f"king_axis={theta['king_axis_alpha']:.9g}",
-            f"hand_axis={theta['hand_axis_alpha']:.9g}",
-            f"progress_axis={theta['progress_axis_alpha']:.9g}",
-            f"pair={theta['pair_alpha']:.9g}",
-        ]
-    )
-
-
-def theta_args(theta: dict[str, float], bucket_counts: Path | None) -> list[str]:
-    out = ["--sfnn-factorizer-alpha", alpha_arg(theta)]
-    any_count = False
-    for key, flag in CONFIDENCE_FLAG_BY_KEY.items():
-        value = theta[key]
-        out.extend([flag, f"{value:.9g}"])
-        any_count = any_count or value != 0.0
-    if any_count:
-        if bucket_counts is None:
-            raise ValueError("count-confidence is non-zero, but --bucket-counts was not specified")
+def parameter_args(params: dict[str, float], bucket_counts: Path | None) -> list[str]:
+    out = ["--sfnn-factorizer-alpha", alpha_arg(params)]
+    if bucket_counts is not None:
         out.extend(["--sfnn-bucket-counts", str(bucket_counts)])
+    for name, flag in CONFIDENCE_FLAGS.items():
+        value = params.get(name)
+        if value is not None and abs(value) > 0.0:
+            out.extend([flag, f"{value:.9g}"])
     return out
 
 
-def trial_no_interval_save_rate(sb_per_trial: int) -> int:
-    return max(TRIAL_NO_INTERVAL_SAVE_RATE, sb_per_trial + 1)
+def format_float(value: float | None, digits: int = 9) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{digits}g}"
 
 
-def base_command(
+def parse_float_cell(value: str | None) -> float | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value or value == "-":
+        return None
+    return float(value)
+
+
+def metric_from_summary_row(row: dict[str, str]) -> Metric:
+    return Metric(
+        qloss=parse_float_cell(row.get("quantized_value_loss")),
+        qacc=parse_float_cell(row.get("quantized_value_accuracy")),
+        test_loss=parse_float_cell(row.get("test_value_loss")),
+        test_acc=parse_float_cell(row.get("test_value_accuracy")),
+    )
+
+
+def latest_summary_row(output_dir: Path) -> dict[str, str]:
+    path = output_dir / "summary-learn.log"
+    if not path.exists():
+        raise RuntimeError(f"{path} was not written")
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows = [row for row in rows if any((value or "").strip() for value in row.values())]
+    if not rows:
+        raise RuntimeError(f"{path} has no data rows")
+    return rows[-1]
+
+
+def latest_checkpoint_dir(output_dir: Path) -> Path:
+    candidates: list[tuple[int, Path]] = []
+    for child in output_dir.iterdir():
+        if child.is_dir() and child.name.isdigit() and (child / "state.bin").exists():
+            candidates.append((int(child.name), child))
+    if not candidates:
+        raise RuntimeError(f"no checkpoint directory containing state.bin found under {output_dir}")
+    return max(candidates, key=lambda item: item[0])[1]
+
+
+def ensure_csv(path: Path, fields: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            header = f.readline().strip()
+        expected = ",".join(fields)
+        if header != expected:
+            raise RuntimeError(f"{path} has incompatible header\n  existing: {header}\n  expected: {expected}")
+        return
+    with path.open("w", encoding="utf-8", newline="") as f:
+        csv.DictWriter(f, fieldnames=fields).writeheader()
+
+
+def append_csv(path: Path, fields: list[str], row: dict[str, Any]) -> None:
+    ensure_csv(path, fields)
+    with path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writerow({field: row.get(field, "") for field in fields})
+
+
+def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True))
+        f.write("\n")
+
+
+def copy_dir_replace(src: Path, dst: Path) -> None:
+    if not src.exists():
+        raise RuntimeError(f"source directory does not exist: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".new")
+    old = dst.with_name(dst.name + ".old")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    shutil.copytree(src, tmp)
+    if old.exists():
+        shutil.rmtree(old)
+    if dst.exists():
+        os.replace(dst, old)
+    os.replace(tmp, dst)
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def copy_dir_new(src: Path, dst: Path) -> None:
+    if dst.exists():
+        raise RuntimeError(f"destination already exists: {dst}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+
+
+def remove_dir_quiet(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def run_command(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, float]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    start = time.perf_counter()
+    with log_path.open("w", encoding="utf-8", errors="replace", newline="") as log:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log.write(line)
+            if stream:
+                print(line, end="")
+        code = proc.wait()
+    return code, time.perf_counter() - start
+
+
+def build_train_command(
     args: argparse.Namespace,
-    checkpoint_dir: Path,
-    tag: str,
-    theta: dict[str, float],
-    trial_output_folder: Path,
+    params: dict[str, float],
+    checkpoint: Path,
+    output_dir: Path,
+    stage_delta_sbs: int,
+    settings: EsSettings,
 ) -> list[str]:
     cmd = [
         str(args.exe),
@@ -775,1406 +632,410 @@ def base_command(
         "--test-teacher",
         str(args.test_teacher),
         "--arch",
-        args.arch,
+        str(args.arch),
         "--initial-state",
-        str(checkpoint_dir / "state.bin"),
+        str(checkpoint / "state.bin"),
         "--initial-dataloader-pos",
-        str(checkpoint_dir / "dataloader_pos.txt"),
-        "--output-folder",
-        str(trial_output_folder),
-        "--tag",
-        tag,
+        str(checkpoint / "dataloader_pos.txt"),
+        "--output",
+        str(output_dir),
         "--sfnn-factorizer",
-        args.factorizer,
+        str(args.factorizer),
         "--positions-per-superbatch",
         str(args.positions_per_superbatch),
         "--superbatches",
-        str(args.sb_per_trial),
+        str(stage_delta_sbs),
         "--max-epochs",
         "1",
         "--save-rate",
-        str(trial_no_interval_save_rate(args.sb_per_trial)),
+        str(stage_delta_sbs),
         "--validation-rate",
-        str(args.trial_validation_rate_sbs),
+        str(max(1, min(settings.candidate_validation_rate, stage_delta_sbs))),
         "--quantized-validation-rate",
-        str(args.trial_quantized_validation_rate_sbs),
+        str(max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))),
     ]
-    if args.batch_size is not None:
-        cmd.extend(["--batch-size", str(args.batch_size)])
-    cmd.extend(theta_args(theta, args.bucket_counts))
+    if args.bucket_counts is not None:
+        cmd.extend(["--sfnn-bucket-counts", str(args.bucket_counts)])
+    cmd.extend(parameter_args(params, None))
     cmd.extend(args.extra_args)
     return cmd
 
 
-def find_output_dir(trial_output_folder: Path, tag: str) -> Path:
-    matches = [path for path in trial_output_folder.iterdir() if path.is_dir() and path.name.endswith(f"-{tag}")]
-    if len(matches) != 1:
-        raise FileNotFoundError(f"expected exactly one output dir ending with -{tag!r}, found {len(matches)}")
-    return matches[0]
-
-
-def parse_float(text: str | None) -> float | None:
-    if text is None:
-        return None
-    text = text.strip()
-    if not text or text == "-":
-        return None
-    value = float(text)
-    if math.isnan(value):
-        return None
-    return value
-
-
-def metric_from_row(row: dict[str, str]) -> Metric:
-    return Metric(
-        qloss=parse_float(row.get("quantized_value_loss")),
-        qacc=parse_float(row.get("quantized_value_accuracy")),
-        test_loss=parse_float(row.get("test_value_loss")),
-        test_acc=parse_float(row.get("test_value_accuracy")),
-    )
-
-
-def last_summary_row(summary_path: Path) -> dict[str, str]:
-    if not summary_path.exists():
-        raise FileNotFoundError(f"{summary_path} does not exist")
-    last: dict[str, str] | None = None
-    with summary_path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            last = row
-    if last is None:
-        raise ValueError(f"{summary_path} has no rows")
-    return last
-
-
-def checkpoint_metric(checkpoint_dir: Path, metric_name: str) -> Metric:
-    summary_path = checkpoint_dir.parent / "summary-learn.log"
-    if not summary_path.exists():
-        raise FileNotFoundError(f"{summary_path} does not exist")
-    found: Metric | None = None
-    with summary_path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if (row.get("checkpoint") or "").strip() == checkpoint_dir.name:
-                found = metric_from_row(row)
-    if found is None:
-        raise ValueError(f"no summary row for checkpoint {checkpoint_dir.name!r} in {summary_path}")
-    found.score(metric_name)
-    return found
-
-
-def quantized_test_passthrough_args(extra_args: list[str]) -> list[str]:
-    out: list[str] = []
-    i = 0
-    while i < len(extra_args):
-        token = extra_args[i]
-        if token in QUANTIZED_TEST_VALUE_FLAGS:
-            if i + 1 >= len(extra_args):
-                raise ValueError(f"{token} in passthrough args requires a value")
-            out.extend([token, extra_args[i + 1]])
-            i += 2
-        elif token in QUANTIZED_TEST_BOOL_FLAGS:
-            out.append(token)
-            i += 1
-        else:
-            i += 1
-    return out
-
-
-def run_process_tee(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, float, list[str]]:
-    lines: list[str] = []
-    start = time.time()
-    with log_path.open("w", encoding="utf-8", newline="") as log:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            lines.append(line)
-            log.write(line)
-            log.flush()
-            if stream:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-        returncode = proc.wait()
-    elapsed = time.time() - start
-    return returncode, elapsed, lines
-
-
-class BulletOuWorker:
-    def __init__(self, exe: str, log_path: Path, stream: bool) -> None:
-        self.exe = exe
-        self.stream = stream
-        self.next_id = 1
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.main_log = log_path.open("a", encoding="utf-8", newline="")
-        self.proc = subprocess.Popen(
-            [exe, "worker"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True,
-        )
-        if self.proc.stdin is None or self.proc.stdout is None:
-            raise RuntimeError("failed to open bulletou worker pipes")
-
-    def close(self) -> None:
-        try:
-            if self.proc.poll() is None:
-                try:
-                    self.request("quit", {}, Path(os_devnull_log_name()), stream=False)
-                except Exception:
-                    pass
-                try:
-                    self.proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    try:
-                        self.proc.terminate()
-                    except Exception:
-                        pass
-        finally:
-            try:
-                self.main_log.close()
-            except Exception:
-                pass
-
-    def request(
-        self,
-        cmd: str,
-        payload: dict[str, Any],
-        log_path: Path,
-        stream: bool,
-    ) -> tuple[dict[str, Any], float, list[str]]:
-        if self.proc.poll() is not None:
-            raise RuntimeError(f"bulletou worker already exited with code {self.proc.returncode}")
-        request_id = self.next_id
-        self.next_id += 1
-        request = {"id": request_id, "cmd": cmd}
-        request.update(payload)
-        assert self.proc.stdin is not None
-        assert self.proc.stdout is not None
-
-        lines: list[str] = []
-        started = time.time()
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("w", encoding="utf-8", newline="") as log:
-            request_line = json.dumps(request, ensure_ascii=False)
-            self.main_log.write(f">>> {request_line}\n")
-            self.main_log.flush()
-            self.proc.stdin.write(request_line + "\n")
-            self.proc.stdin.flush()
-            while True:
-                line = self.proc.stdout.readline()
-                if line == "":
-                    returncode = self.proc.poll()
-                    if returncode is None:
-                        continue
-                    raise RuntimeError(f"bulletou worker exited while waiting for `{cmd}` response: code={returncode}")
-                lines.append(line)
-                log.write(line)
-                log.flush()
-                self.main_log.write(line)
-                self.main_log.flush()
-                if stream:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-
-                try:
-                    response = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(response, dict) or response.get("id") != request_id or "ok" not in response:
-                    continue
-                elapsed = time.time() - started
-                if not response.get("ok"):
-                    error = response.get("error", "unknown worker error")
-                    raise RuntimeError(f"worker `{cmd}` failed: {error}")
-                payload_value = response.get("payload", {})
-                if not isinstance(payload_value, dict):
-                    raise RuntimeError(f"worker `{cmd}` returned non-object payload")
-                return payload_value, elapsed, lines
-
-
-def os_devnull_log_name() -> str:
-    return "NUL" if sys.platform.startswith("win") else "/dev/null"
-
-
-def use_color(args: argparse.Namespace) -> bool:
-    if args.color == "always":
-        return True
-    if args.color == "never":
-        return False
-    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
-
-
-def color_text(args: argparse.Namespace, text: str, color: str, *, bold: bool = False) -> str:
-    if not use_color(args):
-        return text
-    prefix = ""
-    if bold:
-        prefix += ANSI_COLORS["bold"]
-    prefix += ANSI_COLORS[color]
-    return f"{prefix}{text}{ANSI_COLORS['reset']}"
-
-
-def event_line(args: argparse.Namespace, label: str, message: str, color: str, *, bold: bool = False) -> None:
-    print(f"{color_text(args, f'[{label}]', color, bold=bold)} {message}", flush=True)
-
-
-def objective_label(metric_name: str) -> str:
-    if metric_name == "quantized_value_loss":
-        return "qloss"
-    if metric_name == "test_value_loss":
-        return "test_loss"
-    return metric_name
-
-
-def base_metric_text(args: argparse.Namespace, base_score: float, base_metric: Metric) -> str:
-    label = objective_label(args.metric)
-    text = color_text(args, f"base_{label}={base_score:.9f}", "cyan", bold=True)
-    if args.metric != "quantized_value_loss":
-        text += f"  base_qloss={fmt_metric(base_metric.qloss)}"
-    text += (
-        f"  base_qacc={fmt_metric(base_metric.qacc)}"
-        f"  base_test_loss={fmt_metric(base_metric.test_loss)}"
-        f"  base_test_acc={fmt_metric(base_metric.test_acc)}"
-    )
-    return text
-
-
-def trial_start_line(
+def train_candidate_stage(
     args: argparse.Namespace,
-    *,
-    trial_number: int,
-    side: str,
-    tag: str,
-    base_score: float,
-    base_metric: Metric,
-) -> None:
-    event_line(
-        args,
-        f"TRIAL {trial_number} START",
-        (
-            f"{trial_label(side)}  tag={tag}  "
-            f"{base_metric_text(args, base_score, base_metric)}"
-        ),
+    settings: EsSettings,
+    generation: int,
+    candidate: Candidate,
+    stage: BeamStage,
+    prev_after_sbs: int,
+    temp_root: Path,
+    log_dir: Path,
+    color: bool,
+) -> Candidate:
+    delta = stage.after_sbs - prev_after_sbs
+    out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"gen{generation:04d}-stage{stage.after_sbs:04d}-cand{candidate.index:03d}.stdout.log"
+    event(
+        color,
+        f"[CAND {candidate.index:03d} START]",
+        f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb",
         "cyan",
-        bold=True,
     )
+    cmd = build_train_command(args, candidate.params, candidate.checkpoint, out_dir, delta, settings)
+    if args.dry_run:
+        print("  " + subprocess.list2cmdline(cmd), flush=True)
+        metric = Metric(qloss=math.inf, qacc=None, test_loss=None, test_acc=None)
+        score = metric.score(settings.metric)
+        checkpoint = candidate.checkpoint
+        elapsed = 0.0
+    else:
+        code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
+        if code != 0:
+            raise RuntimeError(f"candidate {candidate.index} failed at stage {stage.after_sbs}sb; see {log_path}")
+        row = latest_summary_row(out_dir)
+        metric = metric_from_summary_row(row)
+        score = metric.score(settings.metric)
+        checkpoint = latest_checkpoint_dir(out_dir)
 
-
-def score_compare_text(args: argparse.Namespace, score: float, base_score: float, *, value_name: str) -> str:
-    label = objective_label(args.metric)
-    return (
-        f"{value_name}_{label}={score:.9f} "
-        f"start_{label}={base_score:.9f} "
-        f"delta={score - base_score:+.9f}"
-    )
-
-
-def trial_threshold_line(
-    args: argparse.Namespace,
-    trial: TrialResult,
-    base_score: float,
-    *,
-    trial_number: int,
-) -> None:
-    beats_target = trial.score < base_score
-    status = "beats_target" if beats_target else "misses_target"
-    color = "green" if beats_target else "yellow"
-    event_line(
-        args,
-        f"TRIAL {trial_number} END",
-        (
-            f"{trial_label(trial.side)} {score_compare_text(args, trial.score, base_score, value_name='final')} "
-            f"qacc={fmt_metric(trial.metric.qacc)} result={status}"
-        ),
+    event(
         color,
-        bold=True,
-    )
-
-
-def population_decision_line(args: argparse.Namespace, best_trial: TrialResult, base_score: float) -> None:
-    beats_base = best_trial.score < base_score
-    color = "green" if beats_base else "yellow"
-    decision = "continue from best trial NN weights; theta_update=toward_best_trial"
-    event_line(
-        args,
-        "DECISION",
+        f"[CAND {candidate.index:03d} END]",
         (
-            f"best_trial={trial_label(best_trial.side)} "
-            f"{score_compare_text(args, best_trial.score, base_score, value_name='best_trial')} "
-            f"decision={decision}"
-        ),
-        color,
-        bold=True,
-    )
-
-
-def colored_metric_value(args: argparse.Namespace, value: float | None, color: str) -> str:
-    return color_text(args, fmt_metric(value), color, bold=True)
-
-
-def lower_is_better_color(value: float | None, baseline: float | None) -> str:
-    if value is None or baseline is None:
-        return "cyan"
-    return "green" if value < baseline else "yellow"
-
-
-def higher_is_better_color(value: float | None, baseline: float | None) -> str:
-    if value is None or baseline is None:
-        return "cyan"
-    return "green" if value > baseline else "yellow"
-
-
-def done_metric_text(
-    args: argparse.Namespace,
-    metric: Metric,
-    score: float,
-    base_score: float | None,
-    base_metric: Metric | None,
-) -> str:
-    parts: list[str] = []
-    label = objective_label(args.metric)
-    if label != "qloss" and label != "test_loss":
-        parts.append(
-            f"{label}={color_text(args, f'{score:.9f}', lower_is_better_color(score, base_score), bold=True)}"
-        )
-    if label == "test_loss":
-        parts.append(
-            "test_loss="
-            + colored_metric_value(
-                args,
-                metric.test_loss,
-                lower_is_better_color(metric.test_loss, base_metric.test_loss if base_metric is not None else None),
-            )
-        )
-    qloss_baseline = base_metric.qloss if base_metric is not None else (base_score if label == "qloss" else None)
-    parts.append(
-        "qloss=" + colored_metric_value(args, metric.qloss, lower_is_better_color(metric.qloss, qloss_baseline))
-    )
-    parts.append(
-        "qacc="
-        + colored_metric_value(
-            args,
-            metric.qacc,
-            higher_is_better_color(metric.qacc, base_metric.qacc if base_metric is not None else None),
-        )
-    )
-    if label != "test_loss" and metric.test_loss is not None:
-        parts.append(f"test_loss={fmt_metric(metric.test_loss)}")
-    if metric.test_acc is not None:
-        parts.append(f"test_acc={fmt_metric(metric.test_acc)}")
-    return " ".join(parts)
-
-
-def accepted_count(args: argparse.Namespace, accepted_sbs: int) -> int:
-    return accepted_sbs // args.sb_per_trial
-
-
-def should_save_accepted_checkpoint(args: argparse.Namespace, accepted_sbs: int) -> bool:
-    if args.save_rate <= 0:
-        return False
-    count = accepted_count(args, accepted_sbs)
-    return count > 0 and count % args.save_rate == 0
-
-
-def next_save_accept_count(args: argparse.Namespace, accepted_sbs: int) -> int | None:
-    if args.save_rate <= 0:
-        return None
-    count = accepted_count(args, accepted_sbs)
-    remainder = count % args.save_rate
-    if remainder == 0:
-        return count
-    return count + (args.save_rate - remainder)
-
-
-def parse_quantized_test_metric(lines: list[str]) -> Metric:
-    qacc: float | None = None
-    qloss: float | None = None
-    test_loss: float | None = None
-    for line in lines:
-        text = line.strip()
-        if text.startswith("accuracy"):
-            match = re.search(r"=\s*([0-9.+\-eE]+)%", text)
-            if match:
-                qacc = float(match.group(1)) / 100.0
-        elif text.startswith("loss_engine_scale"):
-            match = re.search(r"=\s*([0-9.+\-eE]+)", text)
-            if match:
-                qloss = float(match.group(1))
-        elif text.startswith("loss_train_scale"):
-            match = re.search(r"=\s*([0-9.+\-eE]+)", text)
-            if match:
-                test_loss = float(match.group(1))
-    if qloss is None:
-        raise ValueError("quantized-test output did not contain loss_engine_scale")
-    return Metric(qloss=qloss, qacc=qacc, test_loss=test_loss, test_acc=None)
-
-
-def metric_from_worker_quantized_payload(payload: dict[str, Any]) -> Metric:
-    return Metric(
-        qloss=parse_float(str(payload.get("quantized_value_loss")) if payload.get("quantized_value_loss") is not None else None),
-        qacc=parse_float(str(payload.get("quantized_value_accuracy")) if payload.get("quantized_value_accuracy") is not None else None),
-        test_loss=parse_float(str(payload.get("train_scale_loss")) if payload.get("train_scale_loss") is not None else None),
-        test_acc=None,
-    )
-
-
-def metric_from_worker_trial_payload(payload: dict[str, Any]) -> Metric:
-    return Metric(
-        qloss=parse_float(str(payload.get("quantized_value_loss")) if payload.get("quantized_value_loss") is not None else None),
-        qacc=parse_float(str(payload.get("quantized_value_accuracy")) if payload.get("quantized_value_accuracy") is not None else None),
-        test_loss=parse_float(str(payload.get("test_value_loss")) if payload.get("test_value_loss") is not None else None),
-        test_acc=parse_float(str(payload.get("test_value_accuracy")) if payload.get("test_value_accuracy") is not None else None),
-    )
-
-
-def worker_open_session(
-    args: argparse.Namespace,
-    worker: BulletOuWorker,
-    checkpoint_dir: Path,
-    theta: dict[str, float],
-    runner_dir: Path,
-    log_dir: Path,
-) -> None:
-    cmd = base_command(args, checkpoint_dir, "worker-session-open", theta, runner_dir / "session-open")
-    print("[worker-open] " + subprocess.list2cmdline(cmd), flush=True)
-    payload, elapsed, _lines = worker.request(
-        "open",
-        {"args": cmd[1:]},
-        log_dir / "worker-open.stdout.log",
-        stream=not args.no_stream_child_output,
-    )
-    print(
-        f"[worker-open-done] arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
-        f"completed_steps={payload.get('completed_steps')} optimizer_steps={payload.get('optimizer_steps')} "
-        f"elapsed={elapsed:.1f}s",
-        flush=True,
-    )
-
-
-def trial_label(side: str) -> str:
-    return side.replace("_", " ")
-
-
-def worker_accept_cached_trial(
-    args: argparse.Namespace,
-    worker: BulletOuWorker,
-    result: TrialResult,
-    log_dir: Path,
-) -> TrialResult:
-    log_path = log_dir / f"{result.tag}.accept.stdout.log"
-    payload, elapsed, _lines = worker.request(
-        "accept-cached-trial",
-        {"cache_key": result.tag},
-        log_path,
-        stream=not args.no_stream_child_output,
-    )
-    metric = metric_from_worker_trial_payload(payload)
-    score = metric.score(args.metric)
-    row = {
-        "test_value_accuracy": fmt_metric(metric.test_acc),
-        "test_value_loss": fmt_metric(metric.test_loss),
-        "quantized_value_accuracy": fmt_metric(metric.qacc),
-        "quantized_value_loss": fmt_metric(metric.qloss),
-        "checkpoint": "",
-        "worker_trial_theta_json": result.summary_row.get("worker_trial_theta_json", ""),
-    }
-    event_line(
-        args,
-        "WEIGHTS",
-        (
-            f"restored selected trial NN weights ({trial_label(result.side)}) tag={result.tag}; "
-            f"theta is updated separately by population move  "
-            f"{done_metric_text(args, metric, score, None, None)} elapsed={elapsed:.1f}s"
+            f"generation={generation} stage={stage.after_sbs}sb "
+            f"score={format_float(score)} qloss={format_float(metric.qloss)} "
+            f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
+            f"elapsed={elapsed:.1f}s"
         ),
         "green",
-        bold=True,
     )
-    return TrialResult(result.side, result.tag, result.output_dir, result.checkpoint_dir, metric, score, row)
+
+    if candidate.output_dir is not None and not args.keep_temp:
+        remove_dir_quiet(candidate.output_dir)
+
+    candidate.checkpoint = checkpoint
+    candidate.output_dir = out_dir
+    candidate.metric = metric
+    candidate.score = score
+    candidate.stage_sbs = stage.after_sbs
+    candidate.transient_dirs.append(out_dir)
+    return candidate
 
 
-def worker_drop_cached_trials(
-    worker: BulletOuWorker | None,
-    keys: list[str],
-    log_dir: Path,
-    *,
-    stream: bool,
+def rank_candidates(candidates: list[Candidate], lower_is_better: bool) -> list[Candidate]:
+    def key(candidate: Candidate) -> float:
+        if candidate.score is None:
+            raise RuntimeError(f"candidate {candidate.index} has no score")
+        return candidate.score
+
+    return sorted(candidates, key=key, reverse=not lower_is_better)
+
+
+def log_stage_rows(
+    summary_path: Path,
+    generation: int,
+    stage: BeamStage,
+    ranked: list[Candidate],
+    keep: int,
 ) -> None:
-    if worker is None or not keys:
-        return
-    worker.request(
-        "drop-cached-trials",
-        {"cache_keys": keys},
-        log_dir / "worker-drop-cached-trials.stdout.log",
-        stream=stream,
-    )
-
-
-def worker_save_checkpoint(
-    args: argparse.Namespace,
-    worker: BulletOuWorker,
-    checkpoint_hint: Path,
-    theta: dict[str, float],
-    save_dir: Path,
-    accepted_sbs: int,
-    log_dir: Path,
-) -> Path:
-    tag = f"worker-save-{accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)}"
-    cmd = base_command(args, checkpoint_hint, tag, theta, save_dir.parent)
-    epoch = max(1, accepted_sbs // args.epoch_sbs)
-    superbatch = args.epoch_sbs if accepted_sbs % args.epoch_sbs == 0 else accepted_sbs % args.epoch_sbs
-    payload, elapsed, _lines = worker.request(
-        "save",
-        {"args": cmd[1:], "dir": str(save_dir), "epoch": epoch, "superbatch": superbatch},
-        log_dir / f"{tag}.stdout.log",
-        stream=not args.no_stream_child_output,
-    )
-    saved = Path(str(payload.get("checkpoint_dir", save_dir))).resolve()
-    event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={saved} elapsed={elapsed:.1f}s", "cyan", bold=True)
-    return saved
-
-
-def run_base_quantized_test(
-    args: argparse.Namespace,
-    base_checkpoint: Path,
-    log_dir: Path,
-    worker: BulletOuWorker | None = None,
-) -> Metric:
-    nn_bin = base_checkpoint / "nn.bin"
-    if not nn_bin.exists():
-        raise FileNotFoundError(f"{nn_bin} does not exist; use --base-metric-source summary or provide a checkpoint with nn.bin")
-    qt_args = [
-        "--arch",
-        args.arch,
-        "--nn-bin",
-        str(nn_bin),
-        "--test-teacher",
-        str(args.test_teacher),
-        "--mode",
-        args.base_quantized_test_mode,
-    ]
-    qt_args.extend(quantized_test_passthrough_args(args.extra_args))
-    cmd = [str(args.exe), "quantized-test", *qt_args]
-    log_path = log_dir / "base-quantized-test.stdout.log"
-    if worker is not None:
-        print("[base-run worker] quantized-test " + subprocess.list2cmdline(qt_args), flush=True)
-        payload, elapsed, _lines = worker.request(
-            "quantized-test",
-            {"args": qt_args},
-            log_path,
-            stream=not args.no_stream_child_output,
+    for rank, candidate in enumerate(ranked, start=1):
+        metric = candidate.metric or Metric()
+        append_csv(
+            summary_path,
+            SUMMARY_FIELDS,
+            {
+                "generation": generation,
+                "stage_sbs": stage.after_sbs,
+                "candidate": candidate.index,
+                "status": "kept" if rank <= keep else "pruned",
+                "rank": rank,
+                "score": format_float(candidate.score),
+                "quantized_value_loss": format_float(metric.qloss),
+                "quantized_value_accuracy": format_float(metric.qacc),
+                "test_value_loss": format_float(metric.test_loss),
+                "test_value_accuracy": format_float(metric.test_acc),
+                "checkpoint": str(candidate.checkpoint),
+                "output_dir": str(candidate.output_dir or ""),
+                "parameters_json": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+            },
         )
-        metric = metric_from_worker_quantized_payload(payload)
-    else:
-        print("[base-run] " + subprocess.list2cmdline(cmd), flush=True)
-        returncode, elapsed, lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
-        if returncode != 0:
-            raise RuntimeError(f"base quantized-test failed with exit code {returncode}; see {log_path}")
-        metric = parse_quantized_test_metric(lines)
-    print(
-        f"[base-done] source=quantized-test mode={args.base_quantized_test_mode} "
-        f"qloss={fmt_metric(metric.qloss)} qacc={fmt_metric(metric.qacc)} "
-        f"loss_train_scale={fmt_metric(metric.test_loss)} elapsed={elapsed:.1f}s",
-        flush=True,
-    )
-    return metric
 
 
-def run_trial(
-    args: argparse.Namespace,
-    checkpoint_dir: Path,
-    tag: str,
-    side: str,
-    trial_number: int,
-    base_score: float,
-    base_metric: Metric,
-    theta: dict[str, float],
-    trial_output_folder: Path,
-    log_dir: Path,
-    worker: BulletOuWorker | None = None,
-) -> TrialResult:
-    cmd = base_command(args, checkpoint_dir, tag, theta, trial_output_folder)
-    log_path = log_dir / f"{tag}.stdout.log"
-    trial_start_line(
-        args,
-        trial_number=trial_number,
-        side=side,
-        tag=tag,
-        base_score=base_score,
-        base_metric=base_metric,
-    )
-    print("      " + subprocess.list2cmdline(cmd), flush=True)
-    if args.dry_run:
-        return TrialResult(side, tag, log_dir, checkpoint_dir, Metric(None, None, None, None), float("inf"), {})
-    prune_trial_output_by_tag(trial_output_folder, tag)
-    if worker is not None:
-        payload, elapsed, _lines = worker.request(
-            "trial",
-            {"args": cmd[1:], "cache_key": tag},
-            log_path,
-            stream=not args.no_stream_child_output,
-        )
-        metric = metric_from_worker_trial_payload(payload)
-        score = metric.score(args.metric)
-        row = {
-            "test_value_accuracy": fmt_metric(metric.test_acc),
-            "test_value_loss": fmt_metric(metric.test_loss),
-            "quantized_value_accuracy": fmt_metric(metric.qacc),
-            "quantized_value_loss": fmt_metric(metric.qloss),
-            "checkpoint": "",
-            "worker_trial_theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
-        }
-        print(
-            f"[done] {trial_label(side)} tag={tag} "
-            f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
-            flush=True,
-        )
-        return TrialResult(side, tag, trial_output_folder / tag, checkpoint_dir, metric, score, row)
-    else:
-        returncode, elapsed, _lines = run_process_tee(cmd, log_path, stream=not args.no_stream_child_output)
-        if returncode != 0:
-            raise RuntimeError(f"trial {tag} failed with exit code {returncode}; see {log_path}")
-    output_dir = find_output_dir(trial_output_folder, tag)
-    row = last_summary_row(output_dir / "summary-learn.log")
-    metric = metric_from_row(row)
-    score = metric.score(args.metric)
-    checkpoint_name = (row.get("checkpoint") or "").strip()
-    if not checkpoint_name or checkpoint_name == "-":
-        raise ValueError(f"{output_dir / 'summary-learn.log'} final row has no checkpoint column")
-    next_checkpoint = output_dir / checkpoint_name
-    if not (next_checkpoint / "state.bin").exists():
-        raise FileNotFoundError(f"{next_checkpoint / 'state.bin'} does not exist")
-    if not (next_checkpoint / "dataloader_pos.txt").exists():
-        raise FileNotFoundError(f"{next_checkpoint / 'dataloader_pos.txt'} does not exist")
-    print(
-        f"[done] {trial_label(side)} tag={tag} "
-        f"{done_metric_text(args, metric, score, base_score, base_metric)} elapsed={elapsed:.1f}s",
-        flush=True,
-    )
-    return TrialResult(side, tag, output_dir, next_checkpoint, metric, score, row)
+def validate_checkpoint_dir(path: Path) -> None:
+    if not path.exists():
+        raise RuntimeError(f"checkpoint directory does not exist: {path}")
+    if not (path / "state.bin").exists():
+        raise RuntimeError(f"checkpoint directory has no state.bin: {path}")
+    if not (path / "dataloader_pos.txt").exists():
+        raise RuntimeError(f"checkpoint directory has no dataloader_pos.txt: {path}")
 
 
-def fmt_metric(value: float | None) -> str:
-    return "-" if value is None else f"{value:.9f}"
+def load_state(path: Path) -> dict[str, Any]:
+    state = load_json_object(path)
+    version = int(state.get("version", STATE_VERSION))
+    if version != STATE_VERSION:
+        raise ValueError(f"{path}: unsupported state version {version}")
+    return state
 
 
-def ensure_inside(path: Path, root: Path) -> tuple[Path, Path]:
-    resolved = path.resolve()
-    resolved_root = root.resolve()
-    if resolved == resolved_root or resolved_root not in resolved.parents:
-        raise ValueError(f"refusing to modify {resolved}; it is not inside {resolved_root}")
-    return resolved, resolved_root
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    state["version"] = STATE_VERSION
+    atomic_write_json(path, state)
 
 
-def safe_rmtree(path: Path, root: Path) -> None:
-    resolved, _ = ensure_inside(path, root)
-    if resolved.exists():
-        shutil.rmtree(resolved)
+def metric_direction_text(settings: EsSettings) -> str:
+    return "lower is better" if settings.lower_is_better else "higher is better"
 
 
-def move_checkpoint_to_current(src: Path, current_dir: Path, runner_dir: Path) -> Path:
-    ensure_inside(current_dir, runner_dir)
-    temp_dir = runner_dir / "current.new"
-    safe_rmtree(temp_dir, runner_dir)
-    if not src.exists():
-        raise FileNotFoundError(f"{src} does not exist")
-    shutil.move(str(src), str(temp_dir))
-    safe_rmtree(current_dir, runner_dir)
-    temp_dir.rename(current_dir)
-    return current_dir
-
-
-def accepted_checkpoint_name(accepted_sbs: int, epoch_sbs: int) -> str:
-    _ = epoch_sbs
+def public_checkpoint_name(accepted_sbs: int) -> str:
     return f"sb{accepted_sbs:08d}"
-
-
-def copy_public_checkpoint(src: Path, accepted_root: Path, accepted_sbs: int, epoch_sbs: int) -> Path:
-    accepted_root.mkdir(parents=True, exist_ok=True)
-    dst = accepted_root / accepted_checkpoint_name(accepted_sbs, epoch_sbs)
-    if dst.exists():
-        raise FileExistsError(f"accepted checkpoint already exists: {dst}")
-    shutil.copytree(src, dst)
-    return dst
-
-
-def prune_trial_outputs(results: list[TrialResult], trial_output_folder: Path) -> None:
-    for result in results:
-        safe_rmtree(result.output_dir, trial_output_folder)
-
-
-def prune_trial_output_by_tag(trial_output_folder: Path, tag: str) -> None:
-    if not trial_output_folder.exists():
-        return
-    for path in trial_output_folder.iterdir():
-        if path.is_dir() and path.name.endswith(f"-{tag}"):
-            safe_rmtree(path, trial_output_folder)
-
-
-def write_json(path: Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
-
-
-def theta_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, float]:
-    return {key: after[key] - before[key] for key in before}
-
-
-def theta_change_text(before: dict[str, float], after: dict[str, float], keys: list[str]) -> str:
-    parts: list[str] = []
-    for key in keys:
-        old = before[key]
-        new = after[key]
-        diff = new - old
-        if diff == 0.0:
-            continue
-        parts.append(f"{key}:{old:.9g}->{new:.9g}({diff:+.9g})")
-    return ";".join(parts)
-
-
-def schema_backup_path(path: Path) -> Path:
-    base = path.with_name(path.name + ".old-schema")
-    if not base.exists():
-        return base
-    index = 2
-    while True:
-        candidate = path.with_name(f"{path.name}.old-schema{index}")
-        if not candidate.exists():
-            return candidate
-        index += 1
-
-
-def migrate_csv_schema(path: Path, backup: Path, fieldnames: list[str]) -> None:
-    rows: list[dict[str, str]] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(dict(row))
-    path.replace(backup)
-    with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    print(f"[log-schema] migrated CSV schema: {path} (backup={backup})", flush=True)
-
-
-def ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists() and path.stat().st_size > 0:
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.reader(f)
-            header = next(reader, [])
-        if header == fieldnames:
-            return
-        backup = schema_backup_path(path)
-        migrate_csv_schema(path, backup, fieldnames)
-        return
-    with path.open("w", encoding="utf-8", newline="") as f:
-        csv.DictWriter(f, fieldnames=fieldnames).writeheader()
-
-
-def append_csv_row(path: Path, fieldnames: list[str], row: dict[str, Any]) -> None:
-    ensure_csv_header(path, fieldnames)
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writerow(row)
-
-
-def read_csv_rows(path: Path, fieldnames: list[str]) -> list[dict[str, str]]:
-    ensure_csv_header(path, fieldnames)
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    tmp.replace(path)
-
-
-def append_history(path: Path, row: dict[str, Any]) -> None:
-    append_csv_row(path, HISTORY_FIELDS, row)
-
-
-def append_accepted_summary(path: Path, row: dict[str, Any]) -> None:
-    append_csv_row(path, ACCEPTED_SUMMARY_FIELDS, row)
-
-
-def append_trial_summary(path: Path, row: dict[str, Any]) -> None:
-    append_csv_row(path, TRIAL_SUMMARY_FIELDS, row)
-
-
-def trial_checkpoint_text(result: TrialResult) -> str:
-    checkpoint = result.summary_row.get("checkpoint", "").strip()
-    if checkpoint and checkpoint != "-":
-        return str(result.output_dir / checkpoint)
-    return str(result.checkpoint_dir)
-
-
-def make_trial_summary_row(
-    *,
-    iteration: int,
-    trial_number: int,
-    result_label: str,
-    reason: str,
-    accepted_sbs: int,
-    trial: TrialResult,
-    trial_theta: dict[str, float],
-    theta_before: dict[str, float],
-    keys: list[str],
-    saved_checkpoint: str,
-    population_size: int,
-    step_scale: float,
-    move_ratio: float,
-) -> dict[str, Any]:
-    return {
-        "iteration": iteration,
-        "trial": trial_number,
-        "result": result_label,
-        "reason": reason,
-        "accepted_sbs": accepted_sbs,
-        "quantized_value_loss": fmt_metric(trial.metric.qloss),
-        "quantized_value_accuracy": fmt_metric(trial.metric.qacc),
-        "test_value_loss": fmt_metric(trial.metric.test_loss),
-        "test_value_accuracy": fmt_metric(trial.metric.test_acc),
-        "trial_tag": trial.tag,
-        "trial_output_dir": str(trial.output_dir),
-        "checkpoint": trial_checkpoint_text(trial),
-        "saved_checkpoint": saved_checkpoint,
-        "population_size": population_size,
-        "step_scale": f"{step_scale:.9f}",
-        "move_ratio": f"{move_ratio:.9f}",
-        "theta_change": theta_change_text(theta_before, trial_theta, keys),
-        "theta_json": json.dumps(trial_theta, ensure_ascii=False, sort_keys=True),
-    }
-
-
-def append_trial_summary_row(path: Path, **kwargs: Any) -> None:
-    append_trial_summary(path, make_trial_summary_row(**kwargs))
-
-
-def trial_summary_iteration_rows(path: Path, iteration: int) -> list[dict[str, str]]:
-    return [row for row in read_csv_rows(path, TRIAL_SUMMARY_FIELDS) if row.get("iteration") == str(iteration)]
-
-
-def rewrite_trial_summary_iteration(path: Path, iteration: int, iteration_rows: list[dict[str, Any]]) -> None:
-    rows = [row for row in read_csv_rows(path, TRIAL_SUMMARY_FIELDS) if row.get("iteration") != str(iteration)]
-    rows.extend(iteration_rows)
-    write_csv_rows(path, TRIAL_SUMMARY_FIELDS, rows)
-
-
-def default_runner_dir(output_folder: Path, tag_prefix: str) -> Path:
-    return output_folder / f"es-{tag_prefix}"
-
-
-def resolve_runner_dir(args: argparse.Namespace) -> Path:
-    if args.runner_dir is not None:
-        runner_dir = args.runner_dir
-        if not args.resume_runner and (runner_dir / "state.json").exists():
-            raise FileExistsError(f"{runner_dir} already has state.json; use --resume or choose a new --tag-prefix/--runner-dir")
-        return runner_dir
-
-    runner_dir = default_runner_dir(args.output_folder, args.tag_prefix)
-    if args.resume_runner:
-        if (runner_dir / "state.json").exists():
-            return runner_dir
-        raise FileNotFoundError(f"{runner_dir / 'state.json'} does not exist; start a new run without --resume")
-
-    if (runner_dir / "state.json").exists():
-        raise FileExistsError(f"{runner_dir} already has state.json; use --resume or choose a new --tag-prefix")
-    return runner_dir
-
-
-def write_runner_state(
-    path: Path,
-    *,
-    phase: str,
-    iteration: int,
-    next_iteration: int,
-    base_checkpoint: Path,
-    base_score: float,
-    base_metric: Metric,
-    theta: dict[str, float],
-    step_scale: float,
-    accepted_sbs: int,
-    population_size: int,
-    move_ratio: float,
-    complete: bool = False,
-) -> None:
-    write_json(
-        path,
-        {
-            "phase": phase,
-            "iteration": iteration,
-            "next_iteration": next_iteration,
-            "base_checkpoint": str(base_checkpoint),
-            "base_score": base_score,
-            "base_metric": metric_to_json(base_metric),
-            "theta": theta,
-            "step_scale": step_scale,
-            "accepted_sbs": accepted_sbs,
-            "population_size": population_size,
-            "move_ratio": move_ratio,
-            "complete": complete,
-        },
-    )
 
 
 def main() -> int:
     args = parse_args()
-    worker: BulletOuWorker | None = None
-    try:
-        bounds = load_bounds(args.bounds_json)
+    color = color_enabled(args.color)
+    root, specs, settings = load_parameters(args.parameters_file)
+    if args.generations is not None:
+        settings.generations = args.generations
+    if args.save_rate is not None:
+        settings.save_rate = args.save_rate
+    if args.metric is not None:
+        settings.metric = args.metric
+        settings.lower_is_better = "loss" in args.metric
 
-        runner_dir = resolve_runner_dir(args)
-        trial_output_folder = runner_dir / "trials"
-        log_dir = runner_dir / "logs"
-        runner_dir.mkdir(parents=True, exist_ok=True)
-        trial_output_folder.mkdir(parents=True, exist_ok=True)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        current_dir = runner_dir / "current"
-        accepted_root = runner_dir / "accepted-checkpoints"
-
-        state_path = runner_dir / "state.json"
-        history_path = runner_dir / "history.csv"
-        trial_summary_path = runner_dir / "summary-learn.log"
-        accepted_summary_path = runner_dir / "accepted-summary-learn.log"
-        ensure_csv_header(trial_summary_path, TRIAL_SUMMARY_FIELDS)
-        ensure_csv_header(accepted_summary_path, ACCEPTED_SUMMARY_FIELDS)
-        ensure_csv_header(history_path, HISTORY_FIELDS)
-
-        if args.use_worker and not args.dry_run:
-            worker = BulletOuWorker(str(args.exe), log_dir / "worker.stdout.log", stream=not args.no_stream_child_output)
-            hello_payload, _hello_elapsed, _hello_lines = worker.request(
-                "hello",
-                {},
-                log_dir / "worker-hello.stdout.log",
-                stream=not args.no_stream_child_output,
-            )
-            print(
-                f"[worker] started protocol={hello_payload.get('protocol_version')} "
-                f"capabilities={hello_payload.get('capabilities')}",
-                flush=True,
+    if args.bucket_counts is None:
+        nonzero_counts = [
+            name for name in CONFIDENCE_FLAGS
+            if abs(specs[name].current) > 0.0
+        ]
+        if nonzero_counts:
+            raise RuntimeError(
+                "--bucket-counts is required because count-confidence parameters are non-zero: "
+                + ", ".join(nonzero_counts)
             )
 
-        if args.resume_runner:
-            if not state_path.exists():
-                raise FileNotFoundError(f"{state_path} does not exist")
-            state = load_json_object(state_path)
-            accepted_checkpoint = Path(str(state["base_checkpoint"])).resolve()
-            base_metric = metric_from_json(state["base_metric"])
-            base_score = float(state["base_score"])
-            theta_raw = state.get("theta")
-            if not isinstance(theta_raw, dict):
-                raise ValueError("state theta must be an object")
-            if args.theta or args.theta_json is not None:
-                print(
-                    "WARN: --resume loads theta from runner state.json; ignoring --theta/--theta-json from the command line.",
-                    flush=True,
-                )
-            theta = clamp_theta({str(key): float(value) for key, value in theta_raw.items()}, bounds)
-            keys = tuned_keys(args, theta)
-            step_scale = float(state["step_scale"])
-            if args.step_scale is not None:
-                print(
-                    f"WARN: --resume overriding fixed step_scale from state.json: "
-                    f"{step_scale:.9f} -> {args.step_scale:.9f}",
-                    flush=True,
-                )
-                step_scale = args.step_scale
-            population_size = int(state.get("population_size", args.population_size))
-            move_ratio = float(state.get("move_ratio", args.move_ratio))
-            accepted_sbs = int(state.get("accepted_sbs", 0))
-            phase = str(state.get("phase", "complete" if state.get("complete") else "running_trials"))
-            if phase in ("between_iterations", "complete"):
-                start_iteration = int(state.get("next_iteration", int(state["iteration"]) + 1))
-            else:
-                start_iteration = int(state.get("next_iteration", state["iteration"]))
-            base_source = f"{state_path} (--resume)"
-            print(
-                f"[resume] runner_dir={runner_dir} phase={phase} start_iteration={start_iteration} "
-                f"accepted_sbs={accepted_sbs} checkpoint={accepted_checkpoint}",
-                flush=True,
-            )
-        else:
-            theta = clamp_theta(load_theta(args.theta_json, args.theta), bounds)
-            keys = tuned_keys(args, theta)
-            assert args.base_checkpoint is not None
-            accepted_checkpoint = args.base_checkpoint.resolve()
-            if not (accepted_checkpoint / "state.bin").exists():
-                raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
-            if not (accepted_checkpoint / "dataloader_pos.txt").exists():
-                raise FileNotFoundError(f"{accepted_checkpoint / 'dataloader_pos.txt'} does not exist")
+    runner_root = args.output_folder / f"es-{args.tag_prefix}"
+    temp_root = args.temp_folder / f"es-{args.tag_prefix}" if args.temp_folder else runner_root / "temp"
+    log_dir = runner_root / "logs"
+    accepted_root = runner_root / "accepted-checkpoints"
+    current_dir = runner_root / "current"
+    state_path = runner_root / "runner-state.json"
+    summary_path = runner_root / "summary-learn.log"
+    accepted_summary_path = runner_root / "accepted-summary-learn.log"
+    history_path = runner_root / "parameters-history.jsonl"
 
-            if args.base_score is not None:
-                base_metric = Metric(None, None, None, None)
-                base_score = args.base_score
-                base_source = "--base-score"
-            elif args.base_metric_source == "quantized-test" and not args.dry_run:
-                base_metric = run_base_quantized_test(args, accepted_checkpoint, log_dir, worker)
-                base_score = base_metric.score(args.metric)
-                base_source = str(log_dir / "base-quantized-test.stdout.log")
-            else:
-                base_metric = checkpoint_metric(accepted_checkpoint, args.metric)
-                base_score = base_metric.score(args.metric)
-                base_source = str(accepted_checkpoint.parent / "summary-learn.log")
-                if args.base_metric_source == "quantized-test" and args.dry_run:
-                    base_source += " (dry-run fallback)"
-            write_json(
-                runner_dir / "config.json",
-                {
-                    "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items() if k != "extra_args"},
-                    "extra_args": args.extra_args,
-                    "initial_theta": theta,
-                    "bounds": bounds,
-                    "tuned_keys": keys,
-                    "initial_base_checkpoint": str(accepted_checkpoint),
-                    "initial_base_score": base_score,
-                    "accepted_checkpoint_policy": {
-                        "keep_trials": args.keep_trials,
-                        "epoch_sbs": args.epoch_sbs,
-                        "save_rate_accepts": args.save_rate,
-                        "accepted_root": str(accepted_root),
-                        "current_dir": str(current_dir),
-                    },
-                },
-            )
-            step_scale = args.step_scale if args.step_scale is not None else DEFAULT_STEP_SCALE
-            population_size = args.population_size
-            move_ratio = args.move_ratio
-            accepted_sbs = 0
-            start_iteration = 1
+    runner_root.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    accepted_root.mkdir(parents=True, exist_ok=True)
+    ensure_csv(summary_path, SUMMARY_FIELDS)
+    ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
 
-        print(
-            "[theta] loaded "
-            + json.dumps({key: theta[key] for key in sorted(theta)}, ensure_ascii=False, sort_keys=True),
-            flush=True,
-        )
-        print(f"[theta] tuned_keys={','.join(keys) if keys else '-'}", flush=True)
+    if args.resume:
+        if not state_path.exists():
+            raise RuntimeError(f"--resume was specified but {state_path} does not exist")
+        state = load_state(state_path)
+        current_checkpoint = Path(str(state["current_checkpoint"]))
+        generation_start = int(state.get("generation", 0)) + 1
+        accepted_sbs = int(state.get("accepted_sbs", 0))
+        event(color, "[RESUME]", f"generation={generation_start} checkpoint={current_checkpoint}", "yellow")
+    else:
+        if state_path.exists():
+            raise RuntimeError(f"{state_path} already exists; use --resume or choose a new --tag-prefix")
+        assert args.base_checkpoint is not None
+        validate_checkpoint_dir(args.base_checkpoint)
+        copy_dir_replace(args.base_checkpoint, current_dir)
+        current_checkpoint = current_dir
+        generation_start = 1
+        accepted_sbs = 0
+        state = {
+            "generation": 0,
+            "accepted_sbs": 0,
+            "current_checkpoint": str(current_checkpoint),
+            "parameters_file": str(args.parameters_file.resolve()),
+        }
+        save_state(state_path, state)
+        write_current_parameters(args.parameters_file, root, specs)
+        event(color, "[START]", f"checkpoint={current_checkpoint}", "green")
 
-        if not (accepted_checkpoint / "state.bin").exists():
-            raise FileNotFoundError(f"{accepted_checkpoint / 'state.bin'} does not exist")
-        if not (accepted_checkpoint / "dataloader_pos.txt").exists():
-            raise FileNotFoundError(f"{accepted_checkpoint / 'dataloader_pos.txt'} does not exist")
+    validate_checkpoint_dir(current_checkpoint)
 
-        event_line(
-            args,
-            "BASE",
-            (
-                f"{base_metric_text(args, base_score, base_metric)} "
-                f"checkpoint={accepted_checkpoint} source={base_source}"
-            ),
-            "cyan",
-            bold=True,
+    beam_text = ", ".join(f"{stage.after_sbs}sb=>keep{stage.keep}" for stage in settings.beam)
+    event(
+        color,
+        "[CONFIG]",
+        (
+            f"population={settings.population} generations={settings.generations} "
+            f"metric={settings.metric} ({metric_direction_text(settings)}) beam=[{beam_text}] "
+            f"save_rate={settings.save_rate}"
+        ),
+        "cyan",
+    )
+    event(color, "[PARAMETERS]", json.dumps(current_values(specs), ensure_ascii=False, sort_keys=True), "cyan")
+
+    total_generations = settings.generations
+    for generation in range(generation_start, generation_start + total_generations):
+        rng = random.Random(settings.seed + generation * 1_000_003)
+        current_params = current_values(specs)
+        candidates = [
+            Candidate(index=i + 1, params=perturb_parameters(specs, rng), checkpoint=current_checkpoint)
+            for i in range(settings.population)
+        ]
+
+        event(
+            color,
+            "[GEN START]",
+            f"generation={generation} population={settings.population} from={current_checkpoint}",
+            "magenta",
         )
 
-        if worker is not None and not args.dry_run:
-            worker_open_session(args, worker, accepted_checkpoint, theta, runner_dir, log_dir)
-
-        if start_iteration > args.iterations:
-            print(
-                f"[complete] runner_dir={runner_dir} already reached iteration {start_iteration - 1}; "
-                f"--iterations={args.iterations}",
-                flush=True,
-            )
-            return 0
-
-        iteration = start_iteration
-        while iteration <= args.iterations:
-            old_base_score = base_score
-            theta_before = dict(theta)
-            tag_base = f"{args.tag_prefix}-i{iteration:03d}"
-
-            event_line(
-                args,
-                "TARGET",
-                (
-                    f"iteration={iteration}/{args.iterations} population_size={population_size} "
-                    f"{base_metric_text(args, base_score, base_metric)} "
-                    f"step_scale={step_scale:.9f} move_ratio={move_ratio:.9f}"
-                ),
-                "cyan",
-                bold=True,
-            )
-            write_runner_state(
-                state_path,
-                phase="running_trials",
-                iteration=iteration,
-                next_iteration=iteration,
-                base_checkpoint=accepted_checkpoint,
-                base_score=base_score,
-                base_metric=base_metric,
-                theta=theta,
-                step_scale=step_scale,
-                accepted_sbs=accepted_sbs,
-                population_size=population_size,
-                move_ratio=move_ratio,
-            )
-
-            candidates: list[TrialResult] = []
-            trial_thetas: dict[str, dict[str, float]] = {}
-            trial_directions: dict[str, dict[str, int]] = {}
-            for trial_number in range(1, population_size + 1):
-                direction = trial_direction(args.seed, iteration, trial_number, keys)
-                trial_theta = make_variant(theta, bounds, direction, +1, step_scale)
-                side = f"trial_{trial_number:02d}"
-                tag = f"{tag_base}-t{trial_number:02d}"
-                trial = run_trial(
-                    args,
-                    accepted_checkpoint,
-                    tag,
-                    side,
-                    trial_number,
-                    old_base_score,
-                    base_metric,
-                    trial_theta,
-                    trial_output_folder,
-                    log_dir,
-                    worker,
-                )
-                trial_threshold_line(args, trial, old_base_score, trial_number=trial_number)
-                candidates.append(trial)
-                trial_thetas[trial.tag] = trial_theta
-                trial_directions[trial.tag] = direction
-
-            best = min(candidates, key=lambda item: item.score)
-            winner_theta = trial_thetas[best.tag]
-            theta, log_update = move_theta_toward(theta, bounds, keys, winner_theta, move_ratio)
-            max_abs_log_update = max((abs(value) for value in log_update.values()), default=0.0)
-            print(
-                f"[theta] mode=population winner={trial_label(best.side)} "
-                f"move_ratio={move_ratio:.6g} max_abs_log_update={max_abs_log_update:.6g}",
-                flush=True,
-            )
-            population_decision_line(args, best, old_base_score)
-
-            if worker is not None and not args.dry_run:
-                best = worker_accept_cached_trial(args, worker, best, log_dir)
-                worker_drop_cached_trials(
-                    worker,
-                    sorted(trial.tag for trial in candidates if trial.tag != best.tag),
-                    log_dir,
-                    stream=not args.no_stream_child_output,
-                )
-            elif not args.dry_run and not args.keep_trials:
-                accepted_checkpoint = move_checkpoint_to_current(best.checkpoint_dir, current_dir, runner_dir)
-            else:
-                accepted_checkpoint = best.checkpoint_dir
-
-            reason = "best_improved" if best.score < old_base_score else "best_not_improved"
-            base_metric = best.metric
-            base_score = best.score
-            accepted_sbs += args.sb_per_trial
-
-            public_checkpoint = ""
-            if not args.dry_run:
-                if should_save_accepted_checkpoint(args, accepted_sbs):
-                    if worker is not None:
-                        save_dir = accepted_root / accepted_checkpoint_name(accepted_sbs, args.epoch_sbs)
-                        if save_dir.exists():
-                            raise FileExistsError(f"accepted checkpoint already exists: {save_dir}")
-                        accepted_checkpoint = worker_save_checkpoint(
-                            args,
-                            worker,
-                            accepted_checkpoint,
-                            theta,
-                            save_dir,
-                            accepted_sbs,
-                            log_dir,
-                        )
-                        public_checkpoint = str(accepted_checkpoint)
-                    else:
-                        public_checkpoint = str(copy_public_checkpoint(accepted_checkpoint, accepted_root, accepted_sbs, args.epoch_sbs))
-                        event_line(args, "SAVE", f"accepted_sbs={accepted_sbs} checkpoint={public_checkpoint}", "cyan", bold=True)
-
-            selected_trial_tag = best.tag
-            selected_result_label = "accepted"
-            iteration_rows: list[dict[str, Any]] = []
-            for trial in candidates:
-                iteration_rows.append(
-                    make_trial_summary_row(
-                        iteration=iteration,
-                        trial_number=int(trial.side.rsplit("_", 1)[-1]),
-                        result_label="pending",
-                        reason=reason,
-                        accepted_sbs=accepted_sbs,
-                        trial=trial,
-                        trial_theta=trial_thetas[trial.tag],
-                        theta_before=theta_before,
-                        keys=keys,
-                        saved_checkpoint=Path(public_checkpoint).name if public_checkpoint else "",
-                        population_size=population_size,
-                        step_scale=step_scale,
-                        move_ratio=move_ratio,
+        live = candidates
+        prev_after_sbs = 0
+        for stage in settings.beam:
+            trained: list[Candidate] = []
+            for candidate in live:
+                trained.append(
+                    train_candidate_stage(
+                        args=args,
+                        settings=settings,
+                        generation=generation,
+                        candidate=candidate,
+                        stage=stage,
+                        prev_after_sbs=prev_after_sbs,
+                        temp_root=temp_root,
+                        log_dir=log_dir,
+                        color=color,
                     )
                 )
-            public_checkpoint_name = Path(public_checkpoint).name if public_checkpoint else ""
-            if worker is not None and not args.dry_run and not public_checkpoint:
-                selected_checkpoint_text = f"worker-resident:{selected_trial_tag}"
-            else:
-                selected_checkpoint_text = str(accepted_checkpoint)
-            for row in iteration_rows:
-                trial_tag = str(row.get("trial_tag", ""))
-                row["reason"] = reason
-                row["accepted_sbs"] = accepted_sbs
-                if trial_tag == selected_trial_tag:
-                    row["result"] = selected_result_label
-                    if selected_checkpoint_text:
-                        row["checkpoint"] = selected_checkpoint_text
-                    row["saved_checkpoint"] = public_checkpoint_name
-                else:
-                    row["result"] = "discarded"
-                    row["saved_checkpoint"] = ""
-            rewrite_trial_summary_iteration(trial_summary_path, iteration, iteration_rows)
-
-            if not args.dry_run:
-                append_accepted_summary(
-                    accepted_summary_path,
-                    {
-                        "iteration": iteration,
-                        "accepted_sbs": accepted_sbs,
-                        "reason": reason,
-                        "quantized_value_loss": fmt_metric(best.metric.qloss),
-                        "quantized_value_accuracy": fmt_metric(best.metric.qacc),
-                        "test_value_loss": fmt_metric(best.metric.test_loss),
-                        "test_value_accuracy": fmt_metric(best.metric.test_acc),
-                        "saved_checkpoint": Path(public_checkpoint).name if public_checkpoint else "",
-                        "selected_trial": trial_label(best.side),
-                        "population_size": population_size,
-                        "step_scale": f"{step_scale:.9f}",
-                        "move_ratio": f"{move_ratio:.9f}",
-                        "theta_change": theta_change_text(theta_before, theta, keys),
-                        "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
-                        "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
-                        "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
-                    },
-                )
-            if not args.keep_trials and not args.dry_run:
-                prune_trial_outputs(candidates, trial_output_folder)
-
-            append_history(
-                history_path,
-                {
-                    "iteration": iteration,
-                    "reason": reason,
-                    "base_score_before": f"{old_base_score:.9f}",
-                    "population_size": population_size,
-                    "best_trial": trial_label(best.side),
-                    "best_trial_score": f"{best.score:.9f}",
-                    "new_base_score": f"{base_score:.9f}",
-                    "new_base_checkpoint": str(accepted_checkpoint),
-                    "accepted_sbs": accepted_sbs,
-                    "public_checkpoint": public_checkpoint,
-                    "step_scale": f"{step_scale:.9f}",
-                    "move_ratio": f"{move_ratio:.9f}",
-                    "theta_change": theta_change_text(theta_before, theta, keys),
-                    "theta_before_json": json.dumps(theta_before, ensure_ascii=False, sort_keys=True),
-                    "theta_delta_json": json.dumps(theta_delta(theta_before, theta), ensure_ascii=False, sort_keys=True),
-                    "theta_json": json.dumps(theta, ensure_ascii=False, sort_keys=True),
-                    "winner_theta_json": json.dumps(winner_theta, ensure_ascii=False, sort_keys=True),
-                    "directions_json": json.dumps(trial_directions, ensure_ascii=False, sort_keys=True),
-                    "trial_scores_json": json.dumps({trial.tag: trial.score for trial in candidates}, ensure_ascii=False, sort_keys=True),
-                },
-            )
-            next_iteration = iteration + 1
-            write_runner_state(
-                state_path,
-                phase="between_iterations",
-                iteration=iteration,
-                next_iteration=next_iteration,
-                base_checkpoint=accepted_checkpoint,
-                base_score=base_score,
-                base_metric=base_metric,
-                theta=theta,
-                step_scale=step_scale,
-                accepted_sbs=accepted_sbs,
-                population_size=population_size,
-                move_ratio=move_ratio,
-            )
-            theta_change = theta_change_text(theta_before, theta, keys) or "-"
-            event_line(
-                args,
-                "ACCEPT",
+            ranked = rank_candidates(trained, settings.lower_is_better)
+            log_stage_rows(summary_path, generation, stage, ranked, stage.keep)
+            kept = ranked[: stage.keep]
+            pruned = ranked[stage.keep :]
+            best = kept[0]
+            worst_kept = kept[-1]
+            event(
+                color,
+                "[BEAM]",
                 (
-                    f"iteration={iteration} accepted_sbs={accepted_sbs} "
-                    f"reason={reason} {score_compare_text(args, best.score, old_base_score, value_name='final')} "
-                    f"decision=accept best population trial "
-                    f"theta_change={theta_change}"
+                    f"generation={generation} stage={stage.after_sbs}sb "
+                    f"keep={len(kept)}/{len(ranked)} best_score={format_float(best.score)} "
+                    f"worst_kept={format_float(worst_kept.score)}"
                 ),
-                "green" if best.score < old_base_score else "yellow",
-                bold=True,
+                "yellow",
             )
-            if public_checkpoint:
-                event_line(
-                    args,
-                    "SAFE TO STOP",
-                    f"saved_checkpoint={public_checkpoint}",
-                    "green",
-                    bold=True,
-                )
-            elif worker is not None and not args.dry_run:
-                save_at = next_save_accept_count(args, accepted_sbs)
-                suffix = f" next_save_accept={save_at}" if save_at is not None else " public_save_disabled"
-                event_line(
-                    args,
-                    "WAIT FOR SAVE",
-                    "accepted state is GPU-resident; stopping now loses progress since last save." + suffix,
-                    "yellow",
-                    bold=True,
-                )
-            else:
-                event_line(
-                    args,
-                    "SAFE TO STOP",
-                    f"runner_state_written checkpoint={accepted_checkpoint}",
-                    "green",
-                    bold=True,
-                )
-            iteration = next_iteration
+            if not args.keep_temp:
+                for candidate in pruned:
+                    if candidate.output_dir is not None:
+                        remove_dir_quiet(candidate.output_dir)
+            live = kept
+            prev_after_sbs = stage.after_sbs
 
-        write_runner_state(
-            state_path,
-            phase="complete",
-            iteration=args.iterations,
-            next_iteration=args.iterations + 1,
-            base_checkpoint=accepted_checkpoint,
-            base_score=base_score,
-            base_metric=base_metric,
-            theta=theta,
-            step_scale=step_scale,
-            accepted_sbs=accepted_sbs,
-            population_size=population_size,
-            move_ratio=move_ratio,
-            complete=True,
+        survivor = live[0]
+        if survivor.metric is None or survivor.score is None:
+            raise RuntimeError("final survivor has no metric")
+
+        if not args.dry_run:
+            copy_dir_replace(survivor.checkpoint, current_dir)
+        current_checkpoint = current_dir
+        accepted_sbs += settings.beam[-1].after_sbs
+
+        set_current_values(specs, survivor.params)
+        write_current_parameters(args.parameters_file, root, specs)
+
+        saved_checkpoint = ""
+        if settings.save_rate > 0 and (generation % settings.save_rate == 0):
+            public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
+            if not args.dry_run:
+                copy_dir_new(current_dir, public_dir)
+            saved_checkpoint = public_dir.name
+
+        params_json = json.dumps(survivor.params, ensure_ascii=False, sort_keys=True)
+        metric = survivor.metric
+        append_csv(
+            accepted_summary_path,
+            ACCEPTED_FIELDS,
+            {
+                "generation": generation,
+                "accepted_sbs": accepted_sbs,
+                "score": format_float(survivor.score),
+                "quantized_value_loss": format_float(metric.qloss),
+                "quantized_value_accuracy": format_float(metric.qacc),
+                "test_value_loss": format_float(metric.test_loss),
+                "test_value_accuracy": format_float(metric.test_acc),
+                "stage_sbs": settings.beam[-1].after_sbs,
+                "saved_checkpoint": saved_checkpoint,
+                "current_checkpoint": str(current_checkpoint),
+                "parameters_json": params_json,
+            },
         )
-        print(f"[complete] runner_dir={runner_dir}", flush=True)
-        print(f"[complete] best_checkpoint={accepted_checkpoint}", flush=True)
-        print(f"[complete] best_{objective_label(args.metric)}={base_score:.9f}", flush=True)
-        return 0
-    except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        if worker is not None:
-            worker.close()
+        append_jsonl(
+            history_path,
+            {
+                "generation": generation,
+                "accepted_sbs": accepted_sbs,
+                "score": survivor.score,
+                "metric": {
+                    "quantized_value_loss": metric.qloss,
+                    "quantized_value_accuracy": metric.qacc,
+                    "test_value_loss": metric.test_loss,
+                    "test_value_accuracy": metric.test_acc,
+                },
+                "parameters": survivor.params,
+                "current_checkpoint": str(current_checkpoint),
+                "saved_checkpoint": saved_checkpoint,
+            },
+        )
+
+        state = {
+            "generation": generation,
+            "accepted_sbs": accepted_sbs,
+            "current_checkpoint": str(current_checkpoint),
+            "last_score": survivor.score,
+            "last_metric": {
+                "quantized_value_loss": metric.qloss,
+                "quantized_value_accuracy": metric.qacc,
+                "test_value_loss": metric.test_loss,
+                "test_value_accuracy": metric.test_acc,
+            },
+            "parameters_file": str(args.parameters_file.resolve()),
+        }
+        save_state(state_path, state)
+
+        event(
+            color,
+            "[ACCEPT]",
+            (
+                f"generation={generation} accepted_sbs={accepted_sbs} "
+                f"score={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
+                f"qacc={format_float(metric.qacc)}"
+            ),
+            "green",
+        )
+        if saved_checkpoint:
+            event(color, "[SAVE]", f"{accepted_root / saved_checkpoint}", "green")
+            event(color, "[SAFE TO STOP]", f"saved={accepted_root / saved_checkpoint}", "green")
+        else:
+            event(color, "[CURRENT]", f"resume checkpoint updated: {current_checkpoint}", "yellow")
+
+        if not args.keep_temp:
+            gen_temp = temp_root / f"gen{generation:04d}"
+            remove_dir_quiet(gen_temp)
+
+        event(
+            color,
+            "[GEN END]",
+            f"generation={generation} survivor=cand{survivor.index:03d} params={params_json}",
+            "magenta",
+        )
+
+    event(color, "[DONE]", f"current_checkpoint={current_checkpoint}", "green")
+    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        raise SystemExit(130)

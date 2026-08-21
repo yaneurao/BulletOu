@@ -376,71 +376,78 @@ You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confiden
 
 ### 7.3 Automatic local ES tuning by qloss
 
-Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `es_local_runner.py` to search nearby settings instead of hand-writing many small runs.
+Factorizer alpha values and count-confidence values have many useful combinations. If you already have a good checkpoint, use `es_local_runner.py` to run a beam-search-style ES (evolution strategy) around it.
 
-This runner uses a small-population ES-style search. In one iteration, it runs `--population-size` short trials from the same checkpoint. Each trial perturbs the hyperparameters by a small random direction. The runner then selects the trial with the lowest quantized validation loss (`quantized_value_loss`). Accuracy is noisier, so qloss is the objective.
+The runner treats `parameters.json` as the current hyperparameter state. Each generation creates multiple candidates, trains each candidate for the configured number of superbatches, prunes weaker candidates at beam stages, and then promotes the final survivor. The survivor's NN weights and hyperparameters become the next current state.
 
-At startup, the runner runs `bulletou.exe quantized-test --mode gpu` on the base checkpoint's `nn.bin` and measures the base qacc/qloss. It prints the result as a `[BASE]` line. Use `--base-metric-source summary` only when you explicitly want to read an existing summary instead.
+The important rules are:
 
-```text
-1 iteration:
-  trial 1..N: train from the same base checkpoint for --sb-per-trial sb
-  continue from the NN weights of the lowest-qloss trial
-  move theta by --move-ratio toward that winner trial's hyperparameters
+- The survivor's hyperparameter values become the next generation's values directly.
+- There is no separate partial parameter update after selection.
+- Each candidate is sampled independently.
+- `parameters.json` is written back after every accepted generation. To manually edit values, stop the runner, edit the file, then resume.
+
+Example `parameters.json`:
+
+```json
+{
+  "version": 1,
+  "es": {
+    "generations": 100,
+    "population": 16,
+    "beam": [
+      { "after_sbs": 8, "keep": 8 },
+      { "after_sbs": 16, "keep": 4 },
+      { "after_sbs": 24, "keep": 2 },
+      { "after_sbs": 32, "keep": 1 }
+    ],
+    "metric": "quantized_value_loss",
+    "lower_is_better": true,
+    "seed": 1,
+    "save_rate": 1,
+    "candidate_validation_rate": 1,
+    "candidate_quantized_validation_rate": 1
+  },
+  "parameters": {
+    "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 10.0 },
+    "king_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.25, "min": 0.0, "max": 20.0 },
+    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 }
+  }
+}
 ```
 
-`--sb-per-trial 16` means each trial trains for 16 sb. With `--population-size 4`, one iteration spends 16 sb x 4 trials of GPU work, while the accepted path advances by 16 sb.
+`step` is the random sampling width. If `pair.current = 0.3` and `pair.step = 0.02`, candidates sample `pair` between `0.28` and `0.32`. Parameters with `tune: false` stay fixed.
 
-There is no retry window. Each iteration always runs exactly `--population-size` trials, then accepts the lowest-qloss trial among them. Even if the selected trial is worse than the starting qloss, the runner still advances with the best trial in that population. This keeps the local search moving.
-
-Saving is based on accepted iterations. Runner `--save-rate 1` saves after every accept, `--save-rate 4` saves after every four accepts, and `--save-rate 0` disables public accepted checkpoints.
-
-The perturbation size is multiplicative. The default is `--step-scale 1.005`. For example, `pair=0.3` may become roughly `0.3015` or `0.2985` in a trial. The up/down direction is chosen independently for each tuned parameter and each trial.
-
-`--move-ratio` controls how far theta moves toward the winner. The default is `0.25`. For example, if the winner trial used `pair=0.3015` from a current value of `0.3000`, theta does not jump all the way to `0.3015`; it moves roughly one quarter of the way.
-
-By default, trial directories are deleted after the decision. The accepted state is moved into the runner's internal `current/` directory, and the runner saves public checkpoints by accepted sb count, such as `accepted-checkpoints/sb00000064`, `sb00000128`, ... at save boundaries.
-
-Inside each trial, checkpoint saving happens only at the trial end. The runner passes a large `--save-rate` that is not reached during the trial, and relies on BulletOu's default epoch-end save to write the final trial checkpoint. Normal validation and quantized validation run every sb by default. That means stdout shows `test_value_loss` and `quantized_value_loss` for each sb. Use `--trial-validation-rate-sbs` and `--trial-quantized-validation-rate-sbs` if you want a different rate.
-
-With `--use-worker`, the runner starts `bulletou.exe worker` once and keeps one GPU-resident training session open. The worker snapshots/restores weights and optimizer state, so each trial avoids process startup, CUDA warmup, and trial checkpoint saving. After all population trials are measured, the worker restores the cached NN weights of the lowest-qloss trial and uses them as the next continuation source. This is not extra training; it only restores the selected trial state.
-
-Saving under `--use-worker` follows runner `--save-rate` too. For example, with `--sb-per-trial 16`, `--save-rate 4` writes `accepted-checkpoints/sb00000064`, `sb00000128`, ... every four accepts, which is every 64 accepted sb. Accepted states that have not reached a save boundary exist only in the worker process memory. If the run is interrupted, resume starts from the latest saved accepted checkpoint. Use a smaller runner `--save-rate` when exact interruption recovery matters.
-
-The ES runner judges hyperparameters from short-trial qloss. If the trial learning rate is too high, qloss can be dominated by short-term training oscillation rather than by the hyperparameter change. For serious tuning, use a smaller `--lr` / `--lr-min` than you would use for ordinary continuation training. If you deliberately use a high learning rate, increase `--sb-per-trial` to 16 or 32 instead of trusting very short trials too much.
-
-Example:
+Run example:
 
 ```powershell
-$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
+$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\...\0256"
 
 python .\es_local_runner.py `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --parameters-file .\parameters.json `
   --base-checkpoint $base `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
+  --temp-folder C:\BulletOu-es-temp `
   --tag-prefix pair2-qloss `
   --factorizer pair `
-  --iterations 20 `
-  --sb-per-trial 16 `
-  --population-size 4 `
-  --move-ratio 0.25 `
-  --epoch-sbs 32 `
-  --save-rate 4 `
   --positions-per-superbatch 40000000 `
-  --metric quantized_value_loss `
-  --use-worker `
-  --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
-  --tune axis `
-  --tune pair `
-  --tune count `
-  --fixed shared `
   -- `
-  --lr 0.000100 `
-  --lr-min 0.000100 `
+  --lr 0.000030 `
+  --lr-min 0.000010 `
   --wrm-in-offset 0 `
   --wrm-target-offset 0 `
   --lr-schedule step `
@@ -451,69 +458,43 @@ python .\es_local_runner.py `
   --sfnn-saturation-penalty 1e-7
 ```
 
-`--tune` chooses which parameters the runner is allowed to move.
+The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common candidate options such as `--lr` and `--optimizer` there.
 
-| Setting | Parameters moved |
+Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, `--initial-dataloader-pos`, `--sfnn-factorizer-alpha`, or count-confidence options after the delimiter. The runner owns those options for each candidate.
+
+The runner root is `--output-folder\es-<tag-prefix>`.
+
+| Path | Purpose |
 | --- | --- |
-| `--tune alpha` | `shared_alpha`, `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha`, `pair_alpha` |
-| `--tune axis` | `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha` |
-| `--tune pair` | `pair_alpha` only. It does not tune the three pair families separately |
-| `--tune count` | residual count, axis count, and pair count |
-| `--tune axis_count` | `king_axis_count`, `hand_axis_count`, `progress_axis_count` |
-| `--tune pair_count` | `king_hand_pair_count`, `king_progress_pair_count`, `hand_progress_pair_count` |
+| `current/` | Latest accepted checkpoint. Runner `--resume` continues from here |
+| `accepted-checkpoints/sbXXXXXXXX/` | Public checkpoint saved every `save_rate` accepted generations |
+| `summary-learn.log` | All candidate/stage results |
+| `accepted-summary-learn.log` | Final survivor results only |
+| `parameters-history.jsonl` | Accepted parameter history |
+| `runner-state.json` | Resume state |
 
-To tune everything except shared, use:
+Use `--temp-folder` to place temporary candidate checkpoints on a fast SSD such as `C:\BulletOu-es-temp`. Pruned candidates are deleted automatically. Use `--keep-temp` only when you want to inspect those directories.
 
-```powershell
---tune alpha `
---tune count `
---fixed shared
-```
-
-`--tune alpha` includes `shared_alpha`, so keep `--fixed shared` there.
-
-The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common trial options such as `--lr` and `--optimizer` there.
-
-Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, or `--initial-dataloader-pos` after the delimiter. The runner sets those options for each trial. If you want to change the ES runner's own save interval, put runner `--save-rate` before the delimiter.
-
-The runner mirrors `bulletou.exe` stdout to the console and also saves it under `logs/*.stdout.log`. If you want only the log files, add `--no-stream-child-output`.
-
-The runner root contains three CSV logs.
-
-| File | Purpose |
-| --- | --- |
-| `summary-learn.log` | One row per trial, including discarded trials |
-| `accepted-summary-learn.log` | Accepted path only; useful for match-test candidates and interruption points |
-| `history.csv` | One compact row per iteration; mostly for runner diagnostics |
-
-`summary-learn.log` includes `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, and `theta_json`. `result` is either `accepted` or `discarded`. `saved_checkpoint` is the folder name written under `accepted-checkpoints/`; it is empty on rows that did not save a checkpoint. `accepted-summary-learn.log` also puts `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, and `saved_checkpoint` near the front. Long text fields such as `reason` and `theta_json` are pushed to the right. The useful information is which trial was accepted, how qloss changed, which point is saved, and how each hyperparameter moved. If you want to inspect stdout from a file, open `logs/*.stdout.log` under the runner root. The `trials/` directory is deleted by default, so do not keep files inside it open in an editor. If you want to keep trial directories for debugging, add `--keep-trials`. The source checkpoint is not overwritten.
-
-The runner color-highlights only important event lines on the console. `BASE` is the initial baseline, and `TARGET` is the iteration start. Trial starts are printed as `TRIAL 1 START`, `TRIAL 2 START`, ... . When each trial finishes, the matching `TRIAL 1 END`, `TRIAL 2 END`, ... line prints `final_qloss`, `start_qloss`, `delta`, and `qacc`. It is green when `final_qloss < start_qloss`, and yellow otherwise. After all trials, the `DECISION` line prints the best trial qloss, the starting qloss, which NN weights will be used next, and how theta will be updated. With `--use-worker`, a `WEIGHTS` line appears when the worker restores the NN weights that will be used as the next continuation source. `ACCEPT` means the best population trial was accepted, `SAVE` means a checkpoint was written, and `SAFE TO STOP` marks a saved interruption point. With `--use-worker`, an `ACCEPT` without a following `SAVE` is still only resident in GPU memory; the runner prints yellow `WAIT FOR SAVE` in that case. Stop after the next `SAVE` / `SAFE TO STOP` if you do not want to lose accepted progress. Use `--color never` to disable colors.
-
-To resume an interrupted runner, use the same `--output-folder` and `--tag-prefix` and add `--resume`. The runner root is determined as `--output-folder\es-<tag-prefix>`, so you normally do not need to pass `--runner-dir`. The runner restores the checkpoint, theta, step scale, population size, move ratio, and accepted sb count from `state.json`. You do not need to write `--theta` or `--theta-json` by hand when resuming. If they are present, the runner still uses the theta stored in `state.json`.
+To resume, use the same `--output-folder` and `--tag-prefix`, then add `--resume`. The current hyperparameters are read from `parameters.json`, so you do not need to paste checkpoint-time values into the command line.
 
 ```powershell
 python .\es_local_runner.py `
   --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --parameters-file .\parameters.json `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
+  --temp-folder C:\BulletOu-es-temp `
   --tag-prefix pair2-qloss `
   --factorizer pair `
-  --iterations 1000 `
-  --sb-per-trial 16 `
   --positions-per-superbatch 40000000 `
-  --metric quantized_value_loss `
-  --tune alpha `
-  --tune count `
-  --fixed shared `
-  -- --lr 0.000100 --lr-min 0.000100 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
+  -- --lr 0.000030 --lr-min 0.000010 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
 ```
 
-`--iterations` is the target total iteration count for the whole runner. If `state.json` says `next_iteration=37`, `--iterations 1000` continues from iteration 37 through 1000.
+The console prints colored milestone lines: `[GEN START]`, `[CAND 001 START]`, `[CAND 001 END]`, `[BEAM]`, `[ACCEPT]`, and `[SAVE]`. Stop after `[SAVE]` or `[SAFE TO STOP]` if you want a public checkpoint. The `current/` checkpoint is updated after every accept, so runner `--resume` can also continue from accepted states that have not been copied to `accepted-checkpoints/`.
 
 ## 8. Save and validation frequency
 

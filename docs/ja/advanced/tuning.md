@@ -362,71 +362,78 @@ axis 行・pair 行そのものを count に応じて弱めたい場合は、`--
 
 ### 6.3 qloss を見ながらESで自動調整する
 
-factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。すでに良い checkpoint がある場合は、`es_local_runner.py` で近傍探索できます。
+factorizer の alpha や count confidence は、組み合わせが多く、手で総当たりすると時間がかかります。すでに良い checkpoint がある場合は、`es_local_runner.py` で beam search 風の ES (evolution strategy) を回せます。
 
-この runner は、小さな population を使う ES (evolution strategy) 方式です。1 iteration で、同じ checkpoint から `--population-size` 本の短い trial を走らせます。各 trial では、ハイパーパラメーターをランダム方向へ少しだけ動かします。その中で量子化後 loss (`quantized_value_loss`) が最も小さい trial を選びます。accuracy は値が荒いので、判断には qloss を使います。
+この runner は `parameters.json` を現在値として扱います。各 generation で複数 candidate を作り、candidate ごとに指定 sb だけ学習します。途中段階で成績の悪い candidate を捨て、最後に残った candidate の NN 重みとハイパーパラメーターを次の現在値にします。
 
-開始時には、継続元 checkpoint の `nn.bin` を使って `bulletou.exe quantized-test --mode gpu` を実行し、基準 qacc/qloss を測り直します。その結果は `[BASE]` 行として stdout に表示されます。summary から読みたい場合だけ `--base-metric-source summary` を指定します。
+重要な点は次の通りです。
 
-```text
-1 iteration:
-  trial 1..N: 同じ base checkpoint から --sb-per-trial sb だけ学習
-  qloss が最も小さい trial の NN 重みを次の継続元にする
-  theta を winner trial のハイパーパラメーターへ --move-ratio 分だけ近づける
+- 採用された candidate のパラメーター値を、そのまま次の generation の開始値にします。
+- 採用後にパラメーターだけを少し動かす処理はありません。
+- 各 candidate は独立にランダム生成されます。
+- `parameters.json` は accept ごとに書き戻されます。手で値を直したい場合は、停止してこのファイルを編集してから `--resume` します。
+
+`parameters.json` の例:
+
+```json
+{
+  "version": 1,
+  "es": {
+    "generations": 100,
+    "population": 16,
+    "beam": [
+      { "after_sbs": 8, "keep": 8 },
+      { "after_sbs": 16, "keep": 4 },
+      { "after_sbs": 24, "keep": 2 },
+      { "after_sbs": 32, "keep": 1 }
+    ],
+    "metric": "quantized_value_loss",
+    "lower_is_better": true,
+    "seed": 1,
+    "save_rate": 1,
+    "candidate_validation_rate": 1,
+    "candidate_quantized_validation_rate": 1
+  },
+  "parameters": {
+    "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 10.0 },
+    "king_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.25, "min": 0.0, "max": 20.0 },
+    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.5, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 1.0, "min": 0.0, "max": 200.0 }
+  }
+}
 ```
 
-`--sb-per-trial 16` は「1本の trial が16 sb」という意味です。`--population-size 4` なら、1 iteration でGPUが実行する量は 16 sb x 4 trial です。採用経路として進む量は16 sbです。
+`step` は candidate を作るときのランダム幅です。たとえば `pair.current = 0.3`, `pair.step = 0.02` なら、candidate の `pair` は `0.28` から `0.32` の範囲で作られます。`tune: false` の項目は固定されます。
 
-retry window はありません。1 iteration では常に `--population-size` 本の trial を実行し、その中で qloss が一番小さいものを採用します。採用された trial が開始時 qloss より悪くても、その population の中で一番ましなものとして先へ進みます。
-
-保存は accept された回数で決まります。runner の `--save-rate 1` なら accept ごとに保存、`--save-rate 4` なら4回 accept するごとに `accepted-checkpoints/` へ保存します。`--save-rate 0` なら accepted checkpoint の自動保存を無効にします。
-
-パラメーターの探索幅は倍率で指定します。デフォルトは `--step-scale 1.005` です。たとえば `pair=0.3` なら、trial によっておおむね `0.3015` や `0.2985` のような値になります。上下どちらへ動くかは、パラメーターごと、trial ごとにランダムです。
-
-`--move-ratio` は、theta を winner trial の値へどれだけ近づけるかを指定します。デフォルトは `0.25` です。たとえば現在の `pair=0.3000`、winner trial の `pair=0.3015` なら、theta は `0.3015` へ一気に飛ぶのではなく、おおむね4分の1だけ近づきます。
-
-デフォルトでは、trial フォルダは採否判定後に削除されます。採用された state は runner 内部の `current/` に移動され、保存境界ごとに `accepted-checkpoints/sb00000064`, `sb00000128`, ... のように、採用経路の累計sb数で外向け checkpoint が保存されます。
-
-trial 内の checkpoint 保存は trial 末だけです。runner は BulletOu本体へ、trial中に到達しない大きな `--save-rate` を渡し、デフォルト有効の epoch末保存でtrial末checkpointだけを作ります。通常の validation と量子化後 validation はデフォルトで毎 sb 実行されます。そのため stdout には各 sb の `test_value_loss` と `quantized_value_loss` が表示されます。変えたい場合は `--trial-validation-rate-sbs` と `--trial-quantized-validation-rate-sbs` を使います。
-
-`--use-worker` を付けると、runner は `bulletou.exe worker` を1回だけ起動し、GPU上に学習sessionを開いたまま trial を実行します。worker が重みと optimizer state を snapshot/restore するため、trialごとの process 起動、CUDA warmup、checkpoint 保存を避けられます。population の全 trial を測ったあと、qloss が最も小さい trial の NN 重みを cache から戻し、そのまま次の継続元にします。これは追加学習ではなく、選ばれた trial の状態を復元するだけです。
-
-`--use-worker` の保存も runner の `--save-rate` に従います。たとえば `--sb-per-trial 16` で `--save-rate 4` なら、4回 accept した時点、つまり採用経路が64 sb進むたびに `accepted-checkpoints/sb00000064`, `sb00000128`, ... へ保存します。保存されていない採用状態は worker process のメモリ上にだけあります。途中で止めた場合の再開地点は、最後に保存された accepted checkpoint です。こまかく中断再開したい実験では、runner の `--save-rate` を小さくしてください。
-
-ES runner は、短い trial の qloss でハイパーパラメーターを判断します。そのため、trial 側の学習率が高すぎると、ハイパーパラメーターの効果ではなく短期的な学習の振動を拾いやすくなります。本命のチューニングでは、通常の追加学習より小さめの `--lr` / `--lr-min` を使ってください。高い学習率を使う場合は、`--sb-per-trial` を16や32に増やして、短すぎる trial に頼りすぎないほうが安全です。
-
-例:
+実行例:
 
 ```powershell
-$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\SFNN_HALFKA2-SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-sfnn-sojo2tb-32sb-pair2-4.0\0256"
+$base = "C:\shogi\YaneuraOuWorks\BulletOu\checkpoints\...\0256"
 
 python .\es_local_runner.py `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --parameters-file .\parameters.json `
   --base-checkpoint $base `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
+  --temp-folder C:\BulletOu-es-temp `
   --tag-prefix pair2-qloss `
   --factorizer pair `
-  --iterations 20 `
-  --sb-per-trial 16 `
-  --population-size 4 `
-  --move-ratio 0.25 `
-  --epoch-sbs 32 `
-  --save-rate 4 `
   --positions-per-superbatch 40000000 `
-  --metric quantized_value_loss `
-  --use-worker `
-  --theta "shared=1.0,axis=1.0,pair=0.3,residual_count=1.0,axis_count=1.0,pair_count=10.0,king_axis_count=4.0" `
-  --tune axis `
-  --tune pair `
-  --tune count `
-  --fixed shared `
   -- `
-  --lr 0.000100 `
-  --lr-min 0.000100 `
+  --lr 0.000030 `
+  --lr-min 0.000010 `
   --wrm-in-offset 0 `
   --wrm-target-offset 0 `
   --lr-schedule step `
@@ -437,71 +444,43 @@ python .\es_local_runner.py `
   --sfnn-saturation-penalty 1e-7
 ```
 
-`--tune` は「runner が動かすパラメーター」を指定します。
+`--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、candidate 間で共通に使う学習条件を書きます。
 
-| 指定 | 動くもの |
+runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos`、`--sfnn-factorizer-alpha`、count confidence 系オプションは書かないでください。
+
+runner root は `--output-folder\es-<tag-prefix>` です。ここにログと現在 checkpoint が置かれます。
+
+| パス | 内容 |
 | --- | --- |
-| `--tune alpha` | `shared_alpha`, `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha`, `pair_alpha` |
-| `--tune axis` | `king_axis_alpha`, `hand_axis_alpha`, `progress_axis_alpha` |
-| `--tune pair` | `pair_alpha` だけ。`king-hand` などの3種類を個別には動かさない |
-| `--tune count` | residual count、axis count、pair count の全体 |
-| `--tune axis_count` | `king_axis_count`, `hand_axis_count`, `progress_axis_count` |
-| `--tune pair_count` | `king_hand_pair_count`, `king_progress_pair_count`, `hand_progress_pair_count` |
+| `current/` | 常に最新の採用 checkpoint。`--resume` はここから再開する |
+| `accepted-checkpoints/sbXXXXXXXX/` | `save_rate` 世代ごとの外向け保存 checkpoint |
+| `summary-learn.log` | すべての candidate / stage の結果 |
+| `accepted-summary-learn.log` | 採用された survivor だけの結果 |
+| `parameters-history.jsonl` | 採用時点のパラメーター履歴 |
+| `runner-state.json` | 再開用の内部状態 |
 
-shared 以外を全部動かしたい場合は、次のようにします。
+`--temp-folder` を指定すると、candidate の一時 checkpoint をそこへ置きます。SSD の `C:\BulletOu-es-temp` などを指定すると、`D:` に大量の一時フォルダを作らずに済みます。落選 candidate の一時フォルダは自動削除されます。調査用に残す場合だけ `--keep-temp` を指定します。
 
-```powershell
---tune alpha `
---tune count `
---fixed shared
-```
-
-この場合、`--tune alpha` には `shared_alpha` も含まれるので、`--fixed shared` を必ず付けます。
-
-`--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、各 trial で共通に使う学習条件を書きます。
-
-runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos` は書かないでください。ES runner 自体の保存頻度を変える `--save-rate` は、`--` より前に書きます。
-
-runner は `bulletou.exe` の stdout をコンソールへそのまま表示し、同時に `logs/*.stdout.log` にも保存します。画面出力を止めてログファイルだけにしたい場合は `--no-stream-child-output` を付けます。
-
-runner root には3種類のCSVログが出ます。
-
-| ファイル | 内容 |
-| --- | --- |
-| `summary-learn.log` | すべての trial を1行ずつ記録する。採用しなかった trial も残る |
-| `accepted-summary-learn.log` | 採用経路だけを記録する。棋力計測候補や停止地点の確認に使う |
-| `history.csv` | 1 iteration を1行にまとめた内部寄りの履歴 |
-
-`summary-learn.log` には `result`, `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint`, `theta_change`, `theta_json` が出ます。`result` は `accepted` または `discarded` です。`saved_checkpoint` は `accepted-checkpoints/` に保存されたフォルダ名です。保存境界でない行では空欄になります。`accepted-summary-learn.log` も `quantized_value_accuracy`, `quantized_value_loss`, `test_value_accuracy`, `test_value_loss`, `saved_checkpoint` が先頭側に来る列順です。`reason` や `theta_json` のような長い列は右側に寄せています。見るべきなのは、どの trial が採用されたか、qloss がどう動いたか、どこが保存済みか、そして各ハイパーパラメーターがどれだけ動いたかです。stdout ログをファイルで見る場合は runner root の `logs/*.stdout.log` を見てください。`trials/` の中は削除対象なので、そこにあるファイルをエディタで開いたままにしないでください。trial フォルダを削除せず調査用に残したい場合は `--keep-trials` を付けます。元の checkpoint は上書きされません。
-
-画面上では、節目の行だけ色付きで出ます。`BASE` は開始時の基準、`TARGET` はその iteration の開始地点です。trial の開始時には `TRIAL 1 START`, `TRIAL 2 START`, ... のように出ます。各 trial が終わると、対応する `TRIAL 1 END`, `TRIAL 2 END`, ... 行に `final_qloss`, `start_qloss`, `delta`, `qacc` が出ます。`final_qloss < start_qloss` なら緑、そうでなければ黄色です。全 trial のあとに `DECISION` 行が出ます。ここには best trial の qloss、開始時 qloss、次に使う NN 重み、theta 更新方法が出ます。`--use-worker` では、次の継続元にする NN 重みを戻したときに `WEIGHTS` 行が出ます。`ACCEPT` は population 内 best trial の採用、`SAVE` は checkpoint 保存、`SAFE TO STOP` はその時点で停止しても保存済みの地点です。`--use-worker` で `ACCEPT` だけ出て `SAVE` がまだ出ていない場合、その採用状態はGPU上にだけあります。その場合は黄色の `WAIT FOR SAVE` が出るので、停止するなら次の `SAVE` / `SAFE TO STOP` まで待ってください。色を消したい場合は `--color never` を指定します。
-
-中断した runner を再開する場合は、同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。runner root は `--output-folder\es-<tag-prefix>` で決まるので、通常は `--runner-dir` を書く必要はありません。`state.json` に保存された `current/` の checkpoint、theta、step scale、population size、move ratio、accepted sb count から再開します。再開時に `--theta` や `--theta-json` を手で書く必要はありません。書いてあっても、runner は `state.json` の theta を使います。
+再開するときは同じ `--output-folder` と `--tag-prefix` を指定して `--resume` を付けます。現在のハイパーパラメーターは `parameters.json` から読むので、checkpoint 時点の値をコマンドラインへ手で書き直す必要はありません。
 
 ```powershell
 python .\es_local_runner.py `
   --resume `
   --exe C:\shogi\YaneuraOuWorks\BulletOu\target\release\examples\bulletou.exe `
+  --parameters-file .\parameters.json `
   --teacher D:\sojoteam_datasets `
   --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
   --bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
   --output-folder D:\BulletOu-snapshots\20260820 `
+  --temp-folder C:\BulletOu-es-temp `
   --tag-prefix pair2-qloss `
   --factorizer pair `
-  --iterations 1000 `
-  --sb-per-trial 16 `
-  --population-size 4 `
-  --move-ratio 0.25 `
   --positions-per-superbatch 40000000 `
-  --metric quantized_value_loss `
-  --tune alpha `
-  --tune count `
-  --fixed shared `
-  -- --lr 0.000100 --lr-min 0.000100 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
+  -- --lr 0.000030 --lr-min 0.000010 --wrm-in-offset 0 --wrm-target-offset 0 --lr-schedule step --optimizer ranger --optimizer-weight-decay 0.0 --batches-per-update 1 --sfnn-dirty-bucket-update --sfnn-saturation-penalty 1e-7
 ```
 
-`--iterations` は「runner全体で何iterationまで進めるか」です。たとえば `state.json` が `next_iteration=37` なら、`--iterations 1000` で37回目から1000回目まで続きます。
+画面上では、`[GEN START]`、`[CAND 001 START]`、`[CAND 001 END]`、`[BEAM]`、`[ACCEPT]`、`[SAVE]` のように節目が色付きで出ます。止めるなら `[SAVE]` または `[SAFE TO STOP]` の直後が安全です。`current/` は accept ごとに更新されるので、`accepted-checkpoints/` に保存されていない地点からも runner の `--resume` は可能です。
 
 ## 7. 保存と検証の頻度
 
