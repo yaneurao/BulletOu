@@ -3,7 +3,8 @@
 
 This runner is intentionally simple:
 
-* `parameters.json` owns the current hyperparameters and ES settings.
+* `es-settings.json` owns the current hyperparameters and ES settings.
+* `bulletou-settings.json` owns the ordinary `bulletou.exe` training options.
 * Each generation creates a population of randomized candidates.
 * Candidates are trained for the configured beam stages.
 * At each stage, candidates are ranked by the configured metric and pruned.
@@ -16,19 +17,9 @@ candidate itself survives.
 Typical use:
 
     python es_local_runner.py ^
-      --exe .\\target\\release\\examples\\bulletou.exe ^
-      --parameters-file .\\parameters.json ^
-      --base-checkpoint C:\\...\\0256 ^
-      --teacher D:\\sojoteam_datasets ^
-      --test-teacher C:\\shogi\\teacher\\test\\test.hcpe ^
-      --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 ^
-      --bucket-counts D:\\sojo_counts\\count-all.bin ^
-      --output-folder D:\\BulletOu-snapshots\\20260820 ^
-      --temp-folder C:\\BulletOu-es-temp ^
-      --tag-prefix pair2-qloss ^
-      -- --lr 0.000030 --lr-min 0.000010 --wrm-in-offset 0 --wrm-target-offset 0
+      --es-settings-file .\\es-settings.json
 
-Arguments after `--` are passed through to `bulletou.exe`.
+Use --resume to continue from the runner root described by es-settings.json.
 """
 
 from __future__ import annotations
@@ -48,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 
-PARAMETER_VERSION = 1
+ES_SETTINGS_VERSION = 1
 STATE_VERSION = 1
 
 
@@ -95,29 +86,33 @@ DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
 }
 
 
-RUNNER_CONTROLLED_FLAGS = {
-    "--backend",
-    "--teacher",
-    "--test-teacher",
-    "--arch",
-    "--parameters-file",
-    "--initial-state",
-    "--initial-dataloader-pos",
-    "--output",
-    "--output-folder",
-    "--tag",
-    "--resume",
-    "--no-resume",
-    "--positions-per-superbatch",
-    "--superbatches",
-    "--max-epochs",
-    "--save-rate",
-    "--validation-rate",
-    "--quantized-validation-rate",
-    "--sfnn-factorizer",
-    "--sfnn-factorizer-alpha",
-    "--sfnn-bucket-counts",
-    *CONFIDENCE_FLAGS.values(),
+RUNNER_CONTROLLED_BULLETOU_SETTINGS = {
+    "initial_state",
+    "initial-state",
+    "initial_dataloader_pos",
+    "initial-dataloader-pos",
+    "output",
+    "output_folder",
+    "output-folder",
+    "tag",
+    "resume",
+    "no_resume",
+    "no-resume",
+    "superbatches",
+    "max_epochs",
+    "max-epochs",
+    "save_rate",
+    "save-rate",
+    "validation_rate",
+    "validation-rate",
+    "quantized_validation_rate",
+    "quantized-validation-rate",
+    "sfnn_factorizer_alpha",
+    "sfnn-factorizer-alpha",
+    "cuda_cpp_skip_final_output",
+    "cuda-cpp-skip-final-output",
+    *{flag.removeprefix("--").replace("-", "_") for flag in CONFIDENCE_FLAGS.values()},
+    *{flag.removeprefix("--") for flag in CONFIDENCE_FLAGS.values()},
 }
 
 
@@ -127,21 +122,19 @@ SUMMARY_FIELDS = [
     "candidate",
     "status",
     "rank",
-    "score",
     "quantized_value_loss",
     "quantized_value_accuracy",
     "test_value_loss",
     "test_value_accuracy",
     "checkpoint",
     "output_dir",
-    "parameters_json",
+    "parameters",
 ]
 
 
 ACCEPTED_FIELDS = [
     "generation",
     "accepted_sbs",
-    "score",
     "quantized_value_loss",
     "quantized_value_accuracy",
     "test_value_loss",
@@ -149,7 +142,7 @@ ACCEPTED_FIELDS = [
     "stage_sbs",
     "saved_checkpoint",
     "current_checkpoint",
-    "parameters_json",
+    "parameters",
 ]
 
 
@@ -210,6 +203,7 @@ class BeamStage:
 
 @dataclass
 class EsSettings:
+    enabled: bool
     generations: int
     population: int
     beam: list[BeamStage]
@@ -219,6 +213,16 @@ class EsSettings:
     save_rate: int
     candidate_validation_rate: int
     candidate_quantized_validation_rate: int
+
+
+@dataclass
+class RunSettings:
+    exe: Path
+    bulletou_settings_file: Path
+    base_checkpoint: Path | None
+    output_folder: Path | None
+    temp_folder: Path | None
+    tag_prefix: str | None
 
 
 @dataclass
@@ -237,27 +241,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a beam-style ES search for BulletOu factorizer/count hyperparameters."
     )
-    parser.add_argument("--exe", required=True, type=Path, help="Path to bulletou.exe")
-    parser.add_argument("--parameters-file", type=Path, default=Path("parameters.json"))
-    parser.add_argument("--base-checkpoint", type=Path, default=None, help="Initial checkpoint directory containing state.bin")
-    parser.add_argument("--teacher", required=True)
-    parser.add_argument("--test-teacher", required=True)
-    parser.add_argument("--arch", required=True)
-    parser.add_argument("--bucket-counts", type=Path, default=None)
-    parser.add_argument("--output-folder", required=True, type=Path)
-    parser.add_argument("--temp-folder", type=Path, default=None, help="Temporary candidate checkpoint root. Default: runner temp/ under output-folder.")
-    parser.add_argument("--tag-prefix", required=True)
-    parser.add_argument("--factorizer", default="pair")
-    parser.add_argument("--positions-per-superbatch", type=int, default=40_000_000)
-    parser.add_argument("--generations", type=int, default=None, help="Override es.generations from parameters.json")
-    parser.add_argument("--save-rate", type=int, default=None, help="Override es.save_rate. N=1 saves every accepted generation.")
-    parser.add_argument(
-        "--metric",
-        choices=["quantized_value_loss", "quantized_value_accuracy", "test_value_loss", "test_value_accuracy"],
-        default=None,
-        help="Override es.metric",
-    )
-    parser.add_argument("--resume", action="store_true", help="Resume from output-folder/es-<tag-prefix>/runner-state.json")
+    parser.add_argument("--es-settings-file", type=Path, default=Path("es-settings.json"))
+    parser.add_argument("--resume", action="store_true", help="Resume from run.output_folder/es-<run.tag_prefix>/runner-state.json")
     parser.add_argument("--keep-temp", action="store_true", help="Keep candidate temp directories for debugging")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -266,21 +251,7 @@ def parse_args() -> argparse.Namespace:
         help="Do not mirror bulletou.exe stdout to console; logs are still written under runner logs/.",
     )
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
-    parser.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to bulletou.exe")
     args = parser.parse_args()
-    if args.extra_args and args.extra_args[0] == "--":
-        args.extra_args = args.extra_args[1:]
-    if args.positions_per_superbatch <= 0:
-        parser.error("--positions-per-superbatch must be > 0")
-    if args.generations is not None and args.generations <= 0:
-        parser.error("--generations must be > 0")
-    if args.save_rate is not None and args.save_rate < 0:
-        parser.error("--save-rate must be >= 0")
-    if not args.resume and args.base_checkpoint is None:
-        parser.error("--base-checkpoint is required unless --resume is specified")
-    for token in args.extra_args:
-        if token in RUNNER_CONTROLLED_FLAGS:
-            parser.error(f"{token} is controlled by es_local_runner.py; remove it from arguments after --")
     return args
 
 
@@ -345,11 +316,34 @@ def parse_parameter_spec(name: str, value: Any) -> ParameterSpec:
     return spec
 
 
-def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec], EsSettings]:
+def es_settings_path(base_file: Path, raw: Any, name: str, required: bool = True) -> Path | None:
+    if raw is None:
+        if required:
+            raise ValueError(f"{base_file}: run.{name} is required")
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{base_file}: run.{name} must be a non-empty string")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = base_file.parent / path
+    return path
+
+
+def validate_bulletou_settings_for_es(path: Path) -> None:
     root = load_json_object(path)
-    version = int(root.get("version", PARAMETER_VERSION))
-    if version != PARAMETER_VERSION:
-        raise ValueError(f"{path}: unsupported version {version}; expected {PARAMETER_VERSION}")
+    bad = sorted(set(root) & RUNNER_CONTROLLED_BULLETOU_SETTINGS)
+    if bad:
+        raise ValueError(
+            f"{path}: these BulletOu settings are controlled by es_local_runner.py and must not be written here: "
+            + ", ".join(bad)
+        )
+
+
+def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec], EsSettings, RunSettings]:
+    root = load_json_object(path)
+    version = int(root.get("version", ES_SETTINGS_VERSION))
+    if version != ES_SETTINGS_VERSION:
+        raise ValueError(f"{path}: unsupported version {version}; expected {ES_SETTINGS_VERSION}")
 
     params_obj = root.get("parameters")
     if not isinstance(params_obj, dict):
@@ -367,11 +361,8 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     if not isinstance(es_obj, dict):
         raise ValueError(f"{path}: `es` object is required")
     enabled = es_obj.get("enabled")
-    if enabled is not True:
-        raise ValueError(
-            f"{path}: es.enabled must be true for es_local_runner.py; "
-            "set es.enabled=false when using the same parameters file with bulletou.exe"
-        )
+    if not isinstance(enabled, bool):
+        raise ValueError(f"{path}: es.enabled must be true or false")
 
     generations = int(es_obj.get("generations", 1))
     population = int(es_obj.get("population", 4))
@@ -428,6 +419,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError("final es.beam stage must keep exactly 1 candidate")
 
     settings = EsSettings(
+        enabled=enabled,
         generations=generations,
         population=population,
         beam=beam,
@@ -438,7 +430,36 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         candidate_validation_rate=candidate_validation_rate,
         candidate_quantized_validation_rate=candidate_quantized_validation_rate,
     )
-    return root, specs, settings
+    run_obj = root.get("run")
+    if not isinstance(run_obj, dict):
+        raise ValueError(f"{path}: `run` object is required")
+    unknown_run = sorted(set(run_obj) - {"exe", "bulletou_settings_file", "base_checkpoint", "output_folder", "temp_folder", "tag_prefix"})
+    if unknown_run:
+        raise ValueError(f"{path}: unknown run field(s): {', '.join(unknown_run)}")
+    exe = es_settings_path(path, run_obj.get("exe"), "exe")
+    bulletou_settings_file = es_settings_path(path, run_obj.get("bulletou_settings_file"), "bulletou_settings_file")
+    base_checkpoint = es_settings_path(path, run_obj.get("base_checkpoint"), "base_checkpoint", required=False)
+    output_folder = es_settings_path(path, run_obj.get("output_folder"), "output_folder", required=enabled)
+    temp_folder = es_settings_path(path, run_obj.get("temp_folder"), "temp_folder", required=False)
+    tag_prefix = run_obj.get("tag_prefix")
+    if enabled and (not isinstance(tag_prefix, str) or not tag_prefix.strip()):
+        raise ValueError(f"{path}: run.tag_prefix must be a non-empty string")
+    if not isinstance(tag_prefix, str) or not tag_prefix.strip():
+        tag_prefix = None
+    assert exe is not None
+    assert bulletou_settings_file is not None
+    if enabled:
+        assert output_folder is not None
+        validate_bulletou_settings_for_es(bulletou_settings_file)
+    run = RunSettings(
+        exe=exe,
+        bulletou_settings_file=bulletou_settings_file,
+        base_checkpoint=base_checkpoint,
+        output_folder=output_folder,
+        temp_folder=temp_folder,
+        tag_prefix=tag_prefix,
+    )
+    return root, specs, settings, run
 
 
 def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, ParameterSpec]) -> None:
@@ -457,7 +478,7 @@ def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, 
         obj["max"] = spec.maximum
         params_obj[name] = obj
     root["parameters"] = params_obj
-    root["version"] = PARAMETER_VERSION
+    root["version"] = ES_SETTINGS_VERSION
     atomic_write_json(path, root)
 
 
@@ -487,10 +508,8 @@ def alpha_arg(params: dict[str, float]) -> str:
     return ",".join(parts)
 
 
-def parameter_args(params: dict[str, float], bucket_counts: Path | None) -> list[str]:
+def parameter_args(params: dict[str, float]) -> list[str]:
     out = ["--sfnn-factorizer-alpha", alpha_arg(params)]
-    if bucket_counts is not None:
-        out.extend(["--sfnn-bucket-counts", str(bucket_counts)])
     for name, flag in CONFIDENCE_FLAGS.items():
         value = params.get(name)
         if value is not None and abs(value) > 0.0:
@@ -601,6 +620,12 @@ def remove_dir_quiet(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def copy_settings_files(dst: Path, es_settings_file: Path, bulletou_settings_file: Path) -> None:
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(es_settings_file, dst / "es-settings.json")
+    shutil.copy2(bulletou_settings_file, dst / "bulletou-settings.json")
+
+
 def run_command(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, float]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.perf_counter()
@@ -623,7 +648,7 @@ def run_command(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, floa
 
 
 def build_train_command(
-    args: argparse.Namespace,
+    run: RunSettings,
     params: dict[str, float],
     checkpoint: Path,
     output_dir: Path,
@@ -631,25 +656,15 @@ def build_train_command(
     settings: EsSettings,
 ) -> list[str]:
     cmd = [
-        str(args.exe),
-        "--backend",
-        "cuda-cpp",
-        "--teacher",
-        str(args.teacher),
-        "--test-teacher",
-        str(args.test_teacher),
-        "--arch",
-        str(args.arch),
+        str(run.exe),
+        "--settings-file",
+        str(run.bulletou_settings_file),
         "--initial-state",
         str(checkpoint / "state.bin"),
         "--initial-dataloader-pos",
         str(checkpoint / "dataloader_pos.txt"),
         "--output",
         str(output_dir),
-        "--sfnn-factorizer",
-        str(args.factorizer),
-        "--positions-per-superbatch",
-        str(args.positions_per_superbatch),
         "--superbatches",
         str(stage_delta_sbs),
         "--max-epochs",
@@ -661,15 +676,13 @@ def build_train_command(
         "--quantized-validation-rate",
         str(max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))),
     ]
-    if args.bucket_counts is not None:
-        cmd.extend(["--sfnn-bucket-counts", str(args.bucket_counts)])
-    cmd.extend(parameter_args(params, None))
-    cmd.extend(args.extra_args)
+    cmd.extend(parameter_args(params))
     return cmd
 
 
 def train_candidate_stage(
     args: argparse.Namespace,
+    run: RunSettings,
     settings: EsSettings,
     generation: int,
     candidate: Candidate,
@@ -691,7 +704,7 @@ def train_candidate_stage(
         f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb",
         "cyan",
     )
-    cmd = build_train_command(args, candidate.params, candidate.checkpoint, out_dir, delta, settings)
+    cmd = build_train_command(run, candidate.params, candidate.checkpoint, out_dir, delta, settings)
     if args.dry_run:
         print("  " + subprocess.list2cmdline(cmd), flush=True)
         metric = Metric(qloss=math.inf, qacc=None, test_loss=None, test_acc=None)
@@ -712,7 +725,7 @@ def train_candidate_stage(
         f"[CAND {candidate.index:03d} END]",
         (
             f"generation={generation} stage={stage.after_sbs}sb "
-            f"score={format_float(score)} qloss={format_float(metric.qloss)} "
+            f"{settings.metric}={format_float(score)} qloss={format_float(metric.qloss)} "
             f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
             f"elapsed={elapsed:.1f}s"
         ),
@@ -758,14 +771,13 @@ def log_stage_rows(
                 "candidate": candidate.index,
                 "status": "kept" if rank <= keep else "pruned",
                 "rank": rank,
-                "score": format_float(candidate.score),
                 "quantized_value_loss": format_float(metric.qloss),
                 "quantized_value_accuracy": format_float(metric.qacc),
                 "test_value_loss": format_float(metric.test_loss),
                 "test_value_accuracy": format_float(metric.test_acc),
                 "checkpoint": str(candidate.checkpoint),
                 "output_dir": str(candidate.output_dir or ""),
-                "parameters_json": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+                "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
             },
         )
 
@@ -800,31 +812,47 @@ def public_checkpoint_name(accepted_sbs: int) -> str:
     return f"sb{accepted_sbs:08d}"
 
 
+def run_once_from_settings(
+    args: argparse.Namespace,
+    run: RunSettings,
+    specs: dict[str, ParameterSpec],
+    color: bool,
+) -> int:
+    """Run one ordinary bulletou.exe training command using current parameter values."""
+    cmd = [str(run.exe), "--settings-file", str(run.bulletou_settings_file)]
+    cmd.extend(parameter_args(current_values(specs)))
+    if args.resume:
+        cmd.append("--resume")
+    event(
+        color,
+        "[RUN]",
+        "es.enabled=false; launching one bulletou.exe run with current parameter values",
+        "cyan",
+    )
+    event(color, "[SETTINGS]", f"bulletou={run.bulletou_settings_file}", "cyan")
+    if args.dry_run:
+        print("  " + subprocess.list2cmdline(cmd), flush=True)
+        return 0
+    code, elapsed = run_command(cmd, Path("bulletou-settings-run.stdout.log"), stream=not args.no_stream_child_output)
+    if code == 0:
+        event(color, "[DONE]", f"elapsed={elapsed:.1f}s", "green")
+    else:
+        event(color, "[ERROR]", f"bulletou.exe exited with code {code}; see bulletou-settings-run.stdout.log", "red")
+    return code
+
+
 def main() -> int:
     args = parse_args()
     color = color_enabled(args.color)
-    root, specs, settings = load_parameters(args.parameters_file)
-    if args.generations is not None:
-        settings.generations = args.generations
-    if args.save_rate is not None:
-        settings.save_rate = args.save_rate
-    if args.metric is not None:
-        settings.metric = args.metric
-        settings.lower_is_better = "loss" in args.metric
+    root, specs, settings, run = load_parameters(args.es_settings_file)
 
-    if args.bucket_counts is None:
-        nonzero_counts = [
-            name for name in CONFIDENCE_FLAGS
-            if abs(specs[name].current) > 0.0
-        ]
-        if nonzero_counts:
-            raise RuntimeError(
-                "--bucket-counts is required because count-confidence parameters are non-zero: "
-                + ", ".join(nonzero_counts)
-            )
+    if not settings.enabled:
+        return run_once_from_settings(args, run, specs, color)
 
-    runner_root = args.output_folder / f"es-{args.tag_prefix}"
-    temp_root = args.temp_folder / f"es-{args.tag_prefix}" if args.temp_folder else runner_root / "temp"
+    assert run.output_folder is not None
+    assert run.tag_prefix is not None
+    runner_root = run.output_folder / f"es-{run.tag_prefix}"
+    temp_root = run.temp_folder / f"es-{run.tag_prefix}" if run.temp_folder else runner_root / "temp"
     log_dir = runner_root / "logs"
     accepted_root = runner_root / "accepted-checkpoints"
     current_dir = runner_root / "current"
@@ -849,10 +877,11 @@ def main() -> int:
         event(color, "[RESUME]", f"generation={generation_start} checkpoint={current_checkpoint}", "yellow")
     else:
         if state_path.exists():
-            raise RuntimeError(f"{state_path} already exists; use --resume or choose a new --tag-prefix")
-        assert args.base_checkpoint is not None
-        validate_checkpoint_dir(args.base_checkpoint)
-        copy_dir_replace(args.base_checkpoint, current_dir)
+            raise RuntimeError(f"{state_path} already exists; use --resume or choose a new run.tag_prefix")
+        if run.base_checkpoint is None:
+            raise RuntimeError(f"{args.es_settings_file}: run.base_checkpoint is required unless --resume is specified")
+        validate_checkpoint_dir(run.base_checkpoint)
+        copy_dir_replace(run.base_checkpoint, current_dir)
         current_checkpoint = current_dir
         generation_start = 1
         accepted_sbs = 0
@@ -860,10 +889,13 @@ def main() -> int:
             "generation": 0,
             "accepted_sbs": 0,
             "current_checkpoint": str(current_checkpoint),
-            "parameters_file": str(args.parameters_file.resolve()),
+            "es_settings_file": str(args.es_settings_file.resolve()),
+            "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
         }
         save_state(state_path, state)
-        write_current_parameters(args.parameters_file, root, specs)
+        write_current_parameters(args.es_settings_file, root, specs)
+        if not args.dry_run:
+            copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
         event(color, "[START]", f"checkpoint={current_checkpoint}", "green")
 
     validate_checkpoint_dir(current_checkpoint)
@@ -875,7 +907,7 @@ def main() -> int:
         (
             f"population={settings.population} generations={settings.generations} "
             f"metric={settings.metric} ({metric_direction_text(settings)}) beam=[{beam_text}] "
-            f"save_rate={settings.save_rate}"
+            f"save_rate={settings.save_rate} bulletou_settings={run.bulletou_settings_file}"
         ),
         "cyan",
     )
@@ -905,6 +937,7 @@ def main() -> int:
                 trained.append(
                     train_candidate_stage(
                         args=args,
+                        run=run,
                         settings=settings,
                         generation=generation,
                         candidate=candidate,
@@ -926,8 +959,8 @@ def main() -> int:
                 "[BEAM]",
                 (
                     f"generation={generation} stage={stage.after_sbs}sb "
-                    f"keep={len(kept)}/{len(ranked)} best_score={format_float(best.score)} "
-                    f"worst_kept={format_float(worst_kept.score)}"
+                    f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
+                    f"worst_kept_{settings.metric}={format_float(worst_kept.score)}"
                 ),
                 "yellow",
             )
@@ -948,13 +981,16 @@ def main() -> int:
         accepted_sbs += settings.beam[-1].after_sbs
 
         set_current_values(specs, survivor.params)
-        write_current_parameters(args.parameters_file, root, specs)
+        write_current_parameters(args.es_settings_file, root, specs)
+        if not args.dry_run:
+            copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
 
         saved_checkpoint = ""
         if settings.save_rate > 0 and (generation % settings.save_rate == 0):
             public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
             if not args.dry_run:
                 copy_dir_new(current_dir, public_dir)
+                copy_settings_files(public_dir, args.es_settings_file, run.bulletou_settings_file)
             saved_checkpoint = public_dir.name
 
         params_json = json.dumps(survivor.params, ensure_ascii=False, sort_keys=True)
@@ -965,7 +1001,6 @@ def main() -> int:
             {
                 "generation": generation,
                 "accepted_sbs": accepted_sbs,
-                "score": format_float(survivor.score),
                 "quantized_value_loss": format_float(metric.qloss),
                 "quantized_value_accuracy": format_float(metric.qacc),
                 "test_value_loss": format_float(metric.test_loss),
@@ -973,7 +1008,7 @@ def main() -> int:
                 "stage_sbs": settings.beam[-1].after_sbs,
                 "saved_checkpoint": saved_checkpoint,
                 "current_checkpoint": str(current_checkpoint),
-                "parameters_json": params_json,
+                "parameters": params_json,
             },
         )
         append_jsonl(
@@ -981,7 +1016,8 @@ def main() -> int:
             {
                 "generation": generation,
                 "accepted_sbs": accepted_sbs,
-                "score": survivor.score,
+                "metric_value": survivor.score,
+                "metric_name": settings.metric,
                 "metric": {
                     "quantized_value_loss": metric.qloss,
                     "quantized_value_accuracy": metric.qacc,
@@ -998,14 +1034,16 @@ def main() -> int:
             "generation": generation,
             "accepted_sbs": accepted_sbs,
             "current_checkpoint": str(current_checkpoint),
-            "last_score": survivor.score,
+            "last_metric_value": survivor.score,
+            "last_metric_name": settings.metric,
             "last_metric": {
                 "quantized_value_loss": metric.qloss,
                 "quantized_value_accuracy": metric.qacc,
                 "test_value_loss": metric.test_loss,
                 "test_value_accuracy": metric.test_acc,
             },
-            "parameters_file": str(args.parameters_file.resolve()),
+            "es_settings_file": str(args.es_settings_file.resolve()),
+            "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
         }
         save_state(state_path, state)
 
@@ -1014,7 +1052,7 @@ def main() -> int:
             "[ACCEPT]",
             (
                 f"generation={generation} accepted_sbs={accepted_sbs} "
-                f"score={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
+                f"{settings.metric}={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
                 f"qacc={format_float(metric.qacc)}"
             ),
             "green",

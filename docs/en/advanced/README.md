@@ -9,7 +9,7 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | Page | Topic |
 | --- | --- |
 | [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, and loss |
-| [Automatic ES tuning](auto-tuning.md) | `parameters.json` based automatic tuning for factorizer and count confidence |
+| [Automatic ES tuning](auto-tuning.md) | Automatic factorizer / count-confidence tuning with `es-settings.json` and `bulletou-settings.json` |
 | [Loss scale and `FV_SCALE`](scale-and-fv-scale.md) | WRM loss, plain sigmoid loss, and quantized output scale |
 | [Continued training](additional-training.md) | Add epochs after a finished run, or continue with a new teacher or LR |
 | [LayerStack](layerstack.md) | SFNN hand / king / progress buckets |
