@@ -62,14 +62,14 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "king_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
-    "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
+    "pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 20.0 },
-    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
-    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
-    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
   }
 }
 ```
@@ -169,7 +169,7 @@ The runner root is `output_folder/es-<tag_prefix>`.
 Each parameter is written like this:
 
 ```json
-"pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 }
+"pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 }
 ```
 
 | Field | Meaning |
@@ -205,18 +205,14 @@ Count confidence uses a `count.bin` file created by `bucket-count`. It weakens t
 | Key | BulletOu option | Meaning |
 | --- | --- | --- |
 | `residual_count` | `--sfnn-residual-count-confidence` | Count confidence for bucket-specific residuals |
-| `axis_count` | `--sfnn-axis-count-confidence` | Shared value for king / hand / progress axis terms |
 | `king_axis_count` | `--sfnn-king-axis-count-confidence` | King-axis override |
 | `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | Hand-axis override |
 | `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | Progress-axis override |
-| `pair_count` | `--sfnn-pair-count-confidence` | Shared value for king-hand / king-progress / hand-progress pair terms |
 | `king_hand_pair_count` | `--sfnn-king-hand-pair-count-confidence` | King-hand pair override |
 | `king_progress_pair_count` | `--sfnn-king-progress-pair-count-confidence` | King-progress pair override |
 | `hand_progress_pair_count` | `--sfnn-hand-progress-pair-count-confidence` | Hand-progress pair override |
 
 `0.0` disables that confidence. Larger values require more observations before the corresponding term is trusted strongly.
-
-`axis_count` and `pair_count` are shared fallback values for all axis terms or all pair terms. If you use explicit fields such as `king_axis_count` or `king_progress_pair_count`, it is clearer to omit `axis_count` / `pair_count`. When they are omitted and inactive, the runner will not write them back automatically.
 
 ## Use current values without ES
 

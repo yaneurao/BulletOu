@@ -62,14 +62,14 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "king_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
-    "pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 },
+    "pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
     "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 20.0 },
-    "king_axis_count": { "current": 4.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
-    "king_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
-    "hand_progress_pair_count": { "current": 10.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 200.0 }
   }
 }
 ```
@@ -169,7 +169,7 @@ runner root は `output_folder/es-<tag_prefix>` になります。
 各パラメーターは次の形で書きます。
 
 ```json
-"pair": { "current": 0.3, "tune": true, "step": 0.02, "min": 0.0, "max": 10.0 }
+"pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 }
 ```
 
 | フィールド | 意味 |
@@ -205,18 +205,14 @@ count confidence は、`bucket-count` で作った `count.bin` を使って、�
 | キー | 対応する BulletOu オプション | 意味 |
 | --- | --- | --- |
 | `residual_count` | `--sfnn-residual-count-confidence` | bucket 固有 residual の count confidence |
-| `axis_count` | `--sfnn-axis-count-confidence` | king / hand / progress axis の共通値 |
 | `king_axis_count` | `--sfnn-king-axis-count-confidence` | king axis 専用 |
 | `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | hand axis 専用 |
 | `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | progress axis 専用 |
-| `pair_count` | `--sfnn-pair-count-confidence` | king-hand / king-progress / hand-progress pair の共通値 |
 | `king_hand_pair_count` | `--sfnn-king-hand-pair-count-confidence` | king-hand pair 専用 |
 | `king_progress_pair_count` | `--sfnn-king-progress-pair-count-confidence` | king-progress pair 専用 |
 | `hand_progress_pair_count` | `--sfnn-hand-progress-pair-count-confidence` | hand-progress pair 専用 |
 
 値が `0.0` なら、その count confidence は無効です。値を大きくすると、十分な出現回数がない成分をより強く抑えます。
-
-`axis_count` と `pair_count` は、それぞれ axis 系 / pair 系に共通の値を使いたい場合の項目です。`king_axis_count` や `king_progress_pair_count` のような個別項目を使う場合は、`axis_count` / `pair_count` を書かないほうが設定の意図が読みやすくなります。未指定のままなら、runner が勝手に書き戻すこともありません。
 
 ## `es.enabled=false` で current 値だけ使う
 

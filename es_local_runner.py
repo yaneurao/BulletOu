@@ -54,11 +54,9 @@ ALPHA_PARAMETERS = {
 
 CONFIDENCE_FLAGS = {
     "residual_count": "--sfnn-residual-count-confidence",
-    "axis_count": "--sfnn-axis-count-confidence",
     "king_axis_count": "--sfnn-king-axis-count-confidence",
     "hand_axis_count": "--sfnn-hand-axis-count-confidence",
     "progress_axis_count": "--sfnn-progress-axis-count-confidence",
-    "pair_count": "--sfnn-pair-count-confidence",
     "king_hand_pair_count": "--sfnn-king-hand-pair-count-confidence",
     "king_progress_pair_count": "--sfnn-king-progress-pair-count-confidence",
     "hand_progress_pair_count": "--sfnn-hand-progress-pair-count-confidence",
@@ -75,11 +73,9 @@ DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
     "progress_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
     "pair": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
     "residual_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 20.0},
-    "axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
     "king_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
     "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
     "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
     "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
     "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
     "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 200.0},
@@ -111,6 +107,10 @@ RUNNER_CONTROLLED_BULLETOU_SETTINGS = {
     "sfnn-factorizer-alpha",
     "cuda_cpp_skip_final_output",
     "cuda-cpp-skip-final-output",
+    "sfnn_axis_count_confidence",
+    "sfnn-axis-count-confidence",
+    "sfnn_pair_count_confidence",
+    "sfnn-pair-count-confidence",
     *{flag.removeprefix("--").replace("-", "_") for flag in CONFIDENCE_FLAGS.values()},
     *{flag.removeprefix("--") for flag in CONFIDENCE_FLAGS.values()},
 }
@@ -987,9 +987,9 @@ def main() -> int:
             "es_settings_file": str(args.es_settings_file.resolve()),
             "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
         }
-        save_state(state_path, state)
-        write_current_parameters(args.es_settings_file, root, specs)
         if not args.dry_run:
+            save_state(state_path, state)
+            write_current_parameters(args.es_settings_file, root, specs)
             copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
         event(color, "[START]", f"base_checkpoint={current_checkpoint}", "green")
 
@@ -1085,8 +1085,8 @@ def main() -> int:
         accepted_sbs += settings.beam[-1].after_sbs
 
         set_current_values(specs, survivor.params)
-        write_current_parameters(args.es_settings_file, root, specs)
         if not args.dry_run:
+            write_current_parameters(args.es_settings_file, root, specs)
             copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
 
         saved_checkpoint = ""
@@ -1149,7 +1149,8 @@ def main() -> int:
             "es_settings_file": str(args.es_settings_file.resolve()),
             "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
         }
-        save_state(state_path, state)
+        if not args.dry_run:
+            save_state(state_path, state)
 
         event(
             color,
