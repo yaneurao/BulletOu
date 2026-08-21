@@ -68,10 +68,10 @@ KNOWN_PARAMETERS = set(ALPHA_PARAMETERS) | set(CONFIDENCE_FLAGS)
 
 DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
     "shared": {"current": 1.0, "tune": False, "step": 0.0, "min": 0.0, "max": 10.0},
-    "king_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
-    "hand_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
-    "progress_axis": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
-    "pair": {"current": 1.0, "tune": False, "step": 0.03, "min": 0.0, "max": 10.0},
+    "king_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 10.0},
+    "hand_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 10.0},
+    "progress_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 10.0},
+    "pair": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 10.0},
     "residual_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 20.0},
     "king_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
     "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},

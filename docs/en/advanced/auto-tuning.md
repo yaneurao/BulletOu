@@ -59,10 +59,10 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   },
   "parameters": {
     "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 10.0 },
-    "king_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
-    "pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 },
+    "king_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 10.0 },
+    "pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 10.0 },
     "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 20.0 },
     "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
@@ -169,7 +169,7 @@ The runner root is `output_folder/es-<tag_prefix>`.
 Each parameter is written like this:
 
 ```json
-"pair": { "current": 1.0, "tune": true, "step": 0.03, "min": 0.0, "max": 10.0 }
+"pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 10.0 }
 ```
 
 | Field | Meaning |
