@@ -3110,7 +3110,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
             };
             eprintln!(
                 "  {}  {}  {}  {}  {}  {}  {}  {}",
-                paint_log_tag("[save]", ConsoleColor::BoldGreen),
+                paint_log_tag("[train]", ConsoleColor::BoldCyan),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
                     format!("sb {}/{}", progress.superbatch, progress.superbatches_per_epoch),
@@ -3125,7 +3125,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
         }
         None => eprintln!(
             "  {}  {}  {}  {}  {}  {}",
-            paint_log_tag("[save]", ConsoleColor::BoldGreen),
+            paint_log_tag("[train]", ConsoleColor::BoldCyan),
             paint(format!("delta={} pos", format_count(stats.interval_positions)), ConsoleColor::Yellow),
             paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
             colored_seconds("wall", stats.interval_wall_elapsed_sec),
