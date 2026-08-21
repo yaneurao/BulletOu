@@ -143,6 +143,9 @@ ACCEPTED_FIELDS = [
 ]
 
 
+LOG_WRITES_ENABLED = True
+
+
 ANSI = {
     "reset": "\x1b[0m",
     "bold": "\x1b[1m",
@@ -595,6 +598,8 @@ def latest_checkpoint_dir(output_dir: Path) -> Path:
 
 
 def ensure_csv(path: Path, fields: list[str]) -> None:
+    if not LOG_WRITES_ENABLED:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.stat().st_size > 0:
         with path.open("r", encoding="utf-8", newline="") as f:
@@ -608,6 +613,8 @@ def ensure_csv(path: Path, fields: list[str]) -> None:
 
 
 def append_csv(path: Path, fields: list[str], row: dict[str, Any]) -> None:
+    if not LOG_WRITES_ENABLED:
+        return
     ensure_csv(path, fields)
     with path.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -615,6 +622,8 @@ def append_csv(path: Path, fields: list[str], row: dict[str, Any]) -> None:
 
 
 def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    if not LOG_WRITES_ENABLED:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(obj, ensure_ascii=False, sort_keys=True))
@@ -864,9 +873,10 @@ def train_candidate_stage(
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
     out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
-    if out_dir.exists():
-        shutil.rmtree(out_dir)
-    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"gen{generation:04d}-stage{stage.after_sbs:04d}-cand{candidate.index:03d}.stdout.log"
     event(
         color,
@@ -968,7 +978,7 @@ def train_candidate_stage(
         },
     )
 
-    if candidate.output_dir is not None and not args.keep_temp:
+    if candidate.output_dir is not None and not args.keep_temp and not args.dry_run:
         remove_dir_quiet(candidate.output_dir)
 
     candidate.checkpoint = checkpoint
@@ -1199,7 +1209,9 @@ def run_once_from_settings(
 
 
 def main() -> int:
+    global LOG_WRITES_ENABLED
     args = parse_args()
+    LOG_WRITES_ENABLED = not args.dry_run
     color = color_enabled(args.color)
     root, specs, settings, run = load_parameters(args.es_settings_file)
 
@@ -1218,11 +1230,12 @@ def main() -> int:
     accepted_summary_path = runner_root / "accepted-summary-learn.log"
     history_path = runner_root / "parameters-history.jsonl"
 
-    runner_root.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    accepted_root.mkdir(parents=True, exist_ok=True)
-    ensure_csv(summary_path, SUMMARY_FIELDS)
-    ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
+    if not args.dry_run:
+        runner_root.mkdir(parents=True, exist_ok=True)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        accepted_root.mkdir(parents=True, exist_ok=True)
+        ensure_csv(summary_path, SUMMARY_FIELDS)
+        ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
 
     if args.resume:
         if not state_path.exists():
@@ -1438,7 +1451,7 @@ def main() -> int:
                     )
                     best.cache_key = None
                     best.checkpoint = current_checkpoint
-                if not args.keep_temp:
+                if not args.keep_temp and not args.dry_run:
                     for candidate in pruned:
                         if candidate.output_dir is not None:
                             remove_dir_quiet(candidate.output_dir)
@@ -1560,7 +1573,7 @@ def main() -> int:
             else:
                 event(color, "[CURRENT]", f"resume checkpoint updated: {current_checkpoint}", "yellow")
 
-            if not args.keep_temp:
+            if not args.keep_temp and not args.dry_run:
                 gen_temp = temp_root / f"gen{generation:04d}"
                 remove_dir_quiet(gen_temp)
 
