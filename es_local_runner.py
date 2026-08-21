@@ -652,7 +652,7 @@ def copy_settings_files(dst: Path, es_settings_file: Path, bulletou_settings_fil
     shutil.copy2(bulletou_settings_file, dst / "bulletou-settings.json")
 
 
-def run_command(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, float]:
+def run_command(cmd: list[str], log_path: Path, stream: bool, stream_prefix: str = "") -> tuple[int, float]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     start = time.perf_counter()
     with log_path.open("w", encoding="utf-8", errors="replace", newline="") as log:
@@ -668,7 +668,10 @@ def run_command(cmd: list[str], log_path: Path, stream: bool) -> tuple[int, floa
         for line in proc.stdout:
             log.write(line)
             if stream:
-                print(line, end="")
+                if stream_prefix and line.strip():
+                    print(f"{stream_prefix}{line}", end="")
+                else:
+                    print(line, end="")
         code = proc.wait()
     return code, time.perf_counter() - start
 
@@ -764,7 +767,13 @@ def train_candidate_stage(
         checkpoint = candidate.checkpoint
         elapsed = 0.0
     else:
-        code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
+        child_prefix = paint(color, f"[G{generation:04d} S{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
+        code, elapsed = run_command(
+            cmd,
+            log_path,
+            stream=not args.no_stream_child_output,
+            stream_prefix=child_prefix,
+        )
         if code != 0:
             append_csv(
                 summary_path,

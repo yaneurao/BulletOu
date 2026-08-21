@@ -269,4 +269,6 @@ The runner copies the current `es-settings.json` and `bulletou-settings.json` in
 
 If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[BEAM END]` only means candidate pruning finished; it does not mean a public checkpoint has been fully saved.
 
+During ES, each `bulletou.exe` child process is a short candidate job. Therefore `[epoch] start epoch 1/1` belongs to that child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0008 C001]`, meaning generation 2, 8sb stage, candidate 1.
+
 When normal training uses `bulletou.exe --settings-file`, each BulletOu checkpoint gets a copy of `bulletou-settings.json`.

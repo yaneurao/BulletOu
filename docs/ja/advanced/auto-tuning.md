@@ -269,4 +269,6 @@ ES runner が保存する `current/` と `accepted-checkpoints/sbXXXXXXXX/` に�
 
 途中で止めたい場合は、標準出力に `[SAFE TO STOP]` が出た直後が安全です。`[BEAM END]` は候補の枝刈りが終わっただけで、公開 checkpoint の保存完了を意味しません。
 
+ES 実行中の `bulletou.exe` は、候補ごとに短い学習 job として起動されます。そのため、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8sb stage、candidate 1」の意味です。
+
 `bulletou.exe --settings-file` で通常学習した checkpoint には、`bulletou-settings.json` がコピーされます。
