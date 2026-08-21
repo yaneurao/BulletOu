@@ -881,8 +881,12 @@ def main() -> int:
         if run.base_checkpoint is None:
             raise RuntimeError(f"{args.es_settings_file}: run.base_checkpoint is required unless --resume is specified")
         validate_checkpoint_dir(run.base_checkpoint)
-        copy_dir_replace(run.base_checkpoint, current_dir)
-        current_checkpoint = current_dir
+        # Do not eagerly copy the initial checkpoint into the runner directory.
+        # A full SFNN state.bin can be several GiB, and doing this before the
+        # first status line makes the runner look frozen.  The first generation
+        # can read directly from run.base_checkpoint; after a survivor is chosen
+        # we materialize runner_root/current as usual.
+        current_checkpoint = run.base_checkpoint
         generation_start = 1
         accepted_sbs = 0
         state = {
@@ -895,8 +899,8 @@ def main() -> int:
         save_state(state_path, state)
         write_current_parameters(args.es_settings_file, root, specs)
         if not args.dry_run:
-            copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
-        event(color, "[START]", f"checkpoint={current_checkpoint}", "green")
+            copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
+        event(color, "[START]", f"base_checkpoint={current_checkpoint}", "green")
 
     validate_checkpoint_dir(current_checkpoint)
 
