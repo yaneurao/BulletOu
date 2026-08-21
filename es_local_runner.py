@@ -1003,7 +1003,7 @@ def main() -> int:
 
         event(
             color,
-            "[GEN START]",
+            f"[GEN {generation} START]",
             (
                 f"generation={generation} population={settings.population} from={current_checkpoint} "
                 f"base_qloss={format_float(base_metric.qloss)} "
@@ -1043,7 +1043,7 @@ def main() -> int:
             worst_kept = kept[-1]
             event(
                 color,
-                "[BEAM]",
+                f"[GEN {generation} BEAM]",
                 (
                     f"generation={generation} stage={stage.after_sbs}sb "
                     f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
