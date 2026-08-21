@@ -35,13 +35,20 @@ HalfKP 疎入力 (125,388 次元 × 自他 2 perspective)
 - BulletOu をビルド済み (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - 学習データ (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin` のいずれか)
 
-### コマンド
+### 設定
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-halfkp"
+}
+```
+
+実行は次の形です。
 
 ```bash
-./target/release/examples/bulletou \
-    --arch NNUE_halfkp_256x2_32_32 \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-halfkp
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 `--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--superbatches` で epoch 長を決めたうえで `--max-epochs 3` のように指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。

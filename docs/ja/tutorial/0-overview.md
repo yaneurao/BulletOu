@@ -36,7 +36,7 @@ checkpoints/ に nn.bin ができる
 | # | ページ | 内容 |
 | --- | --- | --- |
 | 1 | [クイックスタート](1-quickstart.md) | ビルドと smoke test |
-| 2 | [教師データを用意する](2-data.md) | `--arch` と `--teacher` の準備 |
+| 2 | [教師データを用意する](2-data.md) | `arch` を選び、`teacher` を用意する |
 | 3 | [学習を走らせる](3-train.md) | 最小コマンドで学習 |
 | 4 | [検証を有効にする](4-validation.md) | accuracy / loss を測る |
 | 5 | [中断・再開](5-resume.md) | 止まったときの再開 |

@@ -12,8 +12,8 @@ BulletOu を初めて使う人向けの最短ガイドです。
 | 0 | [概要](0-overview.md) | BulletOu が何を学習するか、どの評価関数に対応しているかを理解する |
 | 1 | [クイックスタート](1-quickstart.md) | 必要なものを揃えて BulletOu をビルドし、最小の学習を動かして動作確認する |
 | 2 | [教師データを用意する](2-data.md) | architecture を選び、教師データを用意する |
-| 3 | [学習を走らせる](3-train.md) | 最低限の `bulletou` コマンドを実行する |
-| 4 | [検証を有効にする](4-validation.md) | `--test-teacher` と `--validation-rate` で accuracy / loss を見る |
+| 3 | [学習を走らせる](3-train.md) | `bulletou-settings.json` を作り、`--settings-file` で学習を始める |
+| 4 | [検証を有効にする](4-validation.md) | `test_teacher` と `validation_rate` を追加して accuracy / loss を見る |
 | 5 | [中断・再開](5-resume.md) | 止まった学習を続きから再開する |
 | 6 | [結果を確認する](6-result.md) | 出力ファイルと学習ログを見る |
 | 7 | [エンジンに組み込む](7-engine.md) | やねうら王エンジンで動作確認する |

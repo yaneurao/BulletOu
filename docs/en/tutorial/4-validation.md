@@ -4,31 +4,38 @@
 
 To watch accuracy / loss during training, point BulletOu at a validation set separate from the training teacher.
 
-## 4.1 Required options
+## 4.1 Required settings
 
-Two options control ordinary validation:
+Two settings control ordinary validation:
 
-| Option | Meaning | If omitted |
+| JSON key / CLI option | Meaning | If omitted |
 | --- | --- | --- |
-| `--test-teacher` | Validation-position file. Without this, `test_value_accuracy` / `test_value_loss` are not computed | no validation |
-| `--validation-rate` | Validate every N sb | same as `--save-rate` |
+| `test_teacher` / `--test-teacher` | Validation-position file. Without this, `test_value_accuracy` / `test_value_loss` are not computed | no validation |
+| `validation_rate` / `--validation-rate` | Validate every N sb | same as `save_rate` |
 
-So the minimum option needed to enable validation is `--test-teacher`.
+So the minimum setting needed to enable validation is `test_teacher`.
 
-If you want accuracy / loss every sb, also pass `--validation-rate 1`.
+If you want accuracy / loss every sb, set `validation_rate` to `1`.
 
-## 4.2 Example command
+## 4.2 Example settings
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "test_teacher": "C:/shogi/teacher/test/test.hcpe",
+  "validation_rate": 1,
+  "positions_per_superbatch": 1000000,
+  "superbatches": 1,
+  "max_epochs": 1,
+  "tag": "first-halfkp"
+}
+```
+
+Run it with:
 
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --test-teacher C:\shogi\teacher\test\test.hcpe `
-  --validation-rate 1 `
-  --positions-per-superbatch 1000000 `
-  --superbatches 1 `
-  --max-epochs 1 `
-  --tag first-halfkp
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 This trains on `teachers` and validates on `C:\shogi\teacher\test\test.hcpe`.
@@ -37,15 +44,17 @@ Use a validation file that is separate from the training teacher. Measuring accu
 
 ## 4.3 Number of validation positions
 
-If `--test-positions` is omitted, BulletOu uses every position in the validation file.
+If `test_positions` / `--test-positions` is omitted, BulletOu uses every position in the validation file.
 
 For a quick check, limit the count:
 
-```powershell
---test-positions 300000
+```json
+{
+  "test_positions": 300000
+}
 ```
 
-For comparisons, keep the validation file, `--test-positions`, and `--test-sample` fixed.
+For comparisons, keep the validation file, `test_positions`, and `test_sample` fixed.
 
 ## 4.4 Output
 
@@ -62,9 +71,9 @@ When validation is enabled, BulletOu prints lines like:
 
 ## 4.5 Save frequency is separate
 
-`--save-rate` controls checkpoint saves.
+`save_rate` / `--save-rate` controls checkpoint saves.
 
-`--validation-rate` controls accuracy / loss measurement.
+`validation_rate` / `--validation-rate` controls accuracy / loss measurement.
 
 `summary-learn.log` still gets one row per sb. For sb where ordinary
 validation is not run, `test_value_accuracy` / `test_value_loss` are `-`.
@@ -76,6 +85,15 @@ For example, to save only at epoch end but validate every sb:
 --validation-rate 1
 ```
 
+or in `bulletou-settings.json`:
+
+```json
+{
+  "save_rate": 9999,
+  "validation_rate": 1
+}
+```
+
 `--save-epoch-end` is enabled by default, so epoch-end checkpoints are still written even when `--save-rate` is large.
 
 ## 4.6 Quantized validation
@@ -84,8 +102,10 @@ Ordinary `test_value_accuracy` / `test_value_loss` are measured with the in-memo
 
 To also watch accuracy / loss after quantizing like `nn.bin`, use `--quantized-validation-rate`:
 
-```powershell
---quantized-validation-rate 1
+```json
+{
+  "quantized_validation_rate": 1
+}
 ```
 
 For sb where quantized validation is not run, `summary-learn.log` writes

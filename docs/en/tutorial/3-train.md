@@ -18,22 +18,39 @@ On Windows, the executable is:
 .\target\release\examples\bulletou.exe
 ```
 
-## 3.2 Minimal command
+## 3.2 Minimal settings file
 
 For a first real run, HalfKP NNUE is the easiest target.
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp
+Create `bulletou-settings.json` in the BulletOu directory:
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "tag": "first-halfkp"
+}
 ```
 
-`--arch` selects the evaluation-function shape. `NNUE_halfkp_256x2_32_32` is a small, easy-to-test NNUE.
+Then run:
 
-`--teacher` points to a teacher file or a directory of teacher files.
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
+```
 
-`--tag` names the experiment. It is optional, but useful once you run more than one experiment.
+`arch` selects the evaluation-function shape. `NNUE_halfkp_256x2_32_32` is a small, easy-to-test NNUE.
+
+`teacher` points to a teacher file or a directory of teacher files.
+
+`tag` names the experiment. It is optional, but useful once you run more than one experiment.
+
+You can still override a JSON value on the command line:
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --tag another-test
+```
 
 ## 3.3 Output
 
@@ -53,16 +70,17 @@ checkpoints/
 
 ## 3.4 Short smoke run
 
-Before launching a long run on huge teacher data, you can force a small run:
+Before launching a long run on huge teacher data, you can force a small run by adding these fields:
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --positions-per-superbatch 1000000 `
-  --superbatches 1 `
-  --max-epochs 1 `
-  --tag smoke-halfkp
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "positions_per_superbatch": 1000000,
+  "superbatches": 1,
+  "max_epochs": 1,
+  "tag": "smoke-halfkp"
+}
 ```
 
 Use this to check that loading, training, and saving all work.

@@ -6,25 +6,23 @@
 
 ## 5.1 基本
 
-同じ `--tag` または同じ `--output` で、同じコマンドをもう一度実行します。`--output-folder` で保存先ドライブを変えている場合は、それも同じ値を指定します。
+同じ `tag` または同じ `output` で、同じ `bulletou-settings.json` を使ってもう一度実行します。`output_folder` で保存先ドライブを変えている場合は、その値も同じままにします。
 
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 `checkpoints/.../000N/state.bin` が見つかると、BulletOu が自動で読み込みます。
 
-checkpointをDドライブに置きたい場合は、`--output-folder` で親フォルダだけを指定できます。`--tag` はそのまま使えます。
+checkpointをDドライブに置きたい場合は、`output_folder` で親フォルダだけを指定できます。`tag` はそのまま使えます。
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --teacher D:\sojoteam_datasets `
-  --output-folder D:\checkpoints `
-  --tag sfnn-test
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "teacher": "D:/sojoteam_datasets",
+  "output_folder": "D:/checkpoints",
+  "tag": "sfnn-test"
+}
 ```
 
 この場合、保存先は次のようになります。
@@ -86,20 +84,17 @@ Get-ChildItem $exp -Directory |
 
 ## 5.3 設定を変えるとき
 
-`--lr`、`--batch-size`、`--superbatches` などを変えると、自動再開は止まります。
+`lr`、`batch_size`、`superbatches` などを変えると、自動再開は止まります。
 
 意図して同じ checkpoint から続けたい場合だけ、`--resume` を付けてください。
 
 ```powershell
 .\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp `
-  --resume `
-  --lr 0.0001
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
 
-新しい実験として始めたい場合は、`--tag` を変えるのが安全です。
+新しい実験として始めたい場合は、`tag` を変えるのが安全です。
 
 ---
 

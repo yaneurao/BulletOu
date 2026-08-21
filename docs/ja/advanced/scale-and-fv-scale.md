@@ -116,22 +116,31 @@ engine_score ≒ network_output * 8128 / 24
 
 まずはデフォルトの WRM で十分です。
 
+```json
+{
+  "backend": "cuda-cpp",
+  "teacher": "D:/sojoteam_datasets",
+  "test_teacher": "C:/shogi/teacher/test/test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "superbatches": 324,
+  "max_epochs": 28,
+  "tag": "sfnn-wrm-default"
+}
+```
+
+実行は次の形です。
+
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --backend cuda-cpp `
-  --teacher D:\sojoteam_datasets `
-  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --superbatches 324 `
-  --max-epochs 28 `
-  --tag sfnn-wrm-default
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 offset なしWRMと比較するなら、次だけ追加します。
 
-```powershell
-  --wrm-in-offset 0 `
-  --wrm-target-offset 0
+```json
+{
+  "wrm_in_offset": 0,
+  "wrm_target_offset": 0
+}
 ```
 
 単純 sigmoid loss を試すなら、次を追加します。

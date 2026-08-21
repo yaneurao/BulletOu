@@ -116,22 +116,31 @@ The `338.7` value is the output scale of the quantized `nn.bin` inside YaneuraOu
 
 Start with the default WRM settings:
 
+```json
+{
+  "backend": "cuda-cpp",
+  "teacher": "D:/sojoteam_datasets",
+  "test_teacher": "C:/shogi/teacher/test/test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "superbatches": 324,
+  "max_epochs": 28,
+  "tag": "sfnn-wrm-default"
+}
+```
+
+Run it with:
+
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --backend cuda-cpp `
-  --teacher D:\sojoteam_datasets `
-  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --superbatches 324 `
-  --max-epochs 28 `
-  --tag sfnn-wrm-default
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 For the zero-offset WRM comparison, add:
 
-```powershell
-  --wrm-in-offset 0 `
-  --wrm-target-offset 0
+```json
+{
+  "wrm_in_offset": 0,
+  "wrm_target_offset": 0
+}
 ```
 
 For the plain sigmoid loss, add:

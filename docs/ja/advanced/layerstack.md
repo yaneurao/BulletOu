@@ -512,44 +512,63 @@ hand / king / progress は掛け算なので、少し足しただけで急に大
 
 ## 14. 使用例
 
+通常の学習例は、`bulletou-settings.json` に設定を書き、`bulletou.exe --settings-file` で起動する形を推奨します。試したい形に応じて `arch` だけ差し替えます。
+
 もっとも軽い king bucket を試す例:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "teacher": "teachers",
+  "tag": "sfnn-k3k3"
+}
 ```
 
 `k9k9` と同じ 81 stacks のまま、自陣深部の筋を見たい例:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k9k9z \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k9k9z",
+  "teacher": "teachers",
+  "tag": "sfnn-k9k9z"
+}
 ```
 
 `k29k29` で玉位置を細かく見る例:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k29k29 \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k29k29",
+  "teacher": "teachers",
+  "tag": "sfnn-k29k29"
+}
 ```
 
 hand と king zone を組み合わせる例:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand256_k9k9z \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_hand256_k9k9z",
+  "teacher": "teachers",
+  "tag": "sfnn-hand256-k9k9z"
+}
 ```
 
 hand / king / progress を全部組み合わせる例:
 
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
+  "teacher": "teachers",
+  "tag": "sfnn-hand256-k3k3-progress16",
+  "sfnn_freeze_progress": true
+}
+```
+
+実行はどの例でも次の形です。
+
 ```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand256_k3k3_progress16 \
-    --teacher teachers/
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 出力された `nn.bin` をやねうら王で読むときは、やねうら王側も同じ architecture 名で build してください。

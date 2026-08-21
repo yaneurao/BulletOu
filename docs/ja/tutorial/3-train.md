@@ -18,22 +18,39 @@ Windows では、実行ファイルは次にできます。
 .\target\release\examples\bulletou.exe
 ```
 
-## 3.2 最小コマンド
+## 3.2 最小の設定ファイル
 
 最初は HalfKP NNUE で動作確認するのが簡単です。
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp
+BulletOu フォルダに `bulletou-settings.json` を作ります。
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "tag": "first-halfkp"
+}
 ```
 
-`--arch` は学習する評価関数の形です。`NNUE_halfkp_256x2_32_32` は小さめで試しやすい構成です。
+実行はこうです。
 
-`--teacher` には教師ファイル、または教師ファイルが入ったフォルダを指定します。
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
+```
 
-`--tag` は実験名です。省略しても動きますが、複数回試すなら付けておくほうが出力を見分けやすくなります。
+`arch` は学習する評価関数の形です。`NNUE_halfkp_256x2_32_32` は小さめで試しやすい構成です。
+
+`teacher` には教師ファイル、または教師ファイルが入ったフォルダを指定します。
+
+`tag` は実験名です。省略しても動きますが、複数回試すなら付けておくほうが出力を見分けやすくなります。
+
+JSON に書いた値は、コマンドラインで上書きできます。
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --tag another-test
+```
 
 ## 3.3 出力先
 
@@ -53,16 +70,17 @@ checkpoints/
 
 ## 3.4 学習を短く試したい場合
 
-巨大な教師データでいきなり長時間回す前に、次のように小さめにして動作確認できます。
+巨大な教師データでいきなり長時間回す前に、次のように小さめの設定にして動作確認できます。
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --positions-per-superbatch 1000000 `
-  --superbatches 1 `
-  --max-epochs 1 `
-  --tag smoke-halfkp
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "positions_per_superbatch": 1000000,
+  "superbatches": 1,
+  "max_epochs": 1,
+  "tag": "smoke-halfkp"
+}
 ```
 
 まずこの形で「読み込み・学習・保存」が通ることを確認してください。

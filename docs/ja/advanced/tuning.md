@@ -6,6 +6,22 @@
 
 最初の学習では、まずデフォルト値のままで十分です。速度、保存頻度、検証頻度、学習率、loss、SFNN factorizer などを調整したくなったら、このページを見てください。
 
+チュートリアルでは `bulletou-settings.json` を使います。このページに出てくる CLI flag は、先頭の `--` を外し、ハイフンをアンダースコアにすると、そのまま JSON に書けます。
+
+```json
+{
+  "positions_per_superbatch": 40000000,
+  "validation_rate": 1,
+  "lr_min": 0.00001
+}
+```
+
+本文中では比較しやすいように短い CLI 断片を書くことがあります。実験として残すなら、同じ値を `bulletou-settings.json` に書いて、次のように実行してください。
+
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
+```
+
 ## 1. ログに出てくる単位
 
 | 名前 | 意味 |
@@ -98,18 +114,19 @@ lr = lr * gamma
 
 `--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch 内で `--lr` から `--lr-min` へ近づくように gamma を計算します。
 
-明示的に `gamma=0.992` を指定する例:
+`bulletou-settings.json` で明示的に `gamma=0.992` を指定する例:
 
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --lr 0.000875 \
-    --lr-min 0.00001 \
-    --lr-schedule step \
-    --lr-step-gamma 0.992 \
-    --tag step-gamma-0992
+```json
+{
+  "teacher": "teachers",
+  "test_teacher": "test.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "lr": 0.000875,
+  "lr_min": 0.00001,
+  "lr_schedule": "step",
+  "lr_step_gamma": 0.992,
+  "tag": "step-gamma-0992"
+}
 ```
 
 ## 4. 勾配accumulation
@@ -216,13 +233,20 @@ W_effective = W_base + W_shared + W_axis + W_pair
 
 例:
 
+```json
+{
+  "teacher": "teachers",
+  "test_teacher": "test.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k29k29",
+  "sfnn_factorizer": "king=axis",
+  "tag": "k29-axis"
+}
+```
+
+実行は次の形です。
+
 ```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k29k29 \
-    --sfnn-factorizer king=axis \
-    --tag k29-axis
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 factorizerの効き具合を変えたい場合は `--sfnn-factorizer-alpha` を使います。

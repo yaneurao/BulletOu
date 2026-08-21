@@ -90,10 +90,15 @@ YaneuraOu's `kHashValue` in `features/half_kpe9.h` is literally `0x5D69D5B9 ^ (F
 # Build (once)
 cargo build --release --features cuda-cpp-backend --example bulletou
 
-# Run
-./target/release/examples/bulletou \
-    --arch NNUE_halfkpe9_256x2_32_32 \
-    --teacher teachers/
+# Run after creating bulletou-settings.json as shown below
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
+```
+
+```json
+{
+  "arch": "NNUE_halfkpe9_256x2_32_32",
+  "teacher": "teachers"
+}
 ```
 
 Default `--output` is `checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/`.

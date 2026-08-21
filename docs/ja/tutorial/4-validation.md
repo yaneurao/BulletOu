@@ -6,29 +6,36 @@
 
 ## 4.1 何を指定するか
 
-検証に関係する基本オプションは2つです。
+検証に関係する基本設定は2つです。
 
-| オプション | 役割 | 省略時 |
+| JSON key / CLI option | 役割 | 省略時 |
 | --- | --- | --- |
-| `--test-teacher` | 検証用局面ファイルを指定する。これを指定しないと `test_value_accuracy` / `test_value_loss` は出ません | 検証しない |
-| `--validation-rate` | 何 sb ごとに検証するかを指定する | `--save-rate` と同じ |
+| `test_teacher` / `--test-teacher` | 検証用局面ファイルを指定する。これを指定しないと `test_value_accuracy` / `test_value_loss` は出ません | 検証しない |
+| `validation_rate` / `--validation-rate` | 何 sb ごとに検証するかを指定する | `save_rate` と同じ |
 
-つまり、検証を有効にする最低条件は `--test-teacher` です。
+つまり、検証を有効にする最低条件は `test_teacher` です。
 
-毎 sb で accuracy / loss を見たい場合は、`--validation-rate 1` も指定します。
+毎 sb で accuracy / loss を見たい場合は、`validation_rate` を `1` にします。
 
-## 4.2 コマンド例
+## 4.2 設定例
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "teachers",
+  "test_teacher": "C:/shogi/teacher/test/test.hcpe",
+  "validation_rate": 1,
+  "positions_per_superbatch": 1000000,
+  "superbatches": 1,
+  "max_epochs": 1,
+  "tag": "first-halfkp"
+}
+```
+
+実行はこうです。
 
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --test-teacher C:\shogi\teacher\test\test.hcpe `
-  --validation-rate 1 `
-  --positions-per-superbatch 1000000 `
-  --superbatches 1 `
-  --max-epochs 1 `
-  --tag first-halfkp
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 この例では、`teachers` で学習し、`C:\shogi\teacher\test\test.hcpe` で検証します。
@@ -37,15 +44,17 @@
 
 ## 4.3 検証に使う局面数
 
-`--test-positions` を省略すると、検証用ファイルの全局面を使います。
+`test_positions` / `--test-positions` を省略すると、検証用ファイルの全局面を使います。
 
 短時間で動作確認したい場合だけ、次のように局面数を制限します。
 
-```powershell
---test-positions 300000
+```json
+{
+  "test_positions": 300000
+}
 ```
 
-本格的に比較する場合は、同じ検証ファイル、同じ `--test-positions`、同じ `--test-sample` を使ってください。
+本格的に比較する場合は、同じ検証ファイル、同じ `test_positions`、同じ `test_sample` を使ってください。
 
 ## 4.4 画面に出るもの
 
@@ -62,9 +71,9 @@
 
 ## 4.5 保存頻度とは別に考える
 
-`--save-rate` は checkpoint を保存する頻度です。
+`save_rate` / `--save-rate` は checkpoint を保存する頻度です。
 
-`--validation-rate` は accuracy / loss を測る頻度です。
+`validation_rate` / `--validation-rate` は accuracy / loss を測る頻度です。
 
 `summary-learn.log` 自体は1sbごとに1行書かれますが、検証しないsbの
 `test_value_accuracy` / `test_value_loss` は `-` になります。
@@ -76,16 +85,27 @@
 --validation-rate 1
 ```
 
+`bulletou-settings.json` に書くならこうです。
+
+```json
+{
+  "save_rate": 9999,
+  "validation_rate": 1
+}
+```
+
 `--save-epoch-end` はデフォルトで有効なので、`--save-rate` を大きくしても epoch 末の checkpoint は保存されます。
 
 ## 4.6 量子化後の検証
 
 学習中の `test_value_accuracy` / `test_value_loss` は、基本的にはメモリ上の f32 重みで測ります。
 
-保存された `nn.bin` と同じように量子化した後の accuracy / loss も見たい場合は、`--quantized-validation-rate` を使います。
+保存された `nn.bin` と同じように量子化した後の accuracy / loss も見たい場合は、`quantized_validation_rate` / `--quantized-validation-rate` を使います。
 
-```powershell
---quantized-validation-rate 1
+```json
+{
+  "quantized_validation_rate": 1
+}
 ```
 
 量子化後検証をしないsbでは、`summary-learn.log` の

@@ -49,11 +49,18 @@ KPP_KKPT is the factorised variant of KPPT: the KPP file drops the turn channel,
 
 `--arch KPPT` trains all three components (KK / KKP / KPP) in one invocation and assembles each save into numbered checkpoint directories (`<output>/0001/`, `<output>/0002/`, ...):
 
+```json
+{
+  "arch": "KPPT",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-kppt"
+}
+```
+
+Run it with:
+
 ```bash
-./target/release/examples/bulletou \
-    --arch KPPT \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kppt
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader returns EOF). For multi-epoch runs, set the epoch length with `--superbatches` and then pass `--max-epochs N`. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries.
@@ -105,12 +112,13 @@ Resume / restart behaviour is identical across every target; see [tutorial: Stop
 
 `--arch KPP_KKPT` produces a factorised eval (KPP without the turn channel, ~half the KPP file size). KK and KKP files are byte-identical to KPPT.
 
-```bash
-./target/release/examples/bulletou \
-    --arch KPP_KKPT \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --superbatches 20
+```json
+{
+  "arch": "KPP_KKPT",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-kpp-kkpt",
+  "superbatches": 20
+}
 ```
 
 ### Common KPPT-family CLI flags

@@ -489,44 +489,63 @@ Larger buckets may show slower early accuracy because each stack receives fewer 
 
 ## 14. Usage examples
 
+For normal training examples, prefer a settings file. Create `bulletou-settings.json`, change only `arch`, and run `bulletou.exe --settings-file`.
+
 Smallest king bucket:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "teacher": "teachers",
+  "tag": "sfnn-k3k3"
+}
 ```
 
 Same 81 stacks as `k9k9`, but with home-rank file zones:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k9k9z \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k9k9z",
+  "teacher": "teachers",
+  "tag": "sfnn-k9k9z"
+}
 ```
 
 Detailed `k29k29` king bucket:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_k29k29 \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k29k29",
+  "teacher": "teachers",
+  "tag": "sfnn-k29k29"
+}
 ```
 
 Combine hand and king zones:
 
-```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand256_k9k9z \
-    --teacher teachers/
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_hand256_k9k9z",
+  "teacher": "teachers",
+  "tag": "sfnn-hand256-k9k9z"
+}
 ```
 
 Combine hand, king, and progress:
 
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
+  "teacher": "teachers",
+  "tag": "sfnn-hand256-k3k3-progress16",
+  "sfnn_freeze_progress": true
+}
+```
+
+Run any of the above with:
+
 ```bash
-./target/release/examples/bulletou \
-    --arch SFNN_halfka2_1024_7_64_hand256_k3k3_progress16 \
-    --teacher teachers/
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 When loading the exported `nn.bin`, build YaneuraOu with the same architecture name.

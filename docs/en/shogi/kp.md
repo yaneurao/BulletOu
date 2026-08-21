@@ -68,13 +68,20 @@ KP was introduced alongside HalfKP in the same architecture family, with the sam
 
 ## Actual usage
 
-### Command
+### Settings
+
+```json
+{
+  "arch": "NNUE_kp_256x2_32_32",
+  "teacher": "teachers",
+  "output": "checkpoints/my-kp"
+}
+```
+
+Run it with:
 
 ```bash
-./target/release/examples/bulletou \
-    --arch NNUE_kp_256x2_32_32 \
-    --teacher teachers/ \
-    --output checkpoints/my-kp
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--arch` differs.

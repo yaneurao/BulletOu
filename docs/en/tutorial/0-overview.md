@@ -36,7 +36,7 @@ load nn.bin in YaneuraOu
 | # | Page | Topic |
 | --- | --- | --- |
 | 1 | [Quick Start](1-quickstart.md) | Build and run a smoke test |
-| 2 | [Prepare training data](2-data.md) | Prepare `--arch` and `--teacher` |
+| 2 | [Prepare training data](2-data.md) | Choose `arch` and prepare `teacher` |
 | 3 | [Run the training](3-train.md) | Run the minimal command |
 | 4 | [Enable validation](4-validation.md) | Measure accuracy / loss |
 | 5 | [Stop and resume](5-resume.md) | Continue after interruption |

@@ -10,25 +10,37 @@
 - 一度学習した重みに **別の教師** で追加学習したい
 - 同じ重みから **学習率を小さく** して微調整したい
 
-## 1. 基本: 同じ `--tag` で再実行
+## 1. 基本: 同じ `tag` で再実行
 
 追加学習の基本ルールは単純です。
 
-- `--tag` と学習設定が同じなら、自動で続きから始まる
-- `--tag` を変えると、別の学習として最初から始まる
+- `tag` と学習設定が同じなら、自動で続きから始まる
+- `tag` を変えると、別の学習として最初から始まる
+
+`bulletou-settings.json` を使う場合、1回目の設定はたとえばこうです。
+
+```json
+{
+  "teacher": "C:/shogi/teacher/main",
+  "arch": "NNUE_kp_256x2_32_32",
+  "tag": "round1",
+  "max_epochs": 3,
+  "superbatches": 6,
+  "lr_schedule": "step",
+  "lr_min": 0.00001
+}
+```
 
 ```powershell
-# 1 回目: 3 epoch 学習
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
+```
 
-# 2 回目: 追加で 3 epoch
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+追加で 3 epoch 回したい場合は、同じ設定ファイルで同じコマンドをもう一度実行します。
+
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 2 回目起動時:
@@ -80,14 +92,12 @@
 ## 3. 例: batch_size を 16384 → 32768 に増やす
 
 ```powershell
-# 続きの 3 epoch を 32768 で
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --batch-size 32768 `
-    --resume `
-    --lr-schedule step --lr-min 0.00001
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
+
+この場合は `bulletou-settings.json` の `batch_size` を `32768` に変更してから実行します。
 
 ### `positions-per-superbatch` と `batch-size`
 
@@ -110,22 +120,10 @@
 別の教師ファイルで続きを学習する典型例:
 
 ```powershell
-# 大量の弱教師で 3 epoch 学習
-.\bulletou.exe --teacher c:\shogi\teacher\bulk\ `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag distill `
-    --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
-
-# 小規模・高品質教師で追加学習 (= 学習率を小さめに)
-.\bulletou.exe --teacher c:\shogi\teacher\strong\ `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag distill `
-    --max-epochs 2 --superbatches 4 `
-    --resume `
-    --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
+
+2回目は `bulletou-settings.json` の `teacher`、`max_epochs`、`superbatches`、`lr`、`lr_min` を変更し、同じ `tag` のまま `--resume` を付けて実行します。
 
 教師変更時の挙動:
 - bulletou が `summary-learn.log` の最終行を見て **`teacher` 列が変わっている** ことを検出
@@ -140,19 +138,12 @@
 完走後の **「もうほとんど収束してるけど、もう少しだけ動かしたい」** 時は LR を 1 桁下げて短く回します:
 
 ```powershell
-# 初回: 3 epoch 通常学習
-.\bulletou.exe --teacher ... --tag main `
-    --max-epochs 3 --superbatches 6 `
-    --lr 0.001 --lr-min 0.00001 `
-    --lr-schedule step ...
-
-# 仕上げ: 1 epoch だけ LR を 1 桁小さく
-.\bulletou.exe --teacher ... --tag main `
-    --max-epochs 1 --superbatches 6 `
-    --resume `
-    --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step ...
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
+
+仕上げの起動では、同じ `tag` のまま `bulletou-settings.json` の `lr` / `lr_min` を下げます。
 
 これは最後に学習率を小さくして微調整する典型パターンです。最後の 1 epoch で大きな揺れを起こさずに少しだけ重みを動かせます。
 

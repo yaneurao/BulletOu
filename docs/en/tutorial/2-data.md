@@ -4,7 +4,7 @@
 
 Goal: choose one evaluation-function architecture and prepare teacher data for BulletOu.
 
-## 2.1 First `--arch`
+## 2.1 First `arch`
 
 Start with:
 
@@ -15,7 +15,7 @@ NNUE_halfkp_256x2_32_32
 This is a small HalfKP NNUE. It is easy to train, easy to debug, and easy to load in YaneuraOu.
 
 Try other evaluation functions after your first training run works.
-This tutorial uses only this `--arch`.
+This tutorial uses only this `arch`.
 
 ## 2.2 Teacher data
 
@@ -36,7 +36,7 @@ teachers/
   teacher.psv
 ```
 
-Passing `--teacher teachers` makes BulletOu read the teacher files in that directory.
+Setting `"teacher": "teachers"` in `bulletou-settings.json` makes BulletOu read the teacher files in that directory.
 
 ## 2.3 Shuffle
 

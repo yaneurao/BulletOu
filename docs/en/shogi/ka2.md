@@ -73,27 +73,38 @@ K-A2 sits between K-P and HalfKA_hm2 in expressiveness: it lets the network see 
 
 Standard 4-layer NNUE network (default `--arch NNUE_ka2_256x2_32_32`):
 
-```bash
-./target/release/examples/bulletou \
-    --arch NNUE_ka2_256x2_32_32 \
-    --teacher teachers/ \
-    --output checkpoints/my-ka2
+```json
+{
+  "arch": "NNUE_ka2_256x2_32_32",
+  "teacher": "teachers",
+  "output": "checkpoints/my-ka2"
+}
 ```
 
 Wider hidden layers (256x2 FT, 64-dim hidden):
 
-```bash
-./target/release/examples/bulletou \
-    --arch NNUE_ka2_256x2_64_64 \
-    --teacher teachers/
+```json
+{
+  "arch": "NNUE_ka2_256x2_64_64",
+  "teacher": "teachers",
+  "tag": "ka2-64-64"
+}
 ```
 
 SFNN-1536 architecture with KA2 input:
 
+```json
+{
+  "arch": "SFNN_ka2_1536_15_32_k3k3",
+  "teacher": "teachers",
+  "tag": "sfnn-ka2-1536"
+}
+```
+
+Run any of these with:
+
 ```bash
-./target/release/examples/bulletou \
-    --arch SFNN_ka2_1536_15_32_k3k3 \
-    --teacher teachers/
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--arch` (and the input dim) differs.

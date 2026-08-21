@@ -10,22 +10,34 @@ Examples:
 - Have saved weights → want to continue with a **different teacher**.
 - Want to lower the LR and polish for a bit.
 
-## 1. The simple rule: same `--tag` resumes
+## 1. The simple rule: same `tag` resumes
 
-Continued training uses the same auto-resume mechanism: **same `--tag` → auto-resume, different `--tag` → fresh start.**
+Continued training uses the same auto-resume mechanism: **same `tag` → auto-resume, different `tag` → fresh start.**
+
+With `bulletou-settings.json`, the first run can look like this:
+
+```json
+{
+  "teacher": "C:/shogi/teacher/main",
+  "arch": "NNUE_kp_256x2_32_32",
+  "tag": "round1",
+  "max_epochs": 3,
+  "superbatches": 6,
+  "lr_schedule": "step",
+  "lr_min": 0.00001
+}
+```
 
 ```powershell
-# Round 1: train 3 epochs
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
+```
 
-# Round 2: 3 more epochs
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
+To add 3 more epochs, run the same command again with the same settings file:
+
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 On the second launch:
@@ -69,15 +81,14 @@ Total effective epochs trained: 3 + 3 = 6.
 
 To change any of these, pass a different `--tag` and run as a separate experiment.
 
-## 3. Example: bump batch_size from 16384 to 32768
+## 3. Example: bump `batch_size` from 16384 to 32768
+
+Edit `bulletou-settings.json`, set `"batch_size": 32768`, and rerun with `--resume`:
 
 ```powershell
-# Continue with 3 more epochs at the larger batch size
-.\bulletou.exe --teacher c:\shogi\teacher\... `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag round1 --max-epochs 3 --superbatches 6 `
-    --batch-size 32768 `
-    --lr-schedule step --lr-min 0.00001
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
 
 ### `positions-per-superbatch` and `batch-size`
@@ -101,21 +112,10 @@ Changing `--batch-size` keeps the weights reusable, but the optimizer has intern
 A common workflow: train on a large weaker corpus, then continue on a smaller stronger corpus:
 
 ```powershell
-# Distill on bulk teacher for 3 epochs
-.\bulletou.exe --teacher c:\shogi\teacher\bulk\ `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag distill `
-    --max-epochs 3 --superbatches 6 `
-    --lr-schedule step --lr-min 0.00001
-
-# Continue on strong teacher with a smaller LR
-.\bulletou.exe --teacher c:\shogi\teacher\strong\ `
-    --arch NNUE_kp_256x2_32_32 `
-    --tag distill `
-    --max-epochs 2 --superbatches 4 `
-    --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
+
+For the second launch, edit `teacher`, `max_epochs`, `superbatches`, `lr`, and `lr_min` in `bulletou-settings.json`, keep the same `tag`, and rerun with `--resume`.
 
 Teacher-change handling:
 - bulletou reads the last `teacher` column in `summary-learn.log` and notices the path differs.
@@ -130,18 +130,12 @@ For `step` / `geometric` / `cos`, every epoch starts from `--lr`. When changing 
 After a near-converged run, a final polish at 1/10 the LR is a classic move:
 
 ```powershell
-# Initial run
-.\bulletou.exe --teacher ... --tag main `
-    --max-epochs 3 --superbatches 6 `
-    --lr 0.001 --lr-min 0.00001 `
-    --lr-schedule step ...
-
-# Polish: 1 more epoch at 1/10 LR
-.\bulletou.exe --teacher ... --tag main `
-    --max-epochs 1 --superbatches 6 `
-    --lr 0.0001 --lr-min 0.000001 `
-    --lr-schedule step ...
+.\target\release\examples\bulletou.exe `
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
+
+For the polish launch, keep the same `tag` and lower `lr` / `lr_min` in the settings file.
 
 This is a simple final low-LR polish: small final step, no big swings.
 

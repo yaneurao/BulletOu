@@ -73,27 +73,38 @@ K-A2 は表現力的に K-P と HalfKA_hm2 の中間: 駒特徴量側にも両�
 
 標準の 4 層 NNUE (デフォルト `--arch NNUE_ka2_256x2_32_32`):
 
-```bash
-./target/release/examples/bulletou \
-    --arch NNUE_ka2_256x2_32_32 \
-    --teacher teachers/ \
-    --output checkpoints/my-ka2
+```json
+{
+  "arch": "NNUE_ka2_256x2_32_32",
+  "teacher": "teachers",
+  "output": "checkpoints/my-ka2"
+}
 ```
 
 hidden を厚くする (256x2 FT、64 次元 hidden):
 
-```bash
-./target/release/examples/bulletou \
-    --arch NNUE_ka2_256x2_64_64 \
-    --teacher teachers/
+```json
+{
+  "arch": "NNUE_ka2_256x2_64_64",
+  "teacher": "teachers",
+  "tag": "ka2-64-64"
+}
 ```
 
 SFNN-1536 architecture を KA2 入力で:
 
+```json
+{
+  "arch": "SFNN_ka2_1536_15_32_k3k3",
+  "teacher": "teachers",
+  "tag": "sfnn-ka2-1536"
+}
+```
+
+実行はどの例でも次の形です。
+
 ```bash
-./target/release/examples/bulletou \
-    --arch SFNN_ka2_1536_15_32_k3k3 \
-    --teacher teachers/
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` (および入力次元) だけが違う。

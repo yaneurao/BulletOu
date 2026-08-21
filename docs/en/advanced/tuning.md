@@ -6,6 +6,22 @@ Read this page after the command in [Tutorial 3: Run training](../tutorial/3-tra
 
 For a first run, keep the defaults. Come back here when you want to adjust speed, save frequency, validation frequency, learning rate, loss, or SFNN factorizer settings.
 
+The tutorial uses `bulletou-settings.json`. Every CLI flag on this page can be written in that file by removing the leading `--` and replacing hyphens with underscores:
+
+```json
+{
+  "positions_per_superbatch": 40000000,
+  "validation_rate": 1,
+  "lr_min": 0.00001
+}
+```
+
+Short examples below may show CLI fragments because they are easier to compare side by side. For a repeatable experiment, put the same values in `bulletou-settings.json` and run:
+
+```powershell
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
+```
+
 ## 1. Units used in the logs
 
 | Name | Meaning |
@@ -98,18 +114,19 @@ lr = lr * gamma
 
 If `--lr-step-positions` is omitted, the interval is one sb. At the next epoch, LR returns to `--lr`.
 
-Example with `gamma=0.992`:
+Example with `gamma=0.992` in `bulletou-settings.json`:
 
-```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k3k3 \
-    --lr 0.000875 \
-    --lr-min 0.00001 \
-    --lr-schedule step \
-    --lr-step-gamma 0.992 \
-    --tag step-gamma-0992
+```json
+{
+  "teacher": "teachers",
+  "test_teacher": "test.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "lr": 0.000875,
+  "lr_min": 0.00001,
+  "lr_schedule": "step",
+  "lr_step_gamma": 0.992,
+  "tag": "step-gamma-0992"
+}
 ```
 
 If you omit `--lr-step-gamma` and set `--superbatches`, BulletOu computes a gamma that moves from `--lr` toward `--lr-min` within one epoch.
@@ -230,13 +247,20 @@ W_effective = W_base + W_shared + W_axis + W_pair
 
 Example:
 
+```json
+{
+  "teacher": "teachers",
+  "test_teacher": "test.hcpe",
+  "arch": "SFNN_halfka2_1024_7_64_k29k29",
+  "sfnn_factorizer": "king=axis",
+  "tag": "k29-axis"
+}
+```
+
+Run it with:
+
 ```bash
-./target/release/examples/bulletou \
-    --teacher teachers/ \
-    --test-teacher test.hcpe \
-    --arch SFNN_halfka2_1024_7_64_k29k29 \
-    --sfnn-factorizer king=axis \
-    --tag k29-axis
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 Use `--sfnn-factorizer-alpha` when you want to change how strongly factorizer terms contribute.

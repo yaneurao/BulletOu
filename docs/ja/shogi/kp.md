@@ -68,13 +68,20 @@ K-P は HalfKP と並んで NNUE 系評価関数の最初期に追加された (
 
 ## 実際の使い方
 
-### コマンド
+### 設定
+
+```json
+{
+  "arch": "NNUE_kp_256x2_32_32",
+  "teacher": "teachers",
+  "output": "checkpoints/my-kp"
+}
+```
+
+実行は次の形です。
 
 ```bash
-./target/release/examples/bulletou \
-    --arch NNUE_kp_256x2_32_32 \
-    --teacher teachers/ \
-    --output checkpoints/my-kp
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` だけが違う。

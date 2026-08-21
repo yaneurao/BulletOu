@@ -90,10 +90,15 @@ index = fe_end × king_sq + bonapiece
 # Build (1 回だけ)
 cargo build --release --features cuda-cpp-backend --example bulletou
 
-# Run
-./target/release/examples/bulletou \
-    --arch NNUE_halfkpe9_256x2_32_32 \
-    --teacher teachers/
+# 下の bulletou-settings.json を作ってから実行
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
+```
+
+```json
+{
+  "arch": "NNUE_halfkpe9_256x2_32_32",
+  "teacher": "teachers"
+}
 ```
 
 `--output` 省略時のデフォルトは `checkpoints/NNUE_HALFKPE9-NNUE_halfkpe9_256x2_32_32/`。

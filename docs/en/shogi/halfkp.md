@@ -35,13 +35,20 @@ HalfKP sparse input (125,388 dims, per perspective)
 - BulletOu built (`cargo build --release --features cuda-cpp-backend --example bulletou`)
 - Training data (`.hcpe` / `.hcpe3` / `.pack` / `.psv` / `.bin`)
 
-### Command
+### Settings
+
+```json
+{
+  "arch": "NNUE_halfkp_256x2_32_32",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-halfkp"
+}
+```
+
+Run it with:
 
 ```bash
-./target/release/examples/bulletou \
-    --arch NNUE_halfkp_256x2_32_32 \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-halfkp
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 Without `--superbatches` or `--max-epochs`, training runs through the teacher data once (until the dataloader reaches EOF). For multi-epoch runs, set the epoch length with `--superbatches` and then pass `--max-epochs N`. `step` / `geometric` / `cos` restart to `--lr` at epoch boundaries.

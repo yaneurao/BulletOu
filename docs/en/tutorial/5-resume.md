@@ -6,25 +6,23 @@ If training stops, rerun the same command with the same settings. BulletOu conti
 
 ## 5.1 Basic rule
 
-Use the same `--tag` or the same `--output`, and rerun the command. If you used `--output-folder` to put checkpoints on another drive, pass the same folder again.
+Use the same `tag` or the same `output`, and rerun with the same `bulletou-settings.json`. If you used `output_folder` to put checkpoints on another drive, keep that value in the settings file too.
 
 ```powershell
-.\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp
+.\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
 When BulletOu finds `checkpoints/.../000N/state.bin`, it loads it automatically.
 
-To put checkpoints on the D: drive, specify only the parent folder with `--output-folder`. `--tag` still works.
+To put checkpoints on the D: drive, specify only the parent folder with `output_folder`. `tag` still works.
 
-```powershell
-.\target\release\examples\bulletou.exe `
-  --arch SFNN_halfka2_1024_7_64_k3k3 `
-  --teacher D:\sojoteam_datasets `
-  --output-folder D:\checkpoints `
-  --tag sfnn-test
+```json
+{
+  "arch": "SFNN_halfka2_1024_7_64_k3k3",
+  "teacher": "D:/sojoteam_datasets",
+  "output_folder": "D:/checkpoints",
+  "tag": "sfnn-test"
+}
 ```
 
 This writes to:
@@ -86,20 +84,17 @@ If training is currently running, do not delete the checkpoint directory that Bu
 
 ## 5.3 Changing settings
 
-If you change settings such as `--lr`, `--batch-size`, or `--superbatches`, automatic resume stops.
+If you change settings such as `lr`, `batch_size`, or `superbatches`, automatic resume stops.
 
 If you intentionally want to continue from the same checkpoint with changed settings, pass `--resume`.
 
 ```powershell
 .\target\release\examples\bulletou.exe `
-  --arch NNUE_halfkp_256x2_32_32 `
-  --teacher teachers `
-  --tag first-halfkp `
-  --resume `
-  --lr 0.0001
+  --settings-file .\bulletou-settings.json `
+  --resume
 ```
 
-For a new experiment, use a new `--tag`.
+For a new experiment, use a new `tag`.
 
 ---
 

@@ -49,11 +49,18 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 `--arch KPPT` を指定すると KK / KKP / KPP の 3 component を **1 コマンドで連続学習** し、各 save を `<output>/0001/`, `<output>/0002/`, ... の番号付き checkpoint directory に集約する。
 
+```json
+{
+  "arch": "KPPT",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-kppt"
+}
+```
+
+実行は次の形です。
+
 ```bash
-./target/release/examples/bulletou \
-    --arch KPPT \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kppt
+./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
 `--superbatches` も `--max-epochs` も省略しているので、教師データを 1 周 (dataloader が EOF を返すまで) で学習が終了する。複数 epoch 回したい場合は `--superbatches` で epoch 長を決めたうえで `--max-epochs 3` のように指定する。`step` / `geometric` / `cos` は epoch 境界で `--lr` に戻る。
@@ -105,12 +112,13 @@ KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
 
 `--arch KPP_KKPT` を指定すれば、KPP のみ手番チャンネルを省いた layout (約半分のサイズ) で書き出される。KK / KKP は KPPT と byte-identical。
 
-```bash
-./target/release/examples/bulletou \
-    --arch KPP_KKPT \
-    --teacher /path/to/train.hcpe \
-    --output checkpoints/my-kpp-kkpt \
-    --superbatches 20
+```json
+{
+  "arch": "KPP_KKPT",
+  "teacher": "/path/to/train.hcpe",
+  "output": "checkpoints/my-kpp-kkpt",
+  "superbatches": 20
+}
 ```
 
 ### 主要 CLI フラグ (KPPT 系すべて共通)
