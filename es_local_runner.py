@@ -1056,11 +1056,12 @@ def main() -> int:
             worst_kept = kept[-1]
             event(
                 color,
-                f"[GEN {generation} BEAM]",
+                f"[BEAM END]",
                 (
                     f"generation={generation} stage={stage.after_sbs}sb "
                     f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
-                    f"worst_kept_{settings.metric}={format_float(worst_kept.score)}"
+                    f"worst_kept_{settings.metric}={format_float(worst_kept.score)} "
+                    f"status=pruned_not_saved"
                 ),
                 "yellow",
             )

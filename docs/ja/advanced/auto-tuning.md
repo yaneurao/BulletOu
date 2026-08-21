@@ -267,4 +267,6 @@ ES runner の出力は `output_folder/es-<tag_prefix>` に作られます。
 
 ES runner が保存する `current/` と `accepted-checkpoints/sbXXXXXXXX/` には、その時点の `es-settings.json` と `bulletou-settings.json` がコピーされます。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 
+途中で止めたい場合は、標準出力に `[SAFE TO STOP]` が出た直後が安全です。`[BEAM END]` は候補の枝刈りが終わっただけで、公開 checkpoint の保存完了を意味しません。
+
 `bulletou.exe --settings-file` で通常学習した checkpoint には、`bulletou-settings.json` がコピーされます。

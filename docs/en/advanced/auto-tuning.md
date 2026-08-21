@@ -267,4 +267,6 @@ The runner root is `output_folder/es-<tag_prefix>`.
 
 The runner copies the current `es-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
 
+If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[BEAM END]` only means candidate pruning finished; it does not mean a public checkpoint has been fully saved.
+
 When normal training uses `bulletou.exe --settings-file`, each BulletOu checkpoint gets a copy of `bulletou-settings.json`.
