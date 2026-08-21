@@ -107,10 +107,6 @@ RUNNER_CONTROLLED_BULLETOU_SETTINGS = {
     "sfnn-factorizer-alpha",
     "cuda_cpp_skip_final_output",
     "cuda-cpp-skip-final-output",
-    "sfnn_axis_count_confidence",
-    "sfnn-axis-count-confidence",
-    "sfnn_pair_count_confidence",
-    "sfnn-pair-count-confidence",
     *{flag.removeprefix("--").replace("-", "_") for flag in CONFIDENCE_FLAGS.values()},
     *{flag.removeprefix("--") for flag in CONFIDENCE_FLAGS.values()},
 }

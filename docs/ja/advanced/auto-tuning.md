@@ -214,6 +214,8 @@ count confidence は、`bucket-count` で作った `count.bin` を使って、�
 
 値が `0.0` なら、その count confidence は無効です。値を大きくすると、十分な出現回数がない成分をより強く抑えます。
 
+通常の `bulletou.exe` には axis 系 / pair 系をまとめて指定する共通オプションもあります。ただし ES の `parameters` では、どの成分を動かしているのかを明確にするため、上の表にある個別項目だけを扱います。
+
 ## `es.enabled=false` で current 値だけ使う
 
 ES を回さず、`parameters.current` の値だけを使いたい場合は、`es.enabled` を `false` にします。

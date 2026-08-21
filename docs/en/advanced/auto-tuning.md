@@ -214,6 +214,8 @@ Count confidence uses a `count.bin` file created by `bucket-count`. It weakens t
 
 `0.0` disables that confidence. Larger values require more observations before the corresponding term is trusted strongly.
 
+Plain `bulletou.exe` still has shared options for all axis terms or all pair terms. ES `parameters` intentionally use only the explicit fields listed above, so it is always clear which component is being tuned.
+
 ## Use current values without ES
 
 If you want to use the tuned `parameters.current` values without running ES, set `es.enabled` to `false`.
