@@ -44,6 +44,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     ],
     "metric": "quantized_value_loss",
     "lower_is_better": true,
+    "use_worker": true,
     "seed": 1,
     "save_rate": 1,
     "candidate_validation_rate": 1,
@@ -122,6 +123,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `beam` | 何 sb 学習した時点で、何個の候補を残すか |
 | `metric` | 候補を比較する指標 |
 | `lower_is_better` | 指標が小さいほど良いなら `true` |
+| `use_worker` | `true` なら長寿命の `bulletou worker` を使う。省略時も `true` |
 | `seed` | 候補生成の乱数 seed |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ保存するか |
 | `candidate_validation_rate` | 候補学習中の f32 validation 間隔 |
@@ -269,6 +271,8 @@ ES runner が保存する `current/` と `accepted-checkpoints/sbXXXXXXXX/` に�
 
 途中で止めたい場合は、標準出力に `[SAFE TO STOP]` が出た直後が安全です。`[BEAM END]` は候補の枝刈りが終わっただけで、公開 checkpoint の保存完了を意味しません。
 
-ES 実行中の `bulletou.exe` は、候補ごとに短い学習 job として起動されます。そのため、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8sb stage、candidate 1」の意味です。
+ES 実行中は、標準では `bulletou worker` を 1 回だけ起動し、その中で候補を試します。これにより、CUDA context、validation cache、qvalid cache、worker warmup を候補ごとに作り直す時間を避けられます。
+
+`use_worker` を `false` にした場合や、runner が worker では安全に扱えない beam 構成を検出した場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8sb stage、candidate 1」の意味です。
 
 `bulletou.exe --settings-file` で通常学習した checkpoint には、`bulletou-settings.json` がコピーされます。

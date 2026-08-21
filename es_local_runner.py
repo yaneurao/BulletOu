@@ -33,6 +33,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -200,6 +201,7 @@ class BeamStage:
 @dataclass
 class EsSettings:
     enabled: bool
+    use_worker: bool
     generations: int
     population: int
     beam: list[BeamStage]
@@ -226,6 +228,7 @@ class Candidate:
     index: int
     params: dict[str, float]
     checkpoint: Path
+    cache_key: str | None = None
     output_dir: Path | None = None
     metric: Metric | None = None
     score: float | None = None
@@ -362,6 +365,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     enabled = es_obj.get("enabled")
     if not isinstance(enabled, bool):
         raise ValueError(f"{path}: es.enabled must be true or false")
+    use_worker = bool(es_obj.get("use_worker", True))
 
     generations = int(es_obj.get("generations", 1))
     population = int(es_obj.get("population", 4))
@@ -419,6 +423,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
 
     settings = EsSettings(
         enabled=enabled,
+        use_worker=use_worker,
         generations=generations,
         population=population,
         beam=beam,
@@ -676,22 +681,125 @@ def run_command(cmd: list[str], log_path: Path, stream: bool, stream_prefix: str
     return code, time.perf_counter() - start
 
 
-def build_train_command(
+class WorkerClient:
+    def __init__(self, exe: Path, log_path: Path, stream: bool, color: bool):
+        self.exe = exe
+        self.log_path = log_path
+        self.stream = stream
+        self.color = color
+        self.request_id = 0
+        self._prefix = paint(color, "[WORKER] ", "magenta")
+        self._prefix_lock = threading.Lock()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log = log_path.open("w", encoding="utf-8", errors="replace", newline="")
+        self.proc = subprocess.Popen(
+            [str(exe), "worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        assert self.proc.stderr is not None
+        self._stderr_thread = threading.Thread(target=self._pump_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _pump_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        for line in self.proc.stderr:
+            self._log.write(line)
+            self._log.flush()
+            if self.stream:
+                with self._prefix_lock:
+                    prefix = self._prefix
+                if line.strip():
+                    print(f"{prefix}{line}", end="")
+                else:
+                    print(line, end="")
+
+    def set_prefix(self, prefix: str) -> None:
+        with self._prefix_lock:
+            self._prefix = prefix
+
+    def request(self, cmd: str, payload: dict[str, Any] | None = None, prefix: str | None = None) -> dict[str, Any]:
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"bulletou worker already exited with code {self.proc.returncode}; see {self.log_path}")
+        self.request_id += 1
+        request = dict(payload or {})
+        request["id"] = self.request_id
+        request["cmd"] = cmd
+        if prefix is not None:
+            self.set_prefix(prefix)
+        line = json.dumps(request, ensure_ascii=False)
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        while True:
+            response_line = self.proc.stdout.readline()
+            if response_line == "":
+                code = self.proc.poll()
+                raise RuntimeError(f"bulletou worker closed stdout while waiting for `{cmd}` response; code={code}; see {self.log_path}")
+            try:
+                response = json.loads(response_line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"bulletou worker returned non-JSON response: {response_line.strip()!r}: {exc}") from exc
+            if response.get("id") != self.request_id:
+                raise RuntimeError(f"bulletou worker response id mismatch: got {response.get('id')}, expected {self.request_id}")
+            if not response.get("ok", False):
+                raise RuntimeError(f"bulletou worker `{cmd}` failed: {response.get('error')}; see {self.log_path}")
+            payload = response.get("payload")
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"bulletou worker `{cmd}` returned non-object payload")
+            return payload
+
+    def close(self) -> None:
+        try:
+            if self.proc.poll() is None:
+                try:
+                    self.request("quit", prefix=paint(self.color, "[WORKER] ", "magenta"))
+                except Exception:
+                    self.proc.terminate()
+        finally:
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+            self._log.close()
+
+
+def metric_from_worker_payload(payload: dict[str, Any]) -> Metric:
+    def as_float(name: str) -> float | None:
+        value = payload.get(name)
+        if value is None:
+            return None
+        return float(value)
+
+    return Metric(
+        qloss=as_float("quantized_value_loss"),
+        qacc=as_float("quantized_value_accuracy"),
+        test_loss=as_float("test_value_loss"),
+        test_acc=as_float("test_value_accuracy"),
+    )
+
+
+def build_train_args(
     run: RunSettings,
     params: dict[str, float],
-    checkpoint: Path,
+    checkpoint: Path | None,
     output_dir: Path,
     stage_delta_sbs: int,
     settings: EsSettings,
+    *,
+    include_initial_state: bool,
 ) -> list[str]:
     cmd = [
-        str(run.exe),
         "--settings-file",
         str(run.bulletou_settings_file),
-        "--initial-state",
-        str(checkpoint / "state.bin"),
-        "--initial-dataloader-pos",
-        str(checkpoint / "dataloader_pos.txt"),
         "--output",
         str(output_dir),
         "--superbatches",
@@ -705,8 +813,39 @@ def build_train_command(
         "--quantized-validation-rate",
         str(max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))),
     ]
+    if include_initial_state:
+        if checkpoint is None:
+            raise RuntimeError("include_initial_state requires a checkpoint")
+        cmd[2:2] = [
+            "--initial-state",
+            str(checkpoint / "state.bin"),
+            "--initial-dataloader-pos",
+            str(checkpoint / "dataloader_pos.txt"),
+        ]
     cmd.extend(parameter_args(params))
     return cmd
+
+
+def build_train_command(
+    run: RunSettings,
+    params: dict[str, float],
+    checkpoint: Path,
+    output_dir: Path,
+    stage_delta_sbs: int,
+    settings: EsSettings,
+) -> list[str]:
+    return [
+        str(run.exe),
+        *build_train_args(
+            run,
+            params,
+            checkpoint,
+            output_dir,
+            stage_delta_sbs,
+            settings,
+            include_initial_state=True,
+        ),
+    ]
 
 
 def train_candidate_stage(
@@ -841,6 +980,119 @@ def train_candidate_stage(
     return candidate
 
 
+def train_candidate_stage_worker(
+    args: argparse.Namespace,
+    worker: WorkerClient | None,
+    run: RunSettings,
+    settings: EsSettings,
+    summary_path: Path,
+    base_metric: Metric,
+    generation: int,
+    candidate: Candidate,
+    stage: BeamStage,
+    prev_after_sbs: int,
+    temp_root: Path,
+    color: bool,
+) -> Candidate:
+    delta = stage.after_sbs - prev_after_sbs
+    out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
+    cache_key = f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
+    event(
+        color,
+        f"[CAND {candidate.index:03d} START]",
+        (
+            f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb worker=on "
+            f"base_qloss={format_float(base_metric.qloss)} "
+            f"base_qacc={format_float(base_metric.qacc)} "
+            f"base_test_loss={format_float(base_metric.test_loss)} "
+            f"base_test_acc={format_float(base_metric.test_acc)}"
+        ),
+        "cyan",
+    )
+    append_csv(
+        summary_path,
+        SUMMARY_FIELDS,
+        {
+            "generation": generation,
+            "stage_sbs": stage.after_sbs,
+            "candidate": candidate.index,
+            "status": "started",
+            "rank": "",
+            "quantized_value_loss": "",
+            "quantized_value_accuracy": "",
+            "test_value_loss": "",
+            "test_value_accuracy": "",
+            "checkpoint": str(candidate.checkpoint),
+            "output_dir": f"worker-cache:{cache_key}",
+            "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+        },
+    )
+    trial_args = build_train_args(
+        run,
+        candidate.params,
+        None,
+        out_dir,
+        delta,
+        settings,
+        include_initial_state=False,
+    )
+    if args.dry_run:
+        print("  worker trial " + json.dumps({"args": trial_args, "keep": False, "cache_key": cache_key}, ensure_ascii=False), flush=True)
+        metric = Metric(qloss=math.inf, qacc=None, test_loss=None, test_acc=None)
+        score = metric.score(settings.metric)
+        elapsed = 0.0
+    else:
+        if worker is None:
+            raise RuntimeError("worker client is not open")
+        prefix = paint(color, f"[G{generation:04d} S{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
+        started = time.perf_counter()
+        payload = worker.request(
+            "trial",
+            {"args": trial_args, "keep": False, "cache_key": cache_key},
+            prefix=prefix,
+        )
+        elapsed = time.perf_counter() - started
+        metric = metric_from_worker_payload(payload)
+        score = metric.score(settings.metric)
+
+    event(
+        color,
+        f"[CAND {candidate.index:03d} END]",
+        (
+            f"generation={generation} stage={stage.after_sbs}sb worker=on "
+            f"{settings.metric}={format_float(score)} qloss={format_float(metric.qloss)} "
+            f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
+            f"elapsed={elapsed:.1f}s"
+        ),
+        "green",
+    )
+    append_csv(
+        summary_path,
+        SUMMARY_FIELDS,
+        {
+            "generation": generation,
+            "stage_sbs": stage.after_sbs,
+            "candidate": candidate.index,
+            "status": "finished",
+            "rank": "",
+            "quantized_value_loss": format_float(metric.qloss),
+            "quantized_value_accuracy": format_float(metric.qacc),
+            "test_value_loss": format_float(metric.test_loss),
+            "test_value_accuracy": format_float(metric.test_acc),
+            "checkpoint": f"worker-cache:{cache_key}",
+            "output_dir": f"worker-cache:{cache_key}",
+            "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+        },
+    )
+
+    candidate.cache_key = cache_key
+    candidate.output_dir = None
+    candidate.metric = metric
+    candidate.score = score
+    candidate.stage_sbs = stage.after_sbs
+    return candidate
+
+
 def rank_candidates(candidates: list[Candidate], lower_is_better: bool) -> list[Candidate]:
     def key(candidate: Candidate) -> float:
         if candidate.score is None:
@@ -859,6 +1111,8 @@ def log_stage_rows(
 ) -> None:
     for rank, candidate in enumerate(ranked, start=1):
         metric = candidate.metric or Metric()
+        checkpoint_text = f"worker-cache:{candidate.cache_key}" if candidate.cache_key else str(candidate.checkpoint)
+        output_text = f"worker-cache:{candidate.cache_key}" if candidate.cache_key else str(candidate.output_dir or "")
         append_csv(
             summary_path,
             SUMMARY_FIELDS,
@@ -872,8 +1126,8 @@ def log_stage_rows(
                 "quantized_value_accuracy": format_float(metric.qacc),
                 "test_value_loss": format_float(metric.test_loss),
                 "test_value_accuracy": format_float(metric.test_acc),
-                "checkpoint": str(candidate.checkpoint),
-                "output_dir": str(candidate.output_dir or ""),
+                "checkpoint": checkpoint_text,
+                "output_dir": output_text,
                 "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
             },
         )
@@ -903,6 +1157,12 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 
 def metric_direction_text(settings: EsSettings) -> str:
     return "lower is better" if settings.lower_is_better else "higher is better"
+
+
+def is_better_score(score: float, best_score: float | None, lower_is_better: bool) -> bool:
+    if best_score is None:
+        return True
+    return score < best_score if lower_is_better else score > best_score
 
 
 def public_checkpoint_name(accepted_sbs: int) -> str:
@@ -1000,6 +1260,14 @@ def main() -> int:
         event(color, "[START]", f"base_checkpoint={current_checkpoint}", "green")
 
     validate_checkpoint_dir(current_checkpoint)
+    worker_enabled = settings.use_worker and all(stage.keep == 1 for stage in settings.beam)
+    if settings.use_worker and not worker_enabled:
+        event(
+            color,
+            "[WORKER]",
+            "disabled for this run because the current worker protocol cannot keep multiple beam branches in memory; using ordinary candidate processes",
+            "yellow",
+        )
 
     beam_text = ", ".join(f"{stage.after_sbs}sb=>keep{stage.keep}" for stage in settings.beam)
     event(
@@ -1008,183 +1276,303 @@ def main() -> int:
         (
             f"population={settings.population} generations={settings.generations} "
             f"metric={settings.metric} ({metric_direction_text(settings)}) beam=[{beam_text}] "
-            f"save_rate={settings.save_rate} bulletou_settings={run.bulletou_settings_file}"
+            f"save_rate={settings.save_rate} worker={'on' if worker_enabled else 'off'} "
+            f"bulletou_settings={run.bulletou_settings_file}"
         ),
         "cyan",
     )
     event(color, "[PARAMETERS]", json.dumps(current_values(specs), ensure_ascii=False, sort_keys=True), "cyan")
 
-    total_generations = settings.generations
-    for generation in range(generation_start, generation_start + total_generations):
-        rng = random.Random(settings.seed + generation * 1_000_003)
-        current_params = current_values(specs)
-        base_metric = latest_learn_log_metric(current_checkpoint)
-        candidates = [
-            Candidate(index=i + 1, params=perturb_parameters(specs, rng), checkpoint=current_checkpoint)
-            for i in range(settings.population)
-        ]
-
-        event(
-            color,
-            f"[GEN {generation} START]",
-            (
-                f"generation={generation} population={settings.population} from={current_checkpoint} "
-                f"base_qloss={format_float(base_metric.qloss)} "
-                f"base_qacc={format_float(base_metric.qacc)} "
-                f"base_test_loss={format_float(base_metric.test_loss)} "
-                f"base_test_acc={format_float(base_metric.test_acc)}"
-            ),
-            "magenta",
-        )
-
-        live = candidates
-        prev_after_sbs = 0
-        for stage in settings.beam:
-            trained: list[Candidate] = []
-            for candidate in live:
-                trained.append(
-                    train_candidate_stage(
-                        args=args,
-                        run=run,
-                        settings=settings,
-                        summary_path=summary_path,
-                        base_metric=base_metric,
-                        generation=generation,
-                        candidate=candidate,
-                        stage=stage,
-                        prev_after_sbs=prev_after_sbs,
-                        temp_root=temp_root,
-                        log_dir=log_dir,
-                        color=color,
-                    )
+    worker: WorkerClient | None = None
+    try:
+        if worker_enabled:
+            if args.dry_run:
+                open_args = build_train_args(
+                    run,
+                    current_values(specs),
+                    current_checkpoint,
+                    runner_root / "worker-session",
+                    settings.beam[-1].after_sbs,
+                    settings,
+                    include_initial_state=True,
                 )
-            ranked = rank_candidates(trained, settings.lower_is_better)
-            log_stage_rows(summary_path, generation, stage, ranked, stage.keep)
-            kept = ranked[: stage.keep]
-            pruned = ranked[stage.keep :]
-            best = kept[0]
-            worst_kept = kept[-1]
+                print("  worker open " + json.dumps({"args": open_args}, ensure_ascii=False), flush=True)
+            else:
+                worker = WorkerClient(
+                    run.exe,
+                    log_dir / "worker.stderr.log",
+                    stream=not args.no_stream_child_output,
+                    color=color,
+                )
+                worker.request("hello", prefix=paint(color, "[WORKER] ", "magenta"))
+                open_args = build_train_args(
+                    run,
+                    current_values(specs),
+                    current_checkpoint,
+                    runner_root / "worker-session",
+                    settings.beam[-1].after_sbs,
+                    settings,
+                    include_initial_state=True,
+                )
+                event(color, "[WORKER OPEN]", f"checkpoint={current_checkpoint}", "yellow")
+                payload = worker.request("open", {"args": open_args}, prefix=paint(color, "[WORKER OPEN] ", "magenta"))
+                event(
+                    color,
+                    "[WORKER READY]",
+                    (
+                        f"arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
+                        f"completed_steps={payload.get('completed_steps')}"
+                    ),
+                    "green",
+                )
+
+        total_generations = settings.generations
+        for generation in range(generation_start, generation_start + total_generations):
+            rng = random.Random(settings.seed + generation * 1_000_003)
+            base_metric = latest_learn_log_metric(current_checkpoint)
+            candidates = [
+                Candidate(index=i + 1, params=perturb_parameters(specs, rng), checkpoint=current_checkpoint)
+                for i in range(settings.population)
+            ]
+
             event(
                 color,
-                f"[BEAM END]",
+                f"[GEN {generation} START]",
                 (
-                    f"generation={generation} stage={stage.after_sbs}sb "
-                    f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
-                    f"worst_kept_{settings.metric}={format_float(worst_kept.score)} "
-                    f"status=pruned_not_saved"
+                    f"generation={generation} population={settings.population} from={current_checkpoint} "
+                    f"base_qloss={format_float(base_metric.qloss)} "
+                    f"base_qacc={format_float(base_metric.qacc)} "
+                    f"base_test_loss={format_float(base_metric.test_loss)} "
+                    f"base_test_acc={format_float(base_metric.test_acc)}"
                 ),
-                "yellow",
+                "magenta",
             )
-            if not args.keep_temp:
-                for candidate in pruned:
-                    if candidate.output_dir is not None:
-                        remove_dir_quiet(candidate.output_dir)
-            live = kept
-            prev_after_sbs = stage.after_sbs
 
-        survivor = live[0]
-        if survivor.metric is None or survivor.score is None:
-            raise RuntimeError("final survivor has no metric")
+            live = candidates
+            prev_after_sbs = 0
+            for stage in settings.beam:
+                trained: list[Candidate] = []
+                stage_best_cache_key: str | None = None
+                stage_best_score: float | None = None
+                for candidate in live:
+                    if worker_enabled:
+                        trained_candidate = train_candidate_stage_worker(
+                            args=args,
+                            worker=worker,
+                            run=run,
+                            settings=settings,
+                            summary_path=summary_path,
+                            base_metric=base_metric,
+                            generation=generation,
+                            candidate=candidate,
+                            stage=stage,
+                            prev_after_sbs=prev_after_sbs,
+                            temp_root=temp_root,
+                            color=color,
+                        )
+                        trained.append(trained_candidate)
+                        if (
+                            not args.dry_run
+                            and stage.keep == 1
+                            and trained_candidate.cache_key is not None
+                            and trained_candidate.score is not None
+                        ):
+                            assert worker is not None
+                            if is_better_score(trained_candidate.score, stage_best_score, settings.lower_is_better):
+                                if stage_best_cache_key is not None:
+                                    worker.request(
+                                        "drop-cached-trials",
+                                        {"cache_keys": [stage_best_cache_key]},
+                                        prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
+                                    )
+                                stage_best_cache_key = trained_candidate.cache_key
+                                stage_best_score = trained_candidate.score
+                            else:
+                                worker.request(
+                                    "drop-cached-trials",
+                                    {"cache_keys": [trained_candidate.cache_key]},
+                                    prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
+                                )
+                    else:
+                        trained.append(
+                            train_candidate_stage(
+                                args=args,
+                                run=run,
+                                settings=settings,
+                                summary_path=summary_path,
+                                base_metric=base_metric,
+                                generation=generation,
+                                candidate=candidate,
+                                stage=stage,
+                                prev_after_sbs=prev_after_sbs,
+                                temp_root=temp_root,
+                                log_dir=log_dir,
+                                color=color,
+                            )
+                        )
+                ranked = rank_candidates(trained, settings.lower_is_better)
+                log_stage_rows(summary_path, generation, stage, ranked, stage.keep)
+                kept = ranked[: stage.keep]
+                pruned = ranked[stage.keep :]
+                best = kept[0]
+                worst_kept = kept[-1]
+                event(
+                    color,
+                    f"[BEAM END]",
+                    (
+                        f"generation={generation} stage={stage.after_sbs}sb "
+                        f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
+                        f"worst_kept_{settings.metric}={format_float(worst_kept.score)} "
+                        f"status=pruned_not_saved"
+                    ),
+                    "yellow",
+                )
+                if worker_enabled and not args.dry_run:
+                    if best.cache_key is None:
+                        raise RuntimeError("worker survivor has no cache key")
+                    assert worker is not None
+                    worker.request(
+                        "accept-cached-trial",
+                        {"cache_key": best.cache_key},
+                        prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
+                    )
+                    best.cache_key = None
+                    best.checkpoint = current_checkpoint
+                if not args.keep_temp:
+                    for candidate in pruned:
+                        if candidate.output_dir is not None:
+                            remove_dir_quiet(candidate.output_dir)
+                live = kept
+                prev_after_sbs = stage.after_sbs
 
-        if not args.dry_run:
-            copy_dir_replace(survivor.checkpoint, current_dir)
-        current_checkpoint = current_dir
-        accepted_sbs += settings.beam[-1].after_sbs
+            survivor = live[0]
+            if survivor.metric is None or survivor.score is None:
+                raise RuntimeError("final survivor has no metric")
 
-        set_current_values(specs, survivor.params)
-        if not args.dry_run:
-            write_current_parameters(args.es_settings_file, root, specs)
-            copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
-
-        saved_checkpoint = ""
-        if settings.save_rate > 0 and (generation % settings.save_rate == 0):
-            public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
+            accepted_sbs += settings.beam[-1].after_sbs
             if not args.dry_run:
-                copy_dir_new(current_dir, public_dir)
-                copy_settings_files(public_dir, args.es_settings_file, run.bulletou_settings_file)
-            saved_checkpoint = public_dir.name
+                if worker_enabled:
+                    assert worker is not None
+                    save_args = build_train_args(
+                        run,
+                        survivor.params,
+                        None,
+                        runner_root / "worker-save-output",
+                        1,
+                        settings,
+                        include_initial_state=False,
+                    )
+                    worker.request(
+                        "save",
+                        {
+                            "args": save_args,
+                            "dir": str(current_dir),
+                            "epoch": generation,
+                            "superbatch": settings.beam[-1].after_sbs,
+                        },
+                        prefix=paint(color, f"[G{generation:04d} SAVE] ", "magenta"),
+                    )
+                else:
+                    copy_dir_replace(survivor.checkpoint, current_dir)
+            current_checkpoint = current_dir
 
-        params_json = json.dumps(survivor.params, ensure_ascii=False, sort_keys=True)
-        metric = survivor.metric
-        append_csv(
-            accepted_summary_path,
-            ACCEPTED_FIELDS,
-            {
+            set_current_values(specs, survivor.params)
+            if not args.dry_run:
+                write_current_parameters(args.es_settings_file, root, specs)
+                copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
+
+            saved_checkpoint = ""
+            if settings.save_rate > 0 and (generation % settings.save_rate == 0):
+                public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
+                if not args.dry_run:
+                    copy_dir_new(current_dir, public_dir)
+                    copy_settings_files(public_dir, args.es_settings_file, run.bulletou_settings_file)
+                saved_checkpoint = public_dir.name
+
+            params_json = json.dumps(survivor.params, ensure_ascii=False, sort_keys=True)
+            metric = survivor.metric
+            append_csv(
+                accepted_summary_path,
+                ACCEPTED_FIELDS,
+                {
+                    "generation": generation,
+                    "accepted_sbs": accepted_sbs,
+                    "quantized_value_loss": format_float(metric.qloss),
+                    "quantized_value_accuracy": format_float(metric.qacc),
+                    "test_value_loss": format_float(metric.test_loss),
+                    "test_value_accuracy": format_float(metric.test_acc),
+                    "stage_sbs": settings.beam[-1].after_sbs,
+                    "saved_checkpoint": saved_checkpoint,
+                    "current_checkpoint": str(current_checkpoint),
+                    "parameters": params_json,
+                },
+            )
+            append_jsonl(
+                history_path,
+                {
+                    "generation": generation,
+                    "accepted_sbs": accepted_sbs,
+                    "metric_value": survivor.score,
+                    "metric_name": settings.metric,
+                    "metric": {
+                        "quantized_value_loss": metric.qloss,
+                        "quantized_value_accuracy": metric.qacc,
+                        "test_value_loss": metric.test_loss,
+                        "test_value_accuracy": metric.test_acc,
+                    },
+                    "parameters": survivor.params,
+                    "current_checkpoint": str(current_checkpoint),
+                    "saved_checkpoint": saved_checkpoint,
+                },
+            )
+
+            state = {
                 "generation": generation,
                 "accepted_sbs": accepted_sbs,
-                "quantized_value_loss": format_float(metric.qloss),
-                "quantized_value_accuracy": format_float(metric.qacc),
-                "test_value_loss": format_float(metric.test_loss),
-                "test_value_accuracy": format_float(metric.test_acc),
-                "stage_sbs": settings.beam[-1].after_sbs,
-                "saved_checkpoint": saved_checkpoint,
                 "current_checkpoint": str(current_checkpoint),
-                "parameters": params_json,
-            },
-        )
-        append_jsonl(
-            history_path,
-            {
-                "generation": generation,
-                "accepted_sbs": accepted_sbs,
-                "metric_value": survivor.score,
-                "metric_name": settings.metric,
-                "metric": {
+                "last_metric_value": survivor.score,
+                "last_metric_name": settings.metric,
+                "last_metric": {
                     "quantized_value_loss": metric.qloss,
                     "quantized_value_accuracy": metric.qacc,
                     "test_value_loss": metric.test_loss,
                     "test_value_accuracy": metric.test_acc,
                 },
-                "parameters": survivor.params,
-                "current_checkpoint": str(current_checkpoint),
-                "saved_checkpoint": saved_checkpoint,
-            },
-        )
+                "es_settings_file": str(args.es_settings_file.resolve()),
+                "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
+            }
+            if not args.dry_run:
+                save_state(state_path, state)
 
-        state = {
-            "generation": generation,
-            "accepted_sbs": accepted_sbs,
-            "current_checkpoint": str(current_checkpoint),
-            "last_metric_value": survivor.score,
-            "last_metric_name": settings.metric,
-            "last_metric": {
-                "quantized_value_loss": metric.qloss,
-                "quantized_value_accuracy": metric.qacc,
-                "test_value_loss": metric.test_loss,
-                "test_value_accuracy": metric.test_acc,
-            },
-            "es_settings_file": str(args.es_settings_file.resolve()),
-            "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
-        }
-        if not args.dry_run:
-            save_state(state_path, state)
+            event(
+                color,
+                "[ACCEPT]",
+                (
+                    f"generation={generation} accepted_sbs={accepted_sbs} "
+                    f"{settings.metric}={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
+                    f"qacc={format_float(metric.qacc)}"
+                ),
+                "green",
+            )
+            if saved_checkpoint:
+                event(color, "[SAVE]", f"{accepted_root / saved_checkpoint}", "green")
+                event(color, "[SAFE TO STOP]", f"saved={accepted_root / saved_checkpoint}", "green")
+            else:
+                event(color, "[CURRENT]", f"resume checkpoint updated: {current_checkpoint}", "yellow")
 
-        event(
-            color,
-            "[ACCEPT]",
-            (
-                f"generation={generation} accepted_sbs={accepted_sbs} "
-                f"{settings.metric}={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
-                f"qacc={format_float(metric.qacc)}"
-            ),
-            "green",
-        )
-        if saved_checkpoint:
-            event(color, "[SAVE]", f"{accepted_root / saved_checkpoint}", "green")
-            event(color, "[SAFE TO STOP]", f"saved={accepted_root / saved_checkpoint}", "green")
-        else:
-            event(color, "[CURRENT]", f"resume checkpoint updated: {current_checkpoint}", "yellow")
+            if not args.keep_temp:
+                gen_temp = temp_root / f"gen{generation:04d}"
+                remove_dir_quiet(gen_temp)
 
-        if not args.keep_temp:
-            gen_temp = temp_root / f"gen{generation:04d}"
-            remove_dir_quiet(gen_temp)
-
-        event(
-            color,
-            "[GEN END]",
-            f"generation={generation} survivor=cand{survivor.index:03d} params={params_json}",
-            "magenta",
-        )
+            event(
+                color,
+                "[GEN END]",
+                f"generation={generation} survivor=cand{survivor.index:03d} params={params_json}",
+                "magenta",
+            )
+    finally:
+        if worker is not None:
+            worker.close()
 
     event(color, "[DONE]", f"current_checkpoint={current_checkpoint}", "green")
     return 0

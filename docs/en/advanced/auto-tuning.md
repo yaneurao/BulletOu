@@ -44,6 +44,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     ],
     "metric": "quantized_value_loss",
     "lower_is_better": true,
+    "use_worker": true,
     "seed": 1,
     "save_rate": 1,
     "candidate_validation_rate": 1,
@@ -122,6 +123,7 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `beam` | When to prune candidates and how many to keep |
 | `metric` | Metric used to rank candidates |
 | `lower_is_better` | `true` if smaller metric values are better |
+| `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
 | `candidate_validation_rate` | f32 validation cadence inside each candidate run |
@@ -269,6 +271,8 @@ The runner copies the current `es-settings.json` and `bulletou-settings.json` in
 
 If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[BEAM END]` only means candidate pruning finished; it does not mean a public checkpoint has been fully saved.
 
-During ES, each `bulletou.exe` child process is a short candidate job. Therefore `[epoch] start epoch 1/1` belongs to that child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0008 C001]`, meaning generation 2, 8sb stage, candidate 1.
+During ES, the runner uses one long-lived `bulletou worker` process by default. This avoids rebuilding the CUDA context, validation cache, qvalid cache, and worker warmup for every candidate.
+
+If `use_worker` is `false`, or if the runner detects a beam layout that cannot be handled safely by the current worker protocol, candidates are run as short `bulletou.exe` child jobs. In that mode, `[epoch] start epoch 1/1` belongs to the child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0008 C001]`, meaning generation 2, 8sb stage, candidate 1.
 
 When normal training uses `bulletou.exe --settings-file`, each BulletOu checkpoint gets a copy of `bulletou-settings.json`.
