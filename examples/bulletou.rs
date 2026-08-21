@@ -3733,6 +3733,164 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
     }
 }
 
+fn sfnn_parameters_json_current_f32(
+    parameters: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<f32>, String> {
+    let Some(value) = parameters.get(key) else {
+        return Ok(None);
+    };
+    let current = match value {
+        serde_json::Value::Number(number) => {
+            number.as_f64().ok_or_else(|| format!("parameters.{key} is not representable as f64"))?
+        }
+        serde_json::Value::Object(obj) => obj
+            .get("current")
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| format!("parameters.{key}.current must be a number"))?,
+        _ => return Err(format!("parameters.{key} must be a number or an object with `current`")),
+    };
+    if !current.is_finite() {
+        return Err(format!("parameters.{key}.current must be finite"));
+    }
+    Ok(Some(current as f32))
+}
+
+fn set_sfnn_parameters_json_alpha(
+    parameters: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<SfnnFactorizerAlphaSpec>, String> {
+    let mut alpha = SfnnFactorizerAlphaSpec::ONE;
+    let mut seen = false;
+    for key in ["shared", "king_axis", "hand_axis", "progress_axis", "pair"] {
+        if let Some(value) = sfnn_parameters_json_current_f32(parameters, key)? {
+            if !(value.is_finite() && (0.0..=SfnnFactorizerAlphaSpec::MAX).contains(&value)) {
+                return Err(format!(
+                    "parameters.{key}.current must be finite and in [0, {}] (got {value})",
+                    SfnnFactorizerAlphaSpec::MAX
+                ));
+            }
+            match key {
+                "shared" => alpha.shared = value,
+                "king_axis" => alpha.king_axis = value,
+                "hand_axis" => alpha.hand_axis = value,
+                "progress_axis" => alpha.progress_axis = value,
+                "pair" => alpha.pair = value,
+                _ => unreachable!(),
+            }
+            seen = true;
+        }
+    }
+    Ok(seen.then_some(alpha))
+}
+
+fn ensure_no_explicit_sfnn_parameters(args: &Args) -> Result<(), String> {
+    if args.sfnn_factorizer_alpha.is_some() {
+        return Err("--parameters-file cannot be combined with --sfnn-factorizer-alpha".to_string());
+    }
+    for (name, value) in [
+        ("--sfnn-residual-count-confidence", args.sfnn_residual_count_confidence),
+        ("--sfnn-axis-count-confidence", args.sfnn_axis_count_confidence),
+        ("--sfnn-king-axis-count-confidence", args.sfnn_king_axis_count_confidence),
+        ("--sfnn-hand-axis-count-confidence", args.sfnn_hand_axis_count_confidence),
+        ("--sfnn-progress-axis-count-confidence", args.sfnn_progress_axis_count_confidence),
+        ("--sfnn-pair-count-confidence", args.sfnn_pair_count_confidence),
+        ("--sfnn-king-hand-pair-count-confidence", args.sfnn_king_hand_pair_count_confidence),
+        ("--sfnn-king-progress-pair-count-confidence", args.sfnn_king_progress_pair_count_confidence),
+        ("--sfnn-hand-progress-pair-count-confidence", args.sfnn_hand_progress_pair_count_confidence),
+    ] {
+        if value.is_some() {
+            return Err(format!("--parameters-file cannot be combined with {name}"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_sfnn_parameters_file(args: &mut Args) -> Result<(), String> {
+    let Some(path) = args.parameters_file.as_deref() else {
+        return Ok(());
+    };
+    ensure_no_explicit_sfnn_parameters(args)?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("failed to read --parameters-file {}: {err}", path.display()))?;
+    let root: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("failed to parse --parameters-file {} as JSON: {err}", path.display()))?;
+    let root =
+        root.as_object().ok_or_else(|| format!("--parameters-file {} must contain a JSON object", path.display()))?;
+    let es = root.get("es").and_then(serde_json::Value::as_object).ok_or_else(|| {
+        format!("--parameters-file {} requires `es.enabled=false` for normal training", path.display())
+    })?;
+    let enabled = es
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("--parameters-file {} requires boolean `es.enabled`", path.display()))?;
+    if enabled {
+        return Err(format!(
+            "--parameters-file {} has `es.enabled=true`; run es_local_runner.py, or set `es.enabled=false` for normal training",
+            path.display()
+        ));
+    }
+    let parameters = root
+        .get("parameters")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| format!("--parameters-file {} requires a `parameters` object", path.display()))?;
+
+    let known: std::collections::BTreeSet<&str> = [
+        "shared",
+        "king_axis",
+        "hand_axis",
+        "progress_axis",
+        "pair",
+        "residual_count",
+        "axis_count",
+        "king_axis_count",
+        "hand_axis_count",
+        "progress_axis_count",
+        "pair_count",
+        "king_hand_pair_count",
+        "king_progress_pair_count",
+        "hand_progress_pair_count",
+    ]
+    .into_iter()
+    .collect();
+    for key in parameters.keys() {
+        if !known.contains(key.as_str()) {
+            return Err(format!("--parameters-file {} has unknown parameters key `{key}`", path.display()));
+        }
+    }
+
+    if let Some(alpha) = set_sfnn_parameters_json_alpha(parameters)? {
+        args.sfnn_factorizer_alpha = Some(alpha);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "residual_count")? {
+        args.sfnn_residual_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "axis_count")? {
+        args.sfnn_axis_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "king_axis_count")? {
+        args.sfnn_king_axis_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "hand_axis_count")? {
+        args.sfnn_hand_axis_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "progress_axis_count")? {
+        args.sfnn_progress_axis_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "pair_count")? {
+        args.sfnn_pair_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "king_hand_pair_count")? {
+        args.sfnn_king_hand_pair_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "king_progress_pair_count")? {
+        args.sfnn_king_progress_pair_count_confidence = Some(value);
+    }
+    if let Some(value) = sfnn_parameters_json_current_f32(parameters, "hand_progress_pair_count")? {
+        args.sfnn_hand_progress_pair_count_confidence = Some(value);
+    }
+    Ok(())
+}
+
 fn requested_sfnn_factorizer_spec(args: &Args) -> SfnnFactorizerSpec {
     if args.no_sfnn_factorized {
         SfnnFactorizerSpec::NONE
@@ -4563,6 +4721,12 @@ struct Args {
     #[arg(long = "sfnn-factorizer", conflicts_with_all = ["sfnn_factorized", "no_sfnn_factorized"])]
     sfnn_factorizer: Option<SfnnFactorizerSpec>,
 
+    /// Read SFNN factorizer alpha / count-confidence current values from a
+    /// shared parameters.json file. This is for normal training with
+    /// `es.enabled=false`; use es_local_runner.py when `es.enabled=true`.
+    #[arg(long = "parameters-file")]
+    parameters_file: Option<PathBuf>,
+
     /// Scale the contribution of active SFNN factorizer terms during forward,
     /// backward, validation, and `nn.bin` export. Accepted values:
     /// `0.95`, `all=0.95`, `shared=0.95`, `king=0.90`,
@@ -4857,6 +5021,9 @@ impl Args {
         }
         if self.sfnn_factorizer_alpha.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer-alpha currently applies to SFNN / LayerStack eval types only".to_string());
+        }
+        if self.parameters_file.is_some() && !eval_type.uses_layerstack() {
+            return Err("--parameters-file currently applies to SFNN / LayerStack eval types only".to_string());
         }
         if !(self.sfnn_factorizer_residual_decay.is_finite() && self.sfnn_factorizer_residual_decay >= 0.0) {
             return Err(format!(
@@ -10946,7 +11113,7 @@ fn main() {
         return;
     }
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     // `--count-teacher` operates standalone (no training): print position
     // counts for the supplied teacher path(s) and exit.
     if args.count_teacher {
@@ -10966,6 +11133,10 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+    if let Err(e) = apply_sfnn_parameters_file(&mut args) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
     let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap_or_else(|e| {
         eprintln!("error: {e}");
@@ -27013,6 +27184,98 @@ mod tests {
         assert_eq!(progress_only.hand_axis, 1.0);
         assert_eq!(progress_only.progress_axis, 4.0);
         assert_eq!(progress_only.pair, 1.0);
+    }
+
+    #[test]
+    fn sfnn_parameters_file_applies_current_values_for_normal_training() {
+        use clap::Parser as _;
+
+        let path = std::env::temp_dir().join(format!("bulletou-parameters-file-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "es": { "enabled": false },
+              "parameters": {
+                "shared": { "current": 1.0, "tune": false },
+                "king_axis": { "current": 1.25, "tune": true },
+                "hand_axis": { "current": 0.75, "tune": true },
+                "progress_axis": { "current": 1.50, "tune": true },
+                "pair": { "current": 0.30, "tune": true },
+                "residual_count": { "current": 1.0, "tune": true },
+                "king_axis_count": { "current": 4.0, "tune": true },
+                "hand_progress_pair_count": { "current": 10.0, "tune": true }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--parameters-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        apply_sfnn_parameters_file(&mut args).unwrap();
+        let alpha = args.sfnn_factorizer_alpha.unwrap();
+        assert_eq!(alpha.shared, 1.0);
+        assert_eq!(alpha.king_axis, 1.25);
+        assert_eq!(alpha.hand_axis, 0.75);
+        assert_eq!(alpha.progress_axis, 1.50);
+        assert_eq!(alpha.pair, 0.30);
+        assert_eq!(args.sfnn_residual_count_confidence, Some(1.0));
+        assert_eq!(args.sfnn_king_axis_count_confidence, Some(4.0));
+        assert_eq!(args.sfnn_hand_progress_pair_count_confidence, Some(10.0));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sfnn_parameters_file_rejects_es_enabled_for_normal_training() {
+        use clap::Parser as _;
+
+        let path =
+            std::env::temp_dir().join(format!("bulletou-parameters-file-es-enabled-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{
+              "version": 1,
+              "es": { "enabled": true },
+              "parameters": {
+                "shared": { "current": 1.0 }
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--parameters-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+
+        let err = apply_sfnn_parameters_file(&mut args).unwrap_err();
+        assert!(err.contains("es.enabled=true"), "{err}");
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -21,6 +21,7 @@ The important rules are:
 {
   "version": 1,
   "es": {
+    "enabled": true,
     "generations": 100,
     "population": 16,
     "beam": [
@@ -52,6 +53,13 @@ The important rules are:
   }
 }
 ```
+
+`es.enabled` tells BulletOu how to use this JSON file.
+
+| Value | Meaning |
+| --- | --- |
+| `true` | Run ES with `es_local_runner.py` |
+| `false` | Use only `parameters.current` values in normal `bulletou.exe` training |
 
 `step` is the random sampling width. If `pair.current = 0.3` and `pair.step = 0.02`, candidates sample `pair` between `0.28` and `0.32`. Parameters with `tune: false` stay fixed.
 
@@ -90,7 +98,31 @@ python .\es_local_runner.py `
 
 The standalone `--` line is the delimiter. Everything after it is passed to `bulletou.exe`, not to the runner. Put common candidate options such as `--lr` and `--optimizer` there.
 
-Do not put `--resume`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, `--initial-dataloader-pos`, `--sfnn-factorizer-alpha`, or count-confidence options after the delimiter. The runner owns those options for each candidate.
+Do not put `--resume`, `--parameters-file`, `--superbatches`, `--max-epochs`, `--save-rate`, `--validation-rate`, `--quantized-validation-rate`, `--tag`, `--output-folder`, `--initial-state`, `--initial-dataloader-pos`, `--sfnn-factorizer-alpha`, or count-confidence options after the delimiter. The runner owns those options for each candidate.
+
+## Use `parameters.json` without ES
+
+If you want to train with the tuned values fixed, set `es.enabled` to `false` in `parameters.json`. Then pass the same file to `bulletou.exe`.
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --backend cuda-cpp `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --sfnn-factorizer pair `
+  --parameters-file .\parameters.json `
+  --sfnn-bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --positions-per-superbatch 40000000 `
+  --superbatches 32 `
+  --max-epochs 1 `
+  --lr 0.000030 `
+  --lr-min 0.000010
+```
+
+In this mode, `bulletou.exe` reads only `parameters.*.current`. Fields such as `step`, `tune`, and `beam` are runner settings and are ignored by normal training.
+
+Do not combine `--parameters-file` with `--sfnn-factorizer-alpha` or count-confidence options. There should be only one source for those values.
 
 ## Output layout
 

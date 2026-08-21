@@ -100,6 +100,7 @@ RUNNER_CONTROLLED_FLAGS = {
     "--teacher",
     "--test-teacher",
     "--arch",
+    "--parameters-file",
     "--initial-state",
     "--initial-dataloader-pos",
     "--output",
@@ -365,6 +366,12 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     es_obj = root.get("es")
     if not isinstance(es_obj, dict):
         raise ValueError(f"{path}: `es` object is required")
+    enabled = es_obj.get("enabled")
+    if enabled is not True:
+        raise ValueError(
+            f"{path}: es.enabled must be true for es_local_runner.py; "
+            "set es.enabled=false when using the same parameters file with bulletou.exe"
+        )
 
     generations = int(es_obj.get("generations", 1))
     population = int(es_obj.get("population", 4))

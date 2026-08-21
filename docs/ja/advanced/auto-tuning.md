@@ -21,6 +21,7 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
 {
   "version": 1,
   "es": {
+    "enabled": true,
     "generations": 100,
     "population": 16,
     "beam": [
@@ -52,6 +53,13 @@ factorizer の alpha や count confidence は、組み合わせが多く、手�
   }
 }
 ```
+
+`es.enabled` は、この JSON をどう使うかを表します。
+
+| 値 | 使い方 |
+| --- | --- |
+| `true` | `es_local_runner.py` で ES を回す |
+| `false` | `bulletou.exe` の通常学習で、`parameters.current` の値だけ使う |
 
 `step` は candidate を作るときのランダム幅です。たとえば `pair.current = 0.3`, `pair.step = 0.02` なら、candidate の `pair` は `0.28` から `0.32` の範囲で作られます。`tune: false` の項目は固定されます。
 
@@ -90,7 +98,31 @@ python .\es_local_runner.py `
 
 `--` だけの行は区切りです。そこから後ろは runner ではなく `bulletou.exe` へ渡されます。`--lr` や `--optimizer` のような、candidate 間で共通に使う学習条件を書きます。
 
-runner が自動で指定するので、`--` より後ろ側には `--resume`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos`、`--sfnn-factorizer-alpha`、count confidence 系オプションは書かないでください。
+runner が自動で指定するので、`--` より後ろ側には `--resume`、`--parameters-file`、`--superbatches`、`--max-epochs`、`--save-rate`、`--validation-rate`、`--quantized-validation-rate`、`--tag`、`--output-folder`、`--initial-state`、`--initial-dataloader-pos`、`--sfnn-factorizer-alpha`、count confidence 系オプションは書かないでください。
+
+## ESせずに `parameters.json` の値だけ使う
+
+ESで見つけた値を固定して学習したい場合は、`parameters.json` の `es.enabled` を `false` にします。その状態で `bulletou.exe` に同じ `--parameters-file` を渡します。
+
+```powershell
+.\target\release\examples\bulletou.exe `
+  --backend cuda-cpp `
+  --teacher D:\sojoteam_datasets `
+  --test-teacher C:\shogi\teacher\test\test20231010_fg2021_dls5_ryfc20_ev8250k825.hcpe `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --sfnn-factorizer pair `
+  --parameters-file .\parameters.json `
+  --sfnn-bucket-counts D:\sojo_counts\SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin `
+  --positions-per-superbatch 40000000 `
+  --superbatches 32 `
+  --max-epochs 1 `
+  --lr 0.000030 `
+  --lr-min 0.000010
+```
+
+この使い方では、`parameters.*.current` だけが学習に反映されます。`step` や `tune` や `beam` は ES runner 用の設定なので、`bulletou.exe` は読みません。
+
+`--parameters-file` と `--sfnn-factorizer-alpha`、count confidence 系オプションを同時に指定することはできません。値の入口が2つあると、どちらが有効かわからなくなるためです。
 
 ## 出力フォルダ
 
