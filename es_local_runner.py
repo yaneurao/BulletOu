@@ -247,6 +247,7 @@ def parse_args() -> argparse.Namespace:
         help="Do not mirror bulletou.exe stdout to console; logs are still written under runner logs/.",
     )
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    parser.add_argument("--debug", action="store_true", help="Print Python traceback for runner errors")
     args = parser.parse_args()
     return args
 
@@ -1186,3 +1187,11 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         raise SystemExit(130)
+    except (RuntimeError, ValueError, OSError) as exc:
+        if "--debug" in sys.argv:
+            raise
+        print(f"error: {exc}", file=sys.stderr)
+        if "already exists; use --resume" in str(exc):
+            print("hint: add --resume to continue the existing ES run, or change run.tag_prefix for a new run.", file=sys.stderr)
+        print("hint: rerun with --debug for a Python traceback.", file=sys.stderr)
+        raise SystemExit(1)
