@@ -9949,6 +9949,7 @@ impl WorkerSfnnSession {
         let mut last_quantized_metrics = None::<TestMetrics>;
         let mut excluded_elapsed = std::time::Duration::ZERO;
         let mut progress_meter = CudaCppProgressMeter::default();
+        let mut last_epoch_banner = None;
         let mut dirty_bucket_marks =
             if trial_args.sfnn_dirty_bucket_update { vec![false; self.shape.num_stacks] } else { Vec::new() };
         let mut dirty_buckets = Vec::<i32>::new();
@@ -9971,6 +9972,8 @@ impl WorkerSfnnSession {
         for_each_cuda_cpp_sfnn_teacher_batch(self.feature_kind, &config, train_steps, |teacher_batch| {
             seen_steps += 1;
             last_dataloader_pos = teacher_batch.dataloader_pos;
+            let progress_for_step = schedule.progress_for_step(seen_steps);
+            print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, trial_args.max_epochs);
             let batches_per_update = trial_args.batches_per_update;
             let is_optimizer_step = seen_steps % batches_per_update == 0;
             let optimizer_step = self.optimizer_steps + optimizer_updates + usize::from(is_optimizer_step);
@@ -10178,6 +10181,24 @@ impl WorkerSfnnSession {
                 }
                 excluded_elapsed = excluded_elapsed.saturating_add(event_started.elapsed());
                 checkpoint_chunk_idx += 1;
+            } else if schedule.production
+                && progress_for_step.is_some_and(|progress| {
+                    progress.batch_in_superbatch == progress.batches_per_superbatch
+                })
+            {
+                self.ctx.synchronize().map_err(|e| e.to_string())?;
+                let positions = seen_steps.saturating_mul(self.batch_size);
+                let (train_elapsed_sec, _positions_per_sec) =
+                    cuda_cpp_train_timing(positions, &started, excluded_elapsed);
+                let progress_stats =
+                    progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
+                print_cuda_cpp_superbatch_progress(
+                    "worker SFNN",
+                    progress_for_step,
+                    self.batch_size,
+                    positions,
+                    progress_stats,
+                );
             }
             Ok::<(), String>(())
         })
