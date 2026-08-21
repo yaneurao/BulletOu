@@ -684,6 +684,7 @@ def train_candidate_stage(
     args: argparse.Namespace,
     run: RunSettings,
     settings: EsSettings,
+    summary_path: Path,
     generation: int,
     candidate: Candidate,
     stage: BeamStage,
@@ -704,6 +705,24 @@ def train_candidate_stage(
         f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb",
         "cyan",
     )
+    append_csv(
+        summary_path,
+        SUMMARY_FIELDS,
+        {
+            "generation": generation,
+            "stage_sbs": stage.after_sbs,
+            "candidate": candidate.index,
+            "status": "started",
+            "rank": "",
+            "quantized_value_loss": "",
+            "quantized_value_accuracy": "",
+            "test_value_loss": "",
+            "test_value_accuracy": "",
+            "checkpoint": str(candidate.checkpoint),
+            "output_dir": str(out_dir),
+            "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+        },
+    )
     cmd = build_train_command(run, candidate.params, candidate.checkpoint, out_dir, delta, settings)
     if args.dry_run:
         print("  " + subprocess.list2cmdline(cmd), flush=True)
@@ -714,6 +733,24 @@ def train_candidate_stage(
     else:
         code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
         if code != 0:
+            append_csv(
+                summary_path,
+                SUMMARY_FIELDS,
+                {
+                    "generation": generation,
+                    "stage_sbs": stage.after_sbs,
+                    "candidate": candidate.index,
+                    "status": "failed",
+                    "rank": "",
+                    "quantized_value_loss": "",
+                    "quantized_value_accuracy": "",
+                    "test_value_loss": "",
+                    "test_value_accuracy": "",
+                    "checkpoint": str(candidate.checkpoint),
+                    "output_dir": str(out_dir),
+                    "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+                },
+            )
             raise RuntimeError(f"candidate {candidate.index} failed at stage {stage.after_sbs}sb; see {log_path}")
         row = latest_summary_row(out_dir)
         metric = metric_from_summary_row(row)
@@ -730,6 +767,24 @@ def train_candidate_stage(
             f"elapsed={elapsed:.1f}s"
         ),
         "green",
+    )
+    append_csv(
+        summary_path,
+        SUMMARY_FIELDS,
+        {
+            "generation": generation,
+            "stage_sbs": stage.after_sbs,
+            "candidate": candidate.index,
+            "status": "finished",
+            "rank": "",
+            "quantized_value_loss": format_float(metric.qloss),
+            "quantized_value_accuracy": format_float(metric.qacc),
+            "test_value_loss": format_float(metric.test_loss),
+            "test_value_accuracy": format_float(metric.test_acc),
+            "checkpoint": str(checkpoint),
+            "output_dir": str(out_dir),
+            "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
+        },
     )
 
     if candidate.output_dir is not None and not args.keep_temp:
@@ -943,6 +998,7 @@ def main() -> int:
                         args=args,
                         run=run,
                         settings=settings,
+                        summary_path=summary_path,
                         generation=generation,
                         candidate=candidate,
                         stage=stage,
