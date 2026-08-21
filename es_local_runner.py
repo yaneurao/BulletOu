@@ -553,6 +553,18 @@ def latest_summary_row(output_dir: Path) -> dict[str, str]:
     return rows[-1]
 
 
+def latest_learn_log_metric(checkpoint: Path) -> Metric:
+    path = checkpoint / "learn.log"
+    if not path.exists():
+        return Metric()
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    rows = [row for row in rows if any((value or "").strip() for value in row.values())]
+    if not rows:
+        return Metric()
+    return metric_from_summary_row(rows[-1])
+
+
 def latest_checkpoint_dir(output_dir: Path) -> Path:
     candidates: list[tuple[int, Path]] = []
     for child in output_dir.iterdir():
@@ -685,6 +697,7 @@ def train_candidate_stage(
     run: RunSettings,
     settings: EsSettings,
     summary_path: Path,
+    base_metric: Metric,
     generation: int,
     candidate: Candidate,
     stage: BeamStage,
@@ -702,7 +715,13 @@ def train_candidate_stage(
     event(
         color,
         f"[CAND {candidate.index:03d} START]",
-        f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb",
+        (
+            f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb "
+            f"base_qloss={format_float(base_metric.qloss)} "
+            f"base_qacc={format_float(base_metric.qacc)} "
+            f"base_test_loss={format_float(base_metric.test_loss)} "
+            f"base_test_acc={format_float(base_metric.test_acc)}"
+        ),
         "cyan",
     )
     append_csv(
@@ -976,6 +995,7 @@ def main() -> int:
     for generation in range(generation_start, generation_start + total_generations):
         rng = random.Random(settings.seed + generation * 1_000_003)
         current_params = current_values(specs)
+        base_metric = latest_learn_log_metric(current_checkpoint)
         candidates = [
             Candidate(index=i + 1, params=perturb_parameters(specs, rng), checkpoint=current_checkpoint)
             for i in range(settings.population)
@@ -984,7 +1004,13 @@ def main() -> int:
         event(
             color,
             "[GEN START]",
-            f"generation={generation} population={settings.population} from={current_checkpoint}",
+            (
+                f"generation={generation} population={settings.population} from={current_checkpoint} "
+                f"base_qloss={format_float(base_metric.qloss)} "
+                f"base_qacc={format_float(base_metric.qacc)} "
+                f"base_test_loss={format_float(base_metric.test_loss)} "
+                f"base_test_acc={format_float(base_metric.test_acc)}"
+            ),
             "magenta",
         )
 
@@ -999,6 +1025,7 @@ def main() -> int:
                         run=run,
                         settings=settings,
                         summary_path=summary_path,
+                        base_metric=base_metric,
                         generation=generation,
                         candidate=candidate,
                         stage=stage,
