@@ -6298,14 +6298,14 @@ impl SfnnTrainStepRunner {
         match values {
             Some(values) => {
                 expect_len(
-                    "SFNN factorizer axis confidence coefficients",
+                    "SFNN factorizer axis multiplier coefficients",
                     self.shape.factorizer_axis_count(),
                     values.len(),
                 )?;
                 for &value in values {
-                    if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+                    if !(value.is_finite() && (0.0..=SfnnFactorizerAlpha::MAX).contains(&value)) {
                         return Err(CudaCppError::message(
-                            "SFNN factorizer axis confidence coefficients must be finite and in [0, 1]",
+                            "SFNN factorizer axis multiplier coefficients must be finite and within the factorizer alpha range",
                         ));
                     }
                 }
