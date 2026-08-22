@@ -165,7 +165,7 @@ If qloss and qacc disagree too often, `borda_count` is a safer compromise:
 
 Tied values receive the average rank of the tied range. For example, if two candidates tie for 2nd and 3rd place, both receive rank 2.5 for that metric.
 
-When `borda_count` is used with worker mode, the runner does not keep every candidate state in host RAM. It measures candidate metrics, computes the rank sum after all candidates are known, and then replays only the survivor once with `keep=true` to advance the worker state. This avoids holding `population` copies of the large optimizer state in memory. The tradeoff is one extra survivor replay per stage.
+When `borda_count` is used with worker mode, the runner stores candidate state caches on disk under `temp_folder`. After all candidates are ranked, the survivor is restored from its disk cache into the worker. This avoids holding `population` copies of the large optimizer state in host RAM and does not require retraining the survivor. The tradeoff is temporary `state.bin` write/read I/O per candidate.
 
 ## `run` fields
 

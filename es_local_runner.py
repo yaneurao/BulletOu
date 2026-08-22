@@ -1023,8 +1023,9 @@ def train_candidate_stage_worker(
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
     out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
-    cache_key = None if settings.metric == BORDA_COUNT_METRIC else f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
-    checkpoint_text = f"worker-cache:{cache_key}" if cache_key else "worker-no-cache"
+    cache_key = f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
+    disk_cache = settings.metric == BORDA_COUNT_METRIC
+    checkpoint_text = f"worker-disk-cache:{cache_key}" if disk_cache else f"worker-cache:{cache_key}"
     event(
         color,
         f"[CAND {candidate.index:03d} START]",
@@ -1065,7 +1066,10 @@ def train_candidate_stage_worker(
         include_initial_state=False,
     )
     if args.dry_run:
-        print("  worker trial " + json.dumps({"args": trial_args, "keep": False, "cache_key": cache_key}, ensure_ascii=False), flush=True)
+        trial_request = {"args": trial_args, "keep": False, "cache_key": cache_key}
+        if disk_cache:
+            trial_request["cache_dir"] = str(out_dir)
+        print("  worker trial " + json.dumps(trial_request, ensure_ascii=False), flush=True)
         metric = Metric(qloss=math.inf, qacc=-math.inf, test_loss=math.inf, test_acc=-math.inf)
         score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
         elapsed = 0.0
@@ -1074,9 +1078,12 @@ def train_candidate_stage_worker(
             raise RuntimeError("worker client is not open")
         prefix = paint(color, f"[G{generation:04d} S{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
         started = time.perf_counter()
+        trial_request = {"args": trial_args, "keep": False, "cache_key": cache_key}
+        if disk_cache:
+            trial_request["cache_dir"] = str(out_dir)
         payload = worker.request(
             "trial",
-            {"args": trial_args, "keep": False, "cache_key": cache_key},
+            trial_request,
             prefix=prefix,
         )
         elapsed = time.perf_counter() - started
@@ -1509,42 +1516,16 @@ def main() -> int:
                             prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
                         )
                 if worker_enabled and not args.dry_run:
-                    assert worker is not None
-                    if settings.metric == BORDA_COUNT_METRIC and best.cache_key is None:
-                        replay_args = build_train_args(
-                            run,
-                            best.params,
-                            None,
-                            runner_root / "worker-borda-survivor",
-                            stage.after_sbs - prev_after_sbs,
-                            settings,
-                            include_initial_state=False,
-                        )
-                        event(
-                            color,
-                            f"[G{generation:04d} KEEP]",
-                            (
-                                "borda_count survivor is replayed once with keep=true; "
-                                "candidate states were not cached in host RAM"
-                            ),
-                            "yellow",
-                        )
-                        worker.request(
-                            "trial",
-                            {"args": replay_args, "keep": True, "cache_key": None},
-                            prefix=paint(color, f"[G{generation:04d} KEEP] ", "magenta"),
-                        )
-                        best.checkpoint = current_checkpoint
-                    elif best.cache_key is None:
+                    if best.cache_key is None:
                         raise RuntimeError("worker survivor has no cache key")
-                    else:
-                        worker.request(
-                            "accept-cached-trial",
-                            {"cache_key": best.cache_key},
-                            prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
-                        )
-                        best.cache_key = None
-                        best.checkpoint = current_checkpoint
+                    assert worker is not None
+                    worker.request(
+                        "accept-cached-trial",
+                        {"cache_key": best.cache_key},
+                        prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
+                    )
+                    best.cache_key = None
+                    best.checkpoint = current_checkpoint
                 if not args.keep_temp and not args.dry_run:
                     for candidate in pruned:
                         if candidate.output_dir is not None:

@@ -171,7 +171,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 
 同点の場合は、その順位範囲の平均順位を使います。たとえば 2 位と 3 位が同点なら、どちらも 2.5 位として計算します。
 
-`borda_count` を worker mode で使う場合、runner は候補ごとの state cache を host RAM に溜めません。候補ごとに metric だけを測り、全候補の順位和を計算したあと、残す候補だけをもう一度 `keep=true` で実行して worker の現在 state にします。これにより、`population` 個ぶんの巨大な optimizer state をメインメモリに保持することを避けます。その代わり、採用候補を 1 回だけ再実行する時間が増えます。
+`borda_count` を worker mode で使う場合、runner は候補ごとの state cache を `temp_folder` 側のdiskに保存します。全候補の順位和を計算したあと、残す候補だけをdisk cacheからworkerへ読み戻します。これにより、`population` 個ぶんの巨大な optimizer state をメインメモリに保持せず、採用候補を再学習する必要もありません。代わりに、候補ごとの一時 `state.bin` をSSDへ書き出すI/Oが発生します。
 
 ## `run` の項目
 

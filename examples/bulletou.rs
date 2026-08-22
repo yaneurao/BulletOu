@@ -9714,8 +9714,14 @@ struct WorkerSfnnHostSnapshot {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+enum WorkerSfnnCachedTrialStorage {
+    Memory(WorkerSfnnHostSnapshot),
+    Disk(std::path::PathBuf),
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnCachedTrialState {
-    snapshot: WorkerSfnnHostSnapshot,
+    storage: WorkerSfnnCachedTrialStorage,
     args: Args,
     dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
     completed_steps: usize,
@@ -9892,6 +9898,62 @@ impl WorkerSfnnSession {
         Ok(WorkerSfnnHostSnapshot { weights, optimizer_states, progress_state: self.progress_state.clone() })
     }
 
+    fn save_disk_cached_trial_state(
+        &mut self,
+        dir: &std::path::Path,
+        completed_steps: usize,
+        optimizer_steps: usize,
+        dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
+    ) -> Result<(), String> {
+        self.ctx.synchronize().map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let weights = self.runner.read_weights(&self.ctx).map_err(|e| e.to_string())?;
+        let optimizer_states = self.runner.read_optimizer_states(&self.ctx).map_err(|e| e.to_string())?;
+        let parent = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+        let tmp_dir = parent.join(format!(
+            "{}.tmp-{}",
+            dir.file_name().and_then(|name| name.to_str()).unwrap_or("worker-trial-cache"),
+            std::process::id()
+        ));
+        if tmp_dir.exists() {
+            std::fs::remove_dir_all(&tmp_dir)
+                .map_err(|err| format!("failed to remove {}: {err}", tmp_dir.display()))?;
+        }
+        std::fs::create_dir(&tmp_dir).map_err(|err| format!("failed to create {}: {err}", tmp_dir.display()))?;
+        let write_result = (|| -> Result<(), String> {
+            write_cuda_cpp_sfnn_weights_bin(
+                &tmp_dir.join("state.bin"),
+                &weights,
+                &optimizer_states,
+                self.progress_state.as_ref(),
+                completed_steps,
+                optimizer_steps,
+            )?;
+            std::fs::write(
+                tmp_dir.join("dataloader_pos.txt"),
+                format!("{},{}\n", dataloader_pos.byte_offset, dataloader_pos.plies),
+            )
+            .map_err(|err| format!("failed to write {}: {err}", tmp_dir.join("dataloader_pos.txt").display()))?;
+            Ok(())
+        })();
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(err);
+        }
+        if dir.exists() {
+            std::fs::remove_dir_all(dir).map_err(|err| format!("failed to remove {}: {err}", dir.display()))?;
+        }
+        std::fs::rename(&tmp_dir, dir)
+            .map_err(|err| format!("failed to rename {} to {}: {err}", tmp_dir.display(), dir.display()))?;
+        eprintln!(
+            "  worker trial cache = disk: {} (state.bin, readback+write {})",
+            dir.display(),
+            format_duration_secs(started.elapsed())
+        );
+        Ok(())
+    }
+
     fn restore_host_snapshot(&mut self, args: &Args, snapshot: &WorkerSfnnHostSnapshot) -> Result<(), String> {
         let started = std::time::Instant::now();
         self.runner
@@ -9907,6 +9969,57 @@ impl WorkerSfnnSession {
         self.apply_args_to_runner(args)?;
         eprintln!("  worker restore = host RAM -> existing GPU buffers: {}", format_duration_secs(started.elapsed()));
         Ok(())
+    }
+
+    fn restore_disk_cached_trial_state(&mut self, args: &Args, dir: &std::path::Path) -> Result<(), String> {
+        let state_path = dir.join("state.bin");
+        let started = std::time::Instant::now();
+        let state = load_cuda_cpp_sfnn_initial_state(&state_path, args, self.feature_kind)?;
+        let optimizer_states = state
+            .optimizer_states
+            .as_ref()
+            .ok_or_else(|| format!("worker disk cache {} has no compatible optimizer state", state_path.display()))?;
+        self.runner
+            .upload_state_from_host(
+                &self.ctx,
+                state.weights.as_host(),
+                optimizer_states.as_host(),
+                cuda_cpp_sfnn_factorizer_active(args),
+                cuda_cpp_sfnn_factorizer_alpha(args),
+            )
+            .map_err(|e| e.to_string())?;
+        self.progress_state = state.progress;
+        self.apply_args_to_runner(args)?;
+        eprintln!(
+            "  worker restore = disk cache -> existing GPU buffers: {} ({})",
+            format_duration_secs(started.elapsed()),
+            dir.display()
+        );
+        Ok(())
+    }
+
+    fn cleanup_cached_trial_storage(storage: WorkerSfnnCachedTrialStorage) {
+        if let WorkerSfnnCachedTrialStorage::Disk(dir) = storage {
+            if let Err(err) = std::fs::remove_dir_all(&dir) {
+                eprintln!("  WARN: failed to remove worker disk cache {}: {err}", dir.display());
+            }
+        }
+    }
+
+    fn drop_cached_trial_state(&mut self, key: &str) -> bool {
+        if let Some(cached) = self.cached_trial_states.remove(key) {
+            Self::cleanup_cached_trial_storage(cached.storage);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_cached_trial_states(&mut self) {
+        let cached = std::mem::take(&mut self.cached_trial_states);
+        for (_, state) in cached {
+            Self::cleanup_cached_trial_storage(state.storage);
+        }
     }
 
     fn run_quantized_validation(&mut self, args: &Args) -> Result<Option<TestMetrics>, String> {
@@ -9954,6 +10067,7 @@ impl WorkerSfnnSession {
         trial_args: Args,
         keep: bool,
         cache_key: Option<String>,
+        cache_dir: Option<std::path::PathBuf>,
     ) -> Result<WorkerSfnnTrialOutcome, String> {
         let trial_feature = worker_require_sfnn_feature(&trial_args)?;
         if trial_feature != self.feature_kind {
@@ -10330,14 +10444,24 @@ impl WorkerSfnnSession {
             self.optimizer_steps = optimizer_steps_after;
             self.dataloader_pos = Some(dataloader_pos);
             self.args = trial_args;
-            self.cached_trial_states.clear();
+            self.clear_cached_trial_states();
         } else if let Some(snapshot) = snapshot.as_ref() {
             if let Some(cache_key) = cache_key {
-                let trial_snapshot = self.snapshot_host_labeled("trial cache")?;
+                let storage = if let Some(cache_dir) = cache_dir {
+                    self.save_disk_cached_trial_state(
+                        &cache_dir,
+                        completed_steps_after,
+                        optimizer_steps_after,
+                        dataloader_pos,
+                    )?;
+                    WorkerSfnnCachedTrialStorage::Disk(cache_dir)
+                } else {
+                    WorkerSfnnCachedTrialStorage::Memory(self.snapshot_host_labeled("trial cache")?)
+                };
                 let previous = self.cached_trial_states.insert(
                     cache_key.clone(),
                     WorkerSfnnCachedTrialState {
-                        snapshot: trial_snapshot,
+                        storage,
                         args: trial_args.clone(),
                         dataloader_pos,
                         completed_steps: completed_steps_after,
@@ -10345,7 +10469,8 @@ impl WorkerSfnnSession {
                         outcome: outcome.clone(),
                     },
                 );
-                if previous.is_some() {
+                if let Some(previous) = previous {
+                    Self::cleanup_cached_trial_storage(previous.storage);
                     eprintln!("  WARN: replaced cached worker trial state `{cache_key}`");
                 }
             }
@@ -10361,12 +10486,20 @@ impl WorkerSfnnSession {
             .cached_trial_states
             .remove(key)
             .ok_or_else(|| format!("worker cached trial state `{key}` does not exist"))?;
-        self.restore_host_snapshot(&cached.args, &cached.snapshot)?;
+        match &cached.storage {
+            WorkerSfnnCachedTrialStorage::Memory(snapshot) => self.restore_host_snapshot(&cached.args, snapshot)?,
+            WorkerSfnnCachedTrialStorage::Disk(dir) => {
+                self.restore_disk_cached_trial_state(&cached.args, dir)?;
+                if let Err(err) = std::fs::remove_dir_all(dir) {
+                    eprintln!("  WARN: failed to remove accepted worker disk cache {}: {err}", dir.display());
+                }
+            }
+        }
         self.args = cached.args;
         self.dataloader_pos = Some(cached.dataloader_pos);
         self.completed_steps = cached.completed_steps;
         self.optimizer_steps = cached.optimizer_steps;
-        self.cached_trial_states.clear();
+        self.clear_cached_trial_states();
         eprintln!("  worker accepted cached trial state `{key}` without extra training");
         Ok(cached.outcome)
     }
@@ -10556,7 +10689,7 @@ fn worker_handle_request(
                     "worker": "bulletou",
                     "protocol_version": args.protocol_version,
                     "capabilities": ["hello", "train", "quantized-test", "open", "trial", "accept-cached-trial", "drop-cached-trials", "save", "quit"],
-                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state, optionally caches the measured state, and restores; `accept-cached-trial` keeps one cached probe without extra training.",
+                    "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state, optionally caches the measured state in host RAM or cache_dir, and restores; `accept-cached-trial` keeps one cached probe without extra training.",
                 }),
             ),
             false,
@@ -10594,7 +10727,9 @@ fn worker_handle_request(
             match worker_args_from_json(request, &format!("bulletou worker {cmd}")).and_then(|trial_args| {
                 let keep = worker_json_bool(request, "keep", false)?;
                 let cache_key = worker_json_string_opt(request, "cache_key")?;
-                session.run_trial(trial_args, keep, cache_key).map(|outcome| (keep, outcome))
+                let cache_dir =
+                    worker_json_string_opt(request, "cache_dir")?.map(std::path::PathBuf::from);
+                session.run_trial(trial_args, keep, cache_key, cache_dir).map(|outcome| (keep, outcome))
             }) {
                 Ok((keep, outcome)) => {
                     let mut payload = worker_trial_payload(&outcome);
@@ -10652,7 +10787,7 @@ fn worker_handle_request(
             };
             let mut dropped = 0usize;
             for key in keys {
-                if session.cached_trial_states.remove(&key).is_some() {
+                if session.drop_cached_trial_state(&key) {
                     dropped += 1;
                 }
             }
