@@ -9535,6 +9535,73 @@ fn worker_json_string_array(request: &serde_json::Value, field: &str) -> Result<
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Copy)]
+struct WorkerBordaMetric {
+    qloss: f32,
+    qacc: f32,
+    test_loss: f32,
+    test_acc: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_f32_field(value: &serde_json::Value, field: &str) -> Result<f32, String> {
+    let raw = value
+        .get(field)
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("worker borda metric requires numeric `{field}`"))?;
+    if !raw.is_finite() {
+        return Err(format!("worker borda metric `{field}` must be finite"));
+    }
+    Ok(raw as f32)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_json_borda_dominators(request: &serde_json::Value) -> Result<Vec<WorkerBordaMetric>, String> {
+    let Some(values) = request.get("borda_dominators") else { return Ok(Vec::new()) };
+    let values = values
+        .as_array()
+        .ok_or_else(|| "worker `borda_dominators` must be an array".to_string())?;
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            if !value.is_object() {
+                return Err(format!("worker `borda_dominators` item {i} must be an object"));
+            }
+            Ok(WorkerBordaMetric {
+                qloss: worker_json_f32_field(value, "quantized_value_loss")?,
+                qacc: worker_json_f32_field(value, "quantized_value_accuracy")?,
+                test_loss: worker_json_f32_field(value, "test_value_loss")?,
+                test_acc: worker_json_f32_field(value, "test_value_accuracy")?,
+            })
+        })
+        .collect()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_borda_metric_dominates(a: WorkerBordaMetric, b: WorkerBordaMetric) -> bool {
+    a.qloss <= b.qloss
+        && a.qacc >= b.qacc
+        && a.test_loss <= b.test_loss
+        && a.test_acc >= b.test_acc
+        && (a.qloss < b.qloss || a.qacc > b.qacc || a.test_loss < b.test_loss || a.test_acc > b.test_acc)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn worker_borda_metric_from_metrics(
+    test_metrics: Option<TestMetrics>,
+    quantized_metrics: Option<TestMetrics>,
+) -> Result<Option<WorkerBordaMetric>, String> {
+    let (Some(test), Some(quantized)) = (test_metrics, quantized_metrics) else { return Ok(None) };
+    Ok(Some(WorkerBordaMetric {
+        qloss: quantized.loss,
+        qacc: quantized.accuracy,
+        test_loss: test.loss,
+        test_acc: test.accuracy,
+    }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn worker_run_quantized_test(request: &serde_json::Value) -> Result<serde_json::Value, String> {
     let mut raw_args = Vec::<std::ffi::OsString>::new();
     raw_args.push(std::ffi::OsString::from("bulletou quantized-test"));
@@ -9704,6 +9771,8 @@ struct WorkerSfnnTrialOutcome {
     test_metrics: Option<TestMetrics>,
     quantized_metrics: Option<TestMetrics>,
     elapsed: std::time::Duration,
+    cached: bool,
+    dominated_by_prior: bool,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -10068,6 +10137,7 @@ impl WorkerSfnnSession {
         keep: bool,
         cache_key: Option<String>,
         cache_dir: Option<std::path::PathBuf>,
+        borda_dominators: Vec<WorkerBordaMetric>,
     ) -> Result<WorkerSfnnTrialOutcome, String> {
         let trial_feature = worker_require_sfnn_feature(&trial_args)?;
         if trial_feature != self.feature_kind {
@@ -10431,13 +10501,20 @@ impl WorkerSfnnSession {
         );
         let completed_steps_after = self.completed_steps.saturating_add(seen_steps);
         let optimizer_steps_after = self.optimizer_steps.saturating_add(optimizer_updates);
-        let outcome = WorkerSfnnTrialOutcome {
+        let candidate_borda_metric = worker_borda_metric_from_metrics(test_metrics, quantized_metrics)?;
+        let dominated_by_prior = match candidate_borda_metric {
+            Some(metric) => borda_dominators.iter().any(|prior| worker_borda_metric_dominates(*prior, metric)),
+            None => false,
+        };
+        let mut outcome = WorkerSfnnTrialOutcome {
             steps: seen_steps,
             optimizer_updates,
             dataloader_pos,
             test_metrics,
             quantized_metrics,
             elapsed,
+            cached: false,
+            dominated_by_prior,
         };
         if keep {
             self.completed_steps = completed_steps_after;
@@ -10447,31 +10524,36 @@ impl WorkerSfnnSession {
             self.clear_cached_trial_states();
         } else if let Some(snapshot) = snapshot.as_ref() {
             if let Some(cache_key) = cache_key {
-                let storage = if let Some(cache_dir) = cache_dir {
-                    self.save_disk_cached_trial_state(
-                        &cache_dir,
-                        completed_steps_after,
-                        optimizer_steps_after,
-                        dataloader_pos,
-                    )?;
-                    WorkerSfnnCachedTrialStorage::Disk(cache_dir)
+                if dominated_by_prior {
+                    eprintln!("  worker trial cache = skipped: Borda candidate is dominated by an earlier candidate");
                 } else {
-                    WorkerSfnnCachedTrialStorage::Memory(self.snapshot_host_labeled("trial cache")?)
-                };
-                let previous = self.cached_trial_states.insert(
-                    cache_key.clone(),
-                    WorkerSfnnCachedTrialState {
-                        storage,
-                        args: trial_args.clone(),
-                        dataloader_pos,
-                        completed_steps: completed_steps_after,
-                        optimizer_steps: optimizer_steps_after,
-                        outcome: outcome.clone(),
-                    },
-                );
-                if let Some(previous) = previous {
-                    Self::cleanup_cached_trial_storage(previous.storage);
-                    eprintln!("  WARN: replaced cached worker trial state `{cache_key}`");
+                    let storage = if let Some(cache_dir) = cache_dir {
+                        self.save_disk_cached_trial_state(
+                            &cache_dir,
+                            completed_steps_after,
+                            optimizer_steps_after,
+                            dataloader_pos,
+                        )?;
+                        WorkerSfnnCachedTrialStorage::Disk(cache_dir)
+                    } else {
+                        WorkerSfnnCachedTrialStorage::Memory(self.snapshot_host_labeled("trial cache")?)
+                    };
+                    outcome.cached = true;
+                    let previous = self.cached_trial_states.insert(
+                        cache_key.clone(),
+                        WorkerSfnnCachedTrialState {
+                            storage,
+                            args: trial_args.clone(),
+                            dataloader_pos,
+                            completed_steps: completed_steps_after,
+                            optimizer_steps: optimizer_steps_after,
+                            outcome: outcome.clone(),
+                        },
+                    );
+                    if let Some(previous) = previous {
+                        Self::cleanup_cached_trial_storage(previous.storage);
+                        eprintln!("  WARN: replaced cached worker trial state `{cache_key}`");
+                    }
                 }
             }
             self.restore_host_snapshot(&base_args, snapshot)?;
@@ -10666,6 +10748,8 @@ fn worker_trial_payload(outcome: &WorkerSfnnTrialOutcome) -> serde_json::Value {
         "test_value_loss": outcome.test_metrics.map(|m| worker_json_f32(m.loss)).unwrap_or(serde_json::Value::Null),
         "quantized_value_accuracy": outcome.quantized_metrics.map(|m| worker_json_f32(m.accuracy)).unwrap_or(serde_json::Value::Null),
         "quantized_value_loss": outcome.quantized_metrics.map(|m| worker_json_f32(m.loss)).unwrap_or(serde_json::Value::Null),
+        "cached": outcome.cached,
+        "dominated_by_prior": outcome.dominated_by_prior,
     })
 }
 
@@ -10729,7 +10813,10 @@ fn worker_handle_request(
                 let cache_key = worker_json_string_opt(request, "cache_key")?;
                 let cache_dir =
                     worker_json_string_opt(request, "cache_dir")?.map(std::path::PathBuf::from);
-                session.run_trial(trial_args, keep, cache_key, cache_dir).map(|outcome| (keep, outcome))
+                let borda_dominators = worker_json_borda_dominators(request)?;
+                session
+                    .run_trial(trial_args, keep, cache_key, cache_dir, borda_dominators)
+                    .map(|outcome| (keep, outcome))
             }) {
                 Ok((keep, outcome)) => {
                     let mut payload = worker_trial_payload(&outcome);

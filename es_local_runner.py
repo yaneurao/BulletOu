@@ -812,6 +812,33 @@ def metric_from_worker_payload(payload: dict[str, Any]) -> Metric:
     )
 
 
+def metric_to_borda_json(metric: Metric) -> dict[str, float]:
+    return {
+        "quantized_value_loss": metric.score("quantized_value_loss"),
+        "quantized_value_accuracy": metric.score("quantized_value_accuracy"),
+        "test_value_loss": metric.score("test_value_loss"),
+        "test_value_accuracy": metric.score("test_value_accuracy"),
+    }
+
+
+def metric_pareto_dominates(a: Metric, b: Metric) -> bool:
+    a_qloss = a.score("quantized_value_loss")
+    a_qacc = a.score("quantized_value_accuracy")
+    a_test_loss = a.score("test_value_loss")
+    a_test_acc = a.score("test_value_accuracy")
+    b_qloss = b.score("quantized_value_loss")
+    b_qacc = b.score("quantized_value_accuracy")
+    b_test_loss = b.score("test_value_loss")
+    b_test_acc = b.score("test_value_accuracy")
+    return (
+        a_qloss <= b_qloss
+        and a_qacc >= b_qacc
+        and a_test_loss <= b_test_loss
+        and a_test_acc >= b_test_acc
+        and (a_qloss < b_qloss or a_qacc > b_qacc or a_test_loss < b_test_loss or a_test_acc > b_test_acc)
+    )
+
+
 def build_train_args(
     run: RunSettings,
     params: dict[str, float],
@@ -1019,6 +1046,7 @@ def train_candidate_stage_worker(
     stage: BeamStage,
     prev_after_sbs: int,
     temp_root: Path,
+    borda_dominators: list[Metric] | None,
     color: bool,
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
@@ -1069,10 +1097,14 @@ def train_candidate_stage_worker(
         trial_request = {"args": trial_args, "keep": False, "cache_key": cache_key}
         if disk_cache:
             trial_request["cache_dir"] = str(out_dir)
+        if borda_dominators:
+            trial_request["borda_dominators"] = [metric_to_borda_json(metric) for metric in borda_dominators]
         print("  worker trial " + json.dumps(trial_request, ensure_ascii=False), flush=True)
         metric = Metric(qloss=math.inf, qacc=-math.inf, test_loss=math.inf, test_acc=-math.inf)
         score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
         elapsed = 0.0
+        cached = True
+        dominated_by_prior = False
     else:
         if worker is None:
             raise RuntimeError("worker client is not open")
@@ -1081,6 +1113,8 @@ def train_candidate_stage_worker(
         trial_request = {"args": trial_args, "keep": False, "cache_key": cache_key}
         if disk_cache:
             trial_request["cache_dir"] = str(out_dir)
+        if borda_dominators:
+            trial_request["borda_dominators"] = [metric_to_borda_json(metric) for metric in borda_dominators]
         payload = worker.request(
             "trial",
             trial_request,
@@ -1089,8 +1123,11 @@ def train_candidate_stage_worker(
         elapsed = time.perf_counter() - started
         metric = metric_from_worker_payload(payload)
         score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
+        cached = bool(payload.get("cached", True))
+        dominated_by_prior = bool(payload.get("dominated_by_prior", False))
 
     score_text = "pending" if score is None else format_float(score)
+    cache_text = "skipped_dominated" if dominated_by_prior else ("disk" if disk_cache else "host")
     event(
         color,
         f"[CAND {candidate.index:03d} END]",
@@ -1098,9 +1135,9 @@ def train_candidate_stage_worker(
             f"generation={generation} stage={stage.after_sbs}sb worker=on "
             f"{settings.metric}={score_text} qloss={format_float(metric.qloss)} "
             f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
-            f"elapsed={elapsed:.1f}s"
+            f"cache={cache_text if cached or dominated_by_prior else 'none'} elapsed={elapsed:.1f}s"
         ),
-        "green",
+        "yellow" if dominated_by_prior else "green",
     )
     append_csv(
         summary_path,
@@ -1115,13 +1152,13 @@ def train_candidate_stage_worker(
             "quantized_value_accuracy": format_float(metric.qacc),
             "test_value_loss": format_float(metric.test_loss),
             "test_value_accuracy": format_float(metric.test_acc),
-            "checkpoint": checkpoint_text,
-            "output_dir": checkpoint_text,
+            "checkpoint": checkpoint_text if cached else "worker-dominated:no-cache",
+            "output_dir": checkpoint_text if cached else "worker-dominated:no-cache",
             "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
         },
     )
 
-    candidate.cache_key = cache_key
+    candidate.cache_key = cache_key if cached else None
     candidate.output_dir = None
     candidate.metric = metric
     candidate.score = score
@@ -1446,8 +1483,39 @@ def main() -> int:
                             stage=stage,
                             prev_after_sbs=prev_after_sbs,
                             temp_root=temp_root,
+                            borda_dominators=[
+                                candidate.metric
+                                for candidate in trained
+                                if settings.metric == BORDA_COUNT_METRIC
+                                and candidate.cache_key is not None
+                                and candidate.metric is not None
+                            ],
                             color=color,
                         )
+                        if (
+                            not args.dry_run
+                            and settings.metric == BORDA_COUNT_METRIC
+                            and trained_candidate.cache_key is not None
+                            and trained_candidate.metric is not None
+                        ):
+                            dominated_prior_keys = [
+                                prior.cache_key
+                                for prior in trained
+                                if prior.cache_key is not None
+                                and prior.metric is not None
+                                and metric_pareto_dominates(trained_candidate.metric, prior.metric)
+                            ]
+                            if dominated_prior_keys:
+                                assert worker is not None
+                                worker.request(
+                                    "drop-cached-trials",
+                                    {"cache_keys": dominated_prior_keys},
+                                    prefix=paint(color, f"[G{generation:04d} DOMINATED DROP] ", "magenta"),
+                                )
+                                dominated_prior_set = set(dominated_prior_keys)
+                                for prior in trained:
+                                    if prior.cache_key in dominated_prior_set:
+                                        prior.cache_key = None
                         trained.append(trained_candidate)
                         if (
                             not args.dry_run

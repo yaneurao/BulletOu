@@ -167,6 +167,8 @@ Tied values receive the average rank of the tied range. For example, if two cand
 
 When `borda_count` is used with worker mode, the runner stores candidate state caches on disk under `temp_folder`. After all candidates are ranked, the survivor is restored from its disk cache into the worker. This avoids holding `population` copies of the large optimizer state in host RAM and does not require retraining the survivor. The tradeoff is temporary `state.bin` write/read I/O per candidate.
 
+If a candidate is worse than an already evaluated candidate in all four metrics, it cannot become the best Borda candidate. In that case, the worker skips cache writing immediately after the trial. If a new candidate is better than a previously cached candidate in all four metrics, the runner drops the older cache immediately.
+
 ## `run` fields
 
 | Field | Meaning |
