@@ -63,7 +63,6 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "king_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
@@ -171,7 +170,7 @@ The runner root is `output_folder/es-<tag_prefix>`.
 Each parameter is written like this:
 
 ```json
-"pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "step": 0.01, "min": 0.0, "max": 100.0 }
 ```
 
 | Field | Meaning |
@@ -196,9 +195,10 @@ Alpha values are multipliers for factorizer terms.
 | `king_axis` | Strength of the king-bucket axis term |
 | `hand_axis` | Strength of the hand-bucket axis term |
 | `progress_axis` | Strength of the progress-bucket axis term |
-| `pair` | Strength of king-hand, king-progress, and hand-progress pair terms |
 
-Changing `shared` moves the global base term, so keeping `shared = 1.0` fixed is often easier to interpret. Axis and pair values control bucket-specific structure.
+Changing `shared` moves the global base term, so keeping `shared = 1.0` fixed is often easier to interpret.
+
+`pair` is a broad global multiplier over every king-hand, king-progress, and hand-progress pair term. To tune each pair family, tune `king_hand_pair_count`, `king_progress_pair_count`, and `hand_progress_pair_count` instead of tuning `pair` itself.
 
 ## Count-confidence parameters
 

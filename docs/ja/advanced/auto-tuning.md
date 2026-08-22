@@ -63,7 +63,6 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "king_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "progress_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
     "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
@@ -171,7 +170,7 @@ runner root は `output_folder/es-<tag_prefix>` になります。
 各パラメーターは次の形で書きます。
 
 ```json
-"pair": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "step": 0.01, "min": 0.0, "max": 100.0 }
 ```
 
 | フィールド | 意味 |
@@ -196,9 +195,10 @@ alpha は factorizer 成分をどれだけ使うかを決める倍率です。
 | `king_axis` | king bucket 軸の成分の強さ |
 | `hand_axis` | hand bucket 軸の成分の強さ |
 | `progress_axis` | progress bucket 軸の成分の強さ |
-| `pair` | king-hand、king-progress、hand-progress の pair 成分の強さ |
 
-`shared` を動かすと全体の土台が変わります。比較実験では、まず `shared = 1.0` 固定にして、axis や pair を動かすほうが結果を読みやすいです。
+`shared` を動かすと全体の土台が変わります。比較実験では、まず `shared = 1.0` 固定にします。
+
+`pair` は king-hand、king-progress、hand-progress の pair 成分すべてにかかる大きな倍率です。各 pair 系の効き方を調整したい場合は、`pair` 自体ではなく `king_hand_pair_count`、`king_progress_pair_count`、`hand_progress_pair_count` を調整対象にしてください。
 
 ## count confidence パラメーター
 
