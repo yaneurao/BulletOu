@@ -3345,6 +3345,7 @@ const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
 const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
 const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY: f32 = 1.0e-7;
 const DEFAULT_SFNN_COUNT_CONFIDENCE: f32 = 0.0;
+const DEFAULT_SFNN_RESIDUAL_COUNT_GATE_CONFIDENCE: f32 = 1.0;
 const DEFAULT_WRM_NNUE2SCORE: f32 = 600.0;
 const DEFAULT_WRM_IN_OFFSET: f32 = 270.0;
 const DEFAULT_WRM_IN_SCALING: f32 = 340.0;
@@ -3764,27 +3765,16 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
                 "king" | "king_axis" | "k" => spec.king_axis = value,
                 "hand" | "hand_axis" | "h" => spec.hand_axis = value,
                 "progress" | "progress_axis" | "prog" => spec.progress_axis = value,
-                "king_hand_pair" | "king-hand-pair" | "king_hand" | "king-hand" | "hand_king" | "hand-king" | "kh" | "hk" => {
+                "king_hand_pair" | "king-hand-pair" | "king_hand" | "king-hand" | "hand_king" | "hand-king" | "kh"
+                | "hk" => {
                     spec.king_hand_pair = value;
                 }
-                "king_progress_pair"
-                | "king-progress-pair"
-                | "king_progress"
-                | "king-progress"
-                | "progress_king"
-                | "progress-king"
-                | "kp"
-                | "pk" => {
+                "king_progress_pair" | "king-progress-pair" | "king_progress" | "king-progress" | "progress_king"
+                | "progress-king" | "kp" | "pk" => {
                     spec.king_progress_pair = value;
                 }
-                "hand_progress_pair"
-                | "hand-progress-pair"
-                | "hand_progress"
-                | "hand-progress"
-                | "progress_hand"
-                | "progress-hand"
-                | "hp"
-                | "ph" => {
+                "hand_progress_pair" | "hand-progress-pair" | "hand_progress" | "hand-progress" | "progress_hand"
+                | "progress-hand" | "hp" | "ph" => {
                     spec.hand_progress_pair = value;
                 }
                 _ => {
@@ -4750,9 +4740,10 @@ struct Args {
     #[arg(long = "sfnn-factorizer-residual-decay", default_value = "0.0")]
     sfnn_factorizer_residual_decay: f32,
 
-    /// Bucket-count file produced by `bulletou bucket-count`. By itself this
-    /// only validates and prints count statistics. Use one of the residual
-    /// count decay options to apply it to training.
+    /// Bucket-count file produced by `bulletou bucket-count`. With an active
+    /// SFNN factorizer this enables the residual count gate by default. Pass
+    /// `--sfnn-residual-count-gate-confidence 0` to use the file only for
+    /// statistics or for explicitly requested count-confidence options.
     #[arg(long = "sfnn-bucket-counts")]
     sfnn_bucket_counts: Option<PathBuf>,
 
@@ -4768,6 +4759,16 @@ struct Args {
     /// residual is trusted. Default 0 disables it.
     #[arg(long = "sfnn-residual-count-confidence")]
     sfnn_residual_count_confidence: Option<f32>,
+
+    /// Dampens the bucket-specific residual contribution during SFNN forward,
+    /// validation, quantized validation, and `nn.bin` export:
+    /// `effective = shared + axis/pair + gate(count) * residual`, where
+    /// `gate = count / (count + residual_params_per_bucket * confidence)`.
+    /// Requires `--sfnn-bucket-counts` and an active factorizer. When
+    /// `--sfnn-bucket-counts` is specified, default 1.0 enables this gate.
+    /// Pass 0 to disable it.
+    #[arg(long = "sfnn-residual-count-gate-confidence")]
+    sfnn_residual_count_gate_confidence: Option<f32>,
 
     /// Dampens SFNN axis factorizer terms by count-derived confidence.
     /// Requires `--sfnn-bucket-counts`. `1.0` means roughly one axis term
@@ -5048,6 +5049,7 @@ impl Args {
         }
         for (name, confidence) in [
             ("--sfnn-residual-count-confidence", self.sfnn_residual_count_confidence),
+            ("--sfnn-residual-count-gate-confidence", self.sfnn_residual_count_gate_confidence),
             ("--sfnn-axis-count-confidence", self.sfnn_axis_count_confidence),
             ("--sfnn-king-axis-count-confidence", self.sfnn_king_axis_count_confidence),
             ("--sfnn-hand-axis-count-confidence", self.sfnn_hand_axis_count_confidence),
@@ -5069,6 +5071,15 @@ impl Args {
         }
         if effective_residual_count_decay != 0.0 && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string());
+        }
+        let effective_residual_count_gate_confidence = effective_sfnn_residual_count_gate_confidence(self);
+        if effective_residual_count_gate_confidence != 0.0 && !eval_type.uses_layerstack() {
+            return Err(
+                "--sfnn-residual-count-gate-confidence applies to SFNN / LayerStack eval types only".to_string()
+            );
+        }
+        if effective_residual_count_gate_confidence != 0.0 && self.sfnn_bucket_counts.is_none() {
+            return Err("--sfnn-residual-count-gate-confidence requires --sfnn-bucket-counts".to_string());
         }
         if effective_sfnn_factorizer_axis_count_confidence_enabled(self) && self.sfnn_bucket_counts.is_none() {
             return Err("--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
@@ -5215,6 +5226,14 @@ impl Args {
         if effective_residual_count_decay != 0.0 && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE {
             return Err(
                 "--sfnn-residual-count-decay requires an active SFNN factorizer; use --sfnn-factorizer shared, axis, or pair"
+                    .to_string(),
+            );
+        }
+        if effective_residual_count_gate_confidence != 0.0
+            && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
+        {
+            return Err(
+                "--sfnn-residual-count-gate-confidence requires an active SFNN factorizer; use --sfnn-factorizer shared, axis, or pair"
                     .to_string(),
             );
         }
@@ -7965,6 +7984,7 @@ fn run_average_sfnn_state(args: &AverageSfnnStateArgs) -> Result<AverageSfnnStat
         effective_sfnn_factorizer_spec(&train_args),
         SfnnFactorizerAlphaSpec::ONE,
         None,
+        None,
         progress_params.as_ref(),
     )?;
 
@@ -8528,6 +8548,11 @@ impl CudaCppSfnnQuantizedValidationCache {
                     device_weights_ref,
                     runner.factorizer,
                     runner.factorizer_alpha,
+                    if runner.residual_count_gates_enabled {
+                        Some(&runner.residual_count_gates_by_stack)
+                    } else {
+                        None
+                    },
                     if runner.factorizer_axis_confidences_enabled {
                         Some(&runner.factorizer_axis_confidences)
                     } else {
@@ -8895,8 +8920,10 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
 
     let factorizer = effective_sfnn_factorizer_spec(args);
     let factorizer_alpha = effective_sfnn_factorizer_alpha(args);
-    let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
-        let counts = if let Some(count_path) = args.sfnn_bucket_counts.as_deref() {
+    let sfnn_bucket_counts = if effective_sfnn_factorizer_axis_multiplier_enabled(args)
+        || effective_sfnn_residual_count_gate_confidence(args) != 0.0
+    {
+        if let Some(count_path) = args.sfnn_bucket_counts.as_deref() {
             let counts = SfnnBucketCounts::read_from_path(count_path)?;
             counts.validate_for_arch(
                 count_path,
@@ -8906,11 +8933,16 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
             Some(counts)
         } else {
             None
-        };
-        sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, counts.as_ref())?
+        }
     } else {
         None
     };
+    let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+        sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, sfnn_bucket_counts.as_ref())?
+    } else {
+        None
+    };
+    let residual_count_gates = sfnn_residual_count_gates_from_counts(args, shape, sfnn_bucket_counts.as_ref())?;
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
     let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
@@ -8958,6 +8990,23 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
         weights.l1w.clone()
     };
     let mut l1b_for_export = weights.l1b.clone();
+    let mut l2w_for_export = weights.l2w.clone();
+    let mut l2b_for_export = weights.l2b.clone();
+    let mut l3w_for_export = weights.l3w.clone();
+    let mut l3b_for_export = weights.l3b.clone();
+    apply_cuda_cpp_sfnn_residual_count_gates_to_stacked_weights(
+        shape,
+        l1fw.is_some() || l1axw.is_some(),
+        l2fw.is_some() || l2axw.is_some(),
+        l3fw.is_some() || l3axw.is_some(),
+        &mut l1w_for_export,
+        &mut l1b_for_export,
+        &mut l2w_for_export,
+        &mut l2b_for_export,
+        &mut l3w_for_export,
+        &mut l3b_for_export,
+        residual_count_gates.as_deref(),
+    )?;
     if !compact_l1 {
         fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
             shape,
@@ -8978,10 +9027,6 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
             factorizer_axis_confidences.as_deref(),
         )?;
     }
-    let mut l2w_for_export = weights.l2w.clone();
-    let mut l2b_for_export = weights.l2b.clone();
-    let mut l3w_for_export = weights.l3w.clone();
-    let mut l3b_for_export = weights.l3b.clone();
     fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
         shape,
         &mut l2w_for_export,
@@ -9558,9 +9603,7 @@ fn worker_json_f32_field(value: &serde_json::Value, field: &str) -> Result<f32, 
 #[cfg(feature = "cuda-cpp-backend")]
 fn worker_json_borda_dominators(request: &serde_json::Value) -> Result<Vec<WorkerBordaMetric>, String> {
     let Some(values) = request.get("borda_dominators") else { return Ok(Vec::new()) };
-    let values = values
-        .as_array()
-        .ok_or_else(|| "worker `borda_dominators` must be an array".to_string())?;
+    let values = values.as_array().ok_or_else(|| "worker `borda_dominators` must be an array".to_string())?;
     values
         .iter()
         .enumerate()
@@ -9799,6 +9842,12 @@ struct WorkerSfnnCachedTrialState {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+struct WorkerSfnnCountSettings {
+    residual_count_gates: Option<Vec<f32>>,
+    factorizer_axis_confidences: Option<Vec<f32>>,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnSession {
     args: Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -9809,6 +9858,7 @@ struct WorkerSfnnSession {
     runner: bulletou_cuda_cpp::SfnnTrainStepRunner,
     validation_cache: Option<CudaCppSfnnResidentValidationCache>,
     quantized_validation_cache: Option<CudaCppSfnnQuantizedValidationCache>,
+    residual_count_gates: Option<Vec<f32>>,
     factorizer_axis_confidences: Option<Vec<f32>>,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     batch_size: usize,
@@ -9875,7 +9925,7 @@ impl WorkerSfnnSession {
             ),
         }
         .map_err(|e| e.to_string())?;
-        let factorizer_axis_confidences = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
+        let count_settings = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
         let dataloader_pos =
             cuda_cpp_auto_resume_dataloader_pos(&args, batch_size, initial_state.completed_steps, "nnue")?;
         let validation_cache =
@@ -9892,7 +9942,8 @@ impl WorkerSfnnSession {
             runner,
             validation_cache,
             quantized_validation_cache,
-            factorizer_axis_confidences,
+            residual_count_gates: count_settings.residual_count_gates,
+            factorizer_axis_confidences: count_settings.factorizer_axis_confidences,
             shape,
             batch_size,
             completed_steps: initial_state.completed_steps,
@@ -9907,7 +9958,7 @@ impl WorkerSfnnSession {
         shape: bulletou_cuda_cpp::SfnnForwardShape,
         ctx: &bulletou_cuda_cpp::Context,
         runner: &mut bulletou_cuda_cpp::SfnnTrainStepRunner,
-    ) -> Result<Option<Vec<f32>>, String> {
+    ) -> Result<WorkerSfnnCountSettings, String> {
         let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
         let sfnn_bucket_counts = if let Some(path) = args.sfnn_bucket_counts.as_deref() {
             let counts = SfnnBucketCounts::read_from_path(path)?;
@@ -9927,27 +9978,36 @@ impl WorkerSfnnSession {
         } else {
             runner.set_residual_count_decay_by_stack(ctx, None).map_err(|e| e.to_string())?;
         }
-        if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+        let residual_count_gates = sfnn_residual_count_gates_from_counts(args, shape, sfnn_bucket_counts.as_ref())?;
+        if let Some(gates) = residual_count_gates.as_ref() {
+            runner.set_residual_count_gates_by_stack(ctx, Some(gates.as_slice())).map_err(|e| e.to_string())?;
+        } else {
+            runner.set_residual_count_gates_by_stack(ctx, None).map_err(|e| e.to_string())?;
+        }
+        let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
             let spec = effective_sfnn_factorizer_spec(args);
-            let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, sfnn_bucket_counts.as_ref())?;
+            let confidences =
+                sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, sfnn_bucket_counts.as_ref())?;
             if let Some(confidences) = confidences.as_ref() {
                 runner.set_factorizer_axis_confidences(ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
             } else {
                 runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
             }
-            return Ok(confidences);
+            confidences
         } else {
             runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
-        }
-        Ok(None)
+            None
+        };
+        Ok(WorkerSfnnCountSettings { residual_count_gates, factorizer_axis_confidences })
     }
 
     fn apply_args_to_runner(&mut self, args: &Args) -> Result<(), String> {
         self.runner
             .set_factorizer_config(cuda_cpp_sfnn_factorizer_active(args), cuda_cpp_sfnn_factorizer_alpha(args))
             .map_err(|e| e.to_string())?;
-        self.factorizer_axis_confidences =
-            Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
+        let count_settings = Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
+        self.residual_count_gates = count_settings.residual_count_gates;
+        self.factorizer_axis_confidences = count_settings.factorizer_axis_confidences;
         Ok(())
     }
 
@@ -10433,9 +10493,8 @@ impl WorkerSfnnSession {
                 excluded_elapsed = excluded_elapsed.saturating_add(event_started.elapsed());
                 checkpoint_chunk_idx += 1;
             } else if schedule.production
-                && progress_for_step.is_some_and(|progress| {
-                    progress.batch_in_superbatch == progress.batches_per_superbatch
-                })
+                && progress_for_step
+                    .is_some_and(|progress| progress.batch_in_superbatch == progress.batches_per_superbatch)
             {
                 self.ctx.synchronize().map_err(|e| e.to_string())?;
                 let positions = seen_steps.saturating_mul(self.batch_size);
@@ -10654,6 +10713,7 @@ impl WorkerSfnnSession {
                     &weights,
                     effective_sfnn_factorizer_spec(&save_args),
                     effective_sfnn_factorizer_alpha(&save_args),
+                    self.residual_count_gates.as_deref(),
                     self.factorizer_axis_confidences.as_deref(),
                     progress_params.as_ref(),
                 )?;
@@ -10689,6 +10749,7 @@ impl WorkerSfnnSession {
                 self.optimizer_steps,
                 self.progress_state.as_ref(),
                 progress_params.as_ref(),
+                self.residual_count_gates.as_deref(),
                 self.factorizer_axis_confidences.as_deref(),
                 log,
             )?
@@ -10811,8 +10872,7 @@ fn worker_handle_request(
             match worker_args_from_json(request, &format!("bulletou worker {cmd}")).and_then(|trial_args| {
                 let keep = worker_json_bool(request, "keep", false)?;
                 let cache_key = worker_json_string_opt(request, "cache_key")?;
-                let cache_dir =
-                    worker_json_string_opt(request, "cache_dir")?.map(std::path::PathBuf::from);
+                let cache_dir = worker_json_string_opt(request, "cache_dir")?.map(std::path::PathBuf::from);
                 let borda_dominators = worker_json_borda_dominators(request)?;
                 session
                     .run_trial(trial_args, keep, cache_key, cache_dir, borda_dominators)
@@ -14980,6 +15040,12 @@ fn effective_sfnn_residual_count_confidence(args: &Args) -> f32 {
     args.sfnn_residual_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
 }
 
+fn effective_sfnn_residual_count_gate_confidence(args: &Args) -> f32 {
+    args.sfnn_residual_count_gate_confidence.unwrap_or_else(|| {
+        if args.sfnn_bucket_counts.is_some() { DEFAULT_SFNN_RESIDUAL_COUNT_GATE_CONFIDENCE } else { 0.0 }
+    })
+}
+
 fn effective_sfnn_axis_count_confidence(args: &Args) -> f32 {
     args.sfnn_axis_count_confidence.unwrap_or(DEFAULT_SFNN_COUNT_CONFIDENCE)
 }
@@ -15060,8 +15126,11 @@ fn sfnn_residual_params_per_bucket(shape: bulletou_cuda_cpp::SfnnForwardShape) -
     if shape.num_stacks == 0 {
         return Err("SFNN shape has zero stacks".to_string());
     }
-    let l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks;
-    let l1b = shape.l1_out();
+    let (l1w, l1b) = if shape.has_compact_l1() {
+        (0usize, 0usize)
+    } else {
+        (cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks, shape.l1_out())
+    };
     let l2w = shape
         .l2_size
         .checked_mul(shape.l2_in())
@@ -15112,6 +15181,61 @@ fn sfnn_count_confidence_multiplier(count: u64, confidence_param_count: f64) -> 
     }
     let count = count as f64;
     (count / (count + confidence_param_count)).clamp(0.0, 1.0) as f32
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_residual_count_gates_from_counts(
+    args: &Args,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    counts: Option<&SfnnBucketCounts>,
+) -> Result<Option<Vec<f32>>, String> {
+    let confidence = effective_sfnn_residual_count_gate_confidence(args);
+    if confidence == 0.0 {
+        return Ok(None);
+    }
+    if !(confidence.is_finite() && confidence >= 0.0) {
+        return Err(format!(
+            "--sfnn-residual-count-gate-confidence must be finite and non-negative (got {confidence})"
+        ));
+    }
+    let counts =
+        counts.ok_or_else(|| "--sfnn-residual-count-gate-confidence requires --sfnn-bucket-counts".to_string())?;
+    if counts.counts.len() != shape.num_stacks {
+        return Err(format!(
+            "--sfnn-bucket-counts stack count mismatch: count file has {}, arch uses {} stacks",
+            counts.counts.len(),
+            shape.num_stacks
+        ));
+    }
+    let params = sfnn_residual_params_per_bucket(shape)? as f64;
+    let k = params * f64::from(confidence);
+    if !(k.is_finite() && k >= 0.0) {
+        return Err(format!(
+            "--sfnn-residual-count-gate-confidence overflowed: residual_params_per_bucket={params:.3}, confidence={confidence}"
+        ));
+    }
+    let values =
+        counts.counts.iter().map(|&count| sfnn_count_confidence_multiplier(u64::from(count), k)).collect::<Vec<_>>();
+    if values.iter().all(|&value| value == 1.0) {
+        return Ok(None);
+    }
+    Ok(Some(values))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_residual_count_gate_summary(values: &[f32]) -> String {
+    if values.is_empty() {
+        return "stacks=0".to_string();
+    }
+    format!(
+        "stacks={}, min={:.4}, p50={:.4}, p90={:.4}, p99={:.4}, max={:.4}",
+        values.len(),
+        values.iter().copied().fold(f32::INFINITY, f32::min),
+        f32_percentile(values, 0.50),
+        f32_percentile(values, 0.90),
+        f32_percentile(values, 0.99),
+        values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+    )
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -15292,6 +15416,83 @@ fn sfnn_factorizer_axis_confidence_summary(
         f32_percentile(&active_values, 0.99),
         active_values.iter().copied().fold(f32::NEG_INFINITY, f32::max)
     )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn apply_cuda_cpp_sfnn_residual_count_gates_to_stacked_weights(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    gate_l1: bool,
+    gate_l2: bool,
+    gate_l3: bool,
+    l1w: &mut [f32],
+    l1b: &mut [f32],
+    l2w: &mut [f32],
+    l2b: &mut [f32],
+    l3w: &mut [f32],
+    l3b: &mut [f32],
+    gates: Option<&[f32]>,
+) -> Result<(), String> {
+    let Some(gates) = gates else {
+        return Ok(());
+    };
+    if gates.len() != shape.num_stacks {
+        return Err(format!(
+            "SFNN residual count gate length mismatch: got {}, expected {}",
+            gates.len(),
+            shape.num_stacks
+        ));
+    }
+    for &gate in gates {
+        if !(gate.is_finite() && (0.0..=1.0).contains(&gate)) {
+            return Err(format!("SFNN residual count gate must be finite and in [0, 1] (got {gate})"));
+        }
+    }
+
+    let l1_out = shape.l1_out();
+    let l1w_stride = cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks;
+    let l2w_stride =
+        shape.l2_size.checked_mul(shape.l2_in()).ok_or_else(|| "SFNN L2 residual gate stride overflow".to_string())?;
+    let l3w_stride = shape.l2_size;
+    if gate_l1 && (l1w.len() != l1w_stride * shape.num_stacks || l1b.len() != l1_out * shape.num_stacks) {
+        return Err("SFNN residual count gate L1 tensor length mismatch".to_string());
+    }
+    if gate_l2 && (l2w.len() != l2w_stride * shape.num_stacks || l2b.len() != shape.l2_size * shape.num_stacks) {
+        return Err("SFNN residual count gate L2 tensor length mismatch".to_string());
+    }
+    if gate_l3 && (l3w.len() != l3w_stride * shape.num_stacks || l3b.len() != shape.num_stacks) {
+        return Err("SFNN residual count gate L3 tensor length mismatch".to_string());
+    }
+
+    for (stack, &gate) in gates.iter().enumerate() {
+        if gate_l1 {
+            let l1w_begin = stack * l1w_stride;
+            for value in &mut l1w[l1w_begin..l1w_begin + l1w_stride] {
+                *value *= gate;
+            }
+            let l1b_begin = stack * l1_out;
+            for value in &mut l1b[l1b_begin..l1b_begin + l1_out] {
+                *value *= gate;
+            }
+        }
+        if gate_l2 {
+            let l2w_begin = stack * l2w_stride;
+            for value in &mut l2w[l2w_begin..l2w_begin + l2w_stride] {
+                *value *= gate;
+            }
+            let l2b_begin = stack * shape.l2_size;
+            for value in &mut l2b[l2b_begin..l2b_begin + shape.l2_size] {
+                *value *= gate;
+            }
+        }
+        if gate_l3 {
+            let l3w_begin = stack * l3w_stride;
+            for value in &mut l3w[l3w_begin..l3w_begin + l3w_stride] {
+                *value *= gate;
+            }
+            l3b[stack] *= gate;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -15921,6 +16122,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         None
     };
+    let sfnn_residual_count_gates = sfnn_residual_count_gates_from_counts(
+        args,
+        initial_weights.shape,
+        sfnn_bucket_counts.as_ref().map(|(_, counts)| counts),
+    )?;
     let sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
         let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts);
         sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
@@ -16064,6 +16270,21 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 f32_percentile(lambdas, 0.90),
                 f32_percentile(lambdas, 0.99),
                 lambdas.iter().copied().fold(0.0_f32, f32::max)
+            ),
+            ConsoleColor::Magenta,
+        );
+    }
+    if let Some(gates) = sfnn_residual_count_gates.as_ref() {
+        let confidence = effective_sfnn_residual_count_gate_confidence(args);
+        let params = sfnn_residual_params_per_bucket(initial_weights.shape)?;
+        print_startup_kv_colored(
+            "count residual gate",
+            format!(
+                "enabled: gate=count/(count+K), K={}*{:.6}={:.3}, {}",
+                format_count(params),
+                confidence,
+                params as f64 * f64::from(confidence),
+                sfnn_residual_count_gate_summary(gates)
             ),
             ConsoleColor::Magenta,
         );
@@ -16235,6 +16456,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     .map_err(|e| e.to_string())?;
     if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
         runner.set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice())).map_err(|e| e.to_string())?;
+    }
+    if let Some(gates) = sfnn_residual_count_gates.as_ref() {
+        runner.set_residual_count_gates_by_stack(&ctx, Some(gates.as_slice())).map_err(|e| e.to_string())?;
     }
     if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
         runner.set_factorizer_axis_confidences(&ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
@@ -16495,6 +16719,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             .set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice()))
                             .map_err(|e| e.to_string())?;
                     }
+                    if let Some(gates) = sfnn_residual_count_gates.as_ref() {
+                        runner
+                            .set_residual_count_gates_by_stack(&ctx, Some(gates.as_slice()))
+                            .map_err(|e| e.to_string())?;
+                    }
                     if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
                         runner
                             .set_factorizer_axis_confidences(&ctx, Some(confidences.as_slice()))
@@ -16519,6 +16748,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         optimizer_steps,
                         None,
                         sfnn_progress_params.as_ref(),
+                        sfnn_residual_count_gates.as_deref(),
                         sfnn_factorizer_axis_confidences.as_deref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
@@ -16706,6 +16936,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             optimizer_steps,
             factorizer_spec,
             effective_sfnn_factorizer_alpha(args),
+            sfnn_residual_count_gates.as_deref(),
             sfnn_factorizer_axis_confidences.as_deref(),
             None,
             sfnn_progress_params.as_ref(),
@@ -17019,6 +17250,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         optimizer_step_offset + optimizer_updates,
                         sfnn_progress_train_state.as_ref(),
                         current_progress_params.as_ref(),
+                        sfnn_residual_count_gates.as_deref(),
                         sfnn_factorizer_axis_confidences.as_deref(),
                         CudaCppCheckpointLog {
                             epoch: chunk.epoch,
@@ -17389,6 +17621,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             optimizer_steps,
             sfnn_progress_train_state.as_ref(),
             current_progress_params.as_ref(),
+            sfnn_residual_count_gates.as_deref(),
             sfnn_factorizer_axis_confidences.as_deref(),
             CudaCppCheckpointLog {
                 epoch: chunk.epoch,
@@ -17464,6 +17697,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         optimizer_steps,
         factorizer_spec,
         effective_sfnn_factorizer_alpha(args),
+        sfnn_residual_count_gates.as_deref(),
         sfnn_factorizer_axis_confidences.as_deref(),
         sfnn_progress_train_state.as_ref(),
         final_progress_params.as_ref(),
@@ -18067,6 +18301,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     optimizer_steps: usize,
     progress_state: Option<&CudaCppSfnnProgressTrainState>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    residual_count_gates: Option<&[f32]>,
     factorizer_axis_confidences: Option<&[f32]>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
@@ -18079,6 +18314,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             weights,
             effective_sfnn_factorizer_spec(args),
             effective_sfnn_factorizer_alpha(args),
+            residual_count_gates,
             factorizer_axis_confidences,
             progress_params,
         )?;
@@ -21873,6 +22109,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     optimizer_steps: usize,
     factorizer: SfnnFactorizerSpec,
     factorizer_alpha: SfnnFactorizerAlphaSpec,
+    residual_count_gates: Option<&[f32]>,
     factorizer_axis_confidences: Option<&[f32]>,
     progress_state: Option<&CudaCppSfnnProgressTrainState>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
@@ -21887,6 +22124,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         weights,
         factorizer,
         factorizer_alpha,
+        residual_count_gates,
         factorizer_axis_confidences,
         progress_params,
     )?;
@@ -22103,6 +22341,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
     weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
     factorizer: SfnnFactorizerSpec,
     factorizer_alpha: SfnnFactorizerAlphaSpec,
+    residual_count_gates: Option<&[f32]>,
     factorizer_axis_confidences: Option<&[f32]>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
@@ -22215,6 +22454,23 @@ fn write_cuda_cpp_sfnn_nn_bin(
         weights.l1w.clone()
     };
     let mut l1b_for_export = weights.l1b.clone();
+    let mut l2w_for_export = weights.l2w.clone();
+    let mut l2b_for_export = weights.l2b.clone();
+    let mut l3w_for_export = weights.l3w.clone();
+    let mut l3b_for_export = weights.l3b.clone();
+    apply_cuda_cpp_sfnn_residual_count_gates_to_stacked_weights(
+        shape,
+        l1fw.is_some() || l1axw.is_some(),
+        l2fw.is_some() || l2axw.is_some(),
+        l3fw.is_some() || l3axw.is_some(),
+        &mut l1w_for_export,
+        &mut l1b_for_export,
+        &mut l2w_for_export,
+        &mut l2b_for_export,
+        &mut l3w_for_export,
+        &mut l3b_for_export,
+        residual_count_gates,
+    )?;
     if !compact_l1 {
         fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
             shape,
@@ -22235,10 +22491,6 @@ fn write_cuda_cpp_sfnn_nn_bin(
             factorizer_axis_confidences,
         )?;
     }
-    let mut l2w_for_export = weights.l2w.clone();
-    let mut l2b_for_export = weights.l2b.clone();
-    let mut l3w_for_export = weights.l3w.clone();
-    let mut l3b_for_export = weights.l3b.clone();
     fold_cuda_cpp_sfnn_l2f_into_stacked_l2(
         shape,
         &mut l2w_for_export,
@@ -23469,6 +23721,7 @@ fn resume_signature(args: &Args) -> String {
         ),
         format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
         format!("sfnn_residual_count_confidence={:.9}", effective_sfnn_residual_count_confidence(args)),
+        format!("sfnn_residual_count_gate_confidence={:.9}", effective_sfnn_residual_count_gate_confidence(args)),
         format!("sfnn_axis_count_confidence={:.9}", effective_sfnn_axis_count_confidence(args)),
         format!("sfnn_king_axis_count_confidence={:.9}", effective_sfnn_king_axis_count_confidence(args)),
         format!("sfnn_hand_axis_count_confidence={:.9}", effective_sfnn_hand_axis_count_confidence(args)),
@@ -23634,8 +23887,14 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     );
     ensure_line_after(
         &mut out,
-        "sfnn_axis_count_confidence=",
+        "sfnn_residual_count_gate_confidence=",
         "sfnn_residual_count_confidence=",
+        "sfnn_residual_count_gate_confidence=0.000000000",
+    );
+    ensure_line_after(
+        &mut out,
+        "sfnn_axis_count_confidence=",
+        "sfnn_residual_count_gate_confidence=",
         "sfnn_axis_count_confidence=0.000000000",
     );
     let axis_count_confidence_default = line_value(&out, "sfnn_axis_count_confidence=", "0.000000000");
@@ -29123,6 +29382,7 @@ mod tests {
             &weights,
             factorizer,
             SfnnFactorizerAlphaSpec::ONE,
+            None,
             None,
             None,
         )

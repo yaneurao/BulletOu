@@ -1838,7 +1838,17 @@ pub fn sfnn_forward_device_with_factorizer_and_alpha(
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
 ) -> Result<()> {
-    sfnn_forward_device_with_factorizer_impl(ctx, batch, weights, workspace, factorizer, factorizer_alpha, None, None)
+    sfnn_forward_device_with_factorizer_impl(
+        ctx,
+        batch,
+        weights,
+        workspace,
+        factorizer,
+        factorizer_alpha,
+        None,
+        None,
+        None,
+    )
 }
 
 fn sfnn_forward_train_device_with_factorizer(
@@ -1849,6 +1859,7 @@ fn sfnn_forward_train_device_with_factorizer(
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
     folded_l0w_scratch: &F32Buffer,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
     sfnn_forward_device_with_factorizer_impl(
@@ -1859,6 +1870,7 @@ fn sfnn_forward_train_device_with_factorizer(
         factorizer,
         factorizer_alpha,
         Some(folded_l0w_scratch),
+        residual_count_gates,
         factorizer_axis_confidences,
     )
 }
@@ -1871,6 +1883,7 @@ fn sfnn_forward_device_with_factorizer_impl(
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
     folded_l0w_scratch: Option<&F32Buffer>,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
     batch.validate()?;
@@ -1894,6 +1907,12 @@ fn sfnn_forward_device_with_factorizer_impl(
     if let Some(scratch) = folded_l0w_scratch {
         expect_len("sfnn folded_l0w scratch", shape.input_size * shape.ft_size, scratch.len())?;
     }
+    let residual_count_gates = if let Some(gates) = residual_count_gates.filter(|_| factorizer.any()) {
+        expect_len("sfnn residual count gates", shape.num_stacks, gates.len())?;
+        gates.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
     let factorizer_axis_confidences =
         if let Some(confidences) = factorizer_axis_confidences.filter(|_| factorizer.any_axis()) {
             expect_len("sfnn factorizer axis confidences", shape.factorizer_axis_count(), confidences.len())?;
@@ -2008,6 +2027,7 @@ fn sfnn_forward_device_with_factorizer_impl(
             factorizer_alpha.hand_axis,
             factorizer_alpha.progress_axis,
             factorizer_alpha.pair,
+            residual_count_gates,
             factorizer_axis_confidences,
             workspace.stm_l0.as_ptr(),
             workspace.nstm_l0.as_ptr(),
@@ -2028,6 +2048,7 @@ pub fn sfnn_build_quantized_proxy_device(
     proxy_weights: &SfnnForwardDeviceWeights,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
     weights.validate()?;
@@ -2074,6 +2095,12 @@ pub fn sfnn_build_quantized_proxy_device(
         } else {
             std::ptr::null_mut()
         };
+    let residual_count_gates = if let Some(gates) = residual_count_gates.filter(|_| factorizer.any()) {
+        expect_len("sfnn residual count gates", shape.num_stacks, gates.len())?;
+        gates.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
     if proxy_weights.l1fw.is_some()
         || proxy_weights.l1fb.is_some()
         || proxy_weights.l1axw.is_some()
@@ -2193,6 +2220,7 @@ pub fn sfnn_build_quantized_proxy_device(
             factorizer_alpha.hand_axis,
             factorizer_alpha.progress_axis,
             factorizer_alpha.pair,
+            residual_count_gates,
             factorizer_axis_confidences,
             proxy_weights.l0w.as_ptr(),
             proxy_weights.l0b.as_ptr(),
@@ -3247,7 +3275,19 @@ pub fn sfnn_backward_device_with_factorizer_and_alpha(
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, false, factorizer, factorizer_alpha, None)
+    sfnn_backward_device_impl(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        false,
+        factorizer,
+        factorizer_alpha,
+        None,
+        None,
+    )
 }
 
 pub fn sfnn_backward_train_device(
@@ -3300,7 +3340,19 @@ pub fn sfnn_backward_train_device_with_factorizer_and_alpha(
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
 ) -> Result<()> {
-    sfnn_backward_device_impl(ctx, batch, weights, forward, loss, backward, true, factorizer, factorizer_alpha, None)
+    sfnn_backward_device_impl(
+        ctx,
+        batch,
+        weights,
+        forward,
+        loss,
+        backward,
+        true,
+        factorizer,
+        factorizer_alpha,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3313,6 +3365,7 @@ fn sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
     backward: &SfnnBackwardWorkspace,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
     sfnn_backward_device_impl(
@@ -3325,6 +3378,7 @@ fn sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
         true,
         factorizer,
         factorizer_alpha,
+        residual_count_gates,
         factorizer_axis_confidences,
     )
 }
@@ -3389,6 +3443,7 @@ pub fn sfnn_backward_train_profile_device_with_factorizer_and_alpha(
         factorizer,
         factorizer_alpha,
         None,
+        None,
     )
 }
 
@@ -3402,6 +3457,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     backward: &SfnnBackwardWorkspace,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<SfnnBackwardStageProfile> {
     batch.validate()?;
@@ -3412,6 +3468,12 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     factorizer.validate_for_shape(weights.shape)?;
     factorizer_alpha.validate()?;
     let shape = weights.shape;
+    let residual_count_gates = if let Some(gates) = residual_count_gates.filter(|_| factorizer.any()) {
+        expect_len("sfnn residual count gates", shape.num_stacks, gates.len())?;
+        gates.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
     let factorizer_axis_confidences =
         if let Some(confidences) = factorizer_axis_confidences.filter(|_| factorizer.any_axis()) {
             expect_len("sfnn factorizer axis confidences", shape.factorizer_axis_count(), confidences.len())?;
@@ -3542,6 +3604,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             factorizer_alpha.hand_axis,
             factorizer_alpha.progress_axis,
             factorizer_alpha.pair,
+            residual_count_gates,
             factorizer_axis_confidences,
             loss.mean_output_gradients.as_ptr(),
             backward.l2_gradients.as_ptr(),
@@ -3598,6 +3661,7 @@ fn sfnn_backward_device_impl(
     use_train_entry: bool,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
     batch.validate()?;
@@ -3608,6 +3672,12 @@ fn sfnn_backward_device_impl(
     factorizer.validate_for_shape(weights.shape)?;
     factorizer_alpha.validate()?;
     let shape = weights.shape;
+    let residual_count_gates = if let Some(gates) = residual_count_gates.filter(|_| factorizer.any()) {
+        expect_len("sfnn residual count gates", shape.num_stacks, gates.len())?;
+        gates.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
     let factorizer_axis_confidences =
         if let Some(confidences) = factorizer_axis_confidences.filter(|_| factorizer.any_axis()) {
             expect_len("sfnn factorizer axis confidences", shape.factorizer_axis_count(), confidences.len())?;
@@ -3738,6 +3808,7 @@ fn sfnn_backward_device_impl(
                 factorizer_alpha.hand_axis,
                 factorizer_alpha.progress_axis,
                 factorizer_alpha.pair,
+                residual_count_gates,
                 factorizer_axis_confidences,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
@@ -3821,6 +3892,7 @@ fn sfnn_backward_device_impl(
                 factorizer_alpha.hand_axis,
                 factorizer_alpha.progress_axis,
                 factorizer_alpha.pair,
+                residual_count_gates,
                 factorizer_axis_confidences,
                 loss.mean_output_gradients.as_ptr(),
                 backward.l2_gradients.as_ptr(),
@@ -6008,6 +6080,8 @@ pub struct SfnnTrainStepRunner {
     pub dirty_buckets: I32Buffer,
     pub residual_count_decay_by_stack: F32Buffer,
     pub residual_count_decay_enabled: bool,
+    pub residual_count_gates_by_stack: F32Buffer,
+    pub residual_count_gates_enabled: bool,
     pub factorizer_axis_confidences: F32Buffer,
     pub factorizer_axis_confidences_enabled: bool,
     pub weights: SfnnForwardDeviceWeights,
@@ -6256,6 +6330,8 @@ impl SfnnTrainStepRunner {
             dirty_buckets: I32Buffer::new(ctx, shape.num_stacks)?,
             residual_count_decay_by_stack: F32Buffer::new(ctx, shape.num_stacks)?,
             residual_count_decay_enabled: false,
+            residual_count_gates_by_stack: F32Buffer::new(ctx, shape.num_stacks)?,
+            residual_count_gates_enabled: false,
             factorizer_axis_confidences: F32Buffer::new(ctx, shape.factorizer_axis_count())?,
             factorizer_axis_confidences_enabled: false,
             weights,
@@ -6294,6 +6370,28 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    pub fn set_residual_count_gates_by_stack(&mut self, ctx: &Context, values: Option<&[f32]>) -> Result<()> {
+        match values {
+            Some(values) => {
+                expect_len("SFNN residual count gates by-stack coefficients", self.shape.num_stacks, values.len())?;
+                for &value in values {
+                    if !(value.is_finite() && (0.0..=1.0).contains(&value)) {
+                        return Err(CudaCppError::message(
+                            "SFNN residual count gates by-stack coefficients must be finite and in [0, 1]",
+                        ));
+                    }
+                }
+                self.residual_count_gates_by_stack.upload(ctx, values)?;
+                self.residual_count_gates_enabled = values.iter().any(|&value| value != 1.0);
+            }
+            None => {
+                self.residual_count_gates_by_stack.fill(ctx, 1.0)?;
+                self.residual_count_gates_enabled = false;
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_factorizer_axis_confidences(&mut self, ctx: &Context, values: Option<&[f32]>) -> Result<()> {
         match values {
             Some(values) => {
@@ -6323,6 +6421,14 @@ impl SfnnTrainStepRunner {
     fn factorizer_axis_confidences(&self) -> Option<&F32Buffer> {
         if self.factorizer_axis_confidences_enabled && self.factorizer.any_axis() {
             Some(&self.factorizer_axis_confidences)
+        } else {
+            None
+        }
+    }
+
+    fn residual_count_gates(&self) -> Option<&F32Buffer> {
+        if self.residual_count_gates_enabled && self.factorizer.any() {
+            Some(&self.residual_count_gates_by_stack)
         } else {
             None
         }
@@ -6450,6 +6556,7 @@ impl SfnnTrainStepRunner {
             self.factorizer,
             self.factorizer_alpha,
             &self.backward_workspace.l0w_gradients,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
         {
@@ -6465,6 +6572,7 @@ impl SfnnTrainStepRunner {
                 self.factorizer,
                 self.factorizer_alpha,
                 &self.backward_workspace.l0w_gradients,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
         }
@@ -6506,6 +6614,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace,
             self.factorizer,
             self.factorizer_alpha,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
 
@@ -6524,6 +6633,7 @@ impl SfnnTrainStepRunner {
                 &self.backward_workspace,
                 self.factorizer,
                 self.factorizer_alpha,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
         }
@@ -6659,6 +6769,7 @@ impl SfnnTrainStepRunner {
             self.factorizer,
             self.factorizer_alpha,
             &self.backward_workspace.l0w_gradients,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
         scalar_loss_device_from_buffers_with_finalize(
@@ -6681,6 +6792,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace,
             self.factorizer,
             self.factorizer_alpha,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
         if update_weights {
@@ -6824,6 +6936,7 @@ impl SfnnTrainStepRunner {
                 self.factorizer,
                 self.factorizer_alpha,
                 &self.backward_workspace.l0w_gradients,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
             scalar_loss_device_from_buffers_with_finalize(
@@ -6846,6 +6959,7 @@ impl SfnnTrainStepRunner {
                 &self.backward_workspace,
                 self.factorizer,
                 self.factorizer_alpha,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
         }
@@ -6952,6 +7066,7 @@ impl SfnnTrainStepRunner {
             self.factorizer,
             self.factorizer_alpha,
             &self.backward_workspace.l0w_gradients,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
         after_forward.record(ctx)?;
@@ -6975,6 +7090,7 @@ impl SfnnTrainStepRunner {
             &self.backward_workspace,
             self.factorizer,
             self.factorizer_alpha,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
         after_backward.record(ctx)?;
@@ -7016,6 +7132,7 @@ impl SfnnTrainStepRunner {
             self.factorizer,
             self.factorizer_alpha,
             None,
+            self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )
     }
@@ -7063,6 +7180,7 @@ impl SfnnTrainStepRunner {
         expect_len("sfnn train targets", self.batch_size, self.targets.len())?;
         expect_len("sfnn train entry_weights", self.batch_size, self.entry_weights.len())?;
         expect_len("sfnn train dirty_buckets", self.shape.num_stacks, self.dirty_buckets.len())?;
+        expect_len("sfnn residual count gates", self.shape.num_stacks, self.residual_count_gates_by_stack.len())?;
         expect_len(
             "sfnn factorizer axis confidences",
             self.shape.factorizer_axis_count(),
@@ -7205,6 +7323,7 @@ impl SfnnTrainStepRunner {
                 self.shape.factorizer_hand_axis_dim,
                 self.factorizer,
                 self.factorizer_alpha,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
                 true,
                 weight_scale,
@@ -7231,6 +7350,7 @@ impl SfnnTrainStepRunner {
                 self.shape.factorizer_hand_axis_dim,
                 self.factorizer,
                 self.factorizer_alpha,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
                 false,
                 weight_scale,
@@ -7257,6 +7377,7 @@ impl SfnnTrainStepRunner {
                 self.shape.factorizer_hand_axis_dim,
                 self.factorizer,
                 self.factorizer_alpha,
+                self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
                 false,
                 weight_scale,
@@ -7371,6 +7492,100 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    fn apply_residual_count_gates_to_gradients(
+        &self,
+        ctx: &Context,
+        lr_multipliers: SfnnLayerLrMultipliers,
+        dirty_update: Option<(&I32Buffer, usize)>,
+    ) -> Result<()> {
+        let Some(gates) = self.residual_count_gates() else {
+            return Ok(());
+        };
+        let dirty_buckets = dirty_update.map(|(buckets, _)| buckets);
+        let dirty_count = dirty_update.map(|(_, count)| count).unwrap_or(0);
+
+        if !self.shape.has_compact_l1()
+            && self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l1w_gradients,
+                gates,
+                self.shape.l1w_len()? / self.shape.num_stacks,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l1b_gradients,
+                gates,
+                self.shape.l1_out(),
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L2)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l2w_gradients,
+                gates,
+                self.shape.l2_in() * self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L2)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l2b_gradients,
+                gates,
+                self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L3)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l3w_gradients,
+                gates,
+                self.shape.l2_size,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L3)
+            && lr_multipliers.param_multiplier(SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias) != 0.0
+        {
+            sfnn_apply_residual_count_gates_to_gradients_device(
+                ctx,
+                &self.backward_workspace.l3b_gradients,
+                gates,
+                1,
+                self.shape.num_stacks,
+                dirty_buckets,
+                dirty_count,
+            )?;
+        }
+        Ok(())
+    }
+
     fn prepare_dirty_buckets<'a>(
         &'a self,
         ctx: &Context,
@@ -7411,6 +7626,7 @@ impl SfnnTrainStepRunner {
         lr_multipliers.validate()?;
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
+        self.apply_residual_count_gates_to_gradients(ctx, lr_multipliers, dirty_update)?;
         self.add_residual_count_decay_gradients(ctx, lr_multipliers, dirty_update)?;
         let l0w_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
         let l0b_lr = lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias);
@@ -7733,6 +7949,7 @@ fn sfnn_add_saturation_penalty_gradients_device(
     factorizer_hand_axis_dim: usize,
     factorizer: SfnnFactorizerActive,
     factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
     shared_weight_input_major: bool,
     weight_scale: f32,
@@ -7810,6 +8027,12 @@ fn sfnn_add_saturation_penalty_gradients_device(
         } else {
             std::ptr::null_mut()
         };
+    let residual_count_gates = if let Some(gates) = residual_count_gates.filter(|_| factorizer.any()) {
+        expect_len("sfnn saturation residual count gates", num_stacks, gates.len())?;
+        gates.as_ptr()
+    } else {
+        std::ptr::null_mut()
+    };
     let (dirty_buckets, dirty_count) = match dirty_buckets {
         Some(buckets) if dirty_count > 0 => {
             if dirty_count > buckets.len() {
@@ -7849,6 +8072,7 @@ fn sfnn_add_saturation_penalty_gradients_device(
             factorizer_alpha.hand_axis,
             factorizer_alpha.progress_axis,
             factorizer_alpha.pair,
+            residual_count_gates,
             factorizer_axis_confidences,
             i32::from(shared_weight_input_major),
             weight_scale,
@@ -7895,6 +8119,48 @@ fn sfnn_add_residual_count_decay_gradients_device(
             weights.as_ptr(),
             gradients.as_ptr(),
             decay_by_stack.as_ptr(),
+            dirty_buckets,
+            dirty_count,
+            stride,
+            num_stacks,
+        )
+    })
+}
+
+fn sfnn_apply_residual_count_gates_to_gradients_device(
+    ctx: &Context,
+    gradients: &F32Buffer,
+    gates: &F32Buffer,
+    stride: usize,
+    num_stacks: usize,
+    dirty_buckets: Option<&I32Buffer>,
+    dirty_count: usize,
+) -> Result<()> {
+    if stride == 0 || num_stacks == 0 {
+        return Err(CudaCppError::message("SFNN residual count gate dimensions must be non-zero"));
+    }
+    let total = num_stacks
+        .checked_mul(stride)
+        .ok_or_else(|| CudaCppError::message("SFNN residual count gate gradient length overflow"))?;
+    expect_len("sfnn residual count gate gradients", total, gradients.len())?;
+    expect_len("sfnn residual count gates", num_stacks, gates.len())?;
+    let (dirty_buckets, dirty_count) = match dirty_buckets {
+        Some(buckets) if dirty_count > 0 => {
+            if dirty_count > buckets.len() {
+                return Err(CudaCppError::message(
+                    "SFNN residual count gate dirty_count exceeds dirty bucket buffer length",
+                ));
+            }
+            (buckets.as_ptr(), dirty_count)
+        }
+        _ => (std::ptr::null_mut(), 0),
+    };
+    // SAFETY: all device buffers are length-checked here; backend validates device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_sfnn_apply_residual_count_gates_to_gradients_device(
+            ctx.as_ptr(),
+            gradients.as_ptr(),
+            gates.as_ptr(),
             dirty_buckets,
             dirty_count,
             stride,
@@ -8689,6 +8955,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             stm_l0: *mut BulletOuCudaCppF32Buffer,
             nstm_l0: *mut BulletOuCudaCppF32Buffer,
@@ -8750,6 +9017,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             dst_l0w: *mut BulletOuCudaCppF32Buffer,
             dst_l0b: *mut BulletOuCudaCppF32Buffer,
@@ -8810,6 +9078,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -8891,6 +9160,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -8973,6 +9243,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             mean_output_gradients: *mut BulletOuCudaCppF32Buffer,
             l2_gradients: *mut BulletOuCudaCppF32Buffer,
@@ -9035,6 +9306,7 @@ mod ffi {
             factorizer_hand_axis_alpha: f32,
             factorizer_progress_axis_alpha: f32,
             factorizer_pair_alpha: f32,
+            residual_count_gates: *mut BulletOuCudaCppF32Buffer,
             factorizer_axis_confidences: *mut BulletOuCudaCppF32Buffer,
             shared_weight_input_major: i32,
             weight_scale: f32,
@@ -9046,6 +9318,15 @@ mod ffi {
             weights: *mut BulletOuCudaCppF32Buffer,
             gradients: *mut BulletOuCudaCppF32Buffer,
             decay_by_stack: *mut BulletOuCudaCppF32Buffer,
+            dirty_buckets: *mut BulletOuCudaCppI32Buffer,
+            dirty_count: usize,
+            stride: usize,
+            num_stacks: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_sfnn_apply_residual_count_gates_to_gradients_device(
+            ctx: *mut BulletOuCudaCppContext,
+            gradients: *mut BulletOuCudaCppF32Buffer,
+            gates: *mut BulletOuCudaCppF32Buffer,
             dirty_buckets: *mut BulletOuCudaCppI32Buffer,
             dirty_count: usize,
             stride: usize,
@@ -9616,8 +9897,18 @@ mod tests {
         let ctx = Context::new(0).unwrap();
         let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
         let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, proxy_shape).unwrap();
-        sfnn_build_quantized_proxy_device(&ctx, shape.input_size, 0, &device_weights, &proxy, factorizer, alpha, None)
-            .unwrap();
+        sfnn_build_quantized_proxy_device(
+            &ctx,
+            shape.input_size,
+            0,
+            &device_weights,
+            &proxy,
+            factorizer,
+            alpha,
+            None,
+            None,
+        )
+        .unwrap();
         ctx.synchronize().unwrap();
 
         let expected_l0w = l0w.iter().map(|&v| qdq(v, 127.0, -32768.0, 32767.0)).collect::<Vec<_>>();

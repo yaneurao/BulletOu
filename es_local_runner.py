@@ -65,7 +65,7 @@ ALPHA_PARAMETERS = {
 
 
 CONFIDENCE_FLAGS = {
-    "residual_count": "--sfnn-residual-count-confidence",
+    "residual_count": "--sfnn-residual-count-gate-confidence",
     "king_axis_count": "--sfnn-king-axis-count-confidence",
     "hand_axis_count": "--sfnn-hand-axis-count-confidence",
     "progress_axis_count": "--sfnn-progress-axis-count-confidence",

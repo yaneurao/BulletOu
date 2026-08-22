@@ -102,13 +102,18 @@ To watch accuracy / loss during training, configure a validation set on the next
 For SFNN architectures with many buckets, such as `hand1024_k3k3_progress4`, rarely seen buckets can learn unstable bucket-specific residuals. You can pre-count bucket occurrences into a `count.bin` file and pass it during training:
 
 ```powershell
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-residual-count-confidence 1.0
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`--sfnn-residual-count-confidence 1.0` means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own parameter count.
+When `--sfnn-bucket-counts` is set and an SFNN factorizer is active, BulletOu enables the residual count gate by default. Low-count buckets lean more on shared factorizer terms; well-observed buckets keep more of their bucket-specific residual.
 
-The count-based controls are off unless you specify them. You can also apply count-based confidence to factorizer terms:
+Disable this gate explicitly if you only want to load the count file for statistics or for other count-confidence options:
+
+```powershell
+--sfnn-residual-count-gate-confidence 0
+```
+
+You can also apply count-based confidence to axis and pair factorizer terms:
 
 ```powershell
 --sfnn-axis-count-confidence 1.0 `
@@ -117,7 +122,7 @@ The count-based controls are off unless you specify them. You can also apply cou
 
 If needed, split them by factorizer family, for example `--sfnn-king-axis-count-confidence`, `--sfnn-hand-axis-count-confidence`, `--sfnn-progress-axis-count-confidence`, `--sfnn-king-hand-pair-count-confidence`, `--sfnn-king-progress-pair-count-confidence`, and `--sfnn-hand-progress-pair-count-confidence`.
 
-The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formula, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
+The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formulas, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
 When the architecture contains `progressN`, such as `progress4`, the progress calculation parameters are trained and saved into the Progress section of `nn.bin`. The count command also needs an `nn.bin` for the same architecture so it can use the same progress bucket assignment.
 

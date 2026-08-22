@@ -234,7 +234,7 @@ count confidence は `bucket-count` で作った `count.bin` を使います。�
 
 | キー | BulletOu のオプション | 意味 |
 | --- | --- | --- |
-| `residual_count` | `--sfnn-residual-count-confidence` | bucket 固有 residual の count confidence |
+| `residual_count` | `--sfnn-residual-count-gate-confidence` | bucket 固有 residual の count gate confidence |
 | `king_axis_count` | `--sfnn-king-axis-count-confidence` | king-axis 用 |
 | `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | hand-axis 用 |
 | `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | progress-axis 用 |

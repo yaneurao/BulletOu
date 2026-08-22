@@ -318,17 +318,55 @@ Then pass it during training:
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-residual-count-confidence 1.0
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
 `count.bin` stores counts for full LayerStack buckets. The same file can also be used for axis and pair factorizer confidence; BulletOu derives those counts by summing the stacks that touch each axis or pair row.
 
-All count-confidence options are off by default. Passing only `--sfnn-bucket-counts <count.bin>` validates the file and prints statistics, but does not change training.
+When `--sfnn-bucket-counts <count.bin>` is set and an SFNN factorizer is active, BulletOu enables the residual count gate by default. This is not an extra regularization loss. It directly scales the bucket-specific residual used by forward according to that bucket's count.
+
+### Residual count gate
+
+With a factorizer, the effective weight can be read as:
+
+```text
+W_effective =
+    gate_stack * W_residual
+  + shared_alpha * W_shared
+  + axis_alpha   * confidence_axis * W_axis
+  + pair_alpha   * confidence_pair * W_pair
+```
+
+`gate_stack` is computed per stack:
+
+```text
+residual_params_per_bucket = number of bucket-specific residual parameters per bucket
+K = residual_params_per_bucket * --sfnn-residual-count-gate-confidence
+gate_stack = count_stack / (count_stack + K)
+```
+
+When `--sfnn-bucket-counts` is set, the default `--sfnn-residual-count-gate-confidence` is `1.0`. This means: do not strongly trust a bucket-specific residual until that bucket has appeared about as many times as its own residual parameter count.
+
+This gate is used consistently by training forward, gradient flow, GPU quantized validation, and `nn.bin` export. The qvalid path and exported `nn.bin` therefore use the same model formula.
+
+Disable it explicitly when you want to load the count file only for statistics or for other count-confidence options:
+
+```powershell
+--sfnn-residual-count-gate-confidence 0
+```
+
+| count | Behavior |
+|---:|---|
+| `0` | Do not use the bucket-specific residual; rely on factorizer terms |
+| `K` | Use 50% of the bucket-specific residual |
+| `9K` | Use 90% of the bucket-specific residual |
+| Very large count | `gate_stack` approaches 1 |
+
+For compact-L1 SFNN storage, L1 is held as compact weights, so this gate applies to L2/L3 bucket-specific residuals. For dense L1 factorizer layouts, the same idea also applies to L1.
 
 ### Count-aware residual decay
 
-This option dampens only the bucket-specific residual tensors:
+Separately from the residual count gate, BulletOu can add a count-aware decay term to the optimizer gradient. This is experimental. Enable it with:
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
@@ -358,17 +396,14 @@ For example, `--sfnn-residual-count-confidence 1.0` means: do not trust a bucket
 | `count = 4 * confidence_count` | About `max_decay / 2` |
 | Very large count | Almost no extra decay |
 
-This does not directly decay the factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual is damped according to count. The effect is: trust the shared structure first, and let heavily observed buckets learn stronger individual residuals.
+This decay does not directly affect factorizer tensors. `shared` / `axis` / `pair` components remain available, while the bucket-specific residual receives a count-dependent regularization gradient.
 
-With `--sfnn-factorizer-alpha all=1.0`, the forward weight can be read as:
+The residual count gate and residual count decay are separate controls. In most experiments, start with the gate alone and add decay only if you need stronger stabilization.
 
 ```text
-W_effective = W_residual + W_factorizer
+gate:  scale W_residual in the forward formula
+decay: add a regularization term to gradients before optimizer update
 ```
-
-The count-aware decay applies only to `W_residual`. Low-count buckets keep `W_residual` small, so `W_effective` stays close to the shared factorizer component. High-count buckets receive weaker decay, so they can learn a larger bucket-specific residual when the data supports it.
-
-In other words, `all=1.0` means “add the factorizer normally,” and count-aware decay means “control the freedom of the bucket-specific component by count.” High-count buckets behave closer to `none`; low-count buckets stay closer to the factorizer.
 
 ### Count-aware axis / pair confidence
 
@@ -412,7 +447,7 @@ With both alpha and count confidence, the effective weight is:
 
 ```text
 W_effective =
-    W_residual
+    gate_stack * W_residual
   + shared_alpha * W_shared
   + axis_alpha   * confidence_axis * W_axis
   + pair_alpha   * confidence_pair * W_pair

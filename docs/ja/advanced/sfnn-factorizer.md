@@ -318,24 +318,62 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin `
---sfnn-residual-count-confidence 1.0
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
 `count.bin` には完全な LayerStack bucket ごとの出現回数が入ります。axis / pair factorizer に対する confidence も、この同じファイルから計算できます。BulletOu は、各 axis 行・pair 行を使う stack の count を合計して使います。
 
-`--sfnn-*-count-confidence` は、指定しなければすべて無効です。`--sfnn-bucket-counts <count.bin>` だけを指定した場合は、count.bin の検証と統計表示だけを行い、学習内容は変えません。
+`--sfnn-bucket-counts <count.bin>` を指定し、SFNN factorizer が有効な場合、BulletOu は residual count gate をデフォルトで有効にします。これは正則化の loss を足す機能ではなく、forward で使う bucket 固有 residual そのものを count に応じて弱める機能です。
 
-### count に応じて residual を弱める
+### residual count gate
 
-bucket 固有 residual だけを count に応じて抑えるには、次のように指定します。
+forward で使う重みを簡略化して書くと、factorizer 有効時は次の形です。
+
+```text
+W_effective =
+    gate_stack * W_residual
+  + shared_alpha * W_shared
+  + axis_alpha   * confidence_axis * W_axis
+  + pair_alpha   * confidence_pair * W_pair
+```
+
+`gate_stack` は stack ごとに次の式で決まります。
+
+```text
+residual_params_per_bucket = 1 bucket が個別に持つ residual パラメーター数
+K = residual_params_per_bucket * --sfnn-residual-count-gate-confidence
+gate_stack = count_stack / (count_stack + K)
+```
+
+`--sfnn-bucket-counts` を指定した場合、`--sfnn-residual-count-gate-confidence` のデフォルト値は `1.0` です。つまり、「bucket 固有 residual のパラメーター数と同じぐらい出現するまでは、その bucket 固有成分を強く信用しない」という設定です。
+
+この gate は、学習中の forward、勾配、GPU quantized validation、`nn.bin` 書き出しのすべてで同じように使われます。そのため、学習中に見ている qvalid と、書き出した `nn.bin` の式がずれません。
+
+`count.bin` を指定しても residual count gate を使いたくない場合は、次のように 0 を指定します。
+
+```powershell
+--sfnn-residual-count-gate-confidence 0
+```
+
+| count | 挙動 |
+|---:|---|
+| `0` | bucket 固有 residual は使わず、factorizer 成分に寄る |
+| `K` | bucket 固有 residual を 50% 使う |
+| `9K` | bucket 固有 residual を 90% 使う |
+| 十分大きい count | `gate_stack` は 1 に近づく |
+
+compact L1 storage の SFNN では、L1 は compact weight として持つため、この gate は L2/L3 の bucket 固有 residual にかかります。dense L1 factorizer を使う構成では L1 にも同じ考え方でかかります。
+
+### residual count decay
+
+residual count gate とは別に、optimizer の gradient に追加の decay を入れることもできます。これは実験用です。使う場合は、次のように指定します。
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
 --sfnn-residual-count-confidence 1.0
 ```
 
-stack ごとの減衰係数は次の式です。
+stack ごとの decay は次の式です。
 
 ```text
 decay_stack = max_decay * min(1, sqrt((confidence_count + 1) / (count_stack + 1)))
@@ -350,25 +388,14 @@ residual_params_per_bucket = 1 bucket が個別に持つ residual パラメー�
 confidence_count = residual_params_per_bucket * --sfnn-residual-count-confidence
 ```
 
-つまり `--sfnn-residual-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ強く信用しない」という意味です。教師データ全体に対する割合ではなく、モデル側の自由度を基準にします。
+この decay は factorizer tensor には直接かけません。`shared` / `axis` / `pair` の共有成分は残し、bucket 固有の residual だけを count に応じて正則化します。
 
-| count | 挙動 |
-|---:|---|
-| `count <= confidence_count` | 最大の `max_decay` で residual を抑える |
-| `count = 4 * confidence_count` | 約 `max_decay / 2` になる |
-| count が十分多い | ほとんど効かなくなる |
-
-この正則化は factorizer tensor には直接かけません。`shared` / `axis` / `pair` の共有成分は残し、bucket 固有の residual だけを count に応じて抑えます。そのため、rare bucket を完全に無視するのではなく、「まず共有成分を信じ、十分な出現回数がある bucket だけ個別成分を強く学習する」という挙動になります。
-
-`--sfnn-factorizer-alpha all=1.0` の場合、forward で使う重みは次のように考えます。
+residual count gate と residual count decay は別の機能です。通常はまず gate だけを使い、さらに崩れを抑えたい場合だけ decay を試します。
 
 ```text
-W_effective = W_residual + W_factorizer
+gate:  forward の式で W_residual に掛ける
+decay: optimizer 更新前の gradient に正則化項を足す
 ```
-
-count decay は `W_residual` にだけかかります。したがって、出現回数が少ない bucket では `W_residual` が小さく抑えられ、`W_effective` は factorizer 側の共有成分に寄ります。出現回数が多い bucket では decay が弱くなるので、必要なら `W_residual` を大きく学習できます。
-
-つまり `all=1.0` は factorizer 成分を普通に足す設定で、count decay は「bucket 固有成分の自由度を count に応じて変える」設定です。count が多い bucket ほど `none` に近い自由度を持ち、count が少ない bucket ほど factorizer に寄ります。
 
 ### count に応じて axis / pair factorizer を弱める
 
@@ -412,7 +439,7 @@ alpha と count confidence を同時に使うと、実効重みは次のよう�
 
 ```text
 W_effective =
-    W_residual
+    gate_stack * W_residual
   + shared_alpha * W_shared
   + axis_alpha   * confidence_axis * W_axis
   + pair_alpha   * confidence_pair * W_pair

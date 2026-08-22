@@ -228,7 +228,7 @@ Count confidence uses a `count.bin` file created by `bucket-count`. It weakens t
 
 | Key | BulletOu option | Meaning |
 | --- | --- | --- |
-| `residual_count` | `--sfnn-residual-count-confidence` | Count confidence for bucket-specific residuals |
+| `residual_count` | `--sfnn-residual-count-gate-confidence` | Count gate confidence for bucket-specific residuals |
 | `king_axis_count` | `--sfnn-king-axis-count-confidence` | King-axis override |
 | `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | Hand-axis override |
 | `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | Progress-axis override |

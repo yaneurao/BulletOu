@@ -354,7 +354,7 @@ penalty_loss_per_weight = lambda * max(0, |q| - threshold)^2
 
 ### 6.2 rare bucket を count で抑える
 
-bucket 数が多い arch では、出現回数の少ない stack の個別成分だけが暴れることがあります。その場合は、教師データから stack ごとの出現回数を数えた `count.bin` を作り、count に応じて base stack residual を弱く正則化できます。
+bucket 数が多い arch では、出現回数の少ない stack の個別成分だけが暴れることがあります。その場合は、教師データから stack ごとの出現回数を数えた `count.bin` を作り、count に応じて bucket 固有 residual を弱められます。
 
 ```powershell
 .\target\release\examples\bulletou.exe bucket-count `
@@ -374,13 +374,16 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-residual-count-confidence 1.0
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`--sfnn-residual-count-confidence 1.0` は、「bucket 固有 residual のパラメーター数と同じぐらいの出現回数があるまでは、その bucket 固有成分をまだ強く信用しない」という意味です。この指定で residual count decay が有効になり、最大減衰量はデフォルトで `1e-7` になります。
+`--sfnn-bucket-counts` を指定し、SFNN factorizer が有効な場合、residual count gate はデフォルトで有効です。これは `W_effective = gate * W_residual + factorizer成分` という形で、forward から bucket 固有 residual を弱めます。
 
-count decay は factorizer 成分ではなく、bucket 固有の residual にだけかかります。count が多い bucket は residual を大きく学習しやすく、count が少ない bucket は factorizer の共有成分に寄ります。
+`gate` は `count / (count + residual_params_per_bucket * confidence)` です。デフォルトの confidence は `1.0` なので、bucket 固有 residual のパラメーター数と同じぐらい出現するまでは、その bucket 固有成分を強く信用しません。
+
+この gate は training、qvalid、`nn.bin` 書き出しで同じように使われます。無効化する場合は `--sfnn-residual-count-gate-confidence 0` を指定します。
+
+追加の正則化として residual count decay を試したい場合だけ、`--sfnn-residual-count-confidence` や `--sfnn-residual-count-decay` を指定します。
 
 axis 行・pair 行そのものを count に応じて弱めたい場合は、`--sfnn-axis-count-confidence` と `--sfnn-pair-count-confidence` を使います。特定の種類だけ強さを変えたい場合は、`--sfnn-king-axis-count-confidence` や `--sfnn-hand-progress-pair-count-confidence` のような個別指定を使います。詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 

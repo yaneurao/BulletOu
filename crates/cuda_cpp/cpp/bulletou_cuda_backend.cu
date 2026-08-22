@@ -1173,6 +1173,16 @@ __device__ __forceinline__ void sfnn_factorizer_axis_alphas(
     }
 }
 
+__device__ __forceinline__ float sfnn_residual_count_gate(
+    const float* residual_count_gates,
+    size_t stack,
+    int has_shared,
+    int has_axis) {
+    return (residual_count_gates != nullptr && (has_shared != 0 || has_axis != 0))
+        ? residual_count_gates[stack]
+        : 1.0f;
+}
+
 __host__ __device__ __forceinline__ size_t sfnn_factorizer_axis_count(
     size_t num_stacks,
     size_t king_axis_dim,
@@ -1274,6 +1284,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float scale) {
     const size_t weight_cell_count = input_dim * output_dim;
@@ -1291,7 +1302,8 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
         ? in_col * output_dim + out_col
         : cell;
 
-    float value = weights[tid];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float value = residual_gate * weights[tid];
     if (has_shared != 0) {
         value += shared_alpha * shared_weights[factorizer_cell];
     }
@@ -1356,6 +1368,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float scale) {
     const size_t total = num_stacks * output_dim;
@@ -1366,7 +1379,8 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
 
     const size_t stack = tid / output_dim;
     const size_t out_col = tid - stack * output_dim;
-    float value = bias[tid];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float value = residual_gate * bias[tid];
     if (has_shared != 0) {
         value += shared_alpha * shared_bias[out_col];
     }
@@ -1438,6 +1452,7 @@ __global__ void sfnn_stacked_l1_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
@@ -1456,7 +1471,8 @@ __global__ void sfnn_stacked_l1_kernel(
     size_t stack = static_cast<size_t>(stack_i32);
     size_t input_base = sample * input_dim;
     size_t stack_base = stack * output_dim * input_dim;
-    float sum = bias[stack * output_dim + out_col];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float sum = residual_gate * bias[stack * output_dim + out_col];
     if (has_shared != 0) {
         sum += shared_alpha * shared_bias[out_col];
     }
@@ -1497,7 +1513,7 @@ __global__ void sfnn_stacked_l1_kernel(
     }
     for (size_t in_col = 0; in_col < input_dim; ++in_col) {
         float input_value = input[input_base + in_col];
-        sum += input_value * weights[stack_base + out_col * input_dim + in_col];
+        sum += input_value * residual_gate * weights[stack_base + out_col * input_dim + in_col];
         if (has_shared != 0) {
             sum += input_value * shared_alpha * shared_weights[in_col * output_dim + out_col];
         }
@@ -1541,6 +1557,7 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
     constexpr unsigned int WARP = 32;
     constexpr unsigned int WARPS_PER_BLOCK = 8;
@@ -1565,6 +1582,7 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     const size_t stack = static_cast<size_t>(stack_i32);
     const size_t input_base = sample * input_dim;
     const size_t stack_base = stack * output_dim * input_dim + out_col * input_dim;
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
     size_t axis_ids[8];
     const size_t axis_count = sfnn_factorizer_axis_ids(
         stack,
@@ -1600,7 +1618,7 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     float sum = 0.0f;
     for (size_t in_col = lane; in_col < input_dim; in_col += WARP) {
         const float input_value = input[input_base + in_col];
-        float weight = weights[stack_base + in_col];
+        float weight = residual_gate * weights[stack_base + in_col];
         if (has_shared != 0) {
             weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
         }
@@ -1619,7 +1637,7 @@ __global__ void sfnn_stacked_l1_warp_kernel(
         sum += __shfl_down_sync(mask, sum, offset);
     }
     if (lane == 0) {
-        sum += bias[stack * output_dim + out_col];
+        sum += residual_gate * bias[stack * output_dim + out_col];
         if (has_shared != 0) {
             sum += shared_alpha * shared_bias[out_col];
         }
@@ -1778,6 +1796,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
@@ -1796,7 +1815,8 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     size_t stack = static_cast<size_t>(stack_i32);
     size_t input_base = sample * input_dim;
     size_t stack_base = stack * output_dim * input_dim;
-    float sum = bias[stack * output_dim + out_col];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float sum = residual_gate * bias[stack * output_dim + out_col];
     if (has_shared != 0) {
         sum += shared_alpha * shared_bias[out_col];
     }
@@ -1836,7 +1856,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
         }
     }
     for (size_t in_col = 0; in_col < input_dim; ++in_col) {
-        float weight = weights[stack_base + out_col * input_dim + in_col];
+        float weight = residual_gate * weights[stack_base + out_col * input_dim + in_col];
         if (has_shared != 0) {
             weight += shared_alpha * shared_weights[out_col * input_dim + in_col];
         }
@@ -1883,6 +1903,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
     size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
     if (sample >= batch) {
@@ -1897,7 +1918,8 @@ __global__ void sfnn_stacked_l3_output_kernel(
 
     size_t stack = static_cast<size_t>(stack_i32);
     size_t input_base = sample * input_dim;
-    float sum = bias[stack];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float sum = residual_gate * bias[stack];
     if (has_shared != 0) {
         sum += shared_alpha * shared_bias[0];
     }
@@ -1937,7 +1959,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
         }
     }
     for (size_t in_col = 0; in_col < input_dim; ++in_col) {
-        float weight = weights[stack * input_dim + in_col];
+        float weight = residual_gate * weights[stack * input_dim + in_col];
         if (has_shared != 0) {
             weight += shared_alpha * shared_weights[in_col];
         }
@@ -2493,6 +2515,7 @@ __global__ void sfnn_add_saturation_penalty_gradients_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float weight_scale,
     float threshold,
@@ -2518,7 +2541,8 @@ __global__ void sfnn_add_saturation_penalty_gradients_kernel(
         ? in_col * output_dim + out_col
         : cell;
 
-    float value = weights[stacked_idx];
+    const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+    float value = residual_gate * weights[stacked_idx];
     if (has_shared != 0) {
         value += shared_alpha * shared_weights[factorizer_cell];
     }
@@ -2608,6 +2632,34 @@ __global__ void sfnn_add_residual_count_decay_gradients_kernel(
     atomicAdd(&gradients[idx], 2.0f * decay * weights[idx]);
 }
 
+__global__ void sfnn_apply_residual_count_gates_to_gradients_kernel(
+    float* gradients,
+    const float* gates,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks) {
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    const size_t total = stack_count * stride;
+    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) {
+        return;
+    }
+
+    const size_t selected_stack = tid / stride;
+    const size_t stack = dirty_count == 0 ? selected_stack : static_cast<size_t>(dirty_buckets[selected_stack]);
+    if (stack >= num_stacks) {
+        return;
+    }
+    const float gate = gates[stack];
+    if (gate == 1.0f) {
+        return;
+    }
+    const size_t cell = tid - selected_stack * stride;
+    const size_t idx = stack * stride + cell;
+    gradients[idx] *= gate;
+}
+
 __global__ void sfnn_stacked_l3_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -2643,6 +2695,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients) {
@@ -2658,7 +2711,8 @@ __global__ void sfnn_stacked_l3_backward_kernel(
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
             float output_gradient = output_gradients[sample];
-            float weight = weights[stack * input_dim + row];
+            const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
+            float weight = residual_gate * weights[stack * input_dim + row];
             if (has_shared != 0) {
                 weight += shared_alpha * shared_weights[row];
             }
@@ -2805,6 +2859,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients) {
@@ -2821,6 +2876,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
             size_t stack_base = stack * output_dim * input_dim;
+            const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
             size_t axis_ids[8];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
@@ -2856,7 +2912,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
                 size_t out_idx = sample * output_dim + out_col;
                 float grad = crelu_pre_gradient_from_value(activations[out_idx], output_gradients[out_idx]);
                 if (grad != 0.0f) {
-                    float weight = weights[stack_base + out_col * input_dim + in_col];
+                    float weight = residual_gate * weights[stack_base + out_col * input_dim + in_col];
                     if (has_shared != 0) {
                         weight += shared_alpha * shared_weights[out_col * input_dim + in_col];
                     }
@@ -3304,6 +3360,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients) {
@@ -3320,6 +3377,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
         if (stack_i32 >= 0 && static_cast<size_t>(stack_i32) < num_stacks) {
             size_t stack = static_cast<size_t>(stack_i32);
             size_t stack_base = stack * output_dim * input_dim;
+            const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
             size_t axis_ids[8];
             size_t axis_count = sfnn_factorizer_axis_ids(
                 stack,
@@ -3354,7 +3412,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 float grad = output_gradients[sample * output_dim + out_col];
                 if (grad != 0.0f) {
-                    float weight = weights[stack_base + out_col * input_dim + in_col];
+                    float weight = residual_gate * weights[stack_base + out_col * input_dim + in_col];
                     if (has_shared != 0) {
                         weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
                     }
@@ -4823,6 +4881,7 @@ int launch_sfnn_forward_kernels(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float* stm_l0,
     float* nstm_l0,
@@ -4977,6 +5036,7 @@ int launch_sfnn_forward_kernels(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates,
             factorizer_axis_confidences);
         if (check_kernel_launch("sfnn_stacked_l1_warp_kernel launch") != 0) {
             return -1;
@@ -5023,6 +5083,7 @@ int launch_sfnn_forward_kernels(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates,
             factorizer_axis_confidences);
     if (check_kernel_launch("sfnn_stacked_l2_crelu_kernel launch") != 0) {
         return -1;
@@ -5062,6 +5123,7 @@ int launch_sfnn_forward_kernels(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates,
         factorizer_axis_confidences);
     if (check_kernel_launch("sfnn_stacked_l3_output_kernel launch") != 0) {
         return -1;
@@ -5417,6 +5479,7 @@ int launch_sfnn_add_saturation_penalty_gradients(
     float hand_axis_alpha,
     float progress_axis_alpha,
     float pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float weight_scale,
     float threshold,
@@ -5479,6 +5542,7 @@ int launch_sfnn_add_saturation_penalty_gradients(
         hand_axis_alpha,
         progress_axis_alpha,
         pair_alpha,
+        residual_count_gates,
         factorizer_axis_confidences,
         weight_scale,
         threshold,
@@ -5680,6 +5744,41 @@ int launch_sfnn_inverse_index_for_perspective(
     return 0;
 }
 
+int launch_sfnn_apply_residual_count_gates_to_gradients(
+    BulletOuCudaCppContext* ctx,
+    float* gradients,
+    const float* gates,
+    const int* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks,
+    const char* label) {
+    if (stride == 0 || num_stacks == 0) {
+        return fail_message("sfnn residual count gate dimensions must be non-zero");
+    }
+    const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
+    if (stack_count > SIZE_MAX / stride) {
+        return fail_message("sfnn residual count gate total size overflow");
+    }
+    const size_t total = stack_count * stride;
+    int blocks = 0;
+    constexpr int threads = 256;
+    if (block_count_1d(total, threads, &blocks, label) != 0) {
+        return -1;
+    }
+    sfnn_apply_residual_count_gates_to_gradients_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        gradients,
+        gates,
+        dirty_buckets,
+        dirty_count,
+        stride,
+        num_stacks);
+    if (check_kernel_launch(label) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int launch_sfnn_inverse_index_l0_backward(
     BulletOuCudaCppContext* ctx,
     const int* stm_indices,
@@ -5809,6 +5908,7 @@ int launch_sfnn_backward_kernels(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     const float* mean_output_gradients,
     float* l2_gradients,
@@ -5969,6 +6069,7 @@ int launch_sfnn_backward_kernels(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
         0);
@@ -6094,6 +6195,7 @@ int launch_sfnn_backward_kernels(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
         0);
@@ -6283,6 +6385,7 @@ int launch_sfnn_backward_kernels(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates,
             factorizer_axis_confidences,
             reduce_l1_params ? 0 : 1,
             0);
@@ -7985,6 +8088,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     BulletOuCudaCppF32Buffer* dst_l0w,
     BulletOuCudaCppF32Buffer* dst_l0b,
@@ -8042,6 +8146,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     const size_t l2b_len = num_stacks * l2_size;
     const size_t l3w_len = num_stacks * l2_size;
     const size_t l3b_len = num_stacks;
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
 
     if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l0w), src_l0w_len, "sfnn proxy src l0w") != 0 ||
@@ -8109,6 +8214,12 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         }
         factorizer_axis_confidences_ptr = factorizer_axis_confidences->ptr;
     }
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn proxy residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
 
     constexpr int threads = 256;
     int blocks = 0;
@@ -8162,6 +8273,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         qb);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l1w_kernel launch") != 0) return -1;
@@ -8189,6 +8301,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         fc_bias_scale);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l1b_kernel launch") != 0) return -1;
@@ -8218,6 +8331,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         qb);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l2w_kernel launch") != 0) return -1;
@@ -8245,6 +8359,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         fc_bias_scale);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l2b_kernel launch") != 0) return -1;
@@ -8274,6 +8389,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         qb);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l3w_kernel launch") != 0) return -1;
@@ -8301,6 +8417,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         fc_bias_scale);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l3b_kernel launch") != 0) return -1;
@@ -8364,6 +8481,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     BulletOuCudaCppF32Buffer* stm_l0,
     BulletOuCudaCppF32Buffer* nstm_l0,
@@ -8386,6 +8504,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
     if (validate_sfnn_shape(
             input_size,
@@ -8486,6 +8605,12 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         }
         factorizer_axis_confidences_ptr = factorizer_axis_confidences->ptr;
     }
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
 
     if (launch_sfnn_forward_kernels(
             ctx,
@@ -8543,6 +8668,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates_ptr,
             factorizer_axis_confidences_ptr,
             stm_l0->ptr,
             nstm_l0->ptr,
@@ -9211,6 +9337,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -9255,6 +9382,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
     if (validate_sfnn_shape(
             input_size,
@@ -9368,6 +9496,12 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         }
         factorizer_axis_confidences_ptr = factorizer_axis_confidences->ptr;
     }
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
 
     if (launch_sfnn_backward_kernels(
             ctx,
@@ -9419,6 +9553,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates_ptr,
             factorizer_axis_confidences_ptr,
             mean_output_gradients->ptr,
             l2_gradients->ptr,
@@ -9509,6 +9644,7 @@ int sfnn_backward_train_device_impl(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -9712,6 +9848,7 @@ int sfnn_backward_train_device_impl(
             factorizer_hand_axis_alpha,
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
+            residual_count_gates,
             factorizer_axis_confidences,
             mean_output_gradients->ptr,
             l2_gradients->ptr,
@@ -9802,6 +9939,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -9841,7 +9979,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn train residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
     if (factorizer_axis_confidences != nullptr) {
         if (axis_count == 0 ||
             validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(factorizer_axis_confidences), axis_count, "sfnn train factorizer axis confidences") != 0) {
@@ -9899,6 +10044,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         mean_output_gradients,
         l2_gradients,
@@ -9984,6 +10130,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     const BulletOuCudaCppF32Buffer* mean_output_gradients,
     BulletOuCudaCppF32Buffer* l2_gradients,
@@ -10025,7 +10172,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair);
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn train residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
     if (factorizer_axis_confidences != nullptr) {
         if (axis_count == 0 ||
             validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(factorizer_axis_confidences), axis_count, "sfnn train factorizer axis confidences") != 0) {
@@ -10083,6 +10237,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         mean_output_gradients,
         l2_gradients,
@@ -10146,6 +10301,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
     float factorizer_hand_axis_alpha,
     float factorizer_progress_axis_alpha,
     float factorizer_pair_alpha,
+    const BulletOuCudaCppF32Buffer* residual_count_gates,
     const BulletOuCudaCppF32Buffer* factorizer_axis_confidences,
     int shared_weight_input_major,
     float weight_scale,
@@ -10193,7 +10349,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
             return -1;
         }
     }
+    const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
+    if (residual_count_gates != nullptr) {
+        if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(residual_count_gates), num_stacks, "sfnn saturation residual count gates") != 0) {
+            return -1;
+        }
+        residual_count_gates_ptr = residual_count_gates->ptr;
+    }
     if (factorizer_axis_confidences != nullptr) {
         if (axis_count == 0 ||
             validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(factorizer_axis_confidences), axis_count, "sfnn saturation factorizer axis confidences") != 0) {
@@ -10235,6 +10398,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
         factorizer_hand_axis_alpha,
         factorizer_progress_axis_alpha,
         factorizer_pair_alpha,
+        residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
         weight_scale,
         threshold,
@@ -10280,6 +10444,40 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_residual_count_decay_gradients_device(
         stride,
         num_stacks,
         "sfnn residual count decay gradients");
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_apply_residual_count_gates_to_gradients_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* gradients,
+    const BulletOuCudaCppF32Buffer* gates,
+    const BulletOuCudaCppI32Buffer* dirty_buckets,
+    size_t dirty_count,
+    size_t stride,
+    size_t num_stacks) {
+    if (stride == 0 || num_stacks == 0) {
+        return fail_message("sfnn residual count gate dimensions must be non-zero");
+    }
+    if (num_stacks > SIZE_MAX / stride) {
+        return fail_message("sfnn residual count gate length overflow");
+    }
+    if (validate_buffer(ctx, gradients, num_stacks * stride, "sfnn residual count gate gradients") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(gates), num_stacks, "sfnn residual count gates") != 0) {
+        return -1;
+    }
+    if (dirty_count > 0) {
+        if (dirty_buckets == nullptr || validate_i32_buffer(ctx, const_cast<BulletOuCudaCppI32Buffer*>(dirty_buckets), dirty_count, "sfnn residual count gate dirty buckets") != 0) {
+            return -1;
+        }
+    }
+    return launch_sfnn_apply_residual_count_gates_to_gradients(
+        ctx,
+        gradients->ptr,
+        gates->ptr,
+        dirty_count > 0 ? dirty_buckets->ptr : nullptr,
+        dirty_count,
+        stride,
+        num_stacks,
+        "sfnn residual count gate gradients");
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(

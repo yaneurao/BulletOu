@@ -368,7 +368,7 @@ This does not change the reported `test_value_loss` definition, so the normal lo
 
 ### 7.2 Count-aware damping for rare buckets
 
-With many bucket stacks, rare stacks can sometimes learn unstable residuals. You can pre-count stack occurrences from the teacher data into a `count.bin` file, then use that file to damp the base stack residual more strongly for low-count stacks.
+With many bucket stacks, rare stacks can sometimes learn unstable residuals. You can pre-count stack occurrences from the teacher data into a `count.bin` file, then use that file to damp bucket-specific residuals for low-count stacks.
 
 ```powershell
 .\target\release\examples\bulletou.exe bucket-count `
@@ -388,13 +388,16 @@ Then pass it during training:
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-residual-count-confidence 1.0
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`--sfnn-residual-count-confidence 1.0` means: do not trust a bucket-specific residual much until that bucket has appeared about as many times as its own residual parameter count. This option enables residual count decay; the maximum decay defaults to `1e-7`.
+When `--sfnn-bucket-counts` is set and an SFNN factorizer is active, the residual count gate is enabled by default. It changes the forward formula to `W_effective = gate * W_residual + factorizer terms`.
 
-The decay applies to the bucket-specific residual, not to the factorizer component. High-count buckets can learn a larger residual; low-count buckets stay closer to the shared factorizer structure.
+The gate is `count / (count + residual_params_per_bucket * confidence)`. The default confidence is `1.0`, so a bucket-specific residual is not strongly trusted until that bucket has appeared about as many times as its own residual parameter count.
+
+This gate is used consistently by training, qvalid, and `nn.bin` export. Disable it with `--sfnn-residual-count-gate-confidence 0`.
+
+If you want an additional regularization term, use `--sfnn-residual-count-confidence` and optionally `--sfnn-residual-count-decay`.
 
 You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confidence` and `--sfnn-pair-count-confidence`. If one family needs a different strength, use the split options such as `--sfnn-king-axis-count-confidence` or `--sfnn-hand-progress-pair-count-confidence`. See [SFNN factorizer](sfnn-factorizer.md) for the formulas and the model-side interpretation.
 
