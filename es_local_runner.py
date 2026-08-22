@@ -49,7 +49,9 @@ ALPHA_PARAMETERS = {
     "king_axis": "king_axis",
     "hand_axis": "hand_axis",
     "progress_axis": "progress_axis",
-    "pair": "pair",
+    "king_hand_pair": "king_hand_pair",
+    "king_progress_pair": "king_progress_pair",
+    "hand_progress_pair": "hand_progress_pair",
 }
 
 
@@ -69,17 +71,19 @@ KNOWN_PARAMETERS = set(ALPHA_PARAMETERS) | set(CONFIDENCE_FLAGS)
 
 DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
     "shared": {"current": 1.0, "tune": False, "step": 0.0, "min": 0.0, "max": 100.0},
-    "king_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "hand_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "progress_axis": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "pair": {"current": 1.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "residual_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "king_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
-    "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.05, "min": 0.0, "max": 100.0},
+    "king_axis": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "hand_axis": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "progress_axis": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "king_hand_pair": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "king_progress_pair": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "hand_progress_pair": {"current": 1.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "residual_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "king_axis_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "hand_axis_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "progress_axis_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
 }
 
 

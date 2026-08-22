@@ -60,16 +60,19 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   },
   "parameters": {
     "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 100.0 },
-    "king_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 }
+    "king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
   }
 }
 ```
@@ -167,10 +170,12 @@ runner root は `output_folder/es-<tag_prefix>` になります。
 
 ## `parameters` の共通フィールド
 
+`shared` を固定する場合、主な調整対象は13個です。axis alpha が3個、pair alpha が3個、axis count confidence が3個、pair count confidence が3個、residual count confidence が1個です。
+
 各パラメーターは次の形で書きます。
 
 ```json
-"king_axis": { "current": 1.0, "tune": true, "step": 0.01, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
 ```
 
 | フィールド | 意味 |
@@ -195,10 +200,13 @@ alpha は factorizer 成分をどれだけ使うかを決める倍率です。
 | `king_axis` | king bucket 軸の成分の強さ |
 | `hand_axis` | hand bucket 軸の成分の強さ |
 | `progress_axis` | progress bucket 軸の成分の強さ |
+| `king_hand_pair` | king-hand pair 成分の強さ |
+| `king_progress_pair` | king-progress pair 成分の強さ |
+| `hand_progress_pair` | hand-progress pair 成分の強さ |
 
 `shared` を動かすと全体の土台が変わります。比較実験では、まず `shared = 1.0` 固定にします。
 
-`pair` は king-hand、king-progress、hand-progress の pair 成分すべてにかかる大きな倍率です。各 pair 系の効き方を調整したい場合は、`pair` 自体ではなく `king_hand_pair_count`、`king_progress_pair_count`、`hand_progress_pair_count` を調整対象にしてください。
+`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3つの pair alpha に同じ値を入れる短縮指定です。ESでは `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
 
 ## count confidence パラメーター
 

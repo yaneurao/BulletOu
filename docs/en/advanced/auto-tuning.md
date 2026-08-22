@@ -60,16 +60,19 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   },
   "parameters": {
     "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 100.0 },
-    "king_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.05, "min": 0.0, "max": 100.0 }
+    "king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "residual_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
   }
 }
 ```
@@ -167,10 +170,12 @@ The runner root is `output_folder/es-<tag_prefix>`.
 
 ## Common `parameters` fields
 
+When `shared` is fixed, the main tuning set has 13 parameters: three axis alpha values, three pair alpha values, three axis count-confidence values, three pair count-confidence values, and one residual count-confidence value.
+
 Each parameter is written like this:
 
 ```json
-"king_axis": { "current": 1.0, "tune": true, "step": 0.01, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
 ```
 
 | Field | Meaning |
@@ -195,10 +200,13 @@ Alpha values are multipliers for factorizer terms.
 | `king_axis` | Strength of the king-bucket axis term |
 | `hand_axis` | Strength of the hand-bucket axis term |
 | `progress_axis` | Strength of the progress-bucket axis term |
+| `king_hand_pair` | Strength of the king-hand pair term |
+| `king_progress_pair` | Strength of the king-progress pair term |
+| `hand_progress_pair` | Strength of the hand-progress pair term |
 
 Changing `shared` moves the global base term, so keeping `shared = 1.0` fixed is often easier to interpret.
 
-`pair` is a broad global multiplier over every king-hand, king-progress, and hand-progress pair term. To tune each pair family, tune `king_hand_pair_count`, `king_progress_pair_count`, and `hand_progress_pair_count` instead of tuning `pair` itself.
+In `bulletou.exe`, `--sfnn-factorizer-alpha pair=...` is a shortcut that sets all three pair alpha values to the same value. In ES settings, tune `king_hand_pair`, `king_progress_pair`, and `hand_progress_pair` separately.
 
 ## Count-confidence parameters
 

@@ -1183,7 +1183,7 @@ pub struct SfnnFactorizerAlpha {
 
 impl SfnnFactorizerAlpha {
     pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
-    const MAX: f32 = 10.0;
+    const MAX: f32 = 100.0;
 
     fn validate(self) -> Result<()> {
         for (name, value) in [

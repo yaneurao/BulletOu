@@ -3634,32 +3634,60 @@ struct SfnnFactorizerAlphaSpec {
     king_axis: f32,
     hand_axis: f32,
     progress_axis: f32,
-    pair: f32,
+    king_hand_pair: f32,
+    king_progress_pair: f32,
+    hand_progress_pair: f32,
 }
 
 impl SfnnFactorizerAlphaSpec {
-    const MAX: f32 = 10.0;
-    const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
+    const MAX: f32 = 100.0;
+    const ONE: Self = Self {
+        shared: 1.0,
+        king_axis: 1.0,
+        hand_axis: 1.0,
+        progress_axis: 1.0,
+        king_hand_pair: 1.0,
+        king_progress_pair: 1.0,
+        hand_progress_pair: 1.0,
+    };
 
     fn is_default(self) -> bool {
         self.shared == 1.0
             && self.king_axis == 1.0
             && self.hand_axis == 1.0
             && self.progress_axis == 1.0
-            && self.pair == 1.0
+            && self.king_hand_pair == 1.0
+            && self.king_progress_pair == 1.0
+            && self.hand_progress_pair == 1.0
+    }
+
+    fn pair_axis_multipliers_are_default(self) -> bool {
+        self.king_hand_pair == 1.0 && self.king_progress_pair == 1.0 && self.hand_progress_pair == 1.0
     }
 
     fn config_string(self) -> String {
         format!(
-            "shared={:.9},king_axis={:.9},hand_axis={:.9},progress_axis={:.9},pair={:.9}",
-            self.shared, self.king_axis, self.hand_axis, self.progress_axis, self.pair
+            "shared={:.9},king_axis={:.9},hand_axis={:.9},progress_axis={:.9},king_hand_pair={:.9},king_progress_pair={:.9},hand_progress_pair={:.9}",
+            self.shared,
+            self.king_axis,
+            self.hand_axis,
+            self.progress_axis,
+            self.king_hand_pair,
+            self.king_progress_pair,
+            self.hand_progress_pair
         )
     }
 
     fn label(self) -> String {
         format!(
-            "shared={:.3}, king={:.3}, hand={:.3}, progress={:.3}, pair={:.3}",
-            self.shared, self.king_axis, self.hand_axis, self.progress_axis, self.pair
+            "shared={:.3}, king={:.3}, hand={:.3}, progress={:.3}, kh_pair={:.3}, kp_pair={:.3}, hp_pair={:.3}",
+            self.shared,
+            self.king_axis,
+            self.hand_axis,
+            self.progress_axis,
+            self.king_hand_pair,
+            self.king_progress_pair,
+            self.hand_progress_pair
         )
     }
 
@@ -3689,7 +3717,15 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
 
         if !raw.contains('=') && !raw.contains(',') {
             let value = Self::parse_value(raw, raw)?;
-            return Ok(Self { shared: value, king_axis: value, hand_axis: value, progress_axis: value, pair: value });
+            return Ok(Self {
+                shared: value,
+                king_axis: value,
+                hand_axis: value,
+                progress_axis: value,
+                king_hand_pair: value,
+                king_progress_pair: value,
+                hand_progress_pair: value,
+            });
         }
 
         let mut spec = Self::ONE;
@@ -3700,7 +3736,7 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
             }
             let (key, value) = token.split_once('=').ok_or_else(|| {
                 format!(
-                    "invalid SFNN factorizer alpha token `{token}`: expected 0.95, all=0.95, axis=0.95, shared=0.95, king=0.95, hand=0.95, progress=0.95, or pair=0.95"
+                    "invalid SFNN factorizer alpha token `{token}`: expected 0.95, all=0.95, axis=0.95, shared=0.95, king=0.95, hand=0.95, progress=0.95, pair=0.95, king_hand_pair=0.95, king_progress_pair=0.95, or hand_progress_pair=0.95"
                 )
             })?;
             let value = Self::parse_value(value, raw)?;
@@ -3710,21 +3746,50 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
                     spec.king_axis = value;
                     spec.hand_axis = value;
                     spec.progress_axis = value;
-                    spec.pair = value;
+                    spec.king_hand_pair = value;
+                    spec.king_progress_pair = value;
+                    spec.hand_progress_pair = value;
                 }
                 "axis" | "axes" => {
                     spec.king_axis = value;
                     spec.hand_axis = value;
                     spec.progress_axis = value;
                 }
+                "pair" | "pairs" | "p" => {
+                    spec.king_hand_pair = value;
+                    spec.king_progress_pair = value;
+                    spec.hand_progress_pair = value;
+                }
                 "shared" | "common" => spec.shared = value,
                 "king" | "king_axis" | "k" => spec.king_axis = value,
                 "hand" | "hand_axis" | "h" => spec.hand_axis = value,
                 "progress" | "progress_axis" | "prog" => spec.progress_axis = value,
-                "pair" | "pairs" | "p" => spec.pair = value,
+                "king_hand_pair" | "king-hand-pair" | "king_hand" | "king-hand" | "hand_king" | "hand-king" | "kh" | "hk" => {
+                    spec.king_hand_pair = value;
+                }
+                "king_progress_pair"
+                | "king-progress-pair"
+                | "king_progress"
+                | "king-progress"
+                | "progress_king"
+                | "progress-king"
+                | "kp"
+                | "pk" => {
+                    spec.king_progress_pair = value;
+                }
+                "hand_progress_pair"
+                | "hand-progress-pair"
+                | "hand_progress"
+                | "hand-progress"
+                | "progress_hand"
+                | "progress-hand"
+                | "hp"
+                | "ph" => {
+                    spec.hand_progress_pair = value;
+                }
                 _ => {
                     return Err(format!(
-                        "invalid SFNN factorizer alpha token `{token}`: key must be all, axis, shared, king, hand, progress, or pair"
+                        "invalid SFNN factorizer alpha token `{token}`: key must be all, axis, shared, king, hand, progress, pair, king_hand_pair, king_progress_pair, or hand_progress_pair"
                     ));
                 }
             }
@@ -3907,7 +3972,11 @@ fn cuda_cpp_sfnn_factorizer_alpha(args: &Args) -> bulletou_cuda_cpp::SfnnFactori
         king_axis: alpha.king_axis,
         hand_axis: alpha.hand_axis,
         progress_axis: alpha.progress_axis,
-        pair: alpha.pair,
+        // Pair alpha is split into king_hand / king_progress / hand_progress on
+        // the CLI side.  The CUDA backend still has one scalar slot for all pair
+        // terms, so pair-specific alpha is folded into the per-axis multiplier
+        // buffer.  Keep the backend scalar neutral to avoid double application.
+        pair: 1.0,
     }
 }
 
@@ -8826,17 +8895,19 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
 
     let factorizer = effective_sfnn_factorizer_spec(args);
     let factorizer_alpha = effective_sfnn_factorizer_alpha(args);
-    let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
-        let count_path = args.sfnn_bucket_counts.as_deref().ok_or_else(|| {
-            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
-        })?;
-        let counts = SfnnBucketCounts::read_from_path(count_path)?;
-        counts.validate_for_arch(
-            count_path,
-            args.arch(),
-            args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
-        )?;
-        sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, &counts)?
+    let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+        let counts = if let Some(count_path) = args.sfnn_bucket_counts.as_deref() {
+            let counts = SfnnBucketCounts::read_from_path(count_path)?;
+            counts.validate_for_arch(
+                count_path,
+                args.arch(),
+                args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
+            )?;
+            Some(counts)
+        } else {
+            None
+        };
+        sfnn_factorizer_axis_confidences_from_counts(args, shape, factorizer, counts.as_ref())?
     } else {
         None
     };
@@ -9781,13 +9852,9 @@ impl WorkerSfnnSession {
         } else {
             runner.set_residual_count_decay_by_stack(ctx, None).map_err(|e| e.to_string())?;
         }
-        if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
-            let counts = sfnn_bucket_counts.as_ref().ok_or_else(|| {
-                "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts"
-                    .to_string()
-            })?;
+        if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
             let spec = effective_sfnn_factorizer_spec(args);
-            let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, counts)?;
+            let confidences = sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, sfnn_bucket_counts.as_ref())?;
             if let Some(confidences) = confidences.as_ref() {
                 runner.set_factorizer_axis_confidences(ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
             } else {
@@ -14737,6 +14804,12 @@ fn effective_sfnn_factorizer_axis_count_confidence_enabled(args: &Args) -> bool 
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn effective_sfnn_factorizer_axis_multiplier_enabled(args: &Args) -> bool {
+    effective_sfnn_factorizer_axis_count_confidence_enabled(args)
+        || !effective_sfnn_factorizer_alpha(args).pair_axis_multipliers_are_default()
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_bucket_count_decay_lambdas(
     counts: &SfnnBucketCounts,
     decay: f32,
@@ -14876,54 +14949,78 @@ fn effective_sfnn_axis_term_count_confidence(args: &Args, kind: SfnnFactorizerAx
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn effective_sfnn_axis_term_pair_alpha(alpha: SfnnFactorizerAlphaSpec, kind: SfnnFactorizerAxisTermKind) -> f32 {
+    match kind {
+        SfnnFactorizerAxisTermKind::KingHandPair => alpha.king_hand_pair,
+        SfnnFactorizerAxisTermKind::KingProgressPair => alpha.king_progress_pair,
+        SfnnFactorizerAxisTermKind::HandProgressPair => alpha.hand_progress_pair,
+        SfnnFactorizerAxisTermKind::KingAxis
+        | SfnnFactorizerAxisTermKind::HandAxis
+        | SfnnFactorizerAxisTermKind::ProgressAxis => 1.0,
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_factorizer_axis_confidences_from_counts(
     args: &Args,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     factorizer: SfnnFactorizerSpec,
-    counts: &SfnnBucketCounts,
+    counts: Option<&SfnnBucketCounts>,
 ) -> Result<Option<Vec<f32>>, String> {
-    if !effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
+    let count_enabled = effective_sfnn_factorizer_axis_count_confidence_enabled(args);
+    let alpha = effective_sfnn_factorizer_alpha(args);
+    let pair_alpha_enabled = !alpha.pair_axis_multipliers_are_default();
+    if !count_enabled && !pair_alpha_enabled {
         return Ok(None);
     }
-    if counts.counts.len() != shape.num_stacks {
-        return Err(format!(
-            "--sfnn-bucket-counts stack count mismatch: count file has {}, arch uses {} stacks",
-            counts.counts.len(),
-            shape.num_stacks
-        ));
-    }
     if !factorizer.any_axis() {
+        if !count_enabled {
+            return Ok(None);
+        }
         return Err(
-            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require axis or pair factorizer terms"
-                .to_string(),
+            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence and pair-specific factorizer alpha require axis or pair factorizer terms".to_string(),
         );
     }
 
     let axis_count = shape.factorizer_axis_count();
     let mut per_axis_counts = vec![0u64; axis_count];
-    for (stack, &count) in counts.counts.iter().enumerate() {
-        if count == 0 {
-            continue;
+    if count_enabled {
+        let counts = counts.ok_or_else(|| {
+            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
+        })?;
+        if counts.counts.len() != shape.num_stacks {
+            return Err(format!(
+                "--sfnn-bucket-counts stack count mismatch: count file has {}, arch uses {} stacks",
+                counts.counts.len(),
+                shape.num_stacks
+            ));
         }
-        for axis in cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer) {
-            if axis < per_axis_counts.len() {
-                per_axis_counts[axis] = per_axis_counts[axis].saturating_add(u64::from(count));
+        for (stack, &count) in counts.counts.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            for axis in cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer) {
+                if axis < per_axis_counts.len() {
+                    per_axis_counts[axis] = per_axis_counts[axis].saturating_add(u64::from(count));
+                }
             }
         }
     }
 
     let params = sfnn_factorizer_axis_term_params(shape)? as f64;
-    for (name, confidence) in [
-        ("--sfnn-king-axis-count-confidence", effective_sfnn_king_axis_count_confidence(args)),
-        ("--sfnn-hand-axis-count-confidence", effective_sfnn_hand_axis_count_confidence(args)),
-        ("--sfnn-progress-axis-count-confidence", effective_sfnn_progress_axis_count_confidence(args)),
-        ("--sfnn-king-hand-pair-count-confidence", effective_sfnn_king_hand_pair_count_confidence(args)),
-        ("--sfnn-king-progress-pair-count-confidence", effective_sfnn_king_progress_pair_count_confidence(args)),
-        ("--sfnn-hand-progress-pair-count-confidence", effective_sfnn_hand_progress_pair_count_confidence(args)),
-    ] {
-        let k = params * f64::from(confidence);
-        if !(k.is_finite() && k >= 0.0) {
-            return Err(format!("{name} overflowed: term_params={params:.3}, confidence={confidence}"));
+    if count_enabled {
+        for (name, confidence) in [
+            ("--sfnn-king-axis-count-confidence", effective_sfnn_king_axis_count_confidence(args)),
+            ("--sfnn-hand-axis-count-confidence", effective_sfnn_hand_axis_count_confidence(args)),
+            ("--sfnn-progress-axis-count-confidence", effective_sfnn_progress_axis_count_confidence(args)),
+            ("--sfnn-king-hand-pair-count-confidence", effective_sfnn_king_hand_pair_count_confidence(args)),
+            ("--sfnn-king-progress-pair-count-confidence", effective_sfnn_king_progress_pair_count_confidence(args)),
+            ("--sfnn-hand-progress-pair-count-confidence", effective_sfnn_hand_progress_pair_count_confidence(args)),
+        ] {
+            let k = params * f64::from(confidence);
+            if !(k.is_finite() && k >= 0.0) {
+                return Err(format!("{name} overflowed: term_params={params:.3}, confidence={confidence}"));
+            }
         }
     }
 
@@ -14936,12 +15033,17 @@ fn sfnn_factorizer_axis_confidences_from_counts(
         let Some(kind) = sfnn_factorizer_axis_term_kind(shape, axis) else {
             continue;
         };
-        let confidence = effective_sfnn_axis_term_count_confidence(args, kind);
-        if confidence == 0.0 {
-            continue;
+        if count_enabled {
+            let confidence = effective_sfnn_axis_term_count_confidence(args, kind);
+            if confidence != 0.0 {
+                let k = params * f64::from(confidence);
+                values[axis] *= sfnn_count_confidence_multiplier(per_axis_counts[axis], k);
+            }
         }
-        let k = params * f64::from(confidence);
-        values[axis] = sfnn_count_confidence_multiplier(per_axis_counts[axis], k);
+        values[axis] *= effective_sfnn_axis_term_pair_alpha(alpha, kind);
+    }
+    if values.iter().all(|&value| value == 1.0) {
+        return Ok(None);
     }
     Ok(Some(values))
 }
@@ -15597,10 +15699,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         None
     };
-    let sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_count_confidence_enabled(args) {
-        let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts).ok_or_else(|| {
-            "--sfnn-*-axis-count-confidence / --sfnn-*-pair-count-confidence require --sfnn-bucket-counts".to_string()
-        })?;
+    let sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+        let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts);
         sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
     } else {
         None
@@ -15748,9 +15848,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     if let Some(confidences) = sfnn_factorizer_axis_confidences.as_ref() {
         print_startup_kv_colored(
-            "count factorizer",
+            "factorizer axis multipliers",
             format!(
-                "axis(k/h/p)={:.6}/{:.6}/{:.6}, pair(kh/kp/hp)={:.6}/{:.6}/{:.6}, {}",
+                "count axis(k/h/p)={:.6}/{:.6}/{:.6}, count pair(kh/kp/hp)={:.6}/{:.6}/{:.6}, {}",
                 effective_sfnn_king_axis_count_confidence(args),
                 effective_sfnn_hand_axis_count_confidence(args),
                 effective_sfnn_progress_axis_count_confidence(args),
@@ -18331,7 +18431,7 @@ fn cuda_cpp_sfnn_factorizer_axis_alpha(
     } else if axis < base_axis_count {
         alpha.hand_axis
     } else if axis < base_axis_count + pair_axis_count {
-        alpha.pair
+        1.0
     } else {
         alpha.progress_axis
     }
@@ -27129,10 +27229,12 @@ mod tests {
         assert_eq!(scalar.king_axis, 0.75);
         assert_eq!(scalar.hand_axis, 0.75);
         assert_eq!(scalar.progress_axis, 0.75);
-        assert_eq!(scalar.pair, 0.75);
+        assert_eq!(scalar.king_hand_pair, 0.75);
+        assert_eq!(scalar.king_progress_pair, 0.75);
+        assert_eq!(scalar.hand_progress_pair, 0.75);
         assert_eq!(
             scalar.config_string(),
-            "shared=0.750000000,king_axis=0.750000000,hand_axis=0.750000000,progress_axis=0.750000000,pair=0.750000000"
+            "shared=0.750000000,king_axis=0.750000000,hand_axis=0.750000000,progress_axis=0.750000000,king_hand_pair=0.750000000,king_progress_pair=0.750000000,hand_progress_pair=0.750000000"
         );
 
         let per_axis: SfnnFactorizerAlphaSpec = "shared=0.95,king=1.10,hand=0.60".parse().unwrap();
@@ -27140,28 +27242,42 @@ mod tests {
         assert_eq!(per_axis.king_axis, 1.10);
         assert_eq!(per_axis.hand_axis, 0.60);
         assert_eq!(per_axis.progress_axis, 1.0);
-        assert_eq!(per_axis.pair, 1.0);
+        assert_eq!(per_axis.king_hand_pair, 1.0);
+        assert_eq!(per_axis.king_progress_pair, 1.0);
+        assert_eq!(per_axis.hand_progress_pair, 1.0);
 
         let all_then_override: SfnnFactorizerAlphaSpec = "all=0.50,king=0.90".parse().unwrap();
         assert_eq!(all_then_override.shared, 0.50);
         assert_eq!(all_then_override.king_axis, 0.90);
         assert_eq!(all_then_override.hand_axis, 0.50);
         assert_eq!(all_then_override.progress_axis, 0.50);
-        assert_eq!(all_then_override.pair, 0.50);
+        assert_eq!(all_then_override.king_hand_pair, 0.50);
+        assert_eq!(all_then_override.king_progress_pair, 0.50);
+        assert_eq!(all_then_override.hand_progress_pair, 0.50);
 
         let axis_pair: SfnnFactorizerAlphaSpec = "axis=4.0,pair=4.0".parse().unwrap();
         assert_eq!(axis_pair.shared, 1.0);
         assert_eq!(axis_pair.king_axis, 4.0);
         assert_eq!(axis_pair.hand_axis, 4.0);
         assert_eq!(axis_pair.progress_axis, 4.0);
-        assert_eq!(axis_pair.pair, 4.0);
+        assert_eq!(axis_pair.king_hand_pair, 4.0);
+        assert_eq!(axis_pair.king_progress_pair, 4.0);
+        assert_eq!(axis_pair.hand_progress_pair, 4.0);
+
+        let split_pair: SfnnFactorizerAlphaSpec =
+            "king_hand_pair=0.7,king_progress_pair=0.8,hand_progress_pair=0.9".parse().unwrap();
+        assert_eq!(split_pair.king_hand_pair, 0.7);
+        assert_eq!(split_pair.king_progress_pair, 0.8);
+        assert_eq!(split_pair.hand_progress_pair, 0.9);
 
         let progress_only: SfnnFactorizerAlphaSpec = "progress=4.0".parse().unwrap();
         assert_eq!(progress_only.shared, 1.0);
         assert_eq!(progress_only.king_axis, 1.0);
         assert_eq!(progress_only.hand_axis, 1.0);
         assert_eq!(progress_only.progress_axis, 4.0);
-        assert_eq!(progress_only.pair, 1.0);
+        assert_eq!(progress_only.king_hand_pair, 1.0);
+        assert_eq!(progress_only.king_progress_pair, 1.0);
+        assert_eq!(progress_only.hand_progress_pair, 1.0);
     }
 
     #[test]
@@ -27218,8 +27334,8 @@ mod tests {
 
     #[test]
     fn sfnn_factorizer_alpha_rejects_out_of_range_and_none_factorizer() {
-        assert!("10.0".parse::<SfnnFactorizerAlphaSpec>().is_ok());
-        assert!("10.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
+        assert!("100.0".parse::<SfnnFactorizerAlphaSpec>().is_ok());
+        assert!("100.01".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("-0.1".parse::<SfnnFactorizerAlphaSpec>().is_err());
         assert!("king=nan".parse::<SfnnFactorizerAlphaSpec>().is_err());
 
@@ -29477,8 +29593,15 @@ mod tests {
             explicit_hand_axis: false,
             ..SfnnFactorizerSpec::NONE
         };
-        let alpha =
-            SfnnFactorizerAlphaSpec { shared: 1.0, king_axis: 0.5, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
+        let alpha = SfnnFactorizerAlphaSpec {
+            shared: 1.0,
+            king_axis: 0.5,
+            hand_axis: 1.0,
+            progress_axis: 1.0,
+            king_hand_pair: 1.0,
+            king_progress_pair: 1.0,
+            hand_progress_pair: 1.0,
+        };
 
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
             shape,
