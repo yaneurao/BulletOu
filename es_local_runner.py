@@ -1023,7 +1023,8 @@ def train_candidate_stage_worker(
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
     out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
-    cache_key = f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
+    cache_key = None if settings.metric == BORDA_COUNT_METRIC else f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
+    checkpoint_text = f"worker-cache:{cache_key}" if cache_key else "worker-no-cache"
     event(
         color,
         f"[CAND {candidate.index:03d} START]",
@@ -1050,7 +1051,7 @@ def train_candidate_stage_worker(
             "test_value_loss": "",
             "test_value_accuracy": "",
             "checkpoint": str(candidate.checkpoint),
-            "output_dir": f"worker-cache:{cache_key}",
+            "output_dir": checkpoint_text,
             "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
         },
     )
@@ -1107,8 +1108,8 @@ def train_candidate_stage_worker(
             "quantized_value_accuracy": format_float(metric.qacc),
             "test_value_loss": format_float(metric.test_loss),
             "test_value_accuracy": format_float(metric.test_acc),
-            "checkpoint": f"worker-cache:{cache_key}",
-            "output_dir": f"worker-cache:{cache_key}",
+            "checkpoint": checkpoint_text,
+            "output_dir": checkpoint_text,
             "parameters": json.dumps(candidate.params, ensure_ascii=False, sort_keys=True),
         },
     )
@@ -1508,16 +1509,42 @@ def main() -> int:
                             prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
                         )
                 if worker_enabled and not args.dry_run:
-                    if best.cache_key is None:
-                        raise RuntimeError("worker survivor has no cache key")
                     assert worker is not None
-                    worker.request(
-                        "accept-cached-trial",
-                        {"cache_key": best.cache_key},
-                        prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
-                    )
-                    best.cache_key = None
-                    best.checkpoint = current_checkpoint
+                    if settings.metric == BORDA_COUNT_METRIC and best.cache_key is None:
+                        replay_args = build_train_args(
+                            run,
+                            best.params,
+                            None,
+                            runner_root / "worker-borda-survivor",
+                            stage.after_sbs - prev_after_sbs,
+                            settings,
+                            include_initial_state=False,
+                        )
+                        event(
+                            color,
+                            f"[G{generation:04d} KEEP]",
+                            (
+                                "borda_count survivor is replayed once with keep=true; "
+                                "candidate states were not cached in host RAM"
+                            ),
+                            "yellow",
+                        )
+                        worker.request(
+                            "trial",
+                            {"args": replay_args, "keep": True, "cache_key": None},
+                            prefix=paint(color, f"[G{generation:04d} KEEP] ", "magenta"),
+                        )
+                        best.checkpoint = current_checkpoint
+                    elif best.cache_key is None:
+                        raise RuntimeError("worker survivor has no cache key")
+                    else:
+                        worker.request(
+                            "accept-cached-trial",
+                            {"cache_key": best.cache_key},
+                            prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
+                        )
+                        best.cache_key = None
+                        best.checkpoint = current_checkpoint
                 if not args.keep_temp and not args.dry_run:
                     for candidate in pruned:
                         if candidate.output_dir is not None:
