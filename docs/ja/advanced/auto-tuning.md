@@ -242,6 +242,8 @@ ES を回さず、`parameters.current` の値だけを使いたい場合は、`e
 python .\es_local_runner.py --es-settings-file .\es-settings.json
 ```
 
+この方法では、`parameters.current` の13個の値を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み取り、`--sfnn-factorizer-alpha` と count confidence 系オプションに変換して `bulletou.exe` に渡します。
+
 このとき `bulletou-settings.json` には、通常学習に必要な `superbatches`、`max_epochs`、`save_rate`、`validation_rate` なども書いてください。
 
 ## `bulletou.exe --settings-file`

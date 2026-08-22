@@ -242,6 +242,8 @@ Then launch the runner once:
 python .\es_local_runner.py --es-settings-file .\es-settings.json
 ```
 
+With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
+
 In this mode, put normal training fields such as `superbatches`, `max_epochs`, `save_rate`, and `validation_rate` in `bulletou-settings.json`.
 
 ## `bulletou.exe --settings-file`
