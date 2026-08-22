@@ -1,27 +1,27 @@
 # ES による自動調整
 
-<a href="../../en/advanced/auto-tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
+<a href="../../en/advanced/auto-tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-2563EB?style=flat-square"></a>
 
-このページでは、`es_local_runner.py` を使って factorizer の強さや count confidence を自動調整する方法を説明します。
+このページでは、`es_local_runner.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
 
-ここでいう ES は evolution strategy です。複数の候補を少しずつ違うパラメーターで学習させ、検証 loss が良い候補だけを残します。勾配推定によって別の微小更新を行う方式ではありません。最後に残った候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
+ここでいう ES は evolution strategy です。いくつかの候補を少し違うパラメーターで学習させ、設定した指標で良い候補を残します。勾配を推定して別の小さな更新を行う方式ではありません。最後に残った候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
 
 ## 使う JSON ファイル
 
-自動調整では、設定を 2 つの JSON に分けます。
+runner は 2 つの JSON ファイルを使います。
 
 | ファイル | 役割 |
 | --- | --- |
 | `es-settings.json` | ES の世代数、population、beam、調整するパラメーター、現在値を書く |
-| `bulletou-settings.json` | `bulletou.exe` に渡す通常の学習設定を書く |
+| `bulletou-settings.json` | 通常の `bulletou.exe` 学習オプションを書く |
 
-`es-settings.json` の中に `bulletou-settings.json` の path を書きます。runner の実行時は `--es-settings-file` だけ指定すればよいです。
+`es-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--es-settings-file` だけを渡します。
 
 ```powershell
 python .\es_local_runner.py --es-settings-file .\es-settings.json
 ```
 
-再開するときは同じ `es-settings.json` を指定して `--resume` を付けます。
+同じ runner を再開するときは `--resume` を付けます。
 
 ```powershell
 python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
@@ -42,7 +42,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
       { "after_sbs": 24, "keep": 2 },
       { "after_sbs": 32, "keep": 1 }
     ],
-    "metric": "quantized_value_loss",
+    "metric": "borda_count",
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
@@ -56,7 +56,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "base_checkpoint": "C:/shogi/YaneuraOuWorks/BulletOu/checkpoints/.../0256",
     "output_folder": "D:/BulletOu-snapshots/20260820",
     "temp_folder": "C:/BulletOu-es-temp",
-    "tag_prefix": "pair2-qloss"
+    "tag_prefix": "pair2-es"
   },
   "parameters": {
     "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 100.0 },
@@ -79,7 +79,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
 
 ## `bulletou-settings.json` の例
 
-`bulletou-settings.json` には、通常 `bulletou.exe` に書く学習条件を書きます。JSON のキーは CLI の `--` を外し、ハイフンをアンダースコアにした名前です。たとえば `--lr-min` は `lr_min` です。
+`bulletou-settings.json` には、通常 `bulletou.exe` に渡す学習オプションを書きます。JSON のキーは CLI オプション名から `--` を外し、ハイフンをアンダースコアにした名前です。たとえば `--lr-min` は `lr_min` です。
 
 ```json
 {
@@ -100,34 +100,37 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   "wrm_in_offset": 0,
   "wrm_target_offset": 0,
   "sfnn_dirty_bucket_update": true,
+  "sfnn_freeze_progress": true,
   "sfnn_saturation_penalty": 1e-7
 }
 ```
 
-ES 実行時は runner が候補ごとに次の値を決めます。そのため、`bulletou-settings.json` には書かないでください。
+ES 実行時は runner が候補ごとに次の値を決めます。そのため、これらは `bulletou-settings.json` には書かないでください。
 
 | runner が決める項目 | 理由 |
 | --- | --- |
-| `initial_state`, `initial_dataloader_pos` | 候補ごとの開始 checkpoint が違う |
-| `output`, `output_folder`, `tag` | 候補ごとの出力先を runner が作る |
-| `superbatches`, `max_epochs` | beam の stage ごとに学習 sb 数が違う |
+| `initial_state`, `initial_dataloader_pos` | 候補ごとに開始 checkpoint が変わる |
+| `output`, `output_folder`, `tag` | 候補ごとに出力先を分ける |
+| `superbatches`, `max_epochs` | beam の stage ごとに学習 sb 数が変わる |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
 | `sfnn_factorizer_alpha` | ES の `parameters` から候補ごとに作る |
 | `sfnn_*_count_confidence` | ES の `parameters` から候補ごとに作る |
+
+`progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
 
 ## `es` の項目
 
 | 項目 | 意味 |
 | --- | --- |
-| `enabled` | `true` なら ES を実行する。`false` なら `parameters.current` だけを使って 1 回だけ通常学習を起動する |
-| `generations` | 世代数。1 世代ごとに 1 つの候補が採用される |
+| `enabled` | `true` なら ES を実行する。`false` なら `parameters.current` だけを使って通常学習を 1 回起動する |
+| `generations` | 世代数。1 世代ごとに 1 つの候補を採用する |
 | `population` | 世代開始時に作る候補数 |
-| `beam` | 何 sb 学習した時点で、何個の候補を残すか |
+| `beam` | 何 sb 学習した時点で、候補をいくつ残すか |
 | `metric` | 候補を比較する指標 |
-| `lower_is_better` | 指標が小さいほど良いなら `true` |
-| `use_worker` | `true` なら長寿命の `bulletou worker` を使う。省略時も `true` |
-| `seed` | 候補生成の乱数 seed |
-| `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ保存するか |
+| `lower_is_better` | 小さいほど良い指標なら `true`。`borda_count` では常に順位和が小さいほど良いので、この値は使われない |
+| `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
+| `seed` | 候補生成用の乱数 seed |
+| `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
 | `candidate_validation_rate` | 候補学習中の f32 validation 間隔 |
 | `candidate_quantized_validation_rate` | 候補学習中の量子化 validation 間隔 |
 
@@ -142,7 +145,9 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 ]
 ```
 
-この例では 16 候補で開始し、8 sb 後に 8 候補、16 sb 後に 4 候補、24 sb 後に 2 候補、32 sb 後に 1 候補へ絞ります。最後の `keep` は必ず `1` にしてください。
+この例では、16 候補で開始し、8 sb 後に 8 候補、16 sb 後に 4 候補、24 sb 後に 2 候補、32 sb 後に 1 候補へ絞ります。最後の `keep` は必ず `1` にしてください。
+
+## `metric`
 
 `metric` は主に次のどれかを使います。
 
@@ -152,8 +157,19 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `quantized_value_accuracy` | 量子化後の validation accuracy | `false` |
 | `test_value_loss` | f32 weight の validation loss | `true` |
 | `test_value_accuracy` | f32 weight の validation accuracy | `false` |
+| `borda_count` | 4 指標それぞれで順位を付け、順位和が最小の候補を選ぶ | `true` |
 
-棋力計測に近い候補を探す目的なら、まず `quantized_value_loss` を見るのが無難です。
+`quantized_value_loss` だけを見ると、`quantized_value_accuracy` や f32 側の指標と食い違うことがあります。その場合は `borda_count` が使えます。
+
+`borda_count` は次の手順で候補を比較します。
+
+1. `quantized_value_loss` が小さい順に順位を付ける。
+2. `quantized_value_accuracy` が大きい順に順位を付ける。
+3. `test_value_loss` が小さい順に順位を付ける。
+4. `test_value_accuracy` が大きい順に順位を付ける。
+5. 4 つの順位を合計し、合計がもっとも小さい候補を残す。
+
+同点の場合は、その順位範囲の平均順位を使います。たとえば 2 位と 3 位が同点なら、どちらも 2.5 位として計算します。
 
 ## `run` の項目
 
@@ -163,14 +179,14 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `bulletou_settings_file` | 通常学習設定を書いた JSON |
 | `base_checkpoint` | 最初に読む checkpoint。`state.bin` と `dataloader_pos.txt` が必要 |
 | `output_folder` | runner root を作る親フォルダ |
-| `temp_folder` | 候補の一時 checkpoint を作る場所。高速な SSD を推奨 |
+| `temp_folder` | 候補の一時 checkpoint を作る場所。高速な SSD 推奨 |
 | `tag_prefix` | runner root 名に使う名前 |
 
-runner root は `output_folder/es-<tag_prefix>` になります。
+runner root は `output_folder/es-<tag_prefix>` です。
 
-## `parameters` の共通フィールド
+## `parameters` の書き方
 
-`shared` を固定する場合、主な調整対象は13個です。axis alpha が3個、pair alpha が3個、axis count confidence が3個、pair count confidence が3個、residual count confidence が1個です。
+`shared` を固定する場合、主な調整対象は 13 個です。axis alpha が 3 個、pair alpha が 3 個、axis count confidence が 3 個、pair count confidence が 3 個、residual count confidence が 1 個です。
 
 各パラメーターは次の形で書きます。
 
@@ -178,21 +194,21 @@ runner root は `output_folder/es-<tag_prefix>` になります。
 "king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
 ```
 
-| フィールド | 意味 |
+| 項目 | 意味 |
 | --- | --- |
-| `current` | 現在値。候補はこの値の周辺に作られる |
+| `current` | 現在値。候補はこの値の周辺から作られる |
 | `tune` | `true` なら ES が動かす。`false` なら固定 |
-| `step` | 候補を作る倍率の幅。候補は `current * exp(random(-step, step))` で作る |
+| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step, step))` で作られる |
 | `min` | 下限 |
 | `max` | 上限 |
 
-`step` は加算幅ではありません。`step = 0.02` なら候補はおよそ `current` の ±2% の範囲、`step = 0.10` ならおよそ 0.90 倍から 1.11 倍の範囲になります。`tune = true` にするパラメーターは `current > 0` にしてください。
+`step` は加算幅ではありません。`step = 0.02` なら、おおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。`tune = true` のパラメーターは `current > 0` である必要があります。
 
-採用された候補の値は `current` に書き戻されます。再開時に手で `king_axis=...` のような長い値を打ち直す必要はありません。
+候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
 
 ## alpha パラメーター
 
-alpha は factorizer 成分をどれだけ使うかを決める倍率です。
+alpha は factorizer 成分の強さです。
 
 | キー | 意味 |
 | --- | --- |
@@ -204,31 +220,31 @@ alpha は factorizer 成分をどれだけ使うかを決める倍率です。
 | `king_progress_pair` | king-progress pair 成分の強さ |
 | `hand_progress_pair` | hand-progress pair 成分の強さ |
 
-`shared` を動かすと全体の土台が変わります。比較実験では、まず `shared = 1.0` 固定にします。
+`shared` を動かすと全体の土台が動くので、最初は `shared = 1.0` で固定したほうが結果を読みやすいです。
 
-`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3つの pair alpha に同じ値を入れる短縮指定です。ESでは `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
+`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3 つの pair alpha に同じ値を入れる短縮指定です。ES では `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
 
 ## count confidence パラメーター
 
-count confidence は、`bucket-count` で作った `count.bin` を使って、出現回数が少ない成分を弱めるための値です。
+count confidence は `bucket-count` で作った `count.bin` を使います。出現回数が少なく、信用しにくい成分を弱めるための係数です。
 
-| キー | 対応する BulletOu オプション | 意味 |
+| キー | BulletOu のオプション | 意味 |
 | --- | --- | --- |
 | `residual_count` | `--sfnn-residual-count-confidence` | bucket 固有 residual の count confidence |
-| `king_axis_count` | `--sfnn-king-axis-count-confidence` | king axis 専用 |
-| `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | hand axis 専用 |
-| `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | progress axis 専用 |
-| `king_hand_pair_count` | `--sfnn-king-hand-pair-count-confidence` | king-hand pair 専用 |
-| `king_progress_pair_count` | `--sfnn-king-progress-pair-count-confidence` | king-progress pair 専用 |
-| `hand_progress_pair_count` | `--sfnn-hand-progress-pair-count-confidence` | hand-progress pair 専用 |
+| `king_axis_count` | `--sfnn-king-axis-count-confidence` | king-axis 用 |
+| `hand_axis_count` | `--sfnn-hand-axis-count-confidence` | hand-axis 用 |
+| `progress_axis_count` | `--sfnn-progress-axis-count-confidence` | progress-axis 用 |
+| `king_hand_pair_count` | `--sfnn-king-hand-pair-count-confidence` | king-hand pair 用 |
+| `king_progress_pair_count` | `--sfnn-king-progress-pair-count-confidence` | king-progress pair 用 |
+| `hand_progress_pair_count` | `--sfnn-hand-progress-pair-count-confidence` | hand-progress pair 用 |
 
-値が `0.0` なら、その count confidence は無効です。値を大きくすると、十分な出現回数がない成分をより強く抑えます。
+`0.0` なら、その confidence は無効です。大きい値にすると、十分な出現回数がある成分だけを強く信用します。
 
-通常の `bulletou.exe` には axis 系 / pair 系をまとめて指定する共通オプションもあります。ただし ES の `parameters` では、どの成分を動かしているのかを明確にするため、上の表にある個別項目だけを扱います。
+通常の `bulletou.exe` には axis 系や pair 系をまとめて指定する共通オプションもあります。ただし ES の `parameters` では、どの成分を動かしているのかを明確にするため、上の表にある個別項目だけを扱います。
 
-## `es.enabled=false` で current 値だけ使う
+## ES を回さず `current` の値だけ使う
 
-ES を回さず、`parameters.current` の値だけを使いたい場合は、`es.enabled` を `false` にします。
+ES で調整済みの `parameters.current` だけを使い、ES 自体は回したくない場合は、`es.enabled` を `false` にします。
 
 ```json
 "es": {
@@ -236,25 +252,25 @@ ES を回さず、`parameters.current` の値だけを使いたい場合は、`e
 }
 ```
 
-この状態で runner を起動すると、ES は行わず、次のような 1 回だけの `bulletou.exe` 実行になります。
+その状態で runner を 1 回起動します。
 
 ```powershell
 python .\es_local_runner.py --es-settings-file .\es-settings.json
 ```
 
-この方法では、`parameters.current` の13個の値を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み取り、`--sfnn-factorizer-alpha` と count confidence 系オプションに変換して `bulletou.exe` に渡します。
+この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このとき `bulletou-settings.json` には、通常学習に必要な `superbatches`、`max_epochs`、`save_rate`、`validation_rate` なども書いてください。
+このモードでは、`superbatches`、`max_epochs`、`save_rate`、`validation_rate` のような通常学習の項目は `bulletou-settings.json` に書きます。
 
 ## `bulletou.exe --settings-file`
 
-`bulletou.exe` 単体でも JSON 設定を読めます。
+`bulletou.exe` も settings JSON を直接読めます。
 
 ```powershell
 .\target\release\examples\bulletou.exe --settings-file .\bulletou-settings.json
 ```
 
-同じオプションを CLI にも書いた場合は、CLI に書いた値が優先されます。
+CLI で明示した値は settings JSON より優先されます。
 
 ```powershell
 .\target\release\examples\bulletou.exe `
@@ -262,27 +278,27 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
   --lr 0.000050
 ```
 
-## 出力フォルダ
+## 出力先
 
-ES runner の出力は `output_folder/es-<tag_prefix>` に作られます。
+runner root は `output_folder/es-<tag_prefix>` です。
 
-| path | 内容 |
+| path | 役割 |
 | --- | --- |
-| `current/` | 最新の採用 checkpoint。`--resume` はここから再開する |
-| `accepted-checkpoints/sbXXXXXXXX/` | `save_rate` 回採用ごとの公開 checkpoint |
+| `current/` | 最新の採用 checkpoint。`--resume` はここから続ける |
+| `accepted-checkpoints/sbXXXXXXXX/` | `save_rate` 回採用するごとに保存される公開 checkpoint |
 | `summary-learn.log` | すべての候補の結果 |
 | `accepted-summary-learn.log` | 採用された候補だけの結果 |
-| `parameters-history.jsonl` | 採用時のパラメーター履歴 |
-| `runner-state.json` | runner の再開情報 |
-| `logs/` | 候補ごとの stdout |
-| `temp/` | 候補の一時 checkpoint。`temp_folder` 指定時はそちらに作る |
+| `parameters-history.jsonl` | 採用されたパラメーターの履歴 |
+| `runner-state.json` | resume 用の状態 |
+| `logs/` | 候補ごとの stdout log |
+| `temp/` | `temp_folder` 未指定時の一時 checkpoint |
 
-ES runner が保存する `current/` と `accepted-checkpoints/sbXXXXXXXX/` には、その時点の `es-settings.json` と `bulletou-settings.json` がコピーされます。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
+runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `es-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 
-途中で止めたい場合は、標準出力に `[SAFE TO STOP]` が出た直後が安全です。`[BEAM END]` は候補の枝刈りが終わっただけで、公開 checkpoint の保存完了を意味しません。
+手動停止するなら、`[SAFE TO STOP]` が表示された直後が安全です。`[BEAM END]` は候補の絞り込みが終わったという意味で、公開 checkpoint の保存完了を意味しません。
 
 ES 実行中は、標準では `bulletou worker` を 1 回だけ起動し、その中で候補を試します。これにより、CUDA context、validation cache、qvalid cache、worker warmup を候補ごとに作り直す時間を避けられます。
 
-`use_worker` を `false` にした場合や、runner が worker では安全に扱えない beam 構成を検出した場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8sb stage、candidate 1」の意味です。
+`use_worker` を `false` にした場合や、runner が worker では安全に扱えない beam 構成を検出した場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8 sb stage、candidate 1」の意味です。
 
-`bulletou.exe --settings-file` で通常学習した checkpoint には、`bulletou-settings.json` がコピーされます。
+通常学習で `bulletou.exe --settings-file` を使った場合も、各 BulletOu checkpoint には `bulletou-settings.json` がコピーされます。

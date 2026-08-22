@@ -44,6 +44,15 @@ ES_SETTINGS_VERSION = 1
 STATE_VERSION = 1
 
 
+BORDA_COUNT_METRIC = "borda_count"
+BORDA_COMPONENTS: tuple[tuple[str, bool], ...] = (
+    ("quantized_value_loss", True),
+    ("quantized_value_accuracy", False),
+    ("test_value_loss", True),
+    ("test_value_accuracy", False),
+)
+
+
 ALPHA_PARAMETERS = {
     "shared": "shared",
     "king_axis": "king_axis",
@@ -178,6 +187,8 @@ class Metric:
             value = self.test_loss
         elif metric_name == "test_value_accuracy":
             value = self.test_acc
+        elif metric_name == BORDA_COUNT_METRIC:
+            raise ValueError("borda_count is computed across candidates, not from one metric value")
         else:
             raise ValueError(f"unsupported metric {metric_name!r}")
         if value is None:
@@ -382,9 +393,10 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         "quantized_value_accuracy",
         "test_value_loss",
         "test_value_accuracy",
+        BORDA_COUNT_METRIC,
     }:
         raise ValueError(f"{path}: unsupported es.metric {metric!r}")
-    lower_is_better = bool(es_obj.get("lower_is_better", "loss" in metric))
+    lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(es_obj.get("lower_is_better", "loss" in metric))
     seed = int(es_obj.get("seed", 1))
     save_rate = int(es_obj.get("save_rate", 1))
     candidate_validation_rate = int(es_obj.get("candidate_validation_rate", 1))
@@ -915,8 +927,8 @@ def train_candidate_stage(
     cmd = build_train_command(run, candidate.params, candidate.checkpoint, out_dir, delta, settings)
     if args.dry_run:
         print("  " + subprocess.list2cmdline(cmd), flush=True)
-        metric = Metric(qloss=math.inf, qacc=None, test_loss=None, test_acc=None)
-        score = metric.score(settings.metric)
+        metric = Metric(qloss=math.inf, qacc=-math.inf, test_loss=math.inf, test_acc=-math.inf)
+        score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
         checkpoint = candidate.checkpoint
         elapsed = 0.0
     else:
@@ -949,15 +961,16 @@ def train_candidate_stage(
             raise RuntimeError(f"candidate {candidate.index} failed at stage {stage.after_sbs}sb; see {log_path}")
         row = latest_summary_row(out_dir)
         metric = metric_from_summary_row(row)
-        score = metric.score(settings.metric)
+        score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
         checkpoint = latest_checkpoint_dir(out_dir)
 
+    score_text = "pending" if score is None else format_float(score)
     event(
         color,
         f"[CAND {candidate.index:03d} END]",
         (
             f"generation={generation} stage={stage.after_sbs}sb "
-            f"{settings.metric}={format_float(score)} qloss={format_float(metric.qloss)} "
+            f"{settings.metric}={score_text} qloss={format_float(metric.qloss)} "
             f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
             f"elapsed={elapsed:.1f}s"
         ),
@@ -1052,8 +1065,8 @@ def train_candidate_stage_worker(
     )
     if args.dry_run:
         print("  worker trial " + json.dumps({"args": trial_args, "keep": False, "cache_key": cache_key}, ensure_ascii=False), flush=True)
-        metric = Metric(qloss=math.inf, qacc=None, test_loss=None, test_acc=None)
-        score = metric.score(settings.metric)
+        metric = Metric(qloss=math.inf, qacc=-math.inf, test_loss=math.inf, test_acc=-math.inf)
+        score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
         elapsed = 0.0
     else:
         if worker is None:
@@ -1067,14 +1080,15 @@ def train_candidate_stage_worker(
         )
         elapsed = time.perf_counter() - started
         metric = metric_from_worker_payload(payload)
-        score = metric.score(settings.metric)
+        score = None if settings.metric == BORDA_COUNT_METRIC else metric.score(settings.metric)
 
+    score_text = "pending" if score is None else format_float(score)
     event(
         color,
         f"[CAND {candidate.index:03d} END]",
         (
             f"generation={generation} stage={stage.after_sbs}sb worker=on "
-            f"{settings.metric}={format_float(score)} qloss={format_float(metric.qloss)} "
+            f"{settings.metric}={score_text} qloss={format_float(metric.qloss)} "
             f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
             f"elapsed={elapsed:.1f}s"
         ),
@@ -1107,13 +1121,50 @@ def train_candidate_stage_worker(
     return candidate
 
 
-def rank_candidates(candidates: list[Candidate], lower_is_better: bool) -> list[Candidate]:
+def assign_borda_count_scores(candidates: list[Candidate]) -> None:
+    """Assign Borda rank-sum scores to candidates.
+
+    Lower is better.  Each component contributes rank 1 for the best candidate,
+    rank 2 for the next, and so on.  Ties receive the average rank for the tied
+    range so stable ordering does not accidentally decide an equal metric.
+    """
+    scores = {id(candidate): 0.0 for candidate in candidates}
+    for metric_name, lower_is_better in BORDA_COMPONENTS:
+        ranked_values: list[tuple[Candidate, float]] = []
+        for candidate in candidates:
+            if candidate.metric is None:
+                raise RuntimeError(f"candidate {candidate.index} has no metric")
+            ranked_values.append((candidate, candidate.metric.score(metric_name)))
+
+        ranked_values.sort(key=lambda item: item[1], reverse=not lower_is_better)
+        i = 0
+        while i < len(ranked_values):
+            j = i + 1
+            value = ranked_values[i][1]
+            while j < len(ranked_values) and ranked_values[j][1] == value:
+                j += 1
+            # Ranks are 1-based.  For a tied block [i, j), average the ranks
+            # (i + 1) through j.
+            average_rank = (i + 1 + j) / 2.0
+            for candidate, _ in ranked_values[i:j]:
+                scores[id(candidate)] += average_rank
+            i = j
+
+    for candidate in candidates:
+        candidate.score = scores[id(candidate)]
+
+
+def rank_candidates(candidates: list[Candidate], settings: EsSettings) -> list[Candidate]:
+    if settings.metric == BORDA_COUNT_METRIC:
+        assign_borda_count_scores(candidates)
+        return sorted(candidates, key=lambda candidate: candidate.score if candidate.score is not None else math.inf)
+
     def key(candidate: Candidate) -> float:
         if candidate.score is None:
             raise RuntimeError(f"candidate {candidate.index} has no score")
         return candidate.score
 
-    return sorted(candidates, key=key, reverse=not lower_is_better)
+    return sorted(candidates, key=key, reverse=not settings.lower_is_better)
 
 
 def log_stage_rows(
@@ -1170,6 +1221,8 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def metric_direction_text(settings: EsSettings) -> str:
+    if settings.metric == BORDA_COUNT_METRIC:
+        return "lower rank sum is better"
     return "lower is better" if settings.lower_is_better else "higher is better"
 
 
@@ -1390,6 +1443,7 @@ def main() -> int:
                         trained.append(trained_candidate)
                         if (
                             not args.dry_run
+                            and settings.metric != BORDA_COUNT_METRIC
                             and stage.keep == 1
                             and trained_candidate.cache_key is not None
                             and trained_candidate.score is not None
@@ -1427,7 +1481,7 @@ def main() -> int:
                                 color=color,
                             )
                         )
-                ranked = rank_candidates(trained, settings.lower_is_better)
+                ranked = rank_candidates(trained, settings)
                 log_stage_rows(summary_path, generation, stage, ranked, stage.keep)
                 kept = ranked[: stage.keep]
                 pruned = ranked[stage.keep :]
@@ -1444,6 +1498,15 @@ def main() -> int:
                     ),
                     "yellow",
                 )
+                if worker_enabled and not args.dry_run and settings.metric == BORDA_COUNT_METRIC:
+                    cache_keys_to_drop = [candidate.cache_key for candidate in pruned if candidate.cache_key is not None]
+                    if cache_keys_to_drop:
+                        assert worker is not None
+                        worker.request(
+                            "drop-cached-trials",
+                            {"cache_keys": cache_keys_to_drop},
+                            prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
+                        )
                 if worker_enabled and not args.dry_run:
                     if best.cache_key is None:
                         raise RuntimeError("worker survivor has no cache key")

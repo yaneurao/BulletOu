@@ -4,7 +4,7 @@
 
 This page explains how to tune SFNN factorizer alpha values and count-confidence values with `es_local_runner.py`.
 
-Here, ES means evolution strategy. The runner creates several candidates with slightly different hyperparameters, trains them for short runs, and keeps the candidates with better validation loss. It does not estimate a gradient and then apply a separate small update. The final survivor's NN weights and hyperparameter values directly become the next generation's starting point.
+Here, ES means evolution strategy. The runner creates several candidates with slightly different hyperparameters, trains them for short runs, and keeps the candidates that rank best by the configured metric. It does not estimate a gradient and then apply a separate small update. The final survivor's NN weights and hyperparameter values directly become the next generation's starting point.
 
 ## JSON files
 
@@ -124,7 +124,7 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `population` | Number of candidates at the start of each generation |
 | `beam` | When to prune candidates and how many to keep |
 | `metric` | Metric used to rank candidates |
-| `lower_is_better` | `true` if smaller metric values are better |
+| `lower_is_better` | `true` if smaller metric values are better. Ignored for `borda_count` because lower rank sum is always better |
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
@@ -152,8 +152,18 @@ Supported metrics:
 | `quantized_value_accuracy` | Validation accuracy after quantization | `false` |
 | `test_value_loss` | Validation loss with f32 weights | `true` |
 | `test_value_accuracy` | Validation accuracy with f32 weights | `false` |
+| `borda_count` | Rank candidates by all four metrics, then choose the smallest rank sum | `true` |
 
 For engine-strength-oriented tuning, `quantized_value_loss` is usually the first metric to try.
+If qloss and qacc disagree too often, `borda_count` is a safer compromise:
+
+1. rank candidates by lower `quantized_value_loss`;
+2. rank candidates by higher `quantized_value_accuracy`;
+3. rank candidates by lower `test_value_loss`;
+4. rank candidates by higher `test_value_accuracy`;
+5. add the four ranks and keep the candidate with the smallest sum.
+
+Tied values receive the average rank of the tied range. For example, if two candidates tie for 2nd and 3rd place, both receive rank 2.5 for that metric.
 
 ## `run` fields
 
