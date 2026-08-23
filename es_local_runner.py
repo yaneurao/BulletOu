@@ -1316,29 +1316,39 @@ def public_checkpoint_name(accepted_sbs: int) -> str:
 def run_once_from_settings(
     args: argparse.Namespace,
     run: RunSettings,
+    settings: EsSettings,
     specs: dict[str, ParameterSpec],
     color: bool,
 ) -> int:
     """Run one ordinary bulletou.exe training command using current parameter values."""
     cmd = [str(run.exe), "--settings-file", str(run.bulletou_settings_file)]
+    cmd.extend(["--superbatches", str(settings.beam[-1].after_sbs)])
+    cmd.extend(["--max-epochs", str(settings.generations)])
     cmd.extend(parameter_args(current_values(specs)))
     if args.resume:
         cmd.append("--resume")
     event(
         color,
         "[RUN]",
-        "es.enabled=false; launching one bulletou.exe run with current parameter values",
+        (
+            "es.enabled=false; launching one bulletou.exe run with current parameter values "
+            f"(superbatches={settings.beam[-1].after_sbs}, max_epochs={settings.generations})"
+        ),
         "cyan",
     )
     event(color, "[SETTINGS]", f"bulletou={run.bulletou_settings_file}", "cyan")
     if args.dry_run:
         print("  " + subprocess.list2cmdline(cmd), flush=True)
         return 0
-    code, elapsed = run_command(cmd, Path("bulletou-settings-run.stdout.log"), stream=not args.no_stream_child_output)
+    if run.output_folder and run.tag_prefix:
+        log_path = run.output_folder / f"es-{run.tag_prefix}" / "logs" / "bulletou-settings-run.stdout.log"
+    else:
+        log_path = run.bulletou_settings_file.parent / "bulletou-settings-run.stdout.log"
+    code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
     if code == 0:
         event(color, "[DONE]", f"elapsed={elapsed:.1f}s", "green")
     else:
-        event(color, "[ERROR]", f"bulletou.exe exited with code {code}; see bulletou-settings-run.stdout.log", "red")
+        event(color, "[ERROR]", f"bulletou.exe exited with code {code}; see {log_path}", "red")
     return code
 
 
@@ -1350,7 +1360,7 @@ def main() -> int:
     root, specs, settings, run = load_parameters(args.es_settings_file)
 
     if not settings.enabled:
-        return run_once_from_settings(args, run, specs, color)
+        return run_once_from_settings(args, run, settings, specs, color)
 
     assert run.output_folder is not None
     assert run.tag_prefix is not None

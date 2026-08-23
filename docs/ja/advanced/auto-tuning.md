@@ -266,7 +266,9 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches`、`max_epochs`、`save_rate`、`validation_rate` のような通常学習の項目は `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`save_rate`、`validation_rate`、`lr` などの通常学習項目は `bulletou-settings.json` に書きます。
+
+`enabled: false` では ES の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 
 ## `bulletou.exe --settings-file`
 

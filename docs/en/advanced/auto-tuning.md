@@ -260,7 +260,9 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, put normal training fields such as `superbatches`, `max_epochs`, `save_rate`, and `validation_rate` in `bulletou-settings.json`.
+In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. Put ordinary training fields such as `save_rate`, `validation_rate`, and `lr` in `bulletou-settings.json`.
+
+With `enabled: false`, the runner does not create ES candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 
 ## `bulletou.exe --settings-file`
 
