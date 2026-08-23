@@ -158,7 +158,7 @@ python .\es_local_runner.py `
 
 In this mode, the runner launches `bulletou.exe` once. It does not create candidates, worker caches, or snapshots. It only converts `parameters.current` into `--sfnn-factorizer-alpha` and count-confidence options, so memory overhead is roughly the same as running `bulletou.exe` directly.
 
-The runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. Put ordinary training settings such as `lr`, `save_rate`, and `validation_rate` in `bulletou-settings.json`.
+The runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. Put ordinary training settings such as `lr` and `save_rate` in `bulletou-settings.json`.
 
 For full ES settings and parameter meanings, see [Advanced: Automatic ES tuning](../advanced/auto-tuning.md).
 

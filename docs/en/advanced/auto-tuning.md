@@ -47,8 +47,8 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "use_worker": true,
     "seed": 1,
     "save_rate": 1,
-    "candidate_validation_rate": 1,
-    "candidate_quantized_validation_rate": 1
+    "validation_rate": 1,
+    "quantized_validation_rate": 1
   },
   "run": {
     "exe": "C:/shogi/YaneuraOuWorks/BulletOu/target/release/examples/bulletou.exe",
@@ -128,8 +128,8 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
-| `candidate_validation_rate` | f32 validation cadence inside each candidate run. `0` measures only at the end of each stage. `-1` disables it |
-| `candidate_quantized_validation_rate` | Quantized validation cadence inside each candidate run. `0` measures only at the end of each stage. `-1` disables it |
+| `validation_rate` | f32 validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
+| `quantized_validation_rate` | Quantized validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
 
 You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want stage-end-only validation.
 
@@ -260,7 +260,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. Put ordinary training fields such as `save_rate`, `validation_rate`, and `lr` in `bulletou-settings.json`.
+In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. Put ordinary training fields such as `lr` and `save_rate` in `bulletou-settings.json`.
 
 With `enabled: false`, the runner does not create ES candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 

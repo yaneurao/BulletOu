@@ -227,8 +227,8 @@ class EsSettings:
     lower_is_better: bool
     seed: int
     save_rate: int
-    candidate_validation_rate: int
-    candidate_quantized_validation_rate: int
+    validation_rate: int
+    quantized_validation_rate: int
 
 
 @dataclass
@@ -399,8 +399,13 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(es_obj.get("lower_is_better", "loss" in metric))
     seed = int(es_obj.get("seed", 1))
     save_rate = int(es_obj.get("save_rate", 1))
-    candidate_validation_rate = int(es_obj.get("candidate_validation_rate", 1))
-    candidate_quantized_validation_rate = int(es_obj.get("candidate_quantized_validation_rate", 1))
+    if "candidate_validation_rate" in es_obj or "candidate_quantized_validation_rate" in es_obj:
+        raise ValueError(
+            f"{path}: es.candidate_validation_rate / es.candidate_quantized_validation_rate were renamed to "
+            "es.validation_rate / es.quantized_validation_rate"
+        )
+    validation_rate = int(es_obj.get("validation_rate", 1))
+    quantized_validation_rate = int(es_obj.get("quantized_validation_rate", 1))
 
     if generations <= 0:
         raise ValueError("es.generations must be > 0")
@@ -408,11 +413,11 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError("es.population must be > 0")
     if save_rate < 0:
         raise ValueError("es.save_rate must be >= 0")
-    if candidate_validation_rate < -1:
-        raise ValueError("es.candidate_validation_rate must be >= -1; -1 disables f32 candidate validation")
-    if candidate_quantized_validation_rate < -1:
+    if validation_rate < -1:
+        raise ValueError("es.validation_rate must be >= -1; -1 disables f32 validation")
+    if quantized_validation_rate < -1:
         raise ValueError(
-            "es.candidate_quantized_validation_rate must be >= -1; -1 disables quantized candidate validation"
+            "es.quantized_validation_rate must be >= -1; -1 disables quantized validation"
         )
     metric_needs_validation = metric in {"test_value_loss", "test_value_accuracy", BORDA_COUNT_METRIC}
     metric_needs_quantized_validation = metric in {
@@ -420,14 +425,14 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         "quantized_value_accuracy",
         BORDA_COUNT_METRIC,
     }
-    if metric_needs_validation and candidate_validation_rate < 0:
+    if metric_needs_validation and validation_rate < 0:
         raise ValueError(
-            f"es.metric {metric!r} requires f32 candidate validation; "
+            f"es.metric {metric!r} requires f32 validation; "
             "use 0 for final-stage-only validation"
         )
-    if metric_needs_quantized_validation and candidate_quantized_validation_rate < 0:
+    if metric_needs_quantized_validation and quantized_validation_rate < 0:
         raise ValueError(
-            f"es.metric {metric!r} requires quantized candidate validation; "
+            f"es.metric {metric!r} requires quantized validation; "
             "use 0 for final-stage-only quantized validation"
         )
 
@@ -468,8 +473,8 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         lower_is_better=lower_is_better,
         seed=seed,
         save_rate=save_rate,
-        candidate_validation_rate=candidate_validation_rate,
-        candidate_quantized_validation_rate=candidate_quantized_validation_rate,
+        validation_rate=validation_rate,
+        quantized_validation_rate=quantized_validation_rate,
     )
     run_obj = root.get("run")
     if not isinstance(run_obj, dict):
@@ -869,17 +874,17 @@ def build_train_args(
 ) -> list[str]:
     validation_rate = (
         0
-        if settings.candidate_validation_rate < 0
+        if settings.validation_rate < 0
         else stage_delta_sbs
-        if settings.candidate_validation_rate == 0
-        else max(1, min(settings.candidate_validation_rate, stage_delta_sbs))
+        if settings.validation_rate == 0
+        else max(1, min(settings.validation_rate, stage_delta_sbs))
     )
     quantized_validation_rate = (
         0
-        if settings.candidate_quantized_validation_rate < 0
+        if settings.quantized_validation_rate < 0
         else stage_delta_sbs
-        if settings.candidate_quantized_validation_rate == 0
-        else max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))
+        if settings.quantized_validation_rate == 0
+        else max(1, min(settings.quantized_validation_rate, stage_delta_sbs))
     )
     cmd = [
         "--settings-file",
@@ -1324,6 +1329,8 @@ def run_once_from_settings(
     cmd = [str(run.exe), "--settings-file", str(run.bulletou_settings_file)]
     cmd.extend(["--superbatches", str(settings.beam[-1].after_sbs)])
     cmd.extend(["--max-epochs", str(settings.generations)])
+    cmd.extend(["--validation-rate", str(settings.validation_rate)])
+    cmd.extend(["--quantized-validation-rate", str(settings.quantized_validation_rate)])
     cmd.extend(parameter_args(current_values(specs)))
     if args.resume:
         cmd.append("--resume")

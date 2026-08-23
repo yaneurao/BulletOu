@@ -152,7 +152,7 @@ python .\es_local_runner.py `
   --resume
 ```
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`lr`、`save_rate`、`validation_rate` などは `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
 
 詳しい ES 設定や `parameters` の意味は [応用編: ES による自動調整](../advanced/auto-tuning.md) を参照してください。
 

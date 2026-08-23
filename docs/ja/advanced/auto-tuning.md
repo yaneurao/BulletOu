@@ -47,8 +47,8 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "use_worker": true,
     "seed": 1,
     "save_rate": 1,
-    "candidate_validation_rate": 1,
-    "candidate_quantized_validation_rate": 1
+    "validation_rate": 1,
+    "quantized_validation_rate": 1
   },
   "run": {
     "exe": "C:/shogi/YaneuraOuWorks/BulletOu/target/release/examples/bulletou.exe",
@@ -131,8 +131,8 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
-| `candidate_validation_rate` | 候補学習中の f32 validation 間隔。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
-| `candidate_quantized_validation_rate` | 候補学習中の量子化 validation 間隔。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
+| `validation_rate` | f32 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
+| `quantized_validation_rate` | 量子化 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
 
 `metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。stage 末尾だけでよい場合は `0` を指定します。
 
@@ -266,7 +266,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`save_rate`、`validation_rate`、`lr` などの通常学習項目は `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` や `save_rate` などの通常学習項目は `bulletou-settings.json` に書きます。
 
 `enabled: false` では ES の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 
