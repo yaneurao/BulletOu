@@ -112,7 +112,7 @@ Fuller option table:
 lr = lr * gamma
 ```
 
-If `--lr-step-positions` is omitted, the interval is one sb. At the next epoch, LR returns to `--lr`.
+If `--lr-step-positions` is omitted, the interval is one sb. If `--lr-step-gamma` is omitted and `--superbatches` is set, BulletOu computes gamma so the last sb in the epoch starts at `--lr-min`. At the next epoch, LR returns to `--lr`.
 
 Example with `gamma=0.992` in `bulletou-settings.json`:
 

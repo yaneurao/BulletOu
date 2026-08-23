@@ -4156,14 +4156,11 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
     let total_positions = (superbatches as u128)
         .saturating_mul(batches_per_superbatch as u128)
         .saturating_mul(effective_batch_size(args) as u128);
-    let steps = total_positions / (step_positions as u128);
-    if steps == 0 {
-        return Err(
-            "automatic --lr-step-gamma needs at least one LR step; reduce --lr-step-positions or increase --superbatches."
-                .to_string(),
-        );
+    let reachable_steps = total_positions.saturating_sub(1) / (step_positions as u128);
+    if reachable_steps == 0 {
+        return Ok((1.0, true));
     }
-    let gamma = ((args.lr_min as f64) / (args.lr as f64)).powf(1.0 / steps as f64) as f32;
+    let gamma = ((args.lr_min as f64) / (args.lr as f64)).powf(1.0 / reachable_steps as f64) as f32;
     Ok((gamma, true))
 }
 
@@ -31368,9 +31365,21 @@ mod tests {
 
         let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap();
         let (gamma, auto) = effective_lr_step_gamma(&args, batches_per_superbatch).unwrap();
-        let expected = (0.00001_f64 / 0.000875_f64).powf(1.0 / 15.0) as f32;
+        let expected = (0.00001_f64 / 0.000875_f64).powf(1.0 / 14.0) as f32;
         assert!(auto);
         assert!((gamma - expected).abs() < 1e-9, "expected {expected}, got {gamma}");
+
+        let step_positions = effective_lr_step_positions(&args, batches_per_superbatch);
+        let period_positions = (15u64)
+            .saturating_mul(batches_per_superbatch as u64)
+            .saturating_mul(effective_batch_size(&args) as u64);
+        let last_superbatch_start = period_positions - step_positions;
+        let last_lr =
+            StepLR::lr_at_positions(args.lr, args.lr_min, gamma, step_positions, period_positions, last_superbatch_start);
+        assert!(
+            (last_lr - args.lr_min).abs() < 1e-9,
+            "last superbatch should start at lr_min; got {last_lr}"
+        );
     }
 
     #[test]

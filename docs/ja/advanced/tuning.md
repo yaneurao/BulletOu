@@ -112,7 +112,7 @@
 lr = lr * gamma
 ```
 
-`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch 内で `--lr` から `--lr-min` へ近づくように gamma を計算します。
+`--lr-step-positions` を省略すると、1 sbごとに学習率が下がります。`--lr-step-gamma` を省略して `--superbatches` を指定すると、BulletOu は epoch の最後の sb 開始時に `--lr-min` へ到達するように gamma を計算します。次の epoch では `--lr` に戻ります。
 
 `bulletou-settings.json` で明示的に `gamma=0.992` を指定する例:
 
