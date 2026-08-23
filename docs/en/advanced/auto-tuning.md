@@ -266,6 +266,8 @@ With `enabled: false`, the runner does not create ES candidates, worker caches, 
 
 The ordinary training output is written under `output_folder/es-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.log` into `output_folder/es-<tag_prefix>/summary-learn.log` and `accepted-summary-learn.log`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
 
+After that, you can set `enabled` back to `true` and run with `--resume`. ES resumes from the updated `current/`. The runner also writes the ordinary-training progress into `runner-state.json`, so `accepted_sbs`, `generation`, and public checkpoint numbering do not roll back.
+
 ## `bulletou.exe --settings-file`
 
 `bulletou.exe` can also read a settings JSON directly.

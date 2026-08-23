@@ -272,6 +272,8 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 普通学習の出力本体は `output_folder/es-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.log` を読み、`output_folder/es-<tag_prefix>/summary-learn.log` と `accepted-summary-learn.log` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
 
+そのあと `enabled` を `true` に戻して `--resume` すると、ES は更新済みの `current/` から続行します。`enabled=false` で進めたぶんの `accepted_sbs` と `generation` も `runner-state.json` に保存されるので、公開 checkpoint の番号も巻き戻りません。
+
 ## `bulletou.exe --settings-file`
 
 `bulletou.exe` も settings JSON を直接読めます。

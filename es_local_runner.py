@@ -690,6 +690,12 @@ def parse_int_cell(value: str | None, default: int = 0) -> int:
         return default
 
 
+def ordinary_source_progress_sbs(row: dict[str, str], epoch_sbs: int) -> int:
+    epoch = parse_int_cell(row.get("epoch"), default=1)
+    sb = parse_int_cell(row.get("superbatch"), default=0)
+    return (max(1, epoch) - 1) * epoch_sbs + sb
+
+
 def import_ordinary_run_summaries(
     *,
     summary_path: Path,
@@ -697,28 +703,40 @@ def import_ordinary_run_summaries(
     ordinary_output: Path,
     settings: EsSettings,
     params: dict[str, float],
+    base_accepted_sbs: int,
     color: bool,
-) -> int:
+) -> tuple[int, int, int]:
     source_summary = ordinary_output / "summary-learn.log"
     rows = read_csv_rows(source_summary)
     if not rows:
         event(color, "[LOG IMPORT]", f"no summary rows found: {source_summary}", "yellow")
-        return 0
+        return 0, base_accepted_sbs, base_accepted_sbs
 
     ensure_csv(summary_path, SUMMARY_FIELDS)
     ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
     imported_rows = count_summary_rows_with_status(summary_path, "ordinary")
     if imported_rows >= len(rows):
         event(color, "[LOG IMPORT]", f"already up to date: imported_rows={imported_rows}", "yellow")
-        return 0
+        epoch_sbs = max(1, settings.beam[-1].after_sbs)
+        imported_progress = max((ordinary_source_progress_sbs(row, epoch_sbs) for row in rows), default=0)
+        accepted_offset = base_accepted_sbs - imported_progress
+        return 0, max(base_accepted_sbs, imported_progress), accepted_offset
 
     params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
     added = 0
     epoch_sbs = max(1, settings.beam[-1].after_sbs)
+    imported_source_progress = max(
+        (ordinary_source_progress_sbs(row, epoch_sbs) for row in rows[:imported_rows]),
+        default=0,
+    )
+    accepted_offset = base_accepted_sbs - imported_source_progress
+    latest_accepted_sbs = base_accepted_sbs
     for row in rows[imported_rows:]:
         epoch = parse_int_cell(row.get("epoch"), default=1)
         sb = parse_int_cell(row.get("superbatch"), default=0)
-        accepted_sbs = (max(1, epoch) - 1) * epoch_sbs + sb
+        source_progress = ordinary_source_progress_sbs(row, epoch_sbs)
+        accepted_sbs = accepted_offset + source_progress
+        latest_accepted_sbs = max(latest_accepted_sbs, accepted_sbs)
         metric = metric_from_summary_row(row)
         checkpoint_path = normal_summary_checkpoint_path(ordinary_output, row.get("checkpoint"))
         saved_checkpoint = (
@@ -763,7 +781,7 @@ def import_ordinary_run_summaries(
         added += 1
 
     event(color, "[LOG IMPORT]", f"imported_rows={added} source={source_summary}", "green")
-    return added
+    return added, latest_accepted_sbs, accepted_offset
 
 
 def sync_ordinary_accepted_checkpoints(
@@ -772,6 +790,7 @@ def sync_ordinary_accepted_checkpoints(
     current_dir: Path,
     ordinary_output: Path,
     settings: EsSettings,
+    accepted_offset: int,
     es_settings_file: Path,
     bulletou_settings_file: Path,
     color: bool,
@@ -793,8 +812,7 @@ def sync_ordinary_accepted_checkpoints(
             continue
         latest_checkpoint = checkpoint
         epoch = parse_int_cell(row.get("epoch"), default=1)
-        sb = parse_int_cell(row.get("superbatch"), default=0)
-        accepted_sbs = (max(1, epoch) - 1) * epoch_sbs + sb
+        accepted_sbs = accepted_offset + ordinary_source_progress_sbs(row, epoch_sbs)
         if settings.save_rate <= 0 or max(1, epoch) % settings.save_rate != 0:
             continue
         public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
@@ -1526,6 +1544,10 @@ def run_once_from_settings(
     accepted_summary_path: Path | None = None
     accepted_root: Path | None = None
     current_dir: Path | None = None
+    state_path: Path | None = None
+    base_generation = 0
+    base_accepted_sbs = 0
+    state_current_checkpoint: Path | None = None
 
     if managed:
         assert run.output_folder is not None
@@ -1535,6 +1557,7 @@ def run_once_from_settings(
         log_dir = runner_root / "logs"
         accepted_root = runner_root / "accepted-checkpoints"
         current_dir = runner_root / "current"
+        state_path = runner_root / "runner-state.json"
         summary_path = runner_root / "summary-learn.log"
         accepted_summary_path = runner_root / "accepted-summary-learn.log"
         if not args.dry_run:
@@ -1545,6 +1568,17 @@ def run_once_from_settings(
             ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
             copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
         log_path = log_dir / "bulletou-settings-run.stdout.log"
+        if state_path.exists():
+            state = load_state(state_path)
+            base_generation = int(state.get("generation", 0))
+            base_accepted_sbs = int(state.get("accepted_sbs", 0))
+            state_current_checkpoint = Path(str(state.get("current_checkpoint", current_dir)))
+            if not args.resume:
+                raise RuntimeError(f"{state_path} already exists; use --resume or choose a new run.tag_prefix")
+        elif args.resume and (current_dir / "state.bin").exists():
+            state_current_checkpoint = current_dir
+        elif args.resume:
+            raise RuntimeError(f"--resume was specified but {state_path} does not exist")
     else:
         log_path = run.bulletou_settings_file.parent / "bulletou-settings-run.stdout.log"
 
@@ -1566,8 +1600,8 @@ def run_once_from_settings(
         assert current_dir is not None
         if args.resume and maybe_latest_checkpoint_dir(ordinary_output) is not None:
             use_bulletou_resume = True
-        elif args.resume and (current_dir / "state.bin").exists():
-            initial_checkpoint = current_dir
+        elif args.resume and state_current_checkpoint is not None:
+            initial_checkpoint = state_current_checkpoint
         elif run.base_checkpoint is not None:
             initial_checkpoint = run.base_checkpoint
     elif args.resume:
@@ -1615,12 +1649,14 @@ def run_once_from_settings(
         assert accepted_summary_path is not None
         assert accepted_root is not None
         assert current_dir is not None
-        import_ordinary_run_summaries(
+        assert state_path is not None
+        _, latest_accepted_sbs, accepted_offset = import_ordinary_run_summaries(
             summary_path=summary_path,
             accepted_summary_path=accepted_summary_path,
             ordinary_output=ordinary_output,
             settings=settings,
             params=params,
+            base_accepted_sbs=base_accepted_sbs,
             color=color,
         )
         sync_ordinary_accepted_checkpoints(
@@ -1628,10 +1664,38 @@ def run_once_from_settings(
             current_dir=current_dir,
             ordinary_output=ordinary_output,
             settings=settings,
+            accepted_offset=accepted_offset,
             es_settings_file=args.es_settings_file,
             bulletou_settings_file=run.bulletou_settings_file,
             color=color,
         )
+        if (current_dir / "state.bin").exists():
+            completed_generations = max(0, (latest_accepted_sbs - base_accepted_sbs) // max(1, epoch_sbs))
+            latest_metric = latest_learn_log_metric(current_dir)
+            state = {
+                "generation": base_generation + completed_generations,
+                "accepted_sbs": latest_accepted_sbs,
+                "current_checkpoint": str(current_dir),
+                "last_metric_name": settings.metric,
+                "last_metric": {
+                    "quantized_value_loss": latest_metric.qloss,
+                    "quantized_value_accuracy": latest_metric.qacc,
+                    "test_value_loss": latest_metric.test_loss,
+                    "test_value_accuracy": latest_metric.test_acc,
+                },
+                "es_settings_file": str(args.es_settings_file.resolve()),
+                "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
+            }
+            save_state(state_path, state)
+            event(
+                color,
+                "[STATE]",
+                (
+                    f"generation={state['generation']} accepted_sbs={latest_accepted_sbs} "
+                    f"current_checkpoint={current_dir}"
+                ),
+                "green",
+            )
 
     if code == 0:
         event(color, "[DONE]", f"elapsed={elapsed:.1f}s", "green")
