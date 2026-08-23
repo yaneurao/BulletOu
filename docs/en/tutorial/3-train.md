@@ -138,6 +138,30 @@ This freezes the progress parameters and trains with the same hard bucket assign
 
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
 
+## 3.7 Use ES-tuned values for normal training
+
+Sometimes you want to keep using the `parameters.current` values from `es-settings.json`, but stop running ES candidate search. Set `es.enabled` to `false`:
+
+```json
+"es": {
+  "enabled": false
+}
+```
+
+Then launch the runner:
+
+```powershell
+python .\es_local_runner.py `
+  --es-settings-file D:\BulletOu-snapshots\settings\es-settings-20260821.json `
+  --resume
+```
+
+In this mode, the runner launches `bulletou.exe` once. It does not create candidates, worker caches, or snapshots. It only converts `parameters.current` into `--sfnn-factorizer-alpha` and count-confidence options, so memory overhead is roughly the same as running `bulletou.exe` directly.
+
+The runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. Put ordinary training settings such as `lr`, `save_rate`, and `validation_rate` in `bulletou-settings.json`.
+
+For full ES settings and parameter meanings, see [Advanced: Automatic ES tuning](../advanced/auto-tuning.md).
+
 ---
 
 Next: [4. Enable validation](4-validation.md)
