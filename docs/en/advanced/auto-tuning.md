@@ -159,10 +159,10 @@ Supported metrics:
 For engine-strength-oriented tuning, `quantized_value_loss` is usually the first metric to try.
 If qloss and qacc disagree too often, `borda_count` is a safer compromise:
 
-1. rank candidates by lower `quantized_value_loss`;
-2. rank candidates by higher `quantized_value_accuracy`;
-3. rank candidates by lower `test_value_loss`;
-4. rank candidates by higher `test_value_accuracy`;
+1. rank candidates by higher `test_value_accuracy`;
+2. rank candidates by lower `test_value_loss`;
+3. rank candidates by higher `quantized_value_accuracy`;
+4. rank candidates by lower `quantized_value_loss`;
 5. add the four ranks and keep the candidate with the smallest sum.
 
 Tied values receive the average rank of the tied range. For example, if two candidates tie for 2nd and 3rd place, both receive rank 2.5 for that metric.
@@ -294,6 +294,8 @@ The runner root is `output_folder/es-<tag_prefix>`.
 | `runner-state.json` | Resume state |
 | `logs/` | Per-candidate stdout logs |
 | `temp/` | Temporary candidate checkpoints, unless `temp_folder` is set |
+
+ES writes metric columns in `summary-learn.log` and `accepted-summary-learn.log` in the same order as normal BulletOu summaries: `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss`.
 
 The runner copies the current `es-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
 

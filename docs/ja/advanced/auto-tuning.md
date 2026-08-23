@@ -165,10 +165,10 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 
 `borda_count` は次の手順で候補を比較します。
 
-1. `quantized_value_loss` が小さい順に順位を付ける。
-2. `quantized_value_accuracy` が大きい順に順位を付ける。
-3. `test_value_loss` が小さい順に順位を付ける。
-4. `test_value_accuracy` が大きい順に順位を付ける。
+1. `test_value_accuracy` が大きい順に順位を付ける。
+2. `test_value_loss` が小さい順に順位を付ける。
+3. `quantized_value_accuracy` が大きい順に順位を付ける。
+4. `quantized_value_loss` が小さい順に順位を付ける。
 5. 4 つの順位を合計し、合計がもっとも小さい候補を残す。
 
 同点の場合は、その順位範囲の平均順位を使います。たとえば 2 位と 3 位が同点なら、どちらも 2.5 位として計算します。
@@ -300,6 +300,8 @@ runner root は `output_folder/es-<tag_prefix>` です。
 | `runner-state.json` | resume 用の状態 |
 | `logs/` | 候補ごとの stdout log |
 | `temp/` | `temp_folder` 未指定時の一時 checkpoint |
+
+ES の `summary-learn.log` と `accepted-summary-learn.log` は、通常の BulletOu の `summary-learn.log` と同じく `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` の順で指標を書きます。
 
 runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `es-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 

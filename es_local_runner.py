@@ -46,10 +46,10 @@ STATE_VERSION = 1
 
 BORDA_COUNT_METRIC = "borda_count"
 BORDA_COMPONENTS: tuple[tuple[str, bool], ...] = (
-    ("quantized_value_loss", True),
-    ("quantized_value_accuracy", False),
-    ("test_value_loss", True),
     ("test_value_accuracy", False),
+    ("test_value_loss", True),
+    ("quantized_value_accuracy", False),
+    ("quantized_value_loss", True),
 )
 
 
@@ -132,10 +132,10 @@ SUMMARY_FIELDS = [
     "candidate",
     "status",
     "rank",
-    "quantized_value_loss",
-    "quantized_value_accuracy",
-    "test_value_loss",
     "test_value_accuracy",
+    "test_value_loss",
+    "quantized_value_accuracy",
+    "quantized_value_loss",
     "checkpoint",
     "output_dir",
     "parameters",
@@ -145,10 +145,10 @@ SUMMARY_FIELDS = [
 ACCEPTED_FIELDS = [
     "generation",
     "accepted_sbs",
-    "quantized_value_loss",
-    "quantized_value_accuracy",
-    "test_value_loss",
     "test_value_accuracy",
+    "test_value_loss",
+    "quantized_value_accuracy",
+    "quantized_value_loss",
     "stage_sbs",
     "saved_checkpoint",
     "current_checkpoint",
@@ -602,6 +602,15 @@ def metric_from_summary_row(row: dict[str, str]) -> Metric:
     )
 
 
+def metric_status_text(metric: Metric, *, prefix: str = "") -> str:
+    return (
+        f"{prefix}acc={format_float(metric.test_acc)} "
+        f"{prefix}loss={format_float(metric.test_loss)} "
+        f"{prefix}qacc={format_float(metric.qacc)} "
+        f"{prefix}qloss={format_float(metric.qloss)}"
+    )
+
+
 def latest_summary_row(output_dir: Path) -> dict[str, str]:
     path = output_dir / "summary-learn.log"
     if not path.exists():
@@ -645,10 +654,25 @@ def ensure_csv(path: Path, fields: list[str]) -> None:
             header = f.readline().strip()
         expected = ",".join(fields)
         if header != expected:
-            raise RuntimeError(f"{path} has incompatible header\n  existing: {header}\n  expected: {expected}")
+            existing_fields = next(csv.reader([header]))
+            if set(existing_fields) != set(fields):
+                raise RuntimeError(f"{path} has incompatible header\n  existing: {header}\n  expected: {expected}")
+            rewrite_csv_with_fields(path, fields)
         return
     with path.open("w", encoding="utf-8", newline="") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
+
+
+def rewrite_csv_with_fields(path: Path, fields: list[str]) -> None:
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    os.replace(tmp, path)
 
 
 def append_csv(path: Path, fields: list[str], row: dict[str, Any]) -> None:
@@ -837,10 +861,10 @@ def metric_from_worker_payload(payload: dict[str, Any]) -> Metric:
 
 def metric_to_borda_json(metric: Metric) -> dict[str, float]:
     return {
-        "quantized_value_loss": metric.score("quantized_value_loss"),
-        "quantized_value_accuracy": metric.score("quantized_value_accuracy"),
-        "test_value_loss": metric.score("test_value_loss"),
         "test_value_accuracy": metric.score("test_value_accuracy"),
+        "test_value_loss": metric.score("test_value_loss"),
+        "quantized_value_accuracy": metric.score("quantized_value_accuracy"),
+        "quantized_value_loss": metric.score("quantized_value_loss"),
     }
 
 
@@ -963,10 +987,7 @@ def train_candidate_stage(
         f"[CAND {candidate.index:03d} START]",
         (
             f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb "
-            f"base_qloss={format_float(base_metric.qloss)} "
-            f"base_qacc={format_float(base_metric.qacc)} "
-            f"base_test_loss={format_float(base_metric.test_loss)} "
-            f"base_test_acc={format_float(base_metric.test_acc)}"
+            f"{metric_status_text(base_metric, prefix='base_')}"
         ),
         "cyan",
     )
@@ -1034,8 +1055,7 @@ def train_candidate_stage(
         f"[CAND {candidate.index:03d} END]",
         (
             f"generation={generation} stage={stage.after_sbs}sb "
-            f"{settings.metric}={score_text} qloss={format_float(metric.qloss)} "
-            f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
+            f"{metric_status_text(metric)} {settings.metric}={score_text} "
             f"elapsed={elapsed:.1f}s"
         ),
         "green",
@@ -1096,10 +1116,7 @@ def train_candidate_stage_worker(
         f"[CAND {candidate.index:03d} START]",
         (
             f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb worker=on "
-            f"base_qloss={format_float(base_metric.qloss)} "
-            f"base_qacc={format_float(base_metric.qacc)} "
-            f"base_test_loss={format_float(base_metric.test_loss)} "
-            f"base_test_acc={format_float(base_metric.test_acc)}"
+            f"{metric_status_text(base_metric, prefix='base_')}"
         ),
         "cyan",
     )
@@ -1170,8 +1187,7 @@ def train_candidate_stage_worker(
         f"[CAND {candidate.index:03d} END]",
         (
             f"generation={generation} stage={stage.after_sbs}sb worker=on "
-            f"{settings.metric}={score_text} qloss={format_float(metric.qloss)} "
-            f"qacc={format_float(metric.qacc)} test_loss={format_float(metric.test_loss)} "
+            f"{metric_status_text(metric)} {settings.metric}={score_text} "
             f"cache={cache_text if cached or dominated_by_prior else 'none'} elapsed={elapsed:.1f}s"
         ),
         "yellow" if dominated_by_prior else "green",
@@ -1504,10 +1520,7 @@ def main() -> int:
                 f"[GEN {generation} START]",
                 (
                     f"generation={generation} population={settings.population} from={current_checkpoint} "
-                    f"base_qloss={format_float(base_metric.qloss)} "
-                    f"base_qacc={format_float(base_metric.qacc)} "
-                    f"base_test_loss={format_float(base_metric.test_loss)} "
-                    f"base_test_acc={format_float(base_metric.test_acc)}"
+                    f"{metric_status_text(base_metric, prefix='base_')}"
                 ),
                 "magenta",
             )
@@ -1754,8 +1767,7 @@ def main() -> int:
                 "[ACCEPT]",
                 (
                     f"generation={generation} accepted_sbs={accepted_sbs} "
-                    f"{settings.metric}={format_float(survivor.score)} qloss={format_float(metric.qloss)} "
-                    f"qacc={format_float(metric.qacc)}"
+                    f"{metric_status_text(metric)} {settings.metric}={format_float(survivor.score)}"
                 ),
                 "green",
             )
