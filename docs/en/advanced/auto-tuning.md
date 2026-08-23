@@ -128,8 +128,10 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
-| `candidate_validation_rate` | f32 validation cadence inside each candidate run |
-| `candidate_quantized_validation_rate` | quantized validation cadence inside each candidate run |
+| `candidate_validation_rate` | f32 validation cadence inside each candidate run. `0` disables it. A large value such as `9999` measures only at the end of each stage |
+| `candidate_quantized_validation_rate` | Quantized validation cadence inside each candidate run. `0` disables it. A large value such as `9999` measures only at the end of each stage |
+
+You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be at least 1. Use a large value such as `9999` when you want stage-end-only validation.
 
 `beam` is read like this:
 

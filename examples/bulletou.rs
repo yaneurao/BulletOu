@@ -4580,13 +4580,13 @@ struct Args {
     #[arg(long)]
     save_rate: Option<usize>,
 
-    /// Run held-out validation every N superbatches. If omitted, validation
-    /// uses `--save-rate` so older commands keep the same behaviour.
+    /// Run held-out validation every N superbatches. Use 0 to disable it.
+    /// If omitted, validation uses `--save-rate`.
     #[arg(long)]
     validation_rate: Option<usize>,
 
     /// Run fast GPU-proxy quantized SFNN validation every N superbatches
-    /// without forcing a checkpoint save. This rounds weights to nn.bin scale
+    /// without forcing a checkpoint save. Use 0 to disable it. This rounds weights to nn.bin scale
     /// and evaluates them with the GPU f32 forward path; use the
     /// `quantized-test` subcommand when exact integer-engine validation is
     /// required. If omitted, proxy quantized validation runs only when a
@@ -5315,12 +5315,6 @@ impl Args {
             effective_batches_per_superbatch(self)?
         };
         validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
-        if self.validation_rate.is_some_and(|validation_rate| validation_rate == 0) {
-            return Err("--validation-rate must be > 0".to_string());
-        }
-        if self.quantized_validation_rate.is_some_and(|rate| rate == 0) {
-            return Err("--quantized-validation-rate must be > 0".to_string());
-        }
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
@@ -10527,7 +10521,9 @@ impl WorkerSfnnSession {
             last_dataloader_pos,
             base_dataloader_pos,
         )?;
-        let test_metrics = if last_test_metrics.is_some() {
+        let test_metrics = if !cuda_cpp_should_schedule_validation(&trial_args) {
+            None
+        } else if last_test_metrics.is_some() {
             last_test_metrics
         } else {
             let progress_params = self.current_progress_params()?;
@@ -10541,7 +10537,9 @@ impl WorkerSfnnSession {
                 &mut self.validation_cache,
             )?
         };
-        let quantized_metrics = if last_quantized_metrics.is_some() {
+        let quantized_metrics = if !cuda_cpp_should_schedule_quantized_validation(&trial_args) {
+            None
+        } else if last_quantized_metrics.is_some() {
             last_quantized_metrics
         } else {
             self.run_quantized_validation(&trial_args)?
@@ -23014,12 +23012,15 @@ fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> 
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_schedule_validation(args: &Args) -> bool {
-    args.test_teacher.is_some() && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
+    args.validation_rate != Some(0)
+        && args.test_teacher.is_some()
+        && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_schedule_quantized_validation(args: &Args) -> bool {
-    args.test_teacher.is_some()
+    args.quantized_validation_rate != Some(0)
+        && args.test_teacher.is_some()
         && matches!(
             args.eval_type(),
             EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
@@ -26727,37 +26728,9 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_backend_rejects_zero_validation_rate() {
-        use clap::Parser as _;
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--backend",
-            "cuda-cpp",
-            "--superbatches",
-            "2",
-            "--max-epochs",
-            "1",
-            "--validation-rate",
-            "0",
-        ])
-        .unwrap();
-
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--validation-rate must be > 0"
-        } else {
-            "cuda-cpp-backend"
-        }));
-    }
-
-    #[test]
-    fn cuda_cpp_backend_rejects_zero_quantized_validation_rate() {
+    fn cuda_cpp_backend_zero_validation_rate_disables_validation() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -26772,17 +26745,45 @@ mod tests {
             "2",
             "--max-epochs",
             "1",
+            "--test-teacher",
+            "validation.psv",
+            "--validation-rate",
+            "0",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_validation));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_backend_zero_quantized_validation_rate_disables_quantized_validation() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "2",
+            "--max-epochs",
+            "1",
+            "--test-teacher",
+            "validation.psv",
             "--quantized-validation-rate",
             "0",
         ])
         .unwrap();
 
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--quantized-validation-rate must be > 0"
-        } else {
-            "cuda-cpp-backend"
-        }));
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_quantized_validation));
     }
 
     #[test]

@@ -11,11 +11,11 @@
 | JSON key / CLI option | 役割 | 省略時 |
 | --- | --- | --- |
 | `test_teacher` / `--test-teacher` | 検証用局面ファイルを指定する。これを指定しないと `test_value_accuracy` / `test_value_loss` は出ません | 検証しない |
-| `validation_rate` / `--validation-rate` | 何 sb ごとに検証するかを指定する | `save_rate` と同じ |
+| `validation_rate` / `--validation-rate` | 何 sb ごとに検証するかを指定する。`0` なら無効 | `save_rate` と同じ |
 
 つまり、検証を有効にする最低条件は `test_teacher` です。
 
-毎 sb で accuracy / loss を見たい場合は、`validation_rate` を `1` にします。
+毎 sb で accuracy / loss を見たい場合は、`validation_rate` を `1` にします。検証を一時的に止めたい場合は `0` にします。
 
 ## 4.2 設定例
 
@@ -100,7 +100,7 @@
 
 学習中の `test_value_accuracy` / `test_value_loss` は、基本的にはメモリ上の f32 重みで測ります。
 
-保存された `nn.bin` と同じように量子化した後の accuracy / loss も見たい場合は、`quantized_validation_rate` / `--quantized-validation-rate` を使います。
+保存された `nn.bin` と同じように量子化した後の accuracy / loss も見たい場合は、`quantized_validation_rate` / `--quantized-validation-rate` を使います。`0` を指定すると量子化 validation は行いません。
 
 ```json
 {

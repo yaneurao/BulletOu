@@ -131,8 +131,10 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
-| `candidate_validation_rate` | 候補学習中の f32 validation 間隔 |
-| `candidate_quantized_validation_rate` | 候補学習中の量子化 validation 間隔 |
+| `candidate_validation_rate` | 候補学習中の f32 validation 間隔。`0` なら無効。大きな値、例えば `9999`、なら各 stage の末尾だけで測る |
+| `candidate_quantized_validation_rate` | 候補学習中の量子化 validation 間隔。`0` なら無効。大きな値、例えば `9999`、なら各 stage の末尾だけで測る |
+
+`metric` が必要とする validation を `0` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を 1 以上にしてください。stage 末尾だけでよい場合は `9999` のような大きな値を指定します。
 
 `beam` は次のように読みます。
 
