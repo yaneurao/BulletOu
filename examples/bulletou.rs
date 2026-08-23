@@ -3363,16 +3363,38 @@ fn effective_save_rate(args: &Args) -> usize {
     args.save_rate.unwrap_or(DEFAULT_SAVE_RATE)
 }
 
-fn effective_validation_rate(args: &Args) -> usize {
-    args.validation_rate.unwrap_or_else(|| effective_save_rate(args))
+fn validation_rate_label(args: &Args) -> String {
+    args.validation_rate.map(|n| n.to_string()).unwrap_or_else(|| effective_save_rate(args).to_string())
 }
 
-fn effective_quantized_validation_rate(args: &Args) -> Option<usize> {
-    args.quantized_validation_rate
+fn validation_period(args: &Args) -> Option<usize> {
+    match args.validation_rate {
+        Some(n) if n < 0 => None,
+        Some(0) => None,
+        Some(n) => Some(n as usize),
+        None => Some(effective_save_rate(args)),
+    }
+}
+
+fn validation_is_epoch_end_only(args: &Args) -> bool {
+    args.validation_rate == Some(0)
+}
+
+fn quantized_validation_period(args: &Args, save_rate: usize) -> Option<usize> {
+    match args.quantized_validation_rate {
+        Some(n) if n < 0 => None,
+        Some(0) => None,
+        Some(n) => Some(n as usize),
+        None => Some(save_rate),
+    }
+}
+
+fn quantized_validation_is_epoch_end_only(args: &Args) -> bool {
+    args.quantized_validation_rate == Some(0)
 }
 
 fn quantized_validation_rate_label(args: &Args) -> String {
-    effective_quantized_validation_rate(args).map(|n| n.to_string()).unwrap_or_else(|| "save".to_string())
+    args.quantized_validation_rate.map(|n| n.to_string()).unwrap_or_else(|| "save".to_string())
 }
 
 fn quantized_validation_mode_label(args: &Args) -> &'static str {
@@ -4580,19 +4602,20 @@ struct Args {
     #[arg(long)]
     save_rate: Option<usize>,
 
-    /// Run held-out validation every N superbatches. If omitted, validation
-    /// uses `--save-rate` so older commands keep the same behaviour.
-    #[arg(long)]
-    validation_rate: Option<usize>,
+    /// Run held-out validation every N superbatches. Use 0 for epoch-end only,
+    /// or -1 to disable it. If omitted, validation uses `--save-rate`.
+    #[arg(long, allow_hyphen_values = true)]
+    validation_rate: Option<isize>,
 
     /// Run fast GPU-proxy quantized SFNN validation every N superbatches
-    /// without forcing a checkpoint save. This rounds weights to nn.bin scale
+    /// without forcing a checkpoint save. Use 0 for epoch-end only, or -1 to disable it.
+    /// This rounds weights to nn.bin scale
     /// and evaluates them with the GPU f32 forward path; use the
     /// `quantized-test` subcommand when exact integer-engine validation is
     /// required. If omitted, proxy quantized validation runs only when a
     /// checkpoint is saved.
-    #[arg(long)]
-    quantized_validation_rate: Option<usize>,
+    #[arg(long, allow_hyphen_values = true)]
+    quantized_validation_rate: Option<isize>,
 
     /// Use the exact CPU integer SFNN forward path for live quantized
     /// validation. The default is the much faster GPU proxy, which is usually
@@ -5315,12 +5338,6 @@ impl Args {
             effective_batches_per_superbatch(self)?
         };
         validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
-        if self.validation_rate.is_some_and(|validation_rate| validation_rate == 0) {
-            return Err("--validation-rate must be > 0".to_string());
-        }
-        if self.quantized_validation_rate.is_some_and(|rate| rate == 0) {
-            return Err("--quantized-validation-rate must be > 0".to_string());
-        }
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
@@ -5361,7 +5378,7 @@ impl Args {
             if effective_save_rate(self) != 1 {
                 return Err("--backend cuda-cpp --lr-schedule plateau requires --save-rate 1".to_string());
             }
-            if effective_validation_rate(self) != 1 {
+            if validation_period(self) != Some(1) {
                 return Err("--backend cuda-cpp --lr-schedule plateau requires --validation-rate 1".to_string());
             }
         }
@@ -10527,7 +10544,9 @@ impl WorkerSfnnSession {
             last_dataloader_pos,
             base_dataloader_pos,
         )?;
-        let test_metrics = if last_test_metrics.is_some() {
+        let test_metrics = if !cuda_cpp_should_schedule_validation(&trial_args) {
+            None
+        } else if last_test_metrics.is_some() {
             last_test_metrics
         } else {
             let progress_params = self.current_progress_params()?;
@@ -10541,7 +10560,9 @@ impl WorkerSfnnSession {
                 &mut self.validation_cache,
             )?
         };
-        let quantized_metrics = if last_quantized_metrics.is_some() {
+        let quantized_metrics = if !cuda_cpp_should_schedule_quantized_validation(&trial_args) {
+            None
+        } else if last_quantized_metrics.is_some() {
             last_quantized_metrics
         } else {
             self.run_quantized_validation(&trial_args)?
@@ -11615,7 +11636,7 @@ fn main() {
             eprintln!("error: --lr-schedule plateau requires --save-rate 1 for per-superbatch LR decisions.");
             std::process::exit(2);
         }
-        if effective_validation_rate(&args) != 1 {
+        if validation_period(&args) != Some(1) {
             eprintln!("error: --lr-schedule plateau requires --validation-rate 1 for per-superbatch LR decisions.");
             std::process::exit(2);
         }
@@ -13185,7 +13206,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
                 effective_save_rate(args),
-                effective_validation_rate(args),
+                validation_rate_label(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
                 args.lr_schedule.cli_name()
@@ -16068,7 +16089,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
                 effective_save_rate(args),
-                effective_validation_rate(args),
+                validation_rate_label(args),
                 quantized_validation_rate_label(args),
                 quantized_validation_mode_label(args),
                 effective_save_epoch_end(args),
@@ -23014,12 +23035,15 @@ fn cuda_cpp_progress_label(schedule: &CudaCppRunSchedule, seen_steps: usize) -> 
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_schedule_validation(args: &Args) -> bool {
-    args.test_teacher.is_some() && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
+    !args.validation_rate.is_some_and(|rate| rate < 0)
+        && args.test_teacher.is_some()
+        && !matches!(args.eval_type(), EvalType::Kppt | EvalType::KppKkpt)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_schedule_quantized_validation(args: &Args) -> bool {
-    args.test_teacher.is_some()
+    !args.quantized_validation_rate.is_some_and(|rate| rate < 0)
+        && args.test_teacher.is_some()
         && matches!(
             args.eval_type(),
             EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2 | EvalType::SfnnKa2
@@ -23368,32 +23392,41 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let mut cumulative_steps = 0usize;
     let save_rate = effective_save_rate(args).max(1);
     let validation_enabled = cuda_cpp_should_schedule_validation(args);
-    let validation_rate = if validation_enabled { effective_validation_rate(args).max(1) } else { save_rate };
+    let validation_period_sbs = if validation_enabled { validation_period(args) } else { None };
+    let validation_epoch_end_only = validation_enabled && validation_is_epoch_end_only(args);
     let quantized_validation_enabled = cuda_cpp_should_schedule_quantized_validation(args);
-    let quantized_validation_rate = effective_quantized_validation_rate(args).unwrap_or(save_rate).max(1);
+    let quantized_validation_period_sbs =
+        if quantized_validation_enabled { quantized_validation_period(args, save_rate) } else { None };
+    let quantized_validation_epoch_end_only =
+        quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
             let save_boundary = next_superbatch_rate_boundary(first_superbatch, save_rate);
-            let validation_boundary = if validation_enabled {
-                next_superbatch_rate_boundary(first_superbatch, validation_rate)
+            let validation_boundary = if let Some(rate) = validation_period_sbs {
+                next_superbatch_rate_boundary(first_superbatch, rate)
             } else {
                 usize::MAX
             };
-            let quantized_validation_boundary =
-                if quantized_validation_enabled && args.quantized_validation_rate.is_some() {
-                    next_superbatch_rate_boundary(first_superbatch, quantized_validation_rate)
-                } else {
-                    usize::MAX
-                };
+            let quantized_validation_boundary = if args.quantized_validation_rate.is_some_and(|rate| rate > 0) {
+                quantized_validation_period_sbs
+                    .map(|rate| next_superbatch_rate_boundary(first_superbatch, rate))
+                    .unwrap_or(usize::MAX)
+            } else {
+                usize::MAX
+            };
             let last_superbatch =
                 save_boundary.min(validation_boundary).min(quantized_validation_boundary).min(superbatches);
             let save_checkpoint = (save_boundary <= superbatches && last_superbatch == save_boundary)
                 || (last_superbatch == superbatches && save_boundary > superbatches && save_epoch_end);
-            let run_validation = validation_enabled && (last_superbatch == validation_boundary || save_checkpoint);
-            let run_quantized_validation =
-                quantized_validation_enabled && (save_checkpoint || last_superbatch == quantized_validation_boundary);
+            let run_validation = validation_enabled
+                && ((validation_epoch_end_only && last_superbatch == superbatches)
+                    || (!validation_epoch_end_only && (last_superbatch == validation_boundary || save_checkpoint)));
+            let run_quantized_validation = quantized_validation_enabled
+                && ((quantized_validation_epoch_end_only && last_superbatch == superbatches)
+                    || (!quantized_validation_epoch_end_only
+                        && (save_checkpoint || last_superbatch == quantized_validation_boundary)));
             let superbatch_count = last_superbatch - first_superbatch + 1;
             let steps = superbatch_count.checked_mul(batches_per_superbatch).ok_or_else(|| {
                 format!("cuda-cpp chunk step overflow at epoch={epoch}, superbatch={last_superbatch}")
@@ -23696,7 +23729,7 @@ fn resume_signature(args: &Args) -> String {
             args.optimizer_beta2.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
         ),
         format!("save_rate={}", effective_save_rate(args)),
-        format!("validation_rate={}", effective_validation_rate(args)),
+        format!("validation_rate={}", validation_rate_label(args)),
         format!("quantized_validation_rate={}", quantized_validation_rate_label(args)),
         format!("quantized_validation_exact={}", args.quantized_validation_exact),
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
@@ -23985,7 +24018,7 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     let stored_has_factorizer = stored.lines().any(|line| line.starts_with("sfnn_factorizer="));
     let factorizer = effective_sfnn_factorizer_spec(args);
     let can_omit_validation_rate =
-        !stored_has_validation_rate && effective_validation_rate(args) == effective_save_rate(args);
+        !stored_has_validation_rate && validation_period(args) == Some(effective_save_rate(args));
     let can_omit_factorizer = !stored_has_factorizer && !factorizer.any_axis();
     let alpha_default_line = "sfnn_factorizer_alpha=shared=1.000000000,king_axis=1.000000000,hand_axis=1.000000000,progress_axis=1.000000000,pair=1.000000000";
     let old_alpha_default_line_with_pair =
@@ -26727,37 +26760,9 @@ mod tests {
         }));
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn cuda_cpp_backend_rejects_zero_validation_rate() {
-        use clap::Parser as _;
-
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--arch",
-            "NNUE_halfkp_256x2_32_32",
-            "--teacher",
-            "/dev/null",
-            "--backend",
-            "cuda-cpp",
-            "--superbatches",
-            "2",
-            "--max-epochs",
-            "1",
-            "--validation-rate",
-            "0",
-        ])
-        .unwrap();
-
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--validation-rate must be > 0"
-        } else {
-            "cuda-cpp-backend"
-        }));
-    }
-
-    #[test]
-    fn cuda_cpp_backend_rejects_zero_quantized_validation_rate() {
+    fn cuda_cpp_backend_zero_validation_rate_runs_epoch_end_only() {
         use clap::Parser as _;
 
         let args = Args::try_parse_from([
@@ -26769,20 +26774,119 @@ mod tests {
             "--backend",
             "cuda-cpp",
             "--superbatches",
-            "2",
+            "3",
             "--max-epochs",
             "1",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "2",
+            "--validation-rate",
+            "0",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.superbatch).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.run_validation).collect::<Vec<_>>(), vec![false, true]);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_backend_negative_validation_rate_disables_validation() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "2",
+            "--validation-rate",
+            "-1",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_validation));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_backend_zero_quantized_validation_rate_runs_epoch_end_only() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "2",
             "--quantized-validation-rate",
             "0",
         ])
         .unwrap();
 
-        let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains(if cfg!(feature = "cuda-cpp-backend") {
-            "--quantized-validation-rate must be > 0"
-        } else {
-            "cuda-cpp-backend"
-        }));
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(schedule.chunks.iter().map(|chunk| chunk.superbatch).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            schedule.chunks.iter().map(|chunk| chunk.run_quantized_validation).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_backend_negative_quantized_validation_rate_disables_quantized_validation() {
+        use clap::Parser as _;
+
+        let args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--superbatches",
+            "3",
+            "--max-epochs",
+            "1",
+            "--test-teacher",
+            "validation.psv",
+            "--save-rate",
+            "2",
+            "--quantized-validation-rate",
+            "-1",
+        ])
+        .unwrap();
+
+        args.validate_backend_flags().unwrap();
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert!(schedule.chunks.iter().all(|chunk| !chunk.run_quantized_validation));
     }
 
     #[test]
@@ -31235,7 +31339,7 @@ mod tests {
         assert_eq!(args.save_rate, None);
         assert_eq!(effective_save_rate(&args), DEFAULT_SAVE_RATE);
         assert_eq!(args.validation_rate, None);
-        assert_eq!(effective_validation_rate(&args), DEFAULT_SAVE_RATE);
+        assert_eq!(validation_period(&args), Some(DEFAULT_SAVE_RATE));
         assert!(args.save_epoch_end);
         assert!(!args.no_save_epoch_end);
         assert!(effective_save_epoch_end(&args));

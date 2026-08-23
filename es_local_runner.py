@@ -408,10 +408,28 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError("es.population must be > 0")
     if save_rate < 0:
         raise ValueError("es.save_rate must be >= 0")
-    if candidate_validation_rate <= 0:
-        raise ValueError("es.candidate_validation_rate must be > 0")
-    if candidate_quantized_validation_rate <= 0:
-        raise ValueError("es.candidate_quantized_validation_rate must be > 0")
+    if candidate_validation_rate < -1:
+        raise ValueError("es.candidate_validation_rate must be >= -1; -1 disables f32 candidate validation")
+    if candidate_quantized_validation_rate < -1:
+        raise ValueError(
+            "es.candidate_quantized_validation_rate must be >= -1; -1 disables quantized candidate validation"
+        )
+    metric_needs_validation = metric in {"test_value_loss", "test_value_accuracy", BORDA_COUNT_METRIC}
+    metric_needs_quantized_validation = metric in {
+        "quantized_value_loss",
+        "quantized_value_accuracy",
+        BORDA_COUNT_METRIC,
+    }
+    if metric_needs_validation and candidate_validation_rate < 0:
+        raise ValueError(
+            f"es.metric {metric!r} requires f32 candidate validation; "
+            "use 0 for final-stage-only validation"
+        )
+    if metric_needs_quantized_validation and candidate_quantized_validation_rate < 0:
+        raise ValueError(
+            f"es.metric {metric!r} requires quantized candidate validation; "
+            "use 0 for final-stage-only quantized validation"
+        )
 
     beam_raw = es_obj.get("beam")
     if beam_raw is None:
@@ -849,6 +867,20 @@ def build_train_args(
     *,
     include_initial_state: bool,
 ) -> list[str]:
+    validation_rate = (
+        0
+        if settings.candidate_validation_rate < 0
+        else stage_delta_sbs
+        if settings.candidate_validation_rate == 0
+        else max(1, min(settings.candidate_validation_rate, stage_delta_sbs))
+    )
+    quantized_validation_rate = (
+        0
+        if settings.candidate_quantized_validation_rate < 0
+        else stage_delta_sbs
+        if settings.candidate_quantized_validation_rate == 0
+        else max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))
+    )
     cmd = [
         "--settings-file",
         str(run.bulletou_settings_file),
@@ -861,9 +893,9 @@ def build_train_args(
         "--save-rate",
         str(stage_delta_sbs),
         "--validation-rate",
-        str(max(1, min(settings.candidate_validation_rate, stage_delta_sbs))),
+        str(validation_rate),
         "--quantized-validation-rate",
-        str(max(1, min(settings.candidate_quantized_validation_rate, stage_delta_sbs))),
+        str(quantized_validation_rate),
     ]
     if include_initial_state:
         if checkpoint is None:

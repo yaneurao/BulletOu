@@ -11,11 +11,11 @@ Two settings control ordinary validation:
 | JSON key / CLI option | Meaning | If omitted |
 | --- | --- | --- |
 | `test_teacher` / `--test-teacher` | Validation-position file. Without this, `test_value_accuracy` / `test_value_loss` are not computed | no validation |
-| `validation_rate` / `--validation-rate` | Validate every N sb | same as `save_rate` |
+| `validation_rate` / `--validation-rate` | Validate every N sb. `0` means epoch-end only; `-1` disables it | same as `save_rate` |
 
 So the minimum setting needed to enable validation is `test_teacher`.
 
-If you want accuracy / loss every sb, set `validation_rate` to `1`.
+If you want accuracy / loss every sb, set `validation_rate` to `1`. Use `0` for epoch-end-only validation, or `-1` to disable validation temporarily.
 
 ## 4.2 Example settings
 
@@ -100,7 +100,7 @@ or in `bulletou-settings.json`:
 
 Ordinary `test_value_accuracy` / `test_value_loss` are measured with the in-memory f32 weights.
 
-To also watch accuracy / loss after quantizing like `nn.bin`, use `--quantized-validation-rate`:
+To also watch accuracy / loss after quantizing like `nn.bin`, use `--quantized-validation-rate`. Use `0` for epoch-end-only quantized validation, or `-1` to disable it:
 
 ```json
 {
