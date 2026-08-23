@@ -260,9 +260,11 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. Put ordinary training fields such as `lr` and `save_rate` in `bulletou-settings.json`.
+In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. Put ordinary training fields such as `lr` in `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
 
 With `enabled: false`, the runner does not create ES candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
+
+The ordinary training output is written under `output_folder/es-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.log` into `output_folder/es-<tag_prefix>/summary-learn.log` and `accepted-summary-learn.log`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
 
 ## `bulletou.exe --settings-file`
 

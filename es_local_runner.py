@@ -645,6 +645,180 @@ def latest_checkpoint_dir(output_dir: Path) -> Path:
     return max(candidates, key=lambda item: item[0])[1]
 
 
+def maybe_latest_checkpoint_dir(output_dir: Path) -> Path | None:
+    if not output_dir.exists():
+        return None
+    try:
+        return latest_checkpoint_dir(output_dir)
+    except RuntimeError:
+        return None
+
+
+def read_csv_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    return [row for row in rows if any((value or "").strip() for value in row.values())]
+
+
+def count_summary_rows_with_status(path: Path, status: str) -> int:
+    return sum(1 for row in read_csv_rows(path) if row.get("status") == status)
+
+
+def normal_summary_checkpoint_path(output_dir: Path, checkpoint_cell: str | None) -> str:
+    if checkpoint_cell is None:
+        return ""
+    checkpoint_cell = checkpoint_cell.strip()
+    if not checkpoint_cell or checkpoint_cell == "-":
+        return ""
+    path = Path(checkpoint_cell)
+    if not path.is_absolute():
+        path = output_dir / checkpoint_cell
+    return str(path)
+
+
+def parse_int_cell(value: str | None, default: int = 0) -> int:
+    if value is None:
+        return default
+    value = value.strip()
+    if not value or value == "-":
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def import_ordinary_run_summaries(
+    *,
+    summary_path: Path,
+    accepted_summary_path: Path,
+    ordinary_output: Path,
+    settings: EsSettings,
+    params: dict[str, float],
+    color: bool,
+) -> int:
+    source_summary = ordinary_output / "summary-learn.log"
+    rows = read_csv_rows(source_summary)
+    if not rows:
+        event(color, "[LOG IMPORT]", f"no summary rows found: {source_summary}", "yellow")
+        return 0
+
+    ensure_csv(summary_path, SUMMARY_FIELDS)
+    ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
+    imported_rows = count_summary_rows_with_status(summary_path, "ordinary")
+    if imported_rows >= len(rows):
+        event(color, "[LOG IMPORT]", f"already up to date: imported_rows={imported_rows}", "yellow")
+        return 0
+
+    params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
+    added = 0
+    epoch_sbs = max(1, settings.beam[-1].after_sbs)
+    for row in rows[imported_rows:]:
+        epoch = parse_int_cell(row.get("epoch"), default=1)
+        sb = parse_int_cell(row.get("superbatch"), default=0)
+        accepted_sbs = (max(1, epoch) - 1) * epoch_sbs + sb
+        metric = metric_from_summary_row(row)
+        checkpoint_path = normal_summary_checkpoint_path(ordinary_output, row.get("checkpoint"))
+        saved_checkpoint = (
+            public_checkpoint_name(accepted_sbs)
+            if checkpoint_path and settings.save_rate > 0 and max(1, epoch) % settings.save_rate == 0
+            else ""
+        )
+        append_csv(
+            summary_path,
+            SUMMARY_FIELDS,
+            {
+                "generation": epoch,
+                "stage_sbs": sb,
+                "candidate": 1,
+                "status": "ordinary",
+                "rank": 1,
+                "test_value_accuracy": format_float(metric.test_acc),
+                "test_value_loss": format_float(metric.test_loss),
+                "quantized_value_accuracy": format_float(metric.qacc),
+                "quantized_value_loss": format_float(metric.qloss),
+                "checkpoint": checkpoint_path,
+                "output_dir": str(ordinary_output),
+                "parameters": params_json,
+            },
+        )
+        append_csv(
+            accepted_summary_path,
+            ACCEPTED_FIELDS,
+            {
+                "generation": epoch,
+                "accepted_sbs": accepted_sbs,
+                "test_value_accuracy": format_float(metric.test_acc),
+                "test_value_loss": format_float(metric.test_loss),
+                "quantized_value_accuracy": format_float(metric.qacc),
+                "quantized_value_loss": format_float(metric.qloss),
+                "stage_sbs": sb,
+                "saved_checkpoint": saved_checkpoint,
+                "current_checkpoint": checkpoint_path,
+                "parameters": params_json,
+            },
+        )
+        added += 1
+
+    event(color, "[LOG IMPORT]", f"imported_rows={added} source={source_summary}", "green")
+    return added
+
+
+def sync_ordinary_accepted_checkpoints(
+    *,
+    accepted_root: Path,
+    current_dir: Path,
+    ordinary_output: Path,
+    settings: EsSettings,
+    es_settings_file: Path,
+    bulletou_settings_file: Path,
+    color: bool,
+) -> int:
+    rows = read_csv_rows(ordinary_output / "summary-learn.log")
+    if not rows:
+        return 0
+
+    accepted_root.mkdir(parents=True, exist_ok=True)
+    epoch_sbs = max(1, settings.beam[-1].after_sbs)
+    copied = 0
+    latest_checkpoint: Path | None = None
+    for row in rows:
+        checkpoint_path_text = normal_summary_checkpoint_path(ordinary_output, row.get("checkpoint"))
+        if not checkpoint_path_text:
+            continue
+        checkpoint = Path(checkpoint_path_text)
+        if not (checkpoint / "state.bin").exists():
+            continue
+        latest_checkpoint = checkpoint
+        epoch = parse_int_cell(row.get("epoch"), default=1)
+        sb = parse_int_cell(row.get("superbatch"), default=0)
+        accepted_sbs = (max(1, epoch) - 1) * epoch_sbs + sb
+        if settings.save_rate <= 0 or max(1, epoch) % settings.save_rate != 0:
+            continue
+        public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
+        if public_dir.exists():
+            if not (public_dir / "state.bin").exists():
+                raise RuntimeError(f"accepted checkpoint exists but has no state.bin: {public_dir}")
+            continue
+        copy_dir_new(checkpoint, public_dir)
+        copy_settings_files(public_dir, es_settings_file, bulletou_settings_file)
+        copied += 1
+
+    if latest_checkpoint is not None:
+        copy_dir_replace(latest_checkpoint, current_dir)
+        copy_settings_files(current_dir, es_settings_file, bulletou_settings_file)
+
+    event(
+        color,
+        "[CHECKPOINT SYNC]",
+        f"copied={copied} accepted_root={accepted_root} current={current_dir}",
+        "green" if copied else "yellow",
+    )
+    return copied
+
+
 def ensure_csv(path: Path, fields: list[str]) -> None:
     if not LOG_WRITES_ENABLED:
         return
@@ -1342,37 +1516,129 @@ def run_once_from_settings(
     color: bool,
 ) -> int:
     """Run one ordinary bulletou.exe training command using current parameter values."""
+    epoch_sbs = settings.beam[-1].after_sbs
+    params = current_values(specs)
+    managed = run.output_folder is not None and run.tag_prefix is not None
+
+    runner_root: Path | None = None
+    ordinary_output: Path | None = None
+    summary_path: Path | None = None
+    accepted_summary_path: Path | None = None
+    accepted_root: Path | None = None
+    current_dir: Path | None = None
+
+    if managed:
+        assert run.output_folder is not None
+        assert run.tag_prefix is not None
+        runner_root = run.output_folder / f"es-{run.tag_prefix}"
+        ordinary_output = runner_root / "bulletou-run"
+        log_dir = runner_root / "logs"
+        accepted_root = runner_root / "accepted-checkpoints"
+        current_dir = runner_root / "current"
+        summary_path = runner_root / "summary-learn.log"
+        accepted_summary_path = runner_root / "accepted-summary-learn.log"
+        if not args.dry_run:
+            runner_root.mkdir(parents=True, exist_ok=True)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            accepted_root.mkdir(parents=True, exist_ok=True)
+            ensure_csv(summary_path, SUMMARY_FIELDS)
+            ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
+            copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
+        log_path = log_dir / "bulletou-settings-run.stdout.log"
+    else:
+        log_path = run.bulletou_settings_file.parent / "bulletou-settings-run.stdout.log"
+
     cmd = [str(run.exe), "--settings-file", str(run.bulletou_settings_file)]
-    cmd.extend(["--superbatches", str(settings.beam[-1].after_sbs)])
+    if managed:
+        assert ordinary_output is not None
+        cmd.extend(["--output", str(ordinary_output)])
+    cmd.extend(["--superbatches", str(epoch_sbs)])
     cmd.extend(["--max-epochs", str(settings.generations)])
+    cmd.extend(["--save-rate", str(epoch_sbs)])
     cmd.extend(["--validation-rate", str(settings.validation_rate)])
     cmd.extend(["--quantized-validation-rate", str(settings.quantized_validation_rate)])
-    cmd.extend(parameter_args(current_values(specs)))
-    if args.resume:
+    cmd.extend(parameter_args(params))
+
+    initial_checkpoint: Path | None = None
+    use_bulletou_resume = False
+    if managed:
+        assert ordinary_output is not None
+        assert current_dir is not None
+        if args.resume and maybe_latest_checkpoint_dir(ordinary_output) is not None:
+            use_bulletou_resume = True
+        elif args.resume and (current_dir / "state.bin").exists():
+            initial_checkpoint = current_dir
+        elif run.base_checkpoint is not None:
+            initial_checkpoint = run.base_checkpoint
+    elif args.resume:
+        use_bulletou_resume = True
+
+    if use_bulletou_resume:
         cmd.append("--resume")
+    elif initial_checkpoint is not None:
+        validate_checkpoint_dir(initial_checkpoint)
+        cmd.extend(
+            [
+                "--initial-state",
+                str(initial_checkpoint / "state.bin"),
+                "--initial-dataloader-pos",
+                str(initial_checkpoint / "dataloader_pos.txt"),
+            ]
+        )
+
     event(
         color,
         "[RUN]",
         (
-            "es.enabled=false; launching one bulletou.exe run with current parameter values "
-            f"(superbatches={settings.beam[-1].after_sbs}, max_epochs={settings.generations})"
+            "es.enabled=false; launching one managed ordinary bulletou.exe run "
+            f"(superbatches={epoch_sbs}, max_epochs={settings.generations})"
         ),
         "cyan",
     )
     event(color, "[SETTINGS]", f"bulletou={run.bulletou_settings_file}", "cyan")
+    if managed:
+        event(color, "[OUTPUT]", f"runner={runner_root} bulletou={ordinary_output}", "cyan")
+        if use_bulletou_resume:
+            event(color, "[RESUME]", f"bulletou output={ordinary_output}", "yellow")
+        elif initial_checkpoint is not None:
+            event(color, "[INITIAL]", f"checkpoint={initial_checkpoint}", "yellow")
+
     if args.dry_run:
         print("  " + subprocess.list2cmdline(cmd), flush=True)
         return 0
-    if run.output_folder and run.tag_prefix:
-        log_path = run.output_folder / f"es-{run.tag_prefix}" / "logs" / "bulletou-settings-run.stdout.log"
-    else:
-        log_path = run.bulletou_settings_file.parent / "bulletou-settings-run.stdout.log"
+
     code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
+
+    if managed:
+        assert ordinary_output is not None
+        assert summary_path is not None
+        assert accepted_summary_path is not None
+        assert accepted_root is not None
+        assert current_dir is not None
+        import_ordinary_run_summaries(
+            summary_path=summary_path,
+            accepted_summary_path=accepted_summary_path,
+            ordinary_output=ordinary_output,
+            settings=settings,
+            params=params,
+            color=color,
+        )
+        sync_ordinary_accepted_checkpoints(
+            accepted_root=accepted_root,
+            current_dir=current_dir,
+            ordinary_output=ordinary_output,
+            settings=settings,
+            es_settings_file=args.es_settings_file,
+            bulletou_settings_file=run.bulletou_settings_file,
+            color=color,
+        )
+
     if code == 0:
         event(color, "[DONE]", f"elapsed={elapsed:.1f}s", "green")
     else:
         event(color, "[ERROR]", f"bulletou.exe exited with code {code}; see {log_path}", "red")
     return code
+
 
 
 def main() -> int:

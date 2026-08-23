@@ -266,9 +266,11 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` や `save_rate` などの通常学習項目は `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` などの通常学習項目は `bulletou-settings.json` に書きます。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
 
 `enabled: false` では ES の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
+
+普通学習の出力本体は `output_folder/es-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.log` を読み、`output_folder/es-<tag_prefix>/summary-learn.log` と `accepted-summary-learn.log` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
 
 ## `bulletou.exe --settings-file`
 
