@@ -46,6 +46,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
+    "parameter_step_scale": 1.0,
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -130,6 +131,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `lower_is_better` | 小さいほど良い指標なら `true`。`borda_count` では常に順位和が小さいほど良いので、この値は使われない |
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
+| `parameter_step_scale` | すべての `parameters.*.step` に掛ける全体倍率。`1.0` なら各 `step` をそのまま使い、`10.0` なら `current` は変えずに候補の揺らし幅だけを 10 倍にする |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
 | `validation_rate` | f32 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
 | `quantized_validation_rate` | 量子化 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
@@ -204,11 +206,11 @@ runner root は `output_folder/es-<tag_prefix>` です。
 | --- | --- |
 | `current` | 現在値。候補はこの値の周辺から作られる |
 | `tune` | `true` なら ES が動かす。`false` なら固定 |
-| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step, step))` で作られる |
+| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` で作られる |
 | `min` | 下限 |
 | `max` | 上限 |
 
-`step` は加算幅ではありません。`step = 0.02` なら、おおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。`tune = true` のパラメーターは `current > 0` である必要があります。
+`step` は加算幅ではありません。`parameter_step_scale = 1.0` なら、`step = 0.02` でおおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。一時的に探索幅を広げたいときは、各 `step` を手で書き換えずに `es.parameter_step_scale` を使います。たとえば `step = 0.005`、`parameter_step_scale = 10.0` なら、実効 step は `0.05` です。この倍率は各パラメーターへ書き戻されず、`current` も変えません。`tune = true` のパラメーターは `current > 0` である必要があります。
 
 候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
 

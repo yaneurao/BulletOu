@@ -226,6 +226,7 @@ class EsSettings:
     metric: str
     lower_is_better: bool
     seed: int
+    parameter_step_scale: float
     save_rate: int
     validation_rate: int
     quantized_validation_rate: int
@@ -398,6 +399,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError(f"{path}: unsupported es.metric {metric!r}")
     lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(es_obj.get("lower_is_better", "loss" in metric))
     seed = int(es_obj.get("seed", 1))
+    parameter_step_scale = float(es_obj.get("parameter_step_scale", 1.0))
     save_rate = int(es_obj.get("save_rate", 1))
     if "candidate_validation_rate" in es_obj or "candidate_quantized_validation_rate" in es_obj:
         raise ValueError(
@@ -411,6 +413,8 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError("es.generations must be > 0")
     if population <= 0:
         raise ValueError("es.population must be > 0")
+    if not math.isfinite(parameter_step_scale) or parameter_step_scale < 0.0:
+        raise ValueError("es.parameter_step_scale must be finite and >= 0")
     if save_rate < 0:
         raise ValueError("es.save_rate must be >= 0")
     if validation_rate < -1:
@@ -472,6 +476,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         metric=metric,
         lower_is_better=lower_is_better,
         seed=seed,
+        parameter_step_scale=parameter_step_scale,
         save_rate=save_rate,
         validation_rate=validation_rate,
         quantized_validation_rate=quantized_validation_rate,
@@ -552,11 +557,14 @@ def set_current_values(specs: dict[str, ParameterSpec], values: dict[str, float]
         specs[name].current = specs[name].clamp(float(value))
 
 
-def perturb_parameters(specs: dict[str, ParameterSpec], rng: random.Random) -> dict[str, float]:
+def perturb_parameters(
+    specs: dict[str, ParameterSpec], rng: random.Random, parameter_step_scale: float
+) -> dict[str, float]:
     out = current_values(specs)
     for name, spec in specs.items():
         if spec.tune:
-            delta = rng.uniform(-spec.step, spec.step)
+            effective_step = spec.step * parameter_step_scale
+            delta = rng.uniform(-effective_step, effective_step)
             out[name] = spec.clamp(spec.current * math.exp(delta))
     return out
 
@@ -1786,6 +1794,7 @@ def main() -> int:
         (
             f"population={settings.population} generations={settings.generations} "
             f"metric={settings.metric} ({metric_direction_text(settings)}) beam=[{beam_text}] "
+            f"parameter_step_scale={settings.parameter_step_scale:g} "
             f"save_rate={settings.save_rate} worker={'on' if worker_enabled else 'off'} "
             f"bulletou_settings={run.bulletou_settings_file}"
         ),
@@ -1841,7 +1850,11 @@ def main() -> int:
             rng = random.Random(settings.seed + generation * 1_000_003)
             base_metric = latest_learn_log_metric(current_checkpoint)
             candidates = [
-                Candidate(index=i + 1, params=perturb_parameters(specs, rng), checkpoint=current_checkpoint)
+                Candidate(
+                    index=i + 1,
+                    params=perturb_parameters(specs, rng, settings.parameter_step_scale),
+                    checkpoint=current_checkpoint,
+                )
                 for i in range(settings.population)
             ]
 

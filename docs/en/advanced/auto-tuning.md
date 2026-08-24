@@ -46,6 +46,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
+    "parameter_step_scale": 1.0,
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -127,6 +128,7 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `lower_is_better` | `true` if smaller metric values are better. Ignored for `borda_count` because lower rank sum is always better |
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
+| `parameter_step_scale` | Global multiplier for every `parameters.*.step`. `1.0` uses each step as written; `10.0` makes all candidate perturbations 10 times wider without changing `current` |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
 | `validation_rate` | f32 validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
 | `quantized_validation_rate` | Quantized validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
@@ -198,11 +200,11 @@ Each parameter is written like this:
 | --- | --- |
 | `current` | Current value. Candidates are sampled around it |
 | `tune` | If `true`, ES may change it. If `false`, it is fixed |
-| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step, step))` |
+| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` |
 | `min` | Lower bound |
 | `max` | Upper bound |
 
-`step` is not an additive width. `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. Parameters with `tune = true` must have `current > 0`.
+`step` is not an additive width. With `parameter_step_scale = 1.0`, `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. If you temporarily want a wider search, set `es.parameter_step_scale` instead of editing every `step` by hand. For example, `step = 0.005` and `parameter_step_scale = 10.0` behaves like an effective step of `0.05`. This multiplier is not written back into each parameter and does not change `current`. Parameters with `tune = true` must have `current > 0`.
 
 When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
 
