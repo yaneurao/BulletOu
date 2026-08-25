@@ -48,7 +48,9 @@ If `generations` is omitted, the runner infers it from the `population` / `trial
 
 The TPE-style sampler uses results from the immediately previous generation. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
 
-For example, generation 2 trials continue from the best checkpoint from generation 1, and their candidate parameters are sampled from generation 1 results. Generation 3 then continues from the best checkpoint from generation 2 and samples from generation 2 results.
+If the previous generation has fewer than `tpe_startup_trials` completed trials, or if it has only one trial and cannot form a bad distribution, the runner does not fall back to fully uniform random sampling. Instead, it samples with Gaussian noise around the previous generation's `recommended` parameters. In other words, generation 1 explores broadly, and generation 2 and later explore around what the previous generation learned.
+
+For example, generation 2 trials continue from the commit checkpoint produced at the end of generation 1, and their candidate parameters are sampled from generation 1 results. Generation 3 then continues from the commit checkpoint produced at the end of generation 2 and samples from generation 2 results.
 
 The runner does not mix all generations for TPE, because each generation starts from a different checkpoint. Mixing metrics from different training stages would make older generations unfairly worse and distort the sampler.
 
@@ -59,7 +61,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | Field | Meaning | Default |
 | --- | --- | --- |
 | `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"`. | `"tpe"` |
-| `tpe_startup_trials` | Number of completed trials required before TPE starts. Until then, the runner samples from the whole search range. | `16` |
+| `tpe_startup_trials` | Number of completed trials required for TPE density estimation. In generation 1, trials are sampled from the full range until there are enough observations. In generation 2 and later, if the previous generation has too few trials, candidates are sampled around the previous generation's `recommended` parameters instead. | `16` |
 | `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
 | `commit_source` | Parameters used for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred value from the top trials. | `"best"` |

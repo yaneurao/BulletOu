@@ -48,7 +48,9 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 
 TPE-style sampler は、直前 generation の結果を使って次の候補を作ります。完了済み trial を metric で並べ、上位を「良かった候補」、残りを「悪かった候補」として、各パラメーターの分布を作ります。そのうえで、良かった候補の分布に近く、悪かった候補の分布から遠い値を優先してサンプルします。
 
-たとえば generation 2 の trial は、generation 1 の best checkpoint から追加学習します。また、generation 2 の候補パラメーターは generation 1 の trial 結果をもとに作ります。generation 3 では generation 2 の best checkpoint から追加学習し、候補パラメーターは generation 2 の結果をもとに作ります。
+ただし、直前 generation の trial 数が `tpe_startup_trials` に満たない場合や、trial が1本しかなく悪かった候補の分布を作れない場合は、探索範囲全体から完全ランダムに戻るのではなく、直前 generation の `recommended` parameter の周辺をガウスノイズでサンプルします。つまり、generation 1 は広く探索し、generation 2 以降は前の generation で得た推奨値を中心に探索します。
+
+たとえば generation 2 の trial は、generation 1 の最後に作られた commit checkpoint から追加学習します。また、generation 2 の候補パラメーターは generation 1 の trial 結果をもとに作ります。generation 3 では generation 2 の最後に作られた commit checkpoint から追加学習し、候補パラメーターは generation 2 の結果をもとに作ります。
 
 全世代の trial を混ぜて TPE しないのは、generation が進むほど開始 checkpoint が変わり、metric の土台も変わるためです。違う学習段階の trial を同じ尺度として混ぜると、古い generation が不利になりやすく、TPE の判断が歪みます。
 
@@ -59,7 +61,7 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 | 項目 | 意味 | 省略時 |
 | --- | --- | --- |
 | `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使います。 | `"tpe"` |
-| `tpe_startup_trials` | TPE を始める前に必要な完了済み trial 数。この本数に到達するまでは、探索範囲全体からランダムにサンプルします。 | `16` |
+| `tpe_startup_trials` | TPE の密度推定に必要な完了済み trial 数。generation 1 ではこの本数に届くまで探索範囲全体からランダムにサンプルします。generation 2 以降で直前 generation の trial 数が足りない場合は、直前 generation の `recommended` parameter 周辺をサンプルします。 | `16` |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
 | `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |

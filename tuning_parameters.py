@@ -10,8 +10,9 @@ This is a small local sampler for expensive BulletOu trials:
 * one generation-end commit run creates the next generation's checkpoint,
 * only the current checkpoint and the observed best checkpoint are kept by default.
 
-The sampler starts with uniform random trials, then uses a small TPE-style
-sampler over completed generations.
+The first generation starts with uniform random trials. Later generations use
+the previous generation: TPE when enough trials exist, otherwise Gaussian
+sampling around the previous generation's recommended parameters.
 """
 
 from __future__ import annotations
@@ -493,6 +494,51 @@ def sample_params_random(specs: dict[str, SearchParameter], rng: random.Random) 
     return out
 
 
+def sample_params_near(
+    specs: dict[str, SearchParameter],
+    rng: random.Random,
+    center: dict[str, float],
+    sigma_ratio: float,
+) -> dict[str, float]:
+    out = current_fixed_values(specs)
+    tuned = [spec for spec in specs.values() if spec.tune]
+    # Sample lr_min after lr so lr_min can be constrained to the sampled lr.
+    tuned.sort(key=lambda spec: 1 if spec.name == "lr_min" else 0)
+    for spec in tuned:
+        sample_spec = spec
+        if spec.name == "lr_min" and "lr" in out and spec.maximum is not None:
+            assert spec.minimum is not None
+            maximum = min(spec.maximum, out["lr"])
+            if maximum < spec.minimum:
+                maximum = spec.minimum
+            sample_spec = SearchParameter(
+                name=spec.name,
+                tune=spec.tune,
+                current=spec.current,
+                minimum=spec.minimum,
+                maximum=maximum,
+                log=spec.log,
+            )
+        center_value = center.get(spec.name)
+        if center_value is None or not math.isfinite(float(center_value)):
+            out[spec.name] = sample_spec.sample_random(rng)
+        else:
+            out[spec.name] = sample_spec.sample_near(rng, float(center_value), sigma_ratio)
+
+    if "lr_min_ratio" in out:
+        lr = out.get("lr")
+        if lr is None:
+            lr_spec = specs.get("lr")
+            if lr_spec is None or lr_spec.current is None:
+                raise ValueError("lr_min_ratio requires parameter `lr`")
+            lr = lr_spec.current
+            out["lr"] = lr
+        out["lr_min"] = lr * out.pop("lr_min_ratio")
+    if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
+        out["lr_min"] = out["lr"]
+    return out
+
+
 def sample_one_parameter_tpe(
     spec: SearchParameter,
     rng: random.Random,
@@ -547,11 +593,16 @@ def sample_params_tpe(
     rng: random.Random,
     completed: list[TrialResult],
     settings: StudySettings,
+    center: dict[str, float] | None,
 ) -> dict[str, float]:
     if len(completed) < settings.tpe_startup_trials:
+        if center is not None:
+            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
         return sample_params_random(specs, rng)
     good, bad = split_good_bad(completed, settings)
     if not good or not bad:
+        if center is not None:
+            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
         return sample_params_random(specs, rng)
 
     best_params: dict[str, float] | None = None
@@ -593,10 +644,11 @@ def sample_params(
     rng: random.Random,
     completed: list[TrialResult],
     settings: StudySettings,
+    center: dict[str, float] | None = None,
 ) -> dict[str, float]:
     if settings.sampler == "random":
         return sample_params_random(specs, rng)
-    return sample_params_tpe(specs, rng, completed, settings)
+    return sample_params_tpe(specs, rng, completed, settings, center)
 
 
 def train_args(
@@ -1113,6 +1165,23 @@ def main() -> int:
                 previous_generation_trials = (
                     generation_results(settings, completed, generation - 1) if generation > 1 else []
                 )
+                previous_recommended_params = (
+                    recommended_params(specs, previous_generation_trials, settings)
+                    if previous_generation_trials
+                    else None
+                )
+                if settings.sampler == "random" or not previous_generation_trials:
+                    sampler_center = "random"
+                elif (
+                    previous_recommended_params is not None
+                    and (
+                        len(previous_generation_trials) < settings.tpe_startup_trials
+                        or len(previous_generation_trials) < 2
+                    )
+                ):
+                    sampler_center = "previous-recommended"
+                else:
+                    sampler_center = "tpe"
                 rng = random.Random(settings.seed + generation * 1_000_003)
                 tuner.event(
                     color,
@@ -1120,7 +1189,8 @@ def main() -> int:
                     (
                         f"population={population} trial_sbs={trial_sbs} "
                         f"base={current_checkpoint or 'scratch'} "
-                        f"sampler_trials={len(previous_generation_trials)}"
+                        f"sampler_trials={len(previous_generation_trials)} "
+                        f"sampler_center={sampler_center}"
                     ),
                     "magenta",
                 )
@@ -1139,10 +1209,10 @@ def main() -> int:
                     )
                 trial_start = max(next_trial, generation_first_trial)
                 for _ in range(generation_first_trial, trial_start):
-                    sample_params(specs, rng, previous_generation_trials, settings)
+                    sample_params(specs, rng, previous_generation_trials, settings, previous_recommended_params)
                 for trial in range(trial_start, generation_last_trial + 1):
                     generation_trial = trial - generation_first_trial + 1
-                    params = sample_params(specs, rng, previous_generation_trials, settings)
+                    params = sample_params(specs, rng, previous_generation_trials, settings, previous_recommended_params)
                     out_dir = trials_root / f"trial{trial:04d}"
                     if out_dir.exists() and not args.dry_run:
                         shutil.rmtree(out_dir)
