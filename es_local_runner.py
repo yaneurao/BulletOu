@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Beam-style ES runner for BulletOu local fine-tuning.
+"""Fixed-length generation ES runner for BulletOu local fine-tuning.
 
 This runner is intentionally simple:
 
 * `es-settings.json` owns the current hyperparameters and ES settings.
 * `bulletou-settings.json` owns the ordinary `bulletou.exe` training options.
 * Each generation creates a population of randomized candidates.
-* Candidates are trained for the configured beam stages.
-* At each stage, candidates are ranked by the configured metric and pruned.
-* The final survivor's NN weights and hyperparameters become the next current
-  state.
+* Each candidate is trained for `es.beam[-1].after_sbs` superbatches.
+* After the whole population is evaluated, the best candidate's NN weights and
+  hyperparameters become the next current state.
 
 There is no gradient estimate and no partial parameter update.  The selected
 candidate itself survives.
@@ -257,7 +256,7 @@ class Candidate:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a beam-style ES search for BulletOu factorizer/count hyperparameters."
+        description="Run a fixed-length generation ES search for BulletOu factorizer/count hyperparameters."
     )
     parser.add_argument("--es-settings-file", type=Path, default=Path("es-settings.json"))
     parser.add_argument("--resume", action="store_true", help="Resume from run.output_folder/es-<run.tag_prefix>/runner-state.json")
@@ -432,12 +431,12 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     if metric_needs_validation and validation_rate < 0:
         raise ValueError(
             f"es.metric {metric!r} requires f32 validation; "
-            "use 0 for final-stage-only validation"
+            "use 0 for trial-end-only validation"
         )
     if metric_needs_quantized_validation and quantized_validation_rate < 0:
         raise ValueError(
             f"es.metric {metric!r} requires quantized validation; "
-            "use 0 for final-stage-only quantized validation"
+            "use 0 for trial-end-only quantized validation"
         )
 
     beam_raw = es_obj.get("beam")
@@ -456,16 +455,14 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     if not beam:
         raise ValueError("es.beam must not be empty")
     prev_after = 0
-    prev_keep = population
     for stage in beam:
         if stage.after_sbs <= prev_after:
             raise ValueError("es.beam after_sbs must be strictly increasing")
-        if stage.keep <= 0 or stage.keep > prev_keep:
-            raise ValueError("es.beam keep must be > 0 and <= previous live candidate count")
+        if stage.keep <= 0:
+            raise ValueError("es.beam keep must be > 0")
         prev_after = stage.after_sbs
-        prev_keep = stage.keep
     if beam[-1].keep != 1:
-        raise ValueError("final es.beam stage must keep exactly 1 candidate")
+        raise ValueError("final es.beam entry must keep exactly 1 candidate")
 
     settings = EsSettings(
         enabled=enabled,
@@ -1176,17 +1173,17 @@ def train_candidate_stage(
     color: bool,
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
-    out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
+    out_dir = temp_root / f"gen{generation:04d}" / f"trial{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
     if not args.dry_run:
         if out_dir.exists():
             shutil.rmtree(out_dir)
         out_dir.parent.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"gen{generation:04d}-stage{stage.after_sbs:04d}-cand{candidate.index:03d}.stdout.log"
+    log_path = log_dir / f"gen{generation:04d}-trial{stage.after_sbs:04d}-cand{candidate.index:03d}.stdout.log"
     event(
         color,
         f"[CAND {candidate.index:03d} START]",
         (
-            f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb "
+            f"generation={generation} trial_sbs={stage.after_sbs} delta={delta}sb "
             f"{metric_status_text(base_metric, prefix='base_')}"
         ),
         "cyan",
@@ -1217,7 +1214,7 @@ def train_candidate_stage(
         checkpoint = candidate.checkpoint
         elapsed = 0.0
     else:
-        child_prefix = paint(color, f"[G{generation:04d} S{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
+        child_prefix = paint(color, f"[G{generation:04d} T{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
         code, elapsed = run_command(
             cmd,
             log_path,
@@ -1254,7 +1251,7 @@ def train_candidate_stage(
         color,
         f"[CAND {candidate.index:03d} END]",
         (
-            f"generation={generation} stage={stage.after_sbs}sb "
+            f"generation={generation} trial_sbs={stage.after_sbs} "
             f"{metric_status_text(metric)} {settings.metric}={score_text} "
             f"elapsed={elapsed:.1f}s"
         ),
@@ -1307,15 +1304,15 @@ def train_candidate_stage_worker(
     color: bool,
 ) -> Candidate:
     delta = stage.after_sbs - prev_after_sbs
-    out_dir = temp_root / f"gen{generation:04d}" / f"stage{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
-    cache_key = f"g{generation:04d}-s{stage.after_sbs:04d}-c{candidate.index:03d}"
+    out_dir = temp_root / f"gen{generation:04d}" / f"trial{stage.after_sbs:04d}" / f"cand{candidate.index:03d}"
+    cache_key = f"g{generation:04d}-t{stage.after_sbs:04d}-c{candidate.index:03d}"
     disk_cache = settings.metric == BORDA_COUNT_METRIC
     checkpoint_text = f"worker-disk-cache:{cache_key}" if disk_cache else f"worker-cache:{cache_key}"
     event(
         color,
         f"[CAND {candidate.index:03d} START]",
         (
-            f"generation={generation} stage={stage.after_sbs}sb delta={delta}sb worker=on "
+            f"generation={generation} trial_sbs={stage.after_sbs} delta={delta}sb worker=on "
             f"{metric_status_text(base_metric, prefix='base_')}"
         ),
         "cyan",
@@ -1362,7 +1359,7 @@ def train_candidate_stage_worker(
     else:
         if worker is None:
             raise RuntimeError("worker client is not open")
-        prefix = paint(color, f"[G{generation:04d} S{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
+        prefix = paint(color, f"[G{generation:04d} T{stage.after_sbs:04d} C{candidate.index:03d}] ", "magenta")
         started = time.perf_counter()
         trial_request = {"args": trial_args, "keep": False, "cache_key": cache_key}
         if disk_cache:
@@ -1386,7 +1383,7 @@ def train_candidate_stage_worker(
         color,
         f"[CAND {candidate.index:03d} END]",
         (
-            f"generation={generation} stage={stage.after_sbs}sb worker=on "
+            f"generation={generation} trial_sbs={stage.after_sbs} worker=on "
             f"{metric_status_text(metric)} {settings.metric}={score_text} "
             f"cache={cache_text if cached or dominated_by_prior else 'none'} elapsed={elapsed:.1f}s"
         ),
@@ -1778,14 +1775,7 @@ def main() -> int:
         event(color, "[START]", f"base_checkpoint={current_checkpoint}", "green")
 
     validate_checkpoint_dir(current_checkpoint)
-    worker_enabled = settings.use_worker and all(stage.keep == 1 for stage in settings.beam)
-    if settings.use_worker and not worker_enabled:
-        event(
-            color,
-            "[WORKER]",
-            "disabled for this run because the current worker protocol cannot keep multiple beam branches in memory; using ordinary candidate processes",
-            "yellow",
-        )
+    worker_enabled = settings.use_worker
 
     beam_text = ", ".join(f"{stage.after_sbs}sb=>keep{stage.keep}" for stage in settings.beam)
     event(
@@ -1793,7 +1783,8 @@ def main() -> int:
         "[CONFIG]",
         (
             f"population={settings.population} generations={settings.generations} "
-            f"metric={settings.metric} ({metric_direction_text(settings)}) beam=[{beam_text}] "
+            f"trial_sbs={settings.beam[-1].after_sbs} "
+            f"metric={settings.metric} ({metric_direction_text(settings)}) beam_config=[{beam_text}] "
             f"parameter_step_scale={settings.parameter_step_scale:g} "
             f"save_rate={settings.save_rate} worker={'on' if worker_enabled else 'off'} "
             f"bulletou_settings={run.bulletou_settings_file}"
@@ -1845,6 +1836,8 @@ def main() -> int:
                     "green",
                 )
 
+        trial_stage = settings.beam[-1]
+        trial_sbs = trial_stage.after_sbs
         total_generations = settings.generations
         for generation in range(generation_start, generation_start + total_generations):
             rng = random.Random(settings.seed + generation * 1_000_003)
@@ -1862,155 +1855,151 @@ def main() -> int:
                 color,
                 f"[GEN {generation} START]",
                 (
-                    f"generation={generation} population={settings.population} from={current_checkpoint} "
+                    f"generation={generation} population={settings.population} trial_sbs={trial_sbs} "
+                    f"from={current_checkpoint} "
                     f"{metric_status_text(base_metric, prefix='base_')}"
                 ),
                 "magenta",
             )
 
-            live = candidates
-            prev_after_sbs = 0
-            for stage in settings.beam:
-                trained: list[Candidate] = []
-                stage_best_cache_key: str | None = None
-                stage_best_score: float | None = None
-                for candidate in live:
-                    if worker_enabled:
-                        trained_candidate = train_candidate_stage_worker(
+            trained: list[Candidate] = []
+            generation_best_cache_key: str | None = None
+            generation_best_score: float | None = None
+            for candidate in candidates:
+                if worker_enabled:
+                    trained_candidate = train_candidate_stage_worker(
+                        args=args,
+                        worker=worker,
+                        run=run,
+                        settings=settings,
+                        summary_path=summary_path,
+                        base_metric=base_metric,
+                        generation=generation,
+                        candidate=candidate,
+                        stage=trial_stage,
+                        prev_after_sbs=0,
+                        temp_root=temp_root,
+                        borda_dominators=[
+                            prior.metric
+                            for prior in trained
+                            if settings.metric == BORDA_COUNT_METRIC
+                            and prior.cache_key is not None
+                            and prior.metric is not None
+                        ],
+                        color=color,
+                    )
+                    if (
+                        not args.dry_run
+                        and settings.metric == BORDA_COUNT_METRIC
+                        and trained_candidate.cache_key is not None
+                        and trained_candidate.metric is not None
+                    ):
+                        dominated_prior_keys = [
+                            prior.cache_key
+                            for prior in trained
+                            if prior.cache_key is not None
+                            and prior.metric is not None
+                            and metric_pareto_dominates(trained_candidate.metric, prior.metric)
+                        ]
+                        if dominated_prior_keys:
+                            assert worker is not None
+                            worker.request(
+                                "drop-cached-trials",
+                                {"cache_keys": dominated_prior_keys},
+                                prefix=paint(color, f"[G{generation:04d} DOMINATED DROP] ", "magenta"),
+                            )
+                            dominated_prior_set = set(dominated_prior_keys)
+                            for prior in trained:
+                                if prior.cache_key in dominated_prior_set:
+                                    prior.cache_key = None
+                    trained.append(trained_candidate)
+                    if (
+                        not args.dry_run
+                        and settings.metric != BORDA_COUNT_METRIC
+                        and trained_candidate.cache_key is not None
+                        and trained_candidate.score is not None
+                    ):
+                        assert worker is not None
+                        if is_better_score(
+                            trained_candidate.score,
+                            generation_best_score,
+                            settings.lower_is_better,
+                        ):
+                            if generation_best_cache_key is not None:
+                                worker.request(
+                                    "drop-cached-trials",
+                                    {"cache_keys": [generation_best_cache_key]},
+                                    prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
+                                )
+                            generation_best_cache_key = trained_candidate.cache_key
+                            generation_best_score = trained_candidate.score
+                        else:
+                            worker.request(
+                                "drop-cached-trials",
+                                {"cache_keys": [trained_candidate.cache_key]},
+                                prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
+                            )
+                else:
+                    trained.append(
+                        train_candidate_stage(
                             args=args,
-                            worker=worker,
                             run=run,
                             settings=settings,
                             summary_path=summary_path,
                             base_metric=base_metric,
                             generation=generation,
                             candidate=candidate,
-                            stage=stage,
-                            prev_after_sbs=prev_after_sbs,
+                            stage=trial_stage,
+                            prev_after_sbs=0,
                             temp_root=temp_root,
-                            borda_dominators=[
-                                candidate.metric
-                                for candidate in trained
-                                if settings.metric == BORDA_COUNT_METRIC
-                                and candidate.cache_key is not None
-                                and candidate.metric is not None
-                            ],
+                            log_dir=log_dir,
                             color=color,
                         )
-                        if (
-                            not args.dry_run
-                            and settings.metric == BORDA_COUNT_METRIC
-                            and trained_candidate.cache_key is not None
-                            and trained_candidate.metric is not None
-                        ):
-                            dominated_prior_keys = [
-                                prior.cache_key
-                                for prior in trained
-                                if prior.cache_key is not None
-                                and prior.metric is not None
-                                and metric_pareto_dominates(trained_candidate.metric, prior.metric)
-                            ]
-                            if dominated_prior_keys:
-                                assert worker is not None
-                                worker.request(
-                                    "drop-cached-trials",
-                                    {"cache_keys": dominated_prior_keys},
-                                    prefix=paint(color, f"[G{generation:04d} DOMINATED DROP] ", "magenta"),
-                                )
-                                dominated_prior_set = set(dominated_prior_keys)
-                                for prior in trained:
-                                    if prior.cache_key in dominated_prior_set:
-                                        prior.cache_key = None
-                        trained.append(trained_candidate)
-                        if (
-                            not args.dry_run
-                            and settings.metric != BORDA_COUNT_METRIC
-                            and stage.keep == 1
-                            and trained_candidate.cache_key is not None
-                            and trained_candidate.score is not None
-                        ):
-                            assert worker is not None
-                            if is_better_score(trained_candidate.score, stage_best_score, settings.lower_is_better):
-                                if stage_best_cache_key is not None:
-                                    worker.request(
-                                        "drop-cached-trials",
-                                        {"cache_keys": [stage_best_cache_key]},
-                                        prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
-                                    )
-                                stage_best_cache_key = trained_candidate.cache_key
-                                stage_best_score = trained_candidate.score
-                            else:
-                                worker.request(
-                                    "drop-cached-trials",
-                                    {"cache_keys": [trained_candidate.cache_key]},
-                                    prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
-                                )
-                    else:
-                        trained.append(
-                            train_candidate_stage(
-                                args=args,
-                                run=run,
-                                settings=settings,
-                                summary_path=summary_path,
-                                base_metric=base_metric,
-                                generation=generation,
-                                candidate=candidate,
-                                stage=stage,
-                                prev_after_sbs=prev_after_sbs,
-                                temp_root=temp_root,
-                                log_dir=log_dir,
-                                color=color,
-                            )
-                        )
-                ranked = rank_candidates(trained, settings)
-                log_stage_rows(summary_path, generation, stage, ranked, stage.keep)
-                kept = ranked[: stage.keep]
-                pruned = ranked[stage.keep :]
-                best = kept[0]
-                worst_kept = kept[-1]
-                event(
-                    color,
-                    f"[BEAM END]",
-                    (
-                        f"generation={generation} stage={stage.after_sbs}sb "
-                        f"keep={len(kept)}/{len(ranked)} best_{settings.metric}={format_float(best.score)} "
-                        f"worst_kept_{settings.metric}={format_float(worst_kept.score)} "
-                        f"status=pruned_not_saved"
-                    ),
-                    "yellow",
-                )
-                if worker_enabled and not args.dry_run and settings.metric == BORDA_COUNT_METRIC:
-                    cache_keys_to_drop = [candidate.cache_key for candidate in pruned if candidate.cache_key is not None]
-                    if cache_keys_to_drop:
-                        assert worker is not None
-                        worker.request(
-                            "drop-cached-trials",
-                            {"cache_keys": cache_keys_to_drop},
-                            prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
-                        )
-                if worker_enabled and not args.dry_run:
-                    if best.cache_key is None:
-                        raise RuntimeError("worker survivor has no cache key")
+                    )
+
+            ranked = rank_candidates(trained, settings)
+            log_stage_rows(summary_path, generation, trial_stage, ranked, 1)
+            survivor = ranked[0]
+            pruned = ranked[1:]
+            event(
+                color,
+                "[GEN RANK]",
+                (
+                    f"generation={generation} trial_sbs={trial_sbs} "
+                    f"best=cand{survivor.index:03d} best_{settings.metric}={format_float(survivor.score)} "
+                    f"population={len(ranked)}"
+                ),
+                "yellow",
+            )
+
+            if worker_enabled and not args.dry_run:
+                cache_keys_to_drop = [candidate.cache_key for candidate in pruned if candidate.cache_key is not None]
+                if cache_keys_to_drop:
                     assert worker is not None
                     worker.request(
-                        "accept-cached-trial",
-                        {"cache_key": best.cache_key},
-                        prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
+                        "drop-cached-trials",
+                        {"cache_keys": cache_keys_to_drop},
+                        prefix=paint(color, f"[G{generation:04d} DROP] ", "magenta"),
                     )
-                    best.cache_key = None
-                    best.checkpoint = current_checkpoint
-                if not args.keep_temp and not args.dry_run:
-                    for candidate in pruned:
-                        if candidate.output_dir is not None:
-                            remove_dir_quiet(candidate.output_dir)
-                live = kept
-                prev_after_sbs = stage.after_sbs
+                if survivor.cache_key is None:
+                    raise RuntimeError("worker survivor has no cache key")
+                assert worker is not None
+                worker.request(
+                    "accept-cached-trial",
+                    {"cache_key": survivor.cache_key},
+                    prefix=paint(color, f"[G{generation:04d} ACCEPT] ", "magenta"),
+                )
+                survivor.cache_key = None
+                survivor.checkpoint = current_checkpoint
+            if not args.keep_temp and not args.dry_run:
+                for candidate in pruned:
+                    if candidate.output_dir is not None:
+                        remove_dir_quiet(candidate.output_dir)
 
-            survivor = live[0]
             if survivor.metric is None or survivor.score is None:
                 raise RuntimeError("final survivor has no metric")
 
-            accepted_sbs += settings.beam[-1].after_sbs
+            accepted_sbs += trial_sbs
             if not args.dry_run:
                 if worker_enabled:
                     assert worker is not None
@@ -2029,7 +2018,7 @@ def main() -> int:
                             "args": save_args,
                             "dir": str(current_dir),
                             "epoch": generation,
-                            "superbatch": settings.beam[-1].after_sbs,
+                            "superbatch": trial_sbs,
                         },
                         prefix=paint(color, f"[G{generation:04d} SAVE] ", "magenta"),
                     )
@@ -2062,7 +2051,7 @@ def main() -> int:
                     "quantized_value_accuracy": format_float(metric.qacc),
                     "test_value_loss": format_float(metric.test_loss),
                     "test_value_accuracy": format_float(metric.test_acc),
-                    "stage_sbs": settings.beam[-1].after_sbs,
+                    "stage_sbs": trial_sbs,
                     "saved_checkpoint": saved_checkpoint,
                     "current_checkpoint": str(current_checkpoint),
                     "parameters": params_json,

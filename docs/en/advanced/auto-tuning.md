@@ -4,7 +4,7 @@
 
 This page explains how to tune SFNN factorizer alpha values and count-confidence values with `es_local_runner.py`.
 
-Here, ES means evolution strategy. The runner creates several candidates with slightly different hyperparameters, trains them for short runs, and keeps the candidates that rank best by the configured metric. It does not estimate a gradient and then apply a separate small update. The final survivor's NN weights and hyperparameter values directly become the next generation's starting point.
+Here, ES means evolution strategy. Each generation creates `population` candidates with slightly different hyperparameters, trains every candidate for a fixed trial length, and selects the candidate that ranks best by the configured metric. It does not estimate a gradient and then apply a separate small update. The selected candidate's NN weights and hyperparameter values directly become the next generation's starting point.
 
 ## JSON files
 
@@ -12,7 +12,7 @@ The runner uses two JSON files.
 
 | File | Purpose |
 | --- | --- |
-| `es-settings.json` | ES generations, population, beam schedule, tunable parameters, and current values |
+| `es-settings.json` | ES generations, population, trial length, tunable parameters, and current values |
 | `bulletou-settings.json` | Normal `bulletou.exe` training options |
 
 `es-settings.json` points to `bulletou-settings.json`. You normally pass only `--es-settings-file` to the runner.
@@ -111,7 +111,7 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | --- | --- |
 | `initial_state`, `initial_dataloader_pos` | Each candidate starts from a runner-selected checkpoint |
 | `output`, `output_folder`, `tag` | Each candidate needs a separate output directory |
-| `superbatches`, `max_epochs` | Each beam stage trains for a different number of sb |
+| `superbatches`, `max_epochs` | The runner sets the candidate trial length |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | The runner sets candidate evaluation cadence |
 | `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
@@ -123,17 +123,17 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `enabled` | `true` runs ES. `false` runs one normal `bulletou.exe` job using `parameters.current` values |
 | `generations` | Number of generations. One candidate is accepted per generation |
 | `population` | Number of candidates at the start of each generation |
-| `beam` | When to prune candidates and how many to keep |
+| `beam` | Candidate trial length. The final `after_sbs` value is used |
 | `metric` | Metric used to rank candidates |
 | `lower_is_better` | `true` if smaller metric values are better. Ignored for `borda_count` because lower rank sum is always better |
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `parameter_step_scale` | Global multiplier for every `parameters.*.step`. `1.0` uses each step as written; `10.0` makes all candidate perturbations 10 times wider without changing `current` |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
-| `validation_rate` | f32 validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
-| `quantized_validation_rate` | Quantized validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each stage. `-1` disables it |
+| `validation_rate` | f32 validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
+| `quantized_validation_rate` | Quantized validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
 
-You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want stage-end-only validation.
+You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want trial-end-only validation.
 
 `beam` is read like this:
 
@@ -146,7 +146,7 @@ You cannot disable a validation that the selected `metric` needs. For example, `
 ]
 ```
 
-This example starts with 16 candidates, keeps 8 after 8 sb, 4 after 16 sb, 2 after 24 sb, and 1 after 32 sb. The final `keep` must be `1`.
+The current runner does not prune candidates in the middle of a trial. In this example, every candidate is trained for 32 sb, then all `population` candidates are ranked. The final `after_sbs`, `32` in this example, is the trial length. `keep` remains in the file shape, but intermediate `keep` values are not used by execution. The final `keep` should be `1`.
 
 Supported metrics:
 
@@ -305,10 +305,10 @@ ES writes metric columns in `summary-learn.log` and `accepted-summary-learn.log`
 
 The runner copies the current `es-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
 
-If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[BEAM END]` only means candidate pruning finished; it does not mean a public checkpoint has been fully saved.
+If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[GEN RANK]` only means candidate evaluation and ranking for the generation finished; it does not mean a public checkpoint has been fully saved.
 
 During ES, the runner uses one long-lived `bulletou worker` process by default. This avoids rebuilding the CUDA context, validation cache, qvalid cache, and worker warmup for every candidate.
 
-If `use_worker` is `false`, or if the runner detects a beam layout that cannot be handled safely by the current worker protocol, candidates are run as short `bulletou.exe` child jobs. In that mode, `[epoch] start epoch 1/1` belongs to the child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0008 C001]`, meaning generation 2, 8sb stage, candidate 1.
+If `use_worker` is `false`, candidates are run as short `bulletou.exe` child jobs. In that mode, `[epoch] start epoch 1/1` belongs to the child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0032 C001]`, meaning generation 2, 32sb trial, candidate 1.
 
 When normal training uses `bulletou.exe --settings-file`, each BulletOu checkpoint gets a copy of `bulletou-settings.json`.

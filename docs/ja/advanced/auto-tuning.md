@@ -4,7 +4,7 @@
 
 このページでは、`es_local_runner.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
 
-ここでいう ES は evolution strategy です。いくつかの候補を少し違うパラメーターで学習させ、設定した指標で良い候補を残します。勾配を推定して別の小さな更新を行う方式ではありません。最後に残った候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
+ここでいう ES は evolution strategy です。各世代で `population` 本の候補を少し違うパラメーターで学習させ、設定した指標で一番良い候補を選びます。勾配を推定して別の小さな更新を行う方式ではありません。選ばれた候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
 
 ## 使う JSON ファイル
 
@@ -12,7 +12,7 @@ runner は 2 つの JSON ファイルを使います。
 
 | ファイル | 役割 |
 | --- | --- |
-| `es-settings.json` | ES の世代数、population、beam、調整するパラメーター、現在値を書く |
+| `es-settings.json` | ES の世代数、population、trial 長、調整するパラメーター、現在値を書く |
 | `bulletou-settings.json` | 通常の `bulletou.exe` 学習オプションを書く |
 
 `es-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--es-settings-file` だけを渡します。
@@ -112,7 +112,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | --- | --- |
 | `initial_state`, `initial_dataloader_pos` | 候補ごとに開始 checkpoint が変わる |
 | `output`, `output_folder`, `tag` | 候補ごとに出力先を分ける |
-| `superbatches`, `max_epochs` | beam の stage ごとに学習 sb 数が変わる |
+| `superbatches`, `max_epochs` | 候補 trial の長さを runner が決める |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
 | `sfnn_factorizer_alpha` | ES の `parameters` から候補ごとに作る |
 | `sfnn_*_count_confidence` | ES の `parameters` から候補ごとに作る |
@@ -126,17 +126,17 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `enabled` | `true` なら ES を実行する。`false` なら `parameters.current` だけを使って通常学習を 1 回起動する |
 | `generations` | 世代数。1 世代ごとに 1 つの候補を採用する |
 | `population` | 世代開始時に作る候補数 |
-| `beam` | 何 sb 学習した時点で、候補をいくつ残すか |
+| `beam` | 候補 1 本あたり何 sb 学習するか。最後の `after_sbs` が trial 長になる |
 | `metric` | 候補を比較する指標 |
 | `lower_is_better` | 小さいほど良い指標なら `true`。`borda_count` では常に順位和が小さいほど良いので、この値は使われない |
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
 | `parameter_step_scale` | すべての `parameters.*.step` に掛ける全体倍率。`1.0` なら各 `step` をそのまま使い、`10.0` なら `current` は変えずに候補の揺らし幅だけを 10 倍にする |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
-| `validation_rate` | f32 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
-| `quantized_validation_rate` | 量子化 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 stage の末尾だけで測る。`-1` なら無効 |
+| `validation_rate` | f32 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
+| `quantized_validation_rate` | 量子化 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
 
-`metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。stage 末尾だけでよい場合は `0` を指定します。
+`metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。trial 末尾だけでよい場合は `0` を指定します。
 
 `beam` は次のように読みます。
 
@@ -149,7 +149,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 ]
 ```
 
-この例では、16 候補で開始し、8 sb 後に 8 候補、16 sb 後に 4 候補、24 sb 後に 2 候補、32 sb 後に 1 候補へ絞ります。最後の `keep` は必ず `1` にしてください。
+現在の runner は途中で候補を絞りません。この例では、各候補を 32 sb ずつ学習し、`population` 本すべてが終わってから順位を付けます。最後の `after_sbs`、つまり上の例では `32` が 1 trial の sb 数です。`keep` は設定ファイルの形を保つために残っていますが、途中の `keep` は実行には使いません。最後の `keep` は `1` にしてください。
 
 ## `metric`
 
@@ -311,10 +311,10 @@ ES の `summary-learn.log` と `accepted-summary-learn.log` は、通常の Bull
 
 runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `es-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 
-手動停止するなら、`[SAFE TO STOP]` が表示された直後が安全です。`[BEAM END]` は候補の絞り込みが終わったという意味で、公開 checkpoint の保存完了を意味しません。
+手動停止するなら、`[SAFE TO STOP]` が表示された直後が安全です。`[GEN RANK]` はその世代の候補評価と順位付けが終わったという意味で、公開 checkpoint の保存完了を意味しません。
 
 ES 実行中は、標準では `bulletou worker` を 1 回だけ起動し、その中で候補を試します。これにより、CUDA context、validation cache、qvalid cache、worker warmup を候補ごとに作り直す時間を避けられます。
 
-`use_worker` を `false` にした場合や、runner が worker では安全に扱えない beam 構成を検出した場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0008 C001]` のような prefix を付けます。これは「generation 2、8 sb stage、candidate 1」の意味です。
+`use_worker` を `false` にした場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0032 C001]` のような prefix を付けます。これは「generation 2、32 sb trial、candidate 1」の意味です。
 
 通常学習で `bulletou.exe --settings-file` を使った場合も、各 BulletOu checkpoint には `bulletou-settings.json` がコピーされます。
