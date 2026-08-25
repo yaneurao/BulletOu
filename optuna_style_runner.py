@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python3
-"""Dependency-free Optuna-style local runner for BulletOu.
+"""Dependency-free Optuna-style local tuner for BulletOu.
 
 This is intentionally not the Optuna package.  It is a small local sampler for
 expensive BulletOu trials:
@@ -128,8 +128,8 @@ class TrialResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run fixed-length Optuna-style BulletOu trials.")
-    parser.add_argument("--settings-file", type=Path, default=Path("optuna-style-settings.json"))
+    parser = argparse.ArgumentParser(description="Run fixed-length Optuna-style BulletOu tuning trials.")
+    parser.add_argument("--settings-file", type=Path, default=Path("tuning-settings.json"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
@@ -165,47 +165,73 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     if version != SETTINGS_VERSION:
         raise ValueError(f"{path}: unsupported version {version}; expected {SETTINGS_VERSION}")
 
-    study_obj = root.get("study")
-    if not isinstance(study_obj, dict):
-        raise ValueError(f"{path}: `study` object is required")
-    metric = str(study_obj.get("metric", "quantized_value_loss"))
+    if "study" in root:
+        raise ValueError(f"{path}: `study` was replaced by `tuning`; update this settings file")
+    tuning_obj = root.get("tuning")
+    if not isinstance(tuning_obj, dict):
+        raise ValueError(f"{path}: `tuning` object is required")
+    removed_tuning_keys = sorted(
+        set(tuning_obj) & {"method", "beam", "candidate_sbs", "parameter_step_scale", "trials"}
+    )
+    if removed_tuning_keys:
+        raise ValueError(
+            f"{path}: obsolete tuning key(s): {', '.join(removed_tuning_keys)}. "
+            "Use tuning.trial_sbs and per-parameter ranges instead."
+        )
+    allowed_tuning_keys = {
+        "population",
+        "trial_sbs",
+        "metric",
+        "lower_is_better",
+        "seed",
+        "startup_trials",
+        "elite_fraction",
+        "elite_sigma",
+        "validation_rate",
+        "quantized_validation_rate",
+        "keep_all_trials",
+    }
+    unknown_tuning_keys = sorted(set(tuning_obj) - allowed_tuning_keys)
+    if unknown_tuning_keys:
+        raise ValueError(f"{path}: unknown tuning field(s): {', '.join(unknown_tuning_keys)}")
+    metric = str(tuning_obj.get("metric", "quantized_value_loss"))
     if metric not in {
         "quantized_value_loss",
         "quantized_value_accuracy",
         "test_value_loss",
         "test_value_accuracy",
     }:
-        raise ValueError(f"{path}: unsupported study.metric {metric!r}")
-    lower_is_better = bool(study_obj.get("lower_is_better", "loss" in metric))
+        raise ValueError(f"{path}: unsupported tuning.metric {metric!r}")
+    lower_is_better = bool(tuning_obj.get("lower_is_better", "loss" in metric))
     settings = StudySettings(
-        trials=int(study_obj.get("trials", 1)),
-        trial_sbs=int(study_obj.get("trial_sbs", 16)),
+        trials=int(tuning_obj.get("population", 1)),
+        trial_sbs=int(tuning_obj.get("trial_sbs", 16)),
         metric=metric,
         lower_is_better=lower_is_better,
-        seed=int(study_obj.get("seed", 1)),
-        startup_trials=int(study_obj.get("startup_trials", 16)),
-        elite_fraction=float(study_obj.get("elite_fraction", 0.25)),
-        elite_sigma=float(study_obj.get("elite_sigma", 0.15)),
-        validation_rate=int(study_obj.get("validation_rate", 0)),
-        quantized_validation_rate=int(study_obj.get("quantized_validation_rate", 0)),
-        keep_all_trials=bool(study_obj.get("keep_all_trials", False)),
+        seed=int(tuning_obj.get("seed", 1)),
+        startup_trials=int(tuning_obj.get("startup_trials", 16)),
+        elite_fraction=float(tuning_obj.get("elite_fraction", 0.25)),
+        elite_sigma=float(tuning_obj.get("elite_sigma", 0.15)),
+        validation_rate=int(tuning_obj.get("validation_rate", 0)),
+        quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
+        keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
     )
     if settings.trials <= 0:
-        raise ValueError("study.trials must be > 0")
+        raise ValueError("tuning.population must be > 0")
     if settings.trial_sbs <= 0:
-        raise ValueError("study.trial_sbs must be > 0")
+        raise ValueError("tuning.trial_sbs must be > 0")
     if settings.startup_trials < 0:
-        raise ValueError("study.startup_trials must be >= 0")
+        raise ValueError("tuning.startup_trials must be >= 0")
     if not (0.0 < settings.elite_fraction <= 1.0):
-        raise ValueError("study.elite_fraction must be in (0, 1]")
+        raise ValueError("tuning.elite_fraction must be in (0, 1]")
     if settings.elite_sigma <= 0.0 or not math.isfinite(settings.elite_sigma):
-        raise ValueError("study.elite_sigma must be finite and > 0")
+        raise ValueError("tuning.elite_sigma must be finite and > 0")
     if settings.validation_rate < -1 or settings.quantized_validation_rate < -1:
-        raise ValueError("study.validation_rate / quantized_validation_rate must be >= -1")
+        raise ValueError("tuning.validation_rate / quantized_validation_rate must be >= -1")
     if metric.startswith("test_value_") and settings.validation_rate < 0:
-        raise ValueError(f"study.metric {metric!r} requires study.validation_rate >= 0")
+        raise ValueError(f"tuning.metric {metric!r} requires tuning.validation_rate >= 0")
     if metric.startswith("quantized_value_") and settings.quantized_validation_rate < 0:
-        raise ValueError(f"study.metric {metric!r} requires study.quantized_validation_rate >= 0")
+        raise ValueError(f"tuning.metric {metric!r} requires tuning.quantized_validation_rate >= 0")
 
     run_obj = root.get("run")
     if not isinstance(run_obj, dict):
@@ -524,8 +550,8 @@ def main() -> int:
     color = use_color(args.color)
     try:
         root, settings, run, specs = load_settings(args.settings_file)
-        runner_root = run.output_folder / f"optuna-{run.tag_prefix}"
-        trials_root = (run.temp_folder / f"optuna-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
+        runner_root = run.output_folder / f"tuning-{run.tag_prefix}"
+        trials_root = (run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
         log_dir = runner_root / "logs"
         summary_path = runner_root / "summary-learn.log"
         state_path = runner_root / "runner-state.json"
@@ -552,7 +578,7 @@ def main() -> int:
             color,
             "[CONFIG]",
             (
-                f"trials={settings.trials} trial_sbs={settings.trial_sbs} metric={settings.metric} "
+                f"population={settings.trials} trial_sbs={settings.trial_sbs} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
                 f"startup_trials={settings.startup_trials} elite_fraction={settings.elite_fraction:g} "
                 f"elite_sigma={settings.elite_sigma:g}"

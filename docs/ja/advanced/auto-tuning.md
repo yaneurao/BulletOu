@@ -33,21 +33,14 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
 {
   "version": 1,
   "tuning": {
-    "method": "population_search",
     "enabled": true,
     "generations": 100,
-    "population": 16,
-    "beam": [
-      { "after_sbs": 8, "keep": 8 },
-      { "after_sbs": 16, "keep": 4 },
-      { "after_sbs": 24, "keep": 2 },
-      { "after_sbs": 32, "keep": 1 }
-    ],
-    "metric": "borda_count",
+    "population": 100,
+    "trial_sbs": 4,
+    "metric": "quantized_value_loss",
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
-    "parameter_step_scale": 1.0,
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -127,31 +120,19 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | --- | --- |
 | `enabled` | `true` なら population search を実行する。`false` なら `parameters.current` だけを使って通常学習を 1 回起動する |
 | `generations` | 世代数。1 世代ごとに 1 つの候補を採用する |
-| `population` | 世代開始時に作る候補数 |
-| `beam` | 候補 1 本あたり何 sb 学習するか。最後の `after_sbs` が trial 長になる |
+| `population` | 1 世代で試す候補数。例では 100 本の候補を試す |
+| `trial_sbs` | 候補 1 本あたり何 sb 学習するか。例では 1 trial = 4 sb |
 | `metric` | 候補を比較する指標 |
 | `lower_is_better` | 小さいほど良い指標なら `true`。`borda_count` では常に順位和が小さいほど良いので、この値は使われない |
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
-| `parameter_step_scale` | すべての `parameters.*.step` に掛ける全体倍率。`1.0` なら各 `step` をそのまま使い、`10.0` なら `current` は変えずに候補の揺らし幅だけを 10 倍にする |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
 | `validation_rate` | f32 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
 | `quantized_validation_rate` | 量子化 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
 
 `metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。trial 末尾だけでよい場合は `0` を指定します。
 
-`beam` は次のように読みます。
-
-```json
-"beam": [
-  { "after_sbs": 8, "keep": 8 },
-  { "after_sbs": 16, "keep": 4 },
-  { "after_sbs": 24, "keep": 2 },
-  { "after_sbs": 32, "keep": 1 }
-]
-```
-
-現在の runner は途中で候補を絞りません。この例では、各候補を 32 sb ずつ学習し、`population` 本すべてが終わってから順位を付けます。最後の `after_sbs`、つまり上の例では `32` が 1 trial の sb 数です。`keep` は設定ファイルの形を保つために残っていますが、途中の `keep` は実行には使いません。最後の `keep` は `1` にしてください。
+`trial_sbs` は候補 1 本あたりの学習長です。`trial_sbs: 4` なら、各候補を 4 sb だけ学習し、`population` 本すべてが終わってから指標で順位を付けます。
 
 ## `metric`
 
@@ -194,6 +175,8 @@ population search 実行時は runner が候補ごとに次の値を決めます
 
 runner root は `output_folder/tuning-<tag_prefix>` です。
 
+`run.base_checkpoint` は最初の開始点です。1 generation ごとの採用 checkpoint は `runner-state.json` の `current_checkpoint` に記録されます。`--resume` 時は `run.base_checkpoint` ではなく `current_checkpoint` から再開します。`tuning-settings.json` の `run.base_checkpoint` は自動では書き換えません。
+
 ## `parameters` の書き方
 
 `shared` を固定する場合、主な調整対象は 13 個です。axis alpha が 3 個、pair alpha が 3 個、axis count confidence が 3 個、pair count confidence が 3 個、residual count confidence が 1 個です。学習率も runner に保持させたい場合は、これに加えて `lr` / `lr_min` を任意で書けます。
@@ -208,11 +191,11 @@ runner root は `output_folder/tuning-<tag_prefix>` です。
 | --- | --- |
 | `current` | 現在値。候補はこの値の周辺から作られる |
 | `tune` | `true` なら population search が動かす。`false` なら固定 |
-| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` で作られる |
+| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step, step))` で作られる |
 | `min` | 下限 |
 | `max` | 上限 |
 
-`step` は加算幅ではありません。`parameter_step_scale = 1.0` なら、`step = 0.02` でおおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。一時的に探索幅を広げたいときは、各 `step` を手で書き換えずに `tuning.parameter_step_scale` を使います。たとえば `step = 0.005`、`parameter_step_scale = 10.0` なら、実効 step は `0.05` です。この倍率は各パラメーターへ書き戻されず、`current` も変えません。`tune = true` のパラメーターは `current > 0` である必要があります。
+`step` は加算幅ではありません。`step = 0.02` なら、おおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。探索幅を広げたいときは、調整したい各パラメーターの `step` を直接変更します。`tune = true` のパラメーターは `current > 0` である必要があります。
 
 候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
 
@@ -269,7 +252,6 @@ population search で調整済みの `parameters.current` だけを使い、popu
 
 ```json
 "tuning": {
-    "method": "population_search",
   "enabled": false
 }
 ```
@@ -282,7 +264,7 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
+このモードでは、`superbatches` は `trial_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
 
 `enabled: false` では population search の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 

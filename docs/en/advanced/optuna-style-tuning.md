@@ -14,7 +14,7 @@ Use it when you want to:
 
 - compare fixed parameters from early training,
 - include `lr` and `lr_min` in the search,
-- run many short trials such as 16sb each,
+- run many short trials such as 4sb each,
 - get inferred recommended parameters, not just the single best observed trial.
 
 ## Settings example
@@ -24,9 +24,9 @@ For compatibility with population search settings, ranges are written as `min` /
 ```json
 {
   "version": 1,
-  "study": {
-    "trials": 64,
-    "trial_sbs": 16,
+  "tuning": {
+    "population": 100,
+    "trial_sbs": 4,
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,
@@ -43,7 +43,7 @@ For compatibility with population search settings, ranges are written as `min` /
     "base_checkpoint": null,
     "output_folder": "D:/BulletOu-snapshots/20260825",
     "temp_folder": "D:/BulletOu-snapshots/20260825",
-    "tag_prefix": "optuna-scratch-16sb"
+    "tag_prefix": "tuning-scratch-4sb"
   },
   "parameters": {
     "lr": { "tune": true, "min": 0.00003, "max": 0.001, "log": true },
@@ -80,14 +80,14 @@ This avoids invalid samples such as `lr_min > lr`.
 
 ```powershell
 python .\optuna_style_runner.py `
-  --settings-file D:\BulletOu-snapshots\settings\optuna-style-settings.json
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 Resume:
 
 ```powershell
 python .\optuna_style_runner.py `
-  --settings-file D:\BulletOu-snapshots\settings\optuna-style-settings.json `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
 
@@ -96,7 +96,7 @@ python .\optuna_style_runner.py `
 The runner root is:
 
 ```text
-<output_folder>/optuna-<tag_prefix>/
+<output_folder>/tuning-<tag_prefix>/
 ```
 
 | path | Meaning |

@@ -33,21 +33,14 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
 {
   "version": 1,
   "tuning": {
-    "method": "population_search",
     "enabled": true,
     "generations": 100,
-    "population": 16,
-    "beam": [
-      { "after_sbs": 8, "keep": 8 },
-      { "after_sbs": 16, "keep": 4 },
-      { "after_sbs": 24, "keep": 2 },
-      { "after_sbs": 32, "keep": 1 }
-    ],
+    "population": 100,
+    "trial_sbs": 4,
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
-    "parameter_step_scale": 1.0,
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -124,31 +117,19 @@ During population search, the runner owns these candidate-specific values, so do
 | --- | --- |
 | `enabled` | `true` runs population search. `false` runs one normal `bulletou.exe` job using `parameters.current` values |
 | `generations` | Number of generations. One candidate is accepted per generation |
-| `population` | Number of candidates at the start of each generation |
-| `beam` | Candidate trial length. The final `after_sbs` value is used |
+| `population` | Number of candidates tested in one generation. The example tests 100 candidates |
+| `trial_sbs` | Training length per candidate. The example uses 1 trial = 4 sb |
 | `metric` | Metric used to rank candidates |
 | `lower_is_better` | `true` if smaller metric values are better. Ignored for `borda_count` because lower rank sum is always better |
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
-| `parameter_step_scale` | Global multiplier for every `parameters.*.step`. `1.0` uses each step as written; `10.0` makes all candidate perturbations 10 times wider without changing `current` |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
 | `validation_rate` | f32 validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
 | `quantized_validation_rate` | Quantized validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
 
 You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want trial-end-only validation.
 
-`beam` is read like this:
-
-```json
-"beam": [
-  { "after_sbs": 8, "keep": 8 },
-  { "after_sbs": 16, "keep": 4 },
-  { "after_sbs": 24, "keep": 2 },
-  { "after_sbs": 32, "keep": 1 }
-]
-```
-
-The current runner does not prune candidates in the middle of a trial. In this example, every candidate is trained for 32 sb, then all `population` candidates are ranked. The final `after_sbs`, `32` in this example, is the trial length. `keep` remains in the file shape, but intermediate `keep` values are not used by execution. The final `keep` should be `1`.
+`trial_sbs` is the training length for one candidate. With `trial_sbs: 4`, every candidate trains for 4 sb, and the runner ranks candidates after the full `population` has finished.
 
 Supported metrics:
 
@@ -188,6 +169,8 @@ If a candidate is worse than an already evaluated candidate in all four metrics,
 
 The runner root is `output_folder/tuning-<tag_prefix>`.
 
+`run.base_checkpoint` is only the initial starting point. After each generation, the accepted checkpoint is recorded in `runner-state.json` as `current_checkpoint`. With `--resume`, the runner resumes from `current_checkpoint`, not from `run.base_checkpoint`. The runner does not rewrite `run.base_checkpoint` in `tuning-settings.json`.
+
 ## Common `parameters` fields
 
 When `shared` is fixed, the main tuning set has 13 parameters: three axis alpha values, three pair alpha values, three axis count-confidence values, three pair count-confidence values, and one residual count-confidence value. If you want the runner to own learning-rate values too, you can optionally add `lr` / `lr_min`.
@@ -202,11 +185,11 @@ Each parameter is written like this:
 | --- | --- |
 | `current` | Current value. Candidates are sampled around it |
 | `tune` | If `true`, population search may change it. If `false`, it is fixed |
-| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` |
+| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step, step))` |
 | `min` | Lower bound |
 | `max` | Upper bound |
 
-`step` is not an additive width. With `parameter_step_scale = 1.0`, `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. If you temporarily want a wider search, set `tuning.parameter_step_scale` instead of editing every `step` by hand. For example, `step = 0.005` and `parameter_step_scale = 10.0` behaves like an effective step of `0.05`. This multiplier is not written back into each parameter and does not change `current`. Parameters with `tune = true` must have `current > 0`.
+`step` is not an additive width. `step = 0.02` samples roughly within ?2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. To widen the search, edit the `step` value of the parameters you want to move. Parameters with `tune = true` must have `current > 0`.
 
 When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
 
@@ -263,7 +246,6 @@ If you want to use the tuned `parameters.current` values without running populat
 
 ```json
 "tuning": {
-    "method": "population_search",
   "enabled": false
 }
 ```
@@ -276,7 +258,7 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
+In this mode, the runner fills `superbatches` from `trial_sbs` and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
 
 With `enabled: false`, the runner does not create population search candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 

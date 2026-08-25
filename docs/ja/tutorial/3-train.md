@@ -140,7 +140,6 @@ population search で調整した `tuning-settings.json` の `parameters.current
 
 ```json
 "tuning": {
-    "method": "population_search",
   "enabled": false
 }
 ```
@@ -153,7 +152,7 @@ python .\bulletou_tuner.py `
   --resume
 ```
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `trial_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
 
 詳しい population search 設定や `parameters` の意味は [応用編: population search による自動調整](../advanced/auto-tuning.md) を参照してください。
 

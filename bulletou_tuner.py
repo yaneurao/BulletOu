@@ -6,7 +6,7 @@ This runner is intentionally simple:
 * `tuning-settings.json` owns the current hyperparameters and tuning settings.
 * `bulletou-settings.json` owns the ordinary `bulletou.exe` training options.
 * Each generation creates a population of randomized candidates.
-* Each candidate is trained for `tuning.beam[-1].after_sbs` superbatches.
+* Each candidate is trained for `tuning.trial_sbs` superbatches.
 * After the whole population is evaluated, the best candidate's NN weights and
   hyperparameters become the next current state.
 
@@ -219,23 +219,20 @@ class ParameterSpec:
 
 
 @dataclass
-class BeamStage:
+class TrialStage:
     after_sbs: int
-    keep: int
 
 
 @dataclass
 class TuningSettings:
-    method: str
     enabled: bool
     use_worker: bool
     generations: int
     population: int
-    beam: list[BeamStage]
+    trial_sbs: int
     metric: str
     lower_is_better: bool
     seed: int
-    parameter_step_scale: float
     save_rate: int
     validation_rate: int
     quantized_validation_rate: int
@@ -266,7 +263,7 @@ class Candidate:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a fixed-length generation population search for BulletOu factorizer/count hyperparameters."
+        description="Run fixed-length local tuning trials for BulletOu factorizer/count hyperparameters."
     )
     parser.add_argument("--tuning-settings-file", type=Path, default=Path("tuning-settings.json"))
     parser.add_argument("--resume", action="store_true", help="Resume from run.output_folder/tuning-<run.tag_prefix>/runner-state.json")
@@ -411,9 +408,28 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     tuning_obj = root.get("tuning")
     if not isinstance(tuning_obj, dict):
         raise ValueError(f"{path}: `tuning` object is required")
-    method = str(tuning_obj.get("method", ""))
-    if method != "population_search":
-        raise ValueError(f"{path}: tuning.method must be \"population_search\"")
+    removed_tuning_keys = sorted(set(tuning_obj) & {"method", "beam", "candidate_sbs", "parameter_step_scale"})
+    if removed_tuning_keys:
+        raise ValueError(
+            f"{path}: obsolete tuning key(s): {', '.join(removed_tuning_keys)}. "
+            "Use tuning.trial_sbs and per-parameter step values instead."
+        )
+    allowed_tuning_keys = {
+        "enabled",
+        "use_worker",
+        "generations",
+        "population",
+        "trial_sbs",
+        "metric",
+        "lower_is_better",
+        "seed",
+        "save_rate",
+        "validation_rate",
+        "quantized_validation_rate",
+    }
+    unknown_tuning_keys = sorted(set(tuning_obj) - allowed_tuning_keys)
+    if unknown_tuning_keys:
+        raise ValueError(f"{path}: unknown tuning field(s): {', '.join(unknown_tuning_keys)}")
     enabled = tuning_obj.get("enabled")
     if not isinstance(enabled, bool):
         raise ValueError(f"{path}: tuning.enabled must be true or false")
@@ -421,6 +437,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
 
     generations = int(tuning_obj.get("generations", 1))
     population = int(tuning_obj.get("population", 4))
+    trial_sbs = int(tuning_obj.get("trial_sbs", 8))
     metric = str(tuning_obj.get("metric", "quantized_value_loss"))
     if metric not in {
         "quantized_value_loss",
@@ -432,7 +449,6 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError(f"{path}: unsupported tuning.metric {metric!r}")
     lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(tuning_obj.get("lower_is_better", "loss" in metric))
     seed = int(tuning_obj.get("seed", 1))
-    parameter_step_scale = float(tuning_obj.get("parameter_step_scale", 1.0))
     save_rate = int(tuning_obj.get("save_rate", 1))
     if "candidate_validation_rate" in tuning_obj or "candidate_quantized_validation_rate" in tuning_obj:
         raise ValueError(
@@ -446,8 +462,8 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError("tuning.generations must be > 0")
     if population <= 0:
         raise ValueError("tuning.population must be > 0")
-    if not math.isfinite(parameter_step_scale) or parameter_step_scale < 0.0:
-        raise ValueError("tuning.parameter_step_scale must be finite and >= 0")
+    if trial_sbs <= 0:
+        raise ValueError("tuning.trial_sbs must be > 0")
     if save_rate < 0:
         raise ValueError("tuning.save_rate must be >= 0")
     if validation_rate < -1:
@@ -473,42 +489,15 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
             "use 0 for trial-end-only quantized validation"
         )
 
-    beam_raw = tuning_obj.get("beam")
-    if beam_raw is None:
-        candidate_sbs = int(tuning_obj.get("candidate_sbs", 8))
-        beam = [BeamStage(after_sbs=candidate_sbs, keep=1)]
-    elif isinstance(beam_raw, list):
-        beam = []
-        for i, item in enumerate(beam_raw):
-            if not isinstance(item, dict):
-                raise ValueError(f"tuning.beam[{i}] must be an object")
-            beam.append(BeamStage(after_sbs=int(item["after_sbs"]), keep=int(item["keep"])))
-    else:
-        raise ValueError("tuning.beam must be a list")
-
-    if not beam:
-        raise ValueError("tuning.beam must not be empty")
-    prev_after = 0
-    for stage in beam:
-        if stage.after_sbs <= prev_after:
-            raise ValueError("tuning.beam after_sbs must be strictly increasing")
-        if stage.keep <= 0:
-            raise ValueError("tuning.beam keep must be > 0")
-        prev_after = stage.after_sbs
-    if beam[-1].keep != 1:
-        raise ValueError("final tuning.beam entry must keep exactly 1 candidate")
-
     settings = TuningSettings(
-        method=method,
         enabled=enabled,
         use_worker=use_worker,
         generations=generations,
         population=population,
-        beam=beam,
+        trial_sbs=trial_sbs,
         metric=metric,
         lower_is_better=lower_is_better,
         seed=seed,
-        parameter_step_scale=parameter_step_scale,
         save_rate=save_rate,
         validation_rate=validation_rate,
         quantized_validation_rate=quantized_validation_rate,
@@ -589,14 +578,11 @@ def set_current_values(specs: dict[str, ParameterSpec], values: dict[str, float]
         specs[name].current = specs[name].clamp(float(value))
 
 
-def perturb_parameters(
-    specs: dict[str, ParameterSpec], rng: random.Random, parameter_step_scale: float
-) -> dict[str, float]:
+def perturb_parameters(specs: dict[str, ParameterSpec], rng: random.Random) -> dict[str, float]:
     out = current_values(specs)
     for name, spec in specs.items():
         if spec.tune:
-            effective_step = spec.step * parameter_step_scale
-            delta = rng.uniform(-effective_step, effective_step)
+            delta = rng.uniform(-spec.step, spec.step)
             out[name] = spec.clamp(spec.current * math.exp(delta))
     return out
 
@@ -761,14 +747,14 @@ def import_ordinary_run_summaries(
     imported_rows = count_summary_rows_with_status(summary_path, "ordinary")
     if imported_rows >= len(rows):
         event(color, "[LOG IMPORT]", f"already up to date: imported_rows={imported_rows}", "yellow")
-        epoch_sbs = max(1, settings.beam[-1].after_sbs)
+        epoch_sbs = max(1, settings.trial_sbs)
         imported_progress = max((ordinary_source_progress_sbs(row, epoch_sbs) for row in rows), default=0)
         accepted_offset = base_accepted_sbs - imported_progress
         return 0, max(base_accepted_sbs, imported_progress), accepted_offset
 
     params_json = json.dumps(params, ensure_ascii=False, sort_keys=True)
     added = 0
-    epoch_sbs = max(1, settings.beam[-1].after_sbs)
+    epoch_sbs = max(1, settings.trial_sbs)
     imported_source_progress = max(
         (ordinary_source_progress_sbs(row, epoch_sbs) for row in rows[:imported_rows]),
         default=0,
@@ -844,7 +830,7 @@ def sync_ordinary_accepted_checkpoints(
         return 0
 
     accepted_root.mkdir(parents=True, exist_ok=True)
-    epoch_sbs = max(1, settings.beam[-1].after_sbs)
+    epoch_sbs = max(1, settings.trial_sbs)
     copied = 0
     latest_checkpoint: Path | None = None
     for row in rows:
@@ -1205,7 +1191,7 @@ def train_candidate_stage(
     base_metric: Metric,
     generation: int,
     candidate: Candidate,
-    stage: BeamStage,
+    stage: TrialStage,
     prev_after_sbs: int,
     temp_root: Path,
     log_dir: Path,
@@ -1336,7 +1322,7 @@ def train_candidate_stage_worker(
     base_metric: Metric,
     generation: int,
     candidate: Candidate,
-    stage: BeamStage,
+    stage: TrialStage,
     prev_after_sbs: int,
     temp_root: Path,
     borda_dominators: list[Metric] | None,
@@ -1504,7 +1490,7 @@ def rank_candidates(candidates: list[Candidate], settings: TuningSettings) -> li
 def log_stage_rows(
     summary_path: Path,
     generation: int,
-    stage: BeamStage,
+    stage: TrialStage,
     ranked: list[Candidate],
     keep: int,
 ) -> None:
@@ -1578,7 +1564,7 @@ def run_once_from_settings(
     color: bool,
 ) -> int:
     """Run one ordinary bulletou.exe training command using current parameter values."""
-    epoch_sbs = settings.beam[-1].after_sbs
+    epoch_sbs = settings.trial_sbs
     params = current_values(specs)
     managed = run.output_folder is not None and run.tag_prefix is not None
 
@@ -1816,15 +1802,13 @@ def main() -> int:
     validate_checkpoint_dir(current_checkpoint)
     worker_enabled = settings.use_worker
 
-    beam_text = ", ".join(f"{stage.after_sbs}sb=>keep{stage.keep}" for stage in settings.beam)
     event(
         color,
         "[CONFIG]",
         (
             f"population={settings.population} generations={settings.generations} "
-            f"trial_sbs={settings.beam[-1].after_sbs} "
-            f"metric={settings.metric} ({metric_direction_text(settings)}) beam_config=[{beam_text}] "
-            f"parameter_step_scale={settings.parameter_step_scale:g} "
+            f"trial_sbs={settings.trial_sbs} "
+            f"metric={settings.metric} ({metric_direction_text(settings)}) "
             f"save_rate={settings.save_rate} worker={'on' if worker_enabled else 'off'} "
             f"bulletou_settings={run.bulletou_settings_file}"
         ),
@@ -1841,7 +1825,7 @@ def main() -> int:
                     current_values(specs),
                     current_checkpoint,
                     runner_root / "worker-session",
-                    settings.beam[-1].after_sbs,
+                    settings.trial_sbs,
                     settings,
                     include_initial_state=True,
                 )
@@ -1859,7 +1843,7 @@ def main() -> int:
                     current_values(specs),
                     current_checkpoint,
                     runner_root / "worker-session",
-                    settings.beam[-1].after_sbs,
+                    settings.trial_sbs,
                     settings,
                     include_initial_state=True,
                 )
@@ -1875,7 +1859,7 @@ def main() -> int:
                     "green",
                 )
 
-        trial_stage = settings.beam[-1]
+        trial_stage = TrialStage(after_sbs=settings.trial_sbs)
         trial_sbs = trial_stage.after_sbs
         total_generations = settings.generations
         for generation in range(generation_start, generation_start + total_generations):
@@ -1884,7 +1868,7 @@ def main() -> int:
             candidates = [
                 Candidate(
                     index=i + 1,
-                    params=perturb_parameters(specs, rng, settings.parameter_step_scale),
+                    params=perturb_parameters(specs, rng),
                     checkpoint=current_checkpoint,
                 )
                 for i in range(settings.population)

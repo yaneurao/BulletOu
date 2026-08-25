@@ -14,7 +14,7 @@ Optuna風 runner は、各 trial を scratch または同じ base checkpoint か
 
 - 初期学習から、どの固定パラメーターがよいか見る
 - `lr` と `lr_min` も探索対象に入れる
-- 1 trial = 16sb のような短い比較を大量に回す
+- 1 trial = 4sb のような短い比較を大量に回す
 - best checkpoint ではなく、上位trialから推定したパラメーターを知る
 
 ## 設定例
@@ -24,9 +24,9 @@ population search settings と合わせるため、探索範囲は `min` / `max`
 ```json
 {
   "version": 1,
-  "study": {
-    "trials": 64,
-    "trial_sbs": 16,
+  "tuning": {
+    "population": 100,
+    "trial_sbs": 4,
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,
@@ -43,7 +43,7 @@ population search settings と合わせるため、探索範囲は `min` / `max`
     "base_checkpoint": null,
     "output_folder": "D:/BulletOu-snapshots/20260825",
     "temp_folder": "D:/BulletOu-snapshots/20260825",
-    "tag_prefix": "optuna-scratch-16sb"
+    "tag_prefix": "tuning-scratch-4sb"
   },
   "parameters": {
     "lr": { "tune": true, "min": 0.00003, "max": 0.001, "log": true },
@@ -80,14 +80,14 @@ lr_min = lr * lr_min_ratio
 
 ```powershell
 python .\optuna_style_runner.py `
-  --settings-file D:\BulletOu-snapshots\settings\optuna-style-settings.json
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 途中再開するときは:
 
 ```powershell
 python .\optuna_style_runner.py `
-  --settings-file D:\BulletOu-snapshots\settings\optuna-style-settings.json `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
 
@@ -96,7 +96,7 @@ python .\optuna_style_runner.py `
 runner root は次の場所です。
 
 ```text
-<output_folder>/optuna-<tag_prefix>/
+<output_folder>/tuning-<tag_prefix>/
 ```
 
 主な出力は次の通りです。

@@ -144,7 +144,6 @@ Sometimes you want to keep using the `parameters.current` values from `tuning-se
 
 ```json
 "tuning": {
-    "method": "population_search",
   "enabled": false
 }
 ```
@@ -159,7 +158,7 @@ python .\bulletou_tuner.py `
 
 In this mode, the runner launches `bulletou.exe` once. It does not create candidates, worker caches, or snapshots. It only converts `parameters.current` into `--sfnn-factorizer-alpha` and count-confidence options, so memory overhead is roughly the same as running `bulletou.exe` directly.
 
-The runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. Put ordinary training settings such as `lr` and `save_rate` in `bulletou-settings.json`.
+The runner fills `superbatches` from `trial_sbs` and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. Put ordinary training settings such as `lr` and `save_rate` in `bulletou-settings.json`.
 
 For full population search settings and parameter meanings, see [Advanced: Automatic population search tuning](../advanced/auto-tuning.md).
 
