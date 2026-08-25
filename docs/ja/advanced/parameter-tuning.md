@@ -46,6 +46,8 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 
 になります。`generations` を省略した場合は、`population` / `trial_sbs` の配列長から generation 数を決めます。`population` や `trial_sbs` の配列が `generations` より短い場合は、最後の値を使い続けます。
 
+`schedule_repeat: true` を指定すると、配列の最後の値を使い続けるのではなく、配列を周期的に繰り返します。たとえば `population: [100, 0]` と `trial_sbs: [4, 128]` なら、奇数 generation は短い探索、偶数 generation は長い定着学習になります。
+
 TPE-style sampler は、直前 generation の結果を使って次の候補を作ります。完了済み trial を metric で並べ、上位を「良かった候補」、残りを「悪かった候補」として、各パラメーターの分布を作ります。そのうえで、良かった候補の分布に近く、悪かった候補の分布から遠い値を優先してサンプルします。
 
 ただし、直前 generation の trial 数がその generation の `tpe_startup_trials` に満たない場合や、trial が1本しかなく悪かった候補の分布を作れない場合は、探索範囲全体から完全ランダムに戻るのではなく、直前 generation の `recommended` parameter の周辺をガウスノイズでサンプルします。つまり、generation 1 は広く探索し、generation 2 以降は前の generation で得た推奨値を中心に探索します。
@@ -54,14 +56,42 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 
 全世代の trial を混ぜて TPE しないのは、generation が進むほど開始 checkpoint が変わり、metric の土台も変わるためです。違う学習段階の trial を同じ尺度として混ぜると、古い generation が不利になりやすく、TPE の判断が歪みます。
 
+## 探索 generation と commit-only generation
+
+`population` は、その generation で試す候補数です。`population=0` を指定した generation は候補探索を行いません。現在採用中の parameter をそのまま使い、`trial_sbs` だけ追加学習して `current-checkpoint/` を更新します。
+
+これは「短い trial で良さそうな parameter を探し、その parameter で長めに学習してから、また次の探索に入る」用途に使います。
+
+```json
+"tuning": {
+  "generations": 5,
+  "schedule_repeat": true,
+  "population": [100, 0],
+  "trial_sbs": [4, 128],
+  "tpe_startup_trials": 16,
+  "sampler": "tpe"
+}
+```
+
+この例では、次のように動きます。
+
+- generation 1: 100候補を各4sb学習して比較
+- generation 2: generation 1で採用された parameter のまま128sb学習
+- generation 3: generation 2のcheckpointから、また100候補を各4sb学習して比較
+- generation 4: generation 3で採用された parameter のまま128sb学習
+- generation 5: もう一度、短い探索
+
+`population=0` の generation では TPE を使わないため、`tpe_startup_trials` は参照されません。
+
 ## sampler の項目
 
 これらは学習そのもののパラメーターではなく、「次にどの候補を試すか」を決める sampler 側の設定です。
 
 | 項目 | 意味 | 省略時 |
 | --- | --- | --- |
+| `schedule_repeat` | `true` なら `population` / `trial_sbs` / `tpe_startup_trials` の配列を generation ごとに繰り返します。`false` なら配列の最後の値を使い続けます。 | `false` |
 | `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使います。 | `"tpe"` |
-| `tpe_startup_trials` | TPE の密度推定に必要な完了済み trial 数。数値または配列で指定できます。配列なら `population` / `trial_sbs` と同じく generation ごとに使い、配列が短い場合は最後の値を使い続けます。generation 1 ではこの本数に届くまで探索範囲全体からランダムにサンプルします。generation 2 以降で直前 generation の trial 数が足りない場合は、直前 generation の `recommended` parameter 周辺をサンプルします。 | `16` |
+| `tpe_startup_trials` | TPE の密度推定に必要な完了済み trial 数。数値または配列で指定できます。配列なら `population` / `trial_sbs` と同じく generation ごとに使います。`schedule_repeat: false` なら配列が短い場合は最後の値を使い続け、`true` なら周期的に繰り返します。generation 1 ではこの本数に届くまで探索範囲全体からランダムにサンプルします。generation 2 以降で直前 generation の trial 数が足りない場合は、直前 generation の `recommended` parameter 周辺をサンプルします。 | `16` |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
 | `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |

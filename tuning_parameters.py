@@ -100,6 +100,7 @@ class SearchParameter:
 @dataclass
 class StudySettings:
     generations: int
+    schedule_repeat: bool
     population_schedule: list[int]
     trial_sbs_schedule: list[int]
     metric: str
@@ -115,15 +116,20 @@ class StudySettings:
     use_worker: bool
     commit_source: str
 
+    def schedule_index(self, generation: int, length: int) -> int:
+        if self.schedule_repeat:
+            return (generation - 1) % length
+        return min(generation - 1, length - 1)
+
     def population_for_generation(self, generation: int) -> int:
-        return self.population_schedule[min(generation - 1, len(self.population_schedule) - 1)]
+        return self.population_schedule[self.schedule_index(generation, len(self.population_schedule))]
 
     def trial_sbs_for_generation(self, generation: int) -> int:
-        return self.trial_sbs_schedule[min(generation - 1, len(self.trial_sbs_schedule) - 1)]
+        return self.trial_sbs_schedule[self.schedule_index(generation, len(self.trial_sbs_schedule))]
 
     def tpe_startup_trials_for_generation(self, generation: int) -> int:
         return self.tpe_startup_trials_schedule[
-            min(generation - 1, len(self.tpe_startup_trials_schedule) - 1)
+            self.schedule_index(generation, len(self.tpe_startup_trials_schedule))
         ]
 
     @property
@@ -261,6 +267,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError(f"{path}: renamed tuning key(s): {replacements}")
     allowed_tuning_keys = {
         "generations",
+        "schedule_repeat",
         "population",
         "trial_sbs",
         "metric",
@@ -294,7 +301,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     commit_source = str(tuning_obj.get("commit_source", "best"))
     if commit_source not in {"best", "recommended"}:
         raise ValueError(f"{path}: unsupported tuning.commit_source {commit_source!r}; expected 'best' or 'recommended'")
-    population_schedule = parse_positive_int_schedule(tuning_obj.get("population"), "tuning.population", 1)
+    population_schedule = parse_nonnegative_int_schedule(tuning_obj.get("population"), "tuning.population", 1)
     trial_sbs_schedule = parse_positive_int_schedule(tuning_obj.get("trial_sbs"), "tuning.trial_sbs", 16)
     tpe_startup_trials_schedule = parse_nonnegative_int_schedule(
         tuning_obj.get("tpe_startup_trials"), "tuning.tpe_startup_trials", 16
@@ -305,6 +312,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError("tuning.generations must be > 0")
     settings = StudySettings(
         generations=generations,
+        schedule_repeat=bool(tuning_obj.get("schedule_repeat", False)),
         population_schedule=population_schedule,
         trial_sbs_schedule=trial_sbs_schedule,
         metric=metric,
@@ -413,6 +421,14 @@ def current_fixed_values(params: dict[str, SearchParameter]) -> dict[str, float]
     for name, spec in params.items():
         if not spec.tune:
             assert spec.current is not None
+            out[name] = spec.current
+    return out
+
+
+def configured_current_values(params: dict[str, SearchParameter]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for name, spec in params.items():
+        if spec.current is not None:
             out[name] = spec.current
     return out
 
@@ -855,6 +871,40 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
     return out
 
 
+def latest_commit_params(summary_path: Path) -> dict[str, float] | None:
+    if not summary_path.exists():
+        return None
+    latest: dict[str, float] | None = None
+    with summary_path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if not row.get("status", "").startswith("commit_"):
+                continue
+            raw = row.get("parameters")
+            if not raw:
+                continue
+            try:
+                params = json.loads(raw)
+                if isinstance(params, dict):
+                    latest = {str(k): float(v) for k, v in params.items()}
+            except Exception:
+                continue
+    return latest
+
+
+def starting_generation(settings: StudySettings, state: dict[str, Any], next_trial: int) -> int:
+    pending_commit_generation = state.get("pending_commit_generation")
+    if pending_commit_generation is not None:
+        return int(pending_commit_generation)
+    current_generation = state.get("current_generation")
+    if current_generation is not None:
+        return int(current_generation) + 1
+    if next_trial <= settings.trials:
+        return generation_for_trial(settings, next_trial)[0]
+    if next_trial == 1 and settings.trials == 0:
+        return 1
+    return settings.generations + 1
+
+
 def write_json(path: Path, obj: dict[str, Any]) -> None:
     tuner.atomic_write_json(path, obj)
 
@@ -970,7 +1020,10 @@ def write_recommendation(
             "lower_is_better": settings.lower_is_better,
             "best_observed": None,
             "recommendation_scope": "none",
-            "recommended": {"parameters": current_fixed_values(specs), "bulletou_overrides": {}},
+            "recommended": {
+                "parameters": configured_current_values(specs),
+                "bulletou_overrides": bulletou_override_preview(configured_current_values(specs)),
+            },
         }
         write_json(path, obj)
         return obj
@@ -1062,6 +1115,7 @@ def main() -> int:
                 "version": SETTINGS_VERSION,
                 "next_trial": next_trial,
                 "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                "current_parameters": configured_current_values(specs),
                 "best_trial": None,
                 "best_selection_metric": None,
                 "best_checkpoint": None,
@@ -1075,6 +1129,11 @@ def main() -> int:
             }
             if not args.dry_run:
                 write_json(state_path, state)
+        current_parameters_raw = state.get("current_parameters")
+        if isinstance(current_parameters_raw, dict):
+            current_parameters = {str(k): float(v) for k, v in current_parameters_raw.items()}
+        else:
+            current_parameters = latest_commit_params(summary_path) or configured_current_values(specs)
         if current_checkpoint is not None:
             tuner.validate_checkpoint_dir(current_checkpoint)
         rng = random.Random(settings.seed + next_trial * 1_000_003)
@@ -1092,6 +1151,7 @@ def main() -> int:
             "[CONFIG]",
             (
                 f"generations={settings.generations} total_trials={settings.trials} "
+                f"schedule_repeat={settings.schedule_repeat} "
                 f"population={settings.population_schedule} trial_sbs={settings.trial_sbs_schedule} "
                 f"sampler={settings.sampler} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
@@ -1140,10 +1200,15 @@ def main() -> int:
             if rec.get("best_observed"):
                 tuner.event(color, "[RECOMMEND]", f"parameters={recommendation_path}", "green")
 
+        start_generation = starting_generation(settings, state, next_trial)
+        if start_generation > settings.generations:
+            tuner.event(color, "[DONE]", "all configured generations are complete", "green")
+            return 0
+
         worker: tuner.WorkerClient | None = None
         try:
             if settings.use_worker:
-                open_trial_sbs = settings.trial_sbs_for_generation(generation_for_trial(settings, next_trial)[0])
+                open_trial_sbs = settings.trial_sbs_for_generation(start_generation)
                 if args.dry_run:
                     open_dir = runner_root / "worker-session"
                     open_params = current_fixed_values(specs)
@@ -1170,15 +1235,6 @@ def main() -> int:
                         color=color,
                     )
 
-            pending_commit_generation = state.get("pending_commit_generation")
-            if pending_commit_generation is not None:
-                start_generation = int(pending_commit_generation)
-            else:
-                start_generation = (
-                    generation_for_trial(settings, next_trial)[0]
-                    if next_trial <= settings.trials
-                    else settings.generations + 1
-                )
             for generation in range(start_generation, settings.generations + 1):
                 generation_first_trial = first_trial_of_generation(settings, generation)
                 population = settings.population_for_generation(generation)
@@ -1193,7 +1249,9 @@ def main() -> int:
                     if previous_generation_trials
                     else None
                 )
-                if settings.sampler == "random" or not previous_generation_trials:
+                if population == 0:
+                    sampler_center = "commit-only"
+                elif settings.sampler == "random" or not previous_generation_trials:
                     sampler_center = "random"
                 elif (
                     previous_recommended_params is not None
@@ -1397,6 +1455,7 @@ def main() -> int:
                         "version": SETTINGS_VERSION,
                         "next_trial": trial + 1,
                         "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                        "current_parameters": current_parameters,
                         "generation_best_trial": generation_best.trial if generation_best else None,
                         "generation_best_selection_metric": generation_best.score if generation_best else None,
                         "pending_commit_generation": generation if trial == generation_last_trial else None,
@@ -1421,7 +1480,7 @@ def main() -> int:
 
                 if args.dry_run:
                     continue
-                if generation_best is None:
+                if population != 0 and generation_best is None:
                     raise RuntimeError(f"generation {generation} produced no completed trials")
 
                 generation_completed = generation_results(settings, completed, generation)
@@ -1434,20 +1493,28 @@ def main() -> int:
                 if isinstance(pending_params, dict):
                     commit_params = {str(k): float(v) for k, v in pending_params.items()}
                     commit_source = str(state.get("pending_commit_source") or settings.commit_source)
+                elif population == 0:
+                    commit_params = dict(current_parameters)
+                    commit_source = "current"
                 elif settings.commit_source == "recommended":
                     commit_params = rec_params
                     commit_source = "recommended"
                 else:
+                    assert generation_best is not None
                     commit_params = generation_best.params
                     commit_source = "best"
-                commit_source_trial = generation_best.trial if commit_source == "best" else None
+                commit_source_trial = generation_best.trial if commit_source == "best" and generation_best else None
 
                 tuner.event(
                     color,
                     f"[GEN {generation} SELECT]",
                     (
-                        f"best_trial={generation_best.trial} best_selection_metric={generation_best.score:.9g} "
-                        f"commit_source={commit_source} completed_trials={len(generation_completed)}"
+                        (
+                            f"best_trial={generation_best.trial} best_selection_metric={generation_best.score:.9g} "
+                            if generation_best is not None
+                            else "commit_only=true "
+                        )
+                        + f"commit_source={commit_source} completed_trials={len(generation_completed)}"
                     ),
                     "green",
                 )
@@ -1456,11 +1523,12 @@ def main() -> int:
                     "version": SETTINGS_VERSION,
                     "next_trial": generation_last_trial + 1,
                     "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                    "current_parameters": current_parameters,
                     "pending_commit_generation": generation,
                     "pending_commit_source": commit_source,
                     "pending_commit_params": commit_params,
-                    "generation_best_trial": generation_best.trial,
-                    "generation_best_selection_metric": generation_best.score,
+                    "generation_best_trial": generation_best.trial if generation_best else None,
+                    "generation_best_selection_metric": generation_best.score if generation_best else None,
                     "best_trial": best.trial if best else None,
                     "best_selection_metric": best.score if best else None,
                     "best_commit_selection_metric": best_commit_score,
@@ -1577,6 +1645,7 @@ def main() -> int:
                 assert commit_score is not None
                 move_dir_replace(pending_commit_dir, current_dir)
                 current_checkpoint = current_dir
+                current_parameters = dict(commit_params)
 
                 tuner.append_csv(
                     summary_path,
@@ -1603,6 +1672,7 @@ def main() -> int:
                     "version": SETTINGS_VERSION,
                     "next_trial": next_trial,
                     "current_checkpoint": str(current_checkpoint),
+                    "current_parameters": current_parameters,
                     "current_generation": generation,
                     "current_generation_trial": commit_source_trial,
                     "current_generation_selection_metric": commit_score,
