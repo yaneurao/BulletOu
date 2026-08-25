@@ -23825,7 +23825,6 @@ fn bulletou_build_info_text() -> String {
     out.push_str(&format!("build_profile={}\n", option_env!("BULLETOU_BUILD_PROFILE").unwrap_or("unknown")));
     out.push_str(&format!("build_target={}\n", option_env!("BULLETOU_BUILD_TARGET").unwrap_or("unknown")));
     out.push_str(&format!("build_features={features}\n"));
-    out.push_str(&format!("built_at_unix={}\n", option_env!("BULLETOU_BUILT_AT_UNIX").unwrap_or("unknown")));
     out
 }
 
