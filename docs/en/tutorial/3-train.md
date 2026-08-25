@@ -160,7 +160,7 @@ In this mode, the runner launches `bulletou.exe` once. It does not create candid
 
 The runner fills `superbatches` from `trial_sbs` and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. Put ordinary training settings such as `lr` and `save_rate` in `bulletou-settings.json`.
 
-For full population search settings and parameter meanings, see [Advanced: Automatic population search tuning](../advanced/auto-tuning.md).
+For `recommended-parameters.json` and the recommendation formula, see [Advanced: Fixed-length trial parameter tuning](../advanced/parameter-tuning.md).
 
 ---
 

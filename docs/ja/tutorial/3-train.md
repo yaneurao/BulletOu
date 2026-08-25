@@ -154,7 +154,7 @@ python .\bulletou_tuner.py `
 
 このモードでは、`superbatches` は `trial_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
 
-詳しい population search 設定や `parameters` の意味は [応用編: population search による自動調整](../advanced/auto-tuning.md) を参照してください。
+`recommended-parameters.json` の読み方や推奨値の算出式は、[応用編: 固定長 trial によるパラメーター調整](../advanced/parameter-tuning.md) を参照してください。
 
 ---
 

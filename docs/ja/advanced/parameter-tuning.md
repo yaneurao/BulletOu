@@ -168,6 +168,53 @@ runner root は次の場所です。
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
 
+## `recommended-parameters.json` の読み方
+
+`recommended-parameters.json` には、主に次の2種類の値が入ります。
+
+| 項目 | 意味 |
+| --- | --- |
+| `best_observed` | 実際に走らせた trial のうち、指定した metric が一番良かったもの |
+| `recommended.parameters` | 上位 trial から推定した、次に使う候補値 |
+
+`best_observed` は「観測された1本の best」です。短い trial では偶然良かっただけの可能性があります。
+一方、`recommended.parameters` は上位 trial をならした値です。長めの本番学習へ使う候補としてはこちらも確認してください。
+
+`recommended.parameters` は、次の手順で計算します。
+
+1. 完了済み trial を metric の良い順に並べます。
+2. `tpe_good_fraction` で指定した上位割合だけを使います。
+3. その上位 trial を、順位に応じた重み付き平均にします。
+
+たとえば次の設定だとします。
+
+```json
+"tpe_startup_trials": 16,
+"tpe_good_fraction": 0.25
+```
+
+16 trial 終了時点では、上位 `ceil(16 * 0.25) = 4` 本を使います。
+重みは best から順に `4, 3, 2, 1` です。
+
+`log: false`、または `log` を省略して線形扱いになっているパラメーターは、次の重み付き算術平均です。
+
+```text
+recommended = (4 * p1 + 3 * p2 + 2 * p3 + 1 * p4) / (4 + 3 + 2 + 1)
+```
+
+`log: true` のパラメーターは、log 空間で平均します。これは重み付き幾何平均に相当します。
+
+```text
+recommended = exp((4 * log(p1) + 3 * log(p2) + 2 * log(p3) + 1 * log(p4)) / (4 + 3 + 2 + 1))
+```
+
+`lr` や `lr_min` のように桁で効く値は `log: true` に向いています。
+factorizer alpha や count confidence のように `min: 0` を許す値は、`log(0)` が定義できないため、通常は線形平均になります。
+
+この推奨値の計算は、次の trial を作る TPE sampler そのものとは別です。
+TPE sampler は良かった trial と悪かった trial の分布を比べて次の候補を作ります。
+`recommended.parameters` は、完了済み trial から「いま人間が見るならこのあたり」という値をまとめたものです。
+
 ## checkpoint の保存と削除
 
 `keep_all_trials` は、trial ごとの checkpoint をどれだけ残すかを決めます。
@@ -188,5 +235,3 @@ runner root は次の場所です。
 - 実行時に `--keep-temp`
 
 通常は storage 消費を抑えるため、`keep_all_trials: false` のままにしておくのが安全です。
-
-`recommended-parameters.json` の `recommended.parameters` は、上位 trial から重み付き平均で推定した値です。`log: true` のパラメーターは log 空間で平均するため、学習率のように桁で効く値に向いています。

@@ -166,6 +166,53 @@ The runner root is:
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
 
+## How to read `recommended-parameters.json`
+
+`recommended-parameters.json` contains two different kinds of parameter values.
+
+| Field | Meaning |
+| --- | --- |
+| `best_observed` | The single completed trial with the best configured metric |
+| `recommended.parameters` | Inferred values from the top completed trials |
+
+`best_observed` is the best trial that actually ran. With short trials, it can be noisy.
+`recommended.parameters` averages the top trials and is often the more useful value to inspect before a longer run.
+
+The recommendation is computed as follows:
+
+1. Sort completed trials by the configured metric.
+2. Keep the top fraction specified by `tpe_good_fraction`.
+3. Average those top trials with rank weights.
+
+For example:
+
+```json
+"tpe_startup_trials": 16,
+"tpe_good_fraction": 0.25
+```
+
+After 16 completed trials, the runner uses the top `ceil(16 * 0.25) = 4` trials.
+The rank weights are `4, 3, 2, 1` from best to fourth-best.
+
+For parameters with `log: false`, or parameters that default to linear handling, the recommendation is a weighted arithmetic mean:
+
+```text
+recommended = (4 * p1 + 3 * p2 + 2 * p3 + 1 * p4) / (4 + 3 + 2 + 1)
+```
+
+For parameters with `log: true`, the average is taken in log space. This is a weighted geometric mean:
+
+```text
+recommended = exp((4 * log(p1) + 3 * log(p2) + 2 * log(p3) + 1 * log(p4)) / (4 + 3 + 2 + 1))
+```
+
+Learning rates such as `lr` and `lr_min` are good candidates for `log: true`.
+Factorizer alpha and count confidence values often allow `min: 0`, so they usually use linear averaging because `log(0)` is undefined.
+
+This recommendation calculation is separate from the TPE sampler that creates the next trial.
+The TPE sampler compares the distributions of good and bad trials to generate candidates.
+`recommended.parameters` is a compact human-readable estimate from completed trials.
+
 ## Checkpoint retention
 
 `keep_all_trials` controls how many trial checkpoints are kept.
@@ -186,5 +233,3 @@ To keep every trial checkpoint, use one of these:
 - `--keep-temp` at runtime
 
 For normal tuning, `keep_all_trials: false` is safer because it avoids rapid storage growth.
-
-`recommended-parameters.json` contains `best_observed` and `recommended`. `best_observed` is the single best trial. `recommended` is a rank-weighted estimate from top trials. Parameters with `log: true` are averaged in log space.
