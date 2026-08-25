@@ -44,6 +44,18 @@ SUMMARY_FIELDS = [
     "quantized_value_accuracy",
     "quantized_value_loss",
     "checkpoint",
+    "parameters",
+]
+
+OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR = [
+    "trial",
+    "status",
+    "score",
+    "test_value_accuracy",
+    "test_value_loss",
+    "quantized_value_accuracy",
+    "quantized_value_loss",
+    "checkpoint",
     "output_dir",
     "parameters",
 ]
@@ -661,6 +673,20 @@ def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
 
 
+def summary_fields_for_path(summary_path: Path) -> list[str]:
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
+        return SUMMARY_FIELDS
+    try:
+        with summary_path.open("r", encoding="utf-8", newline="") as f:
+            header = f.readline().strip()
+        fields = next(csv.reader([header]))
+    except Exception:
+        return SUMMARY_FIELDS
+    if fields == OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR:
+        return OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR
+    return SUMMARY_FIELDS
+
+
 def load_completed(summary_path: Path) -> list[TrialResult]:
     if not summary_path.exists():
         return []
@@ -679,7 +705,7 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
                         metric=metric,
                         score=float(row["score"]),
                         checkpoint=Path(row["checkpoint"]),
-                        output_dir=Path(row["output_dir"]),
+                        output_dir=Path(row.get("output_dir") or row.get("checkpoint") or ""),
                     )
                 )
             except Exception:
@@ -810,6 +836,7 @@ def main() -> int:
         trials_root = (run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
         log_dir = runner_root / "logs"
         summary_path = runner_root / "summary-learn.log"
+        summary_fields = summary_fields_for_path(summary_path)
         state_path = runner_root / "runner-state.json"
         recommendation_path = runner_root / "recommended-parameters.json"
         best_dir = runner_root / "best-checkpoint"
@@ -820,7 +847,7 @@ def main() -> int:
             runner_root.mkdir(parents=True, exist_ok=True)
             trials_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
-            tuner.ensure_csv(summary_path, SUMMARY_FIELDS)
+            tuner.ensure_csv(summary_path, summary_fields)
             shutil.copy2(args.settings_file, runner_root / args.settings_file.name)
             shutil.copy2(run.bulletou_settings_file, runner_root / run.bulletou_settings_file.name)
 
@@ -974,7 +1001,7 @@ def main() -> int:
                     if code != 0:
                         tuner.append_csv(
                             summary_path,
-                            SUMMARY_FIELDS,
+                            summary_fields,
                             {
                                 "trial": trial,
                                 "status": "failed",
@@ -1034,7 +1061,7 @@ def main() -> int:
                 summary_output_dir = str(result.output_dir) if (is_best or keep_non_best_checkpoint) else ""
                 tuner.append_csv(
                     summary_path,
-                    SUMMARY_FIELDS,
+                    summary_fields,
                     {
                         "trial": trial,
                         "status": "finished",
