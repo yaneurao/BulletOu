@@ -73,7 +73,9 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
     "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
     "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
+    "lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
   }
 }
 ```
@@ -92,8 +94,6 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   "sfnn_factorizer": "pair",
   "sfnn_bucket_counts": "D:/sojo_counts/SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin",
   "positions_per_superbatch": 40000000,
-  "lr": 0.000030,
-  "lr_min": 0.000010,
   "lr_schedule": "step",
   "optimizer": "ranger",
   "optimizer_weight_decay": 0.0,
@@ -116,6 +116,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
 | `sfnn_factorizer_alpha` | ES の `parameters` から候補ごとに作る |
 | `sfnn_*_count_confidence` | ES の `parameters` から候補ごとに作る |
+| `lr`, `lr_min` | 任意。`es-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡し、採用時に `current` へ書き戻す |
 
 `progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
 
@@ -194,7 +195,7 @@ runner root は `output_folder/es-<tag_prefix>` です。
 
 ## `parameters` の書き方
 
-`shared` を固定する場合、主な調整対象は 13 個です。axis alpha が 3 個、pair alpha が 3 個、axis count confidence が 3 個、pair count confidence が 3 個、residual count confidence が 1 個です。
+`shared` を固定する場合、主な調整対象は 13 個です。axis alpha が 3 個、pair alpha が 3 個、axis count confidence が 3 個、pair count confidence が 3 個、residual count confidence が 1 個です。学習率も runner に保持させたい場合は、これに加えて `lr` / `lr_min` を任意で書けます。
 
 各パラメーターは次の形で書きます。
 
@@ -213,6 +214,17 @@ runner root は `output_folder/es-<tag_prefix>` です。
 `step` は加算幅ではありません。`parameter_step_scale = 1.0` なら、`step = 0.02` でおおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。一時的に探索幅を広げたいときは、各 `step` を手で書き換えずに `es.parameter_step_scale` を使います。たとえば `step = 0.005`、`parameter_step_scale = 10.0` なら、実効 step は `0.05` です。この倍率は各パラメーターへ書き戻されず、`current` も変えません。`tune = true` のパラメーターは `current > 0` である必要があります。
 
 候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
+
+学習率も runner に現在値として保持させたい場合は、`lr` と `lr_min` を `parameters` に書けます。
+
+```json
+"lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
+"lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+```
+
+この 2 つを `parameters` に書いた場合、runner は各 `bulletou.exe` 起動時に `--lr` と `--lr-min` を追加します。そのため、`bulletou-settings.json` に `lr` / `lr_min` が残っていても、ES 側の値が上書きします。`parameters` に書かなければ、学習率は `bulletou-settings.json` 側の固定値を使います。
+
+`lr` と `lr_min` の両方を調整対象にする場合は、候補生成の範囲全体で必ず `lr_min <= lr` になるように `current` / `min` / `max` を設定してください。runner はこの関係を勝手に丸めず、破れている場合は起動時にエラーにします。
 
 ## alpha パラメーター
 
@@ -268,7 +280,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` などの通常学習項目は `bulletou-settings.json` に書きます。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
 
 `enabled: false` では ES の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 

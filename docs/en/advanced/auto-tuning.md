@@ -73,7 +73,9 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
     "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
     "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
+    "lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
+    "lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
   }
 }
 ```
@@ -92,8 +94,6 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
   "sfnn_factorizer": "pair",
   "sfnn_bucket_counts": "D:/sojo_counts/SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4-count-all.bin",
   "positions_per_superbatch": 40000000,
-  "lr": 0.000030,
-  "lr_min": 0.000010,
   "lr_schedule": "step",
   "optimizer": "ranger",
   "optimizer_weight_decay": 0.0,
@@ -115,6 +115,7 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | The runner sets candidate evaluation cadence |
 | `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
+| `lr`, `lr_min` | Optional. If these are written in `es-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min` and writes accepted values back to `current` |
 
 ## `es` fields
 
@@ -188,7 +189,7 @@ The runner root is `output_folder/es-<tag_prefix>`.
 
 ## Common `parameters` fields
 
-When `shared` is fixed, the main tuning set has 13 parameters: three axis alpha values, three pair alpha values, three axis count-confidence values, three pair count-confidence values, and one residual count-confidence value.
+When `shared` is fixed, the main tuning set has 13 parameters: three axis alpha values, three pair alpha values, three axis count-confidence values, three pair count-confidence values, and one residual count-confidence value. If you want the runner to own learning-rate values too, you can optionally add `lr` / `lr_min`.
 
 Each parameter is written like this:
 
@@ -207,6 +208,17 @@ Each parameter is written like this:
 `step` is not an additive width. With `parameter_step_scale = 1.0`, `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. If you temporarily want a wider search, set `es.parameter_step_scale` instead of editing every `step` by hand. For example, `step = 0.005` and `parameter_step_scale = 10.0` behaves like an effective step of `0.05`. This multiplier is not written back into each parameter and does not change `current`. Parameters with `tune = true` must have `current > 0`.
 
 When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
+
+`lr` and `lr_min` can also be written in `parameters` when you want the runner to own the current learning-rate values:
+
+```json
+"lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
+"lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+```
+
+If you put them in `parameters`, the runner appends `--lr` and `--lr-min` to every `bulletou.exe` run, so those values override any learning rates in `bulletou-settings.json`. If they are omitted from `parameters`, `bulletou-settings.json` owns the learning rates.
+
+When tuning both learning-rate values, choose `current`/`min`/`max` so that every sampled candidate satisfies `lr_min <= lr`. The runner reports an error instead of silently clamping this relationship.
 
 ## Alpha parameters
 
@@ -262,7 +274,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. Put ordinary training fields such as `lr` in `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
+In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
 
 With `enabled: false`, the runner does not create ES candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 

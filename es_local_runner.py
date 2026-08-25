@@ -74,7 +74,14 @@ CONFIDENCE_FLAGS = {
 }
 
 
-KNOWN_PARAMETERS = set(ALPHA_PARAMETERS) | set(CONFIDENCE_FLAGS)
+TRAINING_PARAMETERS = {
+    "lr": "--lr",
+    "lr_min": "--lr-min",
+}
+
+
+FACTORIZER_PARAMETERS = set(ALPHA_PARAMETERS) | set(CONFIDENCE_FLAGS)
+KNOWN_PARAMETERS = FACTORIZER_PARAMETERS | set(TRAINING_PARAMETERS)
 
 
 DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
@@ -92,6 +99,8 @@ DEFAULT_PARAMETER_SPECS: dict[str, dict[str, float | bool]] = {
     "king_hand_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
     "king_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
     "hand_progress_pair_count": {"current": 0.0, "tune": False, "step": 0.005, "min": 0.0, "max": 100.0},
+    "lr": {"current": 0.0001, "tune": False, "step": 0.005, "min": 1.0e-8, "max": 1.0},
+    "lr_min": {"current": 0.00003, "tune": False, "step": 0.005, "min": 1.0e-8, "max": 1.0},
 }
 
 
@@ -336,6 +345,21 @@ def parse_parameter_spec(name: str, value: Any) -> ParameterSpec:
     return spec
 
 
+def validate_learning_rate_specs(specs: dict[str, ParameterSpec]) -> None:
+    lr = specs.get("lr")
+    lr_min = specs.get("lr_min")
+    if lr is None or lr_min is None:
+        return
+    lr_low = lr.minimum if lr.tune else lr.current
+    lr_min_high = lr_min.maximum if lr_min.tune else lr_min.current
+    if lr_min_high > lr_low:
+        raise ValueError(
+            "parameters.lr_min can exceed parameters.lr. "
+            "Choose current/min/max so every sampled candidate satisfies lr_min <= lr; "
+            "the runner does not silently clamp learning rates."
+        )
+
+
 def es_settings_path(base_file: Path, raw: Any, name: str, required: bool = True) -> Path | None:
     if raw is None:
         if required:
@@ -374,8 +398,12 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         raise ValueError(f"{path}: unknown parameter(s): {', '.join(unknown)}")
 
     specs: dict[str, ParameterSpec] = {}
-    for name in sorted(KNOWN_PARAMETERS):
+    for name in sorted(FACTORIZER_PARAMETERS):
         specs[name] = parse_parameter_spec(name, params_obj.get(name, DEFAULT_PARAMETER_SPECS[name]))
+    for name in sorted(TRAINING_PARAMETERS):
+        if name in params_obj:
+            specs[name] = parse_parameter_spec(name, params_obj[name])
+    validate_learning_rate_specs(specs)
 
     es_obj = root.get("es")
     if not isinstance(es_obj, dict):
@@ -515,7 +543,7 @@ def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, 
     original_params = root.get("parameters", {})
     if not isinstance(original_params, dict):
         original_params = {}
-    for name in sorted(KNOWN_PARAMETERS):
+    for name in sorted(specs):
         spec = specs[name]
         defaults = DEFAULT_PARAMETER_SPECS[name]
         was_explicit = name in original_params
@@ -546,7 +574,7 @@ def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, 
 
 
 def current_values(specs: dict[str, ParameterSpec]) -> dict[str, float]:
-    return {name: specs[name].current for name in sorted(KNOWN_PARAMETERS)}
+    return {name: specs[name].current for name in sorted(specs)}
 
 
 def set_current_values(specs: dict[str, ParameterSpec], values: dict[str, float]) -> None:
@@ -580,6 +608,10 @@ def parameter_args(params: dict[str, float]) -> list[str]:
         value = params.get(name)
         if value is not None and abs(value) > 0.0:
             out.extend([flag, f"{value:.9g}"])
+    for name, flag in TRAINING_PARAMETERS.items():
+        value = params.get(name)
+        if value is not None:
+            out.extend([flag, f"{value:.12g}"])
     return out
 
 
