@@ -38,12 +38,12 @@ KNOWN_SEARCH_PARAMETERS = set(tuner.KNOWN_PARAMETERS) | SPECIAL_TRAIN_PARAMETERS
 SUMMARY_FIELDS = [
     "trial",
     "status",
-    "score",
     "test_value_accuracy",
     "test_value_loss",
     "quantized_value_accuracy",
     "quantized_value_loss",
     "parameters",
+    "selection_metric",
     "checkpoint",
 ]
 
@@ -660,8 +660,30 @@ def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
 
 
-def summary_fields_for_path(summary_path: Path) -> list[str]:
-    return SUMMARY_FIELDS
+def upgrade_summary_csv(path: Path) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        old_fields = reader.fieldnames or []
+        rows = list(reader)
+    if old_fields == SUMMARY_FIELDS:
+        return
+    if "score" not in old_fields and "selection_metric" not in old_fields:
+        expected = ",".join(SUMMARY_FIELDS)
+        existing = ",".join(old_fields)
+        raise RuntimeError(f"{path} has incompatible header\n  existing: {existing}\n  expected: {expected}")
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            row["selection_metric"] = row.get("selection_metric") or row.get("score") or ""
+            checkpoint = row.get("checkpoint") or ""
+            if checkpoint.startswith(("worker-cache:", "worker-disk-cache:", "worker-dominated:")):
+                row["checkpoint"] = ""
+            writer.writerow({field: row.get(field, "") for field in SUMMARY_FIELDS})
+    tmp.replace(path)
 
 
 def load_completed(summary_path: Path) -> list[TrialResult]:
@@ -675,12 +697,15 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
             try:
                 metric = tuner.metric_from_summary_row(row)
                 params = json.loads(row["parameters"])
+                selection_metric = row.get("selection_metric") or row.get("score")
+                if selection_metric is None:
+                    continue
                 out.append(
                     TrialResult(
                         trial=int(row["trial"]),
                         params=params,
                         metric=metric,
-                        score=float(row["score"]),
+                        score=float(selection_metric),
                         checkpoint=Path(row["checkpoint"]),
                         output_dir=Path(row.get("output_dir") or row.get("checkpoint") or ""),
                     )
@@ -785,7 +810,7 @@ def write_recommendation(
         "tpe_good_count": max(1, math.ceil(len(completed) * settings.tpe_good_fraction)),
         "best_observed": {
             "trial": best.trial,
-            "score": best.score,
+            "selection_metric": best.score,
             "checkpoint": str(best.checkpoint),
             "parameters": best.params,
             "metrics": {
@@ -813,7 +838,6 @@ def main() -> int:
         trials_root = (run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
         log_dir = runner_root / "logs"
         summary_path = runner_root / "summary-learn.log"
-        summary_fields = summary_fields_for_path(summary_path)
         state_path = runner_root / "runner-state.json"
         recommendation_path = runner_root / "recommended-parameters.json"
         best_dir = runner_root / "best-checkpoint"
@@ -824,7 +848,8 @@ def main() -> int:
             runner_root.mkdir(parents=True, exist_ok=True)
             trials_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
-            tuner.ensure_csv(summary_path, summary_fields)
+            upgrade_summary_csv(summary_path)
+            tuner.ensure_csv(summary_path, SUMMARY_FIELDS)
             shutil.copy2(args.settings_file, runner_root / args.settings_file.name)
             shutil.copy2(run.bulletou_settings_file, runner_root / run.bulletou_settings_file.name)
 
@@ -873,7 +898,7 @@ def main() -> int:
             tuner.event(
                 color,
                 "[BEST]",
-                f"trial={best.trial} score={best.score:.9g} {tuner.metric_status_text(best.metric)}",
+                f"trial={best.trial} selection_metric={best.score:.9g} {tuner.metric_status_text(best.metric)}",
                 "green",
             )
         if not args.dry_run:
@@ -978,18 +1003,17 @@ def main() -> int:
                     if code != 0:
                         tuner.append_csv(
                             summary_path,
-                            summary_fields,
+                            SUMMARY_FIELDS,
                             {
                                 "trial": trial,
                                 "status": "failed",
-                                "score": "",
                                 "test_value_accuracy": "",
                                 "test_value_loss": "",
                                 "quantized_value_accuracy": "",
                                 "quantized_value_loss": "",
-                                "checkpoint": "",
-                                "output_dir": str(out_dir),
                                 "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
+                                "selection_metric": "",
+                                "checkpoint": "",
                             },
                         )
                         raise RuntimeError(f"trial {trial} failed; see {log_path}")
@@ -1035,27 +1059,25 @@ def main() -> int:
                     (not settings.use_worker) and (settings.keep_all_trials or args.keep_temp)
                 )
                 summary_checkpoint = str(best_dir) if is_best else (str(result.checkpoint) if keep_non_best_checkpoint else "")
-                summary_output_dir = str(result.output_dir) if (is_best or keep_non_best_checkpoint) else ""
                 tuner.append_csv(
                     summary_path,
-                    summary_fields,
+                    SUMMARY_FIELDS,
                     {
                         "trial": trial,
                         "status": "finished",
-                        "score": tuner.format_float(score),
                         "test_value_accuracy": tuner.format_float(metric.test_acc),
                         "test_value_loss": tuner.format_float(metric.test_loss),
                         "quantized_value_accuracy": tuner.format_float(metric.qacc),
                         "quantized_value_loss": tuner.format_float(metric.qloss),
-                        "checkpoint": summary_checkpoint,
-                        "output_dir": summary_output_dir,
                         "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
+                        "selection_metric": tuner.format_float(score),
+                        "checkpoint": summary_checkpoint,
                     },
                 )
                 tuner.event(
                     color,
                     f"{display_prefix} END",
-                    f"score={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
+                    f"selection_metric={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
                     "green" if is_best else "cyan",
                 )
                 if is_best:
@@ -1077,7 +1099,7 @@ def main() -> int:
                     "version": SETTINGS_VERSION,
                     "next_trial": trial + 1,
                     "best_trial": best.trial if best else None,
-                    "best_score": best.score if best else None,
+                    "best_selection_metric": best.score if best else None,
                     "best_checkpoint": str(best_dir) if best else None,
                     "recommended_parameters": str(recommendation_path),
                     "settings_file": str(args.settings_file.resolve()),
