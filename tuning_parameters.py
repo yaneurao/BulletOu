@@ -106,7 +106,7 @@ class StudySettings:
     lower_is_better: bool
     sampler: str
     seed: int
-    tpe_startup_trials: int
+    tpe_startup_trials_schedule: list[int]
     tpe_good_fraction: float
     tpe_bandwidth: float
     validation_rate: int
@@ -120,6 +120,11 @@ class StudySettings:
 
     def trial_sbs_for_generation(self, generation: int) -> int:
         return self.trial_sbs_schedule[min(generation - 1, len(self.trial_sbs_schedule) - 1)]
+
+    def tpe_startup_trials_for_generation(self, generation: int) -> int:
+        return self.tpe_startup_trials_schedule[
+            min(generation - 1, len(self.tpe_startup_trials_schedule) - 1)
+        ]
 
     @property
     def trials(self) -> int:
@@ -189,6 +194,20 @@ def parse_positive_int_schedule(raw: Any, name: str, default: int) -> list[int]:
         values = [int(raw)]
     if any(value <= 0 for value in values):
         raise ValueError(f"{name} must contain only positive integers")
+    return values
+
+
+def parse_nonnegative_int_schedule(raw: Any, name: str, default: int) -> list[int]:
+    if raw is None:
+        values = [default]
+    elif isinstance(raw, list):
+        if not raw:
+            raise ValueError(f"{name} must not be an empty array")
+        values = [int(value) for value in raw]
+    else:
+        values = [int(raw)]
+    if any(value < 0 for value in values):
+        raise ValueError(f"{name} must contain only non-negative integers")
     return values
 
 
@@ -277,6 +296,9 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError(f"{path}: unsupported tuning.commit_source {commit_source!r}; expected 'best' or 'recommended'")
     population_schedule = parse_positive_int_schedule(tuning_obj.get("population"), "tuning.population", 1)
     trial_sbs_schedule = parse_positive_int_schedule(tuning_obj.get("trial_sbs"), "tuning.trial_sbs", 16)
+    tpe_startup_trials_schedule = parse_nonnegative_int_schedule(
+        tuning_obj.get("tpe_startup_trials"), "tuning.tpe_startup_trials", 16
+    )
     default_generations = max(len(population_schedule), len(trial_sbs_schedule), 1)
     generations = int(tuning_obj.get("generations", default_generations))
     if generations <= 0:
@@ -289,7 +311,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         lower_is_better=lower_is_better,
         sampler=sampler,
         seed=int(tuning_obj.get("seed", 1)),
-        tpe_startup_trials=int(tuning_obj.get("tpe_startup_trials", 16)),
+        tpe_startup_trials_schedule=tpe_startup_trials_schedule,
         tpe_good_fraction=float(tuning_obj.get("tpe_good_fraction", 0.25)),
         tpe_bandwidth=float(tuning_obj.get("tpe_bandwidth", 0.15)),
         validation_rate=int(tuning_obj.get("validation_rate", 0)),
@@ -298,8 +320,6 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         use_worker=bool(tuning_obj.get("use_worker", True)),
         commit_source=commit_source,
     )
-    if settings.tpe_startup_trials < 0:
-        raise ValueError("tuning.tpe_startup_trials must be >= 0")
     if not (0.0 < settings.tpe_good_fraction <= 1.0):
         raise ValueError("tuning.tpe_good_fraction must be in (0, 1]")
     if settings.tpe_bandwidth <= 0.0 or not math.isfinite(settings.tpe_bandwidth):
@@ -593,9 +613,10 @@ def sample_params_tpe(
     rng: random.Random,
     completed: list[TrialResult],
     settings: StudySettings,
+    tpe_startup_trials: int,
     center: dict[str, float] | None,
 ) -> dict[str, float]:
-    if len(completed) < settings.tpe_startup_trials:
+    if len(completed) < tpe_startup_trials:
         if center is not None:
             return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
         return sample_params_random(specs, rng)
@@ -644,11 +665,12 @@ def sample_params(
     rng: random.Random,
     completed: list[TrialResult],
     settings: StudySettings,
+    tpe_startup_trials: int,
     center: dict[str, float] | None = None,
 ) -> dict[str, float]:
     if settings.sampler == "random":
         return sample_params_random(specs, rng)
-    return sample_params_tpe(specs, rng, completed, settings, center)
+    return sample_params_tpe(specs, rng, completed, settings, tpe_startup_trials, center)
 
 
 def train_args(
@@ -1074,7 +1096,7 @@ def main() -> int:
                 f"sampler={settings.sampler} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
                 f"commit_source={settings.commit_source} "
-                f"tpe_startup_trials={settings.tpe_startup_trials} "
+                f"tpe_startup_trials={settings.tpe_startup_trials_schedule} "
                 f"tpe_good_fraction={settings.tpe_good_fraction:g} "
                 f"tpe_bandwidth={settings.tpe_bandwidth:g} worker={'on' if settings.use_worker else 'off'}"
             ),
@@ -1162,6 +1184,7 @@ def main() -> int:
                 population = settings.population_for_generation(generation)
                 generation_last_trial = generation_first_trial + population - 1
                 trial_sbs = settings.trial_sbs_for_generation(generation)
+                tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
                 previous_generation_trials = (
                     generation_results(settings, completed, generation - 1) if generation > 1 else []
                 )
@@ -1175,7 +1198,7 @@ def main() -> int:
                 elif (
                     previous_recommended_params is not None
                     and (
-                        len(previous_generation_trials) < settings.tpe_startup_trials
+                        len(previous_generation_trials) < tpe_startup_trials
                         or len(previous_generation_trials) < 2
                     )
                 ):
@@ -1188,6 +1211,7 @@ def main() -> int:
                     f"[GEN {generation} START]",
                     (
                         f"population={population} trial_sbs={trial_sbs} "
+                        f"tpe_startup_trials={tpe_startup_trials} "
                         f"base={current_checkpoint or 'scratch'} "
                         f"sampler_trials={len(previous_generation_trials)} "
                         f"sampler_center={sampler_center}"
@@ -1209,10 +1233,24 @@ def main() -> int:
                     )
                 trial_start = max(next_trial, generation_first_trial)
                 for _ in range(generation_first_trial, trial_start):
-                    sample_params(specs, rng, previous_generation_trials, settings, previous_recommended_params)
+                    sample_params(
+                        specs,
+                        rng,
+                        previous_generation_trials,
+                        settings,
+                        tpe_startup_trials,
+                        previous_recommended_params,
+                    )
                 for trial in range(trial_start, generation_last_trial + 1):
                     generation_trial = trial - generation_first_trial + 1
-                    params = sample_params(specs, rng, previous_generation_trials, settings, previous_recommended_params)
+                    params = sample_params(
+                        specs,
+                        rng,
+                        previous_generation_trials,
+                        settings,
+                        tpe_startup_trials,
+                        previous_recommended_params,
+                    )
                     out_dir = trials_root / f"trial{trial:04d}"
                     if out_dir.exists() and not args.dry_run:
                         shutil.rmtree(out_dir)
