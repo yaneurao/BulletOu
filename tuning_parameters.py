@@ -43,21 +43,8 @@ SUMMARY_FIELDS = [
     "test_value_loss",
     "quantized_value_accuracy",
     "quantized_value_loss",
-    "checkpoint",
     "parameters",
-]
-
-OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR = [
-    "trial",
-    "status",
-    "score",
-    "test_value_accuracy",
-    "test_value_loss",
-    "quantized_value_accuracy",
-    "quantized_value_loss",
     "checkpoint",
-    "output_dir",
-    "parameters",
 ]
 
 TPE_CANDIDATES = 64
@@ -674,16 +661,6 @@ def metric_score(metric: tuner.Metric, name: str) -> float:
 
 
 def summary_fields_for_path(summary_path: Path) -> list[str]:
-    if not summary_path.exists() or summary_path.stat().st_size == 0:
-        return SUMMARY_FIELDS
-    try:
-        with summary_path.open("r", encoding="utf-8", newline="") as f:
-            header = f.readline().strip()
-        fields = next(csv.reader([header]))
-    except Exception:
-        return SUMMARY_FIELDS
-    if fields == OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR:
-        return OLD_SUMMARY_FIELDS_WITH_OUTPUT_DIR
     return SUMMARY_FIELDS
 
 
