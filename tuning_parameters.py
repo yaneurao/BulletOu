@@ -11,8 +11,9 @@ This is a small local sampler for expensive BulletOu trials:
 * only the current checkpoint and the observed best checkpoint are kept by default.
 
 The first generation starts with uniform random trials. Later generations use
-the previous generation: TPE when enough trials exist, otherwise Gaussian
-sampling around the previous generation's recommended parameters.
+the latest earlier generation that actually ran trials. Commit-only generations
+with population=0 are skipped as sampler history; the next exploration
+generation still starts from the committed current checkpoint/parameters.
 """
 
 from __future__ import annotations
@@ -813,6 +814,19 @@ def latest_generation_with_results(settings: StudySettings, completed: list[Tria
     return max(result_generation(settings, result) for result in completed)
 
 
+def latest_prior_generation_with_results(
+    settings: StudySettings, completed: list[TrialResult], generation: int
+) -> int | None:
+    prior_generations = [
+        result_generation(settings, result)
+        for result in completed
+        if result_generation(settings, result) < generation
+    ]
+    if not prior_generations:
+        return None
+    return max(prior_generations)
+
+
 def best_result(results: list[TrialResult], settings: StudySettings) -> TrialResult | None:
     if not results:
         return None
@@ -1244,26 +1258,25 @@ def main() -> int:
                 generation_last_trial = generation_first_trial + population - 1
                 trial_sbs = settings.trial_sbs_for_generation(generation)
                 tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
-                previous_generation_trials = (
-                    generation_results(settings, completed, generation - 1) if generation > 1 else []
+                sampler_generation = latest_prior_generation_with_results(settings, completed, generation)
+                sampler_trials = (
+                    generation_results(settings, completed, sampler_generation)
+                    if sampler_generation is not None
+                    else []
                 )
-                previous_recommended_params = (
-                    recommended_params(specs, previous_generation_trials, settings)
-                    if previous_generation_trials
-                    else None
-                )
+                sampler_center_params = dict(current_parameters) if sampler_trials else None
                 if population == 0:
                     sampler_center = "commit-only"
-                elif settings.sampler == "random" or not previous_generation_trials:
+                elif settings.sampler == "random" or not sampler_trials:
                     sampler_center = "random"
                 elif (
-                    previous_recommended_params is not None
+                    sampler_center_params is not None
                     and (
-                        len(previous_generation_trials) < tpe_startup_trials
-                        or len(previous_generation_trials) < 2
+                        len(sampler_trials) < tpe_startup_trials
+                        or len(sampler_trials) < 2
                     )
                 ):
-                    sampler_center = "previous-recommended"
+                    sampler_center = "current-parameters"
                 else:
                     sampler_center = "tpe"
                 rng = random.Random(settings.seed + generation * 1_000_003)
@@ -1274,7 +1287,8 @@ def main() -> int:
                         f"population={population} trial_sbs={trial_sbs} "
                         f"tpe_startup_trials={tpe_startup_trials} "
                         f"base={current_checkpoint or 'scratch'} "
-                        f"sampler_trials={len(previous_generation_trials)} "
+                        f"sampler_generation={sampler_generation or '-'} "
+                        f"sampler_trials={len(sampler_trials)} "
                         f"sampler_center={sampler_center}"
                     ),
                     "magenta",
@@ -1297,20 +1311,20 @@ def main() -> int:
                     sample_params(
                         specs,
                         rng,
-                        previous_generation_trials,
+                        sampler_trials,
                         settings,
                         tpe_startup_trials,
-                        previous_recommended_params,
+                        sampler_center_params,
                     )
                 for trial in range(trial_start, generation_last_trial + 1):
                     generation_trial = trial - generation_first_trial + 1
                     params = sample_params(
                         specs,
                         rng,
-                        previous_generation_trials,
+                        sampler_trials,
                         settings,
                         tpe_startup_trials,
-                        previous_recommended_params,
+                        sampler_center_params,
                     )
                     out_dir = trials_root / f"trial{trial:04d}"
                     if out_dir.exists() and not args.dry_run:
