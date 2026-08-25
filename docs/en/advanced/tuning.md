@@ -1,4 +1,4 @@
-﻿# Adjust training settings
+# Adjust training settings
 
 <a href="../../ja/advanced/tuning.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
@@ -66,7 +66,7 @@ Fuller option table:
 | `--output-folder` | Parent folder for checkpoints. Auto-derived directory names and `--tag` are still used | `checkpoints` |
 | `--output` | Exact checkpoint directory. `--tag` is not used | omitted |
 | `--batch-size` | Positions per weight update | 65536 |
-| `--batches-per-update` | Accumulate N mini-batch gradients before one optimizer update | 1 |
+| `--batchtuning-per-update` | Accumulate N mini-batch gradients before one optimizer update | 1 |
 | `--positions-per-superbatch` | Target positions per sb. Rounded down to a multiple of `batch-size` | 100000000 |
 | `--teacher-shuffle-buffer-sbs` | How many sb of teacher positions to shuffle in RAM. `4` means two 4-sb buffers | 1 |
 | `--teacher-shuffle-buffer-batches` | Same shuffle buffer size, specified in batches. Usually use `--teacher-shuffle-buffer-sbs` instead | omitted |
@@ -401,11 +401,11 @@ If you want an additional regularization term, use `--sfnn-residual-count-confid
 
 You can also damp axis and pair factorizer rows with `--sfnn-axis-count-confidence` and `--sfnn-pair-count-confidence`. If one family needs a different strength, use the split options such as `--sfnn-king-axis-count-confidence` or `--sfnn-hand-progress-pair-count-confidence`. See [SFNN factorizer](sfnn-factorizer.md) for the formulas and the model-side interpretation.
 
-### 7.3 Automatic ES tuning by qloss
+### 7.3 Automatic population search tuning by qloss
 
 The automatic tuning runner needs its own explanation, so it has a dedicated page.
 
-See [Automatic ES tuning](auto-tuning.md).
+See [Automatic population search tuning](auto-tuning.md).
 
 ## 8. Save and validation frequency
 
@@ -441,13 +441,13 @@ If GPU utilization is low and `pos/s` is low, teacher loading, decoding, or shuf
 
 ## 10. Gradient accumulation
 
-Use `--batches-per-update N` when VRAM forces a smaller `--batch-size`, but you still want the optimizer to use a larger virtual batch.
+Use `--batchtuning-per-update N` when VRAM forces a smaller `--batch-size`, but you still want the optimizer to use a larger virtual batch.
 
 Example:
 
 ```bash
 --batch-size 16384
---batches-per-update 4
+--batchtuning-per-update 4
 ```
 
 This reads four 16,384-position mini-batches, adds their gradients, and then applies one Ranger update. The optimizer sees a virtual batch of:
@@ -465,9 +465,9 @@ This is not the same as making each CUDA forward/backward pass as large as 65,53
 --batch-size 65536
 ```
 
-With `--batches-per-update 1`, BulletOu actually uses `610 * 65,536 = 39,976,960` positions for one sb.
+With `--batchtuning-per-update 1`, BulletOu actually uses `610 * 65,536 = 39,976,960` positions for one sb.
 
-When `--batches-per-update` is 2 or larger, BulletOu also rounds the mini-batch count down to a multiple of `--batches-per-update`. For example, with `--batches-per-update 4`, one sb uses 608 batches instead of 610 batches.
+When `--batchtuning-per-update` is 2 or larger, BulletOu also rounds the mini-batch count down to a multiple of `--batchtuning-per-update`. For example, with `--batchtuning-per-update 4`, one sb uses 608 batches instead of 610 batches.
 
 ```text
 608 * 65,536 = 39,845,888 positions

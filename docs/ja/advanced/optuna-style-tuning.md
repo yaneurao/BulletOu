@@ -4,9 +4,9 @@
 
 これは Optuna 本体ではありません。外部 Python package を増やさずに使える、BulletOu 用の軽量な Optuna 風 sampler です。
 
-## ES runner との違い
+## population search runner との違い
 
-ES runner は、採用した checkpoint から次の候補へ進みます。そのため、学習済み checkpoint の途中で factorizer や count confidence を動かすと、変更直後の崩れとパラメーター自体の良し悪しが混ざります。
+population search runner は、採用した checkpoint から次の候補へ進みます。そのため、学習済み checkpoint の途中で factorizer や count confidence を動かすと、変更直後の崩れとパラメーター自体の良し悪しが混ざります。
 
 Optuna風 runner は、各 trial を scratch または同じ base checkpoint から開始します。trial 中はパラメーターを変えません。
 
@@ -19,7 +19,7 @@ Optuna風 runner は、各 trial を scratch または同じ base checkpoint か
 
 ## 設定例
 
-ES settings と合わせるため、探索範囲は `min` / `max` で指定します。
+population search settings と合わせるため、探索範囲は `min` / `max` で指定します。
 
 ```json
 {

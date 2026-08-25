@@ -387,11 +387,11 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 
 axis 行・pair 行そのものを count に応じて弱めたい場合は、`--sfnn-axis-count-confidence` と `--sfnn-pair-count-confidence` を使います。特定の種類だけ強さを変えたい場合は、`--sfnn-king-axis-count-confidence` や `--sfnn-hand-progress-pair-count-confidence` のような個別指定を使います。詳しい式と考え方は [SFNN factorizer](sfnn-factorizer.md) を参照してください。
 
-### 6.3 qloss を見ながらESで自動調整する
+### 6.3 qloss を見ながら population search で自動調整する
 
 自動調整 runner は説明量が多いため、専用ページに分けています。
 
-詳しくは [ESによる自動調整](auto-tuning.md) を参照してください。
+詳しくは [population search による自動調整](auto-tuning.md) を参照してください。
 
 ## 7. 保存と検証の頻度
 

@@ -1,12 +1,12 @@
-#!/usr/bin/env python3
-"""Fixed-length generation ES runner for BulletOu local fine-tuning.
+﻿#!/usr/bin/env python3
+"""Fixed-length generation population-search tuner for BulletOu local fine-tuning.
 
 This runner is intentionally simple:
 
-* `es-settings.json` owns the current hyperparameters and ES settings.
+* `tuning-settings.json` owns the current hyperparameters and tuning settings.
 * `bulletou-settings.json` owns the ordinary `bulletou.exe` training options.
 * Each generation creates a population of randomized candidates.
-* Each candidate is trained for `es.beam[-1].after_sbs` superbatches.
+* Each candidate is trained for `tuning.beam[-1].after_sbs` superbatches.
 * After the whole population is evaluated, the best candidate's NN weights and
   hyperparameters become the next current state.
 
@@ -15,10 +15,10 @@ candidate itself survives.
 
 Typical use:
 
-    python es_local_runner.py ^
-      --es-settings-file .\\es-settings.json
+    python bulletou_tuner.py ^
+      --tuning-settings-file .\\tuning-settings.json
 
-Use --resume to continue from the runner root described by es-settings.json.
+Use --resume to continue from the runner root described by tuning-settings.json.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 
-ES_SETTINGS_VERSION = 1
+TUNING_SETTINGS_VERSION = 1
 STATE_VERSION = 1
 
 
@@ -225,7 +225,8 @@ class BeamStage:
 
 
 @dataclass
-class EsSettings:
+class TuningSettings:
+    method: str
     enabled: bool
     use_worker: bool
     generations: int
@@ -265,10 +266,10 @@ class Candidate:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a fixed-length generation ES search for BulletOu factorizer/count hyperparameters."
+        description="Run a fixed-length generation population search for BulletOu factorizer/count hyperparameters."
     )
-    parser.add_argument("--es-settings-file", type=Path, default=Path("es-settings.json"))
-    parser.add_argument("--resume", action="store_true", help="Resume from run.output_folder/es-<run.tag_prefix>/runner-state.json")
+    parser.add_argument("--tuning-settings-file", type=Path, default=Path("tuning-settings.json"))
+    parser.add_argument("--resume", action="store_true", help="Resume from run.output_folder/tuning-<run.tag_prefix>/runner-state.json")
     parser.add_argument("--keep-temp", action="store_true", help="Keep candidate temp directories for debugging")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -341,7 +342,7 @@ def parse_parameter_spec(name: str, value: Any) -> ParameterSpec:
     if spec.tune and spec.step == 0.0:
         raise ValueError(f"parameters.{name}: tune=true requires multiplicative step > 0")
     if spec.tune and spec.current <= 0.0:
-        raise ValueError(f"parameters.{name}: multiplicative ES requires current > 0")
+        raise ValueError(f"parameters.{name}: multiplicative population tuning requires current > 0")
     return spec
 
 
@@ -360,7 +361,7 @@ def validate_learning_rate_specs(specs: dict[str, ParameterSpec]) -> None:
         )
 
 
-def es_settings_path(base_file: Path, raw: Any, name: str, required: bool = True) -> Path | None:
+def settings_path(base_file: Path, raw: Any, name: str, required: bool = True) -> Path | None:
     if raw is None:
         if required:
             raise ValueError(f"{base_file}: run.{name} is required")
@@ -373,21 +374,21 @@ def es_settings_path(base_file: Path, raw: Any, name: str, required: bool = True
     return path
 
 
-def validate_bulletou_settings_for_es(path: Path) -> None:
+def validate_bulletou_settings_for_tuning(path: Path) -> None:
     root = load_json_object(path)
     bad = sorted(set(root) & RUNNER_CONTROLLED_BULLETOU_SETTINGS)
     if bad:
         raise ValueError(
-            f"{path}: these BulletOu settings are controlled by es_local_runner.py and must not be written here: "
+            f"{path}: these BulletOu settings are controlled by bulletou_tuner.py and must not be written here: "
             + ", ".join(bad)
         )
 
 
-def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec], EsSettings, RunSettings]:
+def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec], TuningSettings, RunSettings]:
     root = load_json_object(path)
-    version = int(root.get("version", ES_SETTINGS_VERSION))
-    if version != ES_SETTINGS_VERSION:
-        raise ValueError(f"{path}: unsupported version {version}; expected {ES_SETTINGS_VERSION}")
+    version = int(root.get("version", TUNING_SETTINGS_VERSION))
+    if version != TUNING_SETTINGS_VERSION:
+        raise ValueError(f"{path}: unsupported version {version}; expected {TUNING_SETTINGS_VERSION}")
 
     params_obj = root.get("parameters")
     if not isinstance(params_obj, dict):
@@ -405,17 +406,22 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
             specs[name] = parse_parameter_spec(name, params_obj[name])
     validate_learning_rate_specs(specs)
 
-    es_obj = root.get("es")
-    if not isinstance(es_obj, dict):
-        raise ValueError(f"{path}: `es` object is required")
-    enabled = es_obj.get("enabled")
+    if "es" in root:
+        raise ValueError(f"{path}: `es` was renamed to `tuning`; update this settings file")
+    tuning_obj = root.get("tuning")
+    if not isinstance(tuning_obj, dict):
+        raise ValueError(f"{path}: `tuning` object is required")
+    method = str(tuning_obj.get("method", ""))
+    if method != "population_search":
+        raise ValueError(f"{path}: tuning.method must be \"population_search\"")
+    enabled = tuning_obj.get("enabled")
     if not isinstance(enabled, bool):
-        raise ValueError(f"{path}: es.enabled must be true or false")
-    use_worker = bool(es_obj.get("use_worker", True))
+        raise ValueError(f"{path}: tuning.enabled must be true or false")
+    use_worker = bool(tuning_obj.get("use_worker", True))
 
-    generations = int(es_obj.get("generations", 1))
-    population = int(es_obj.get("population", 4))
-    metric = str(es_obj.get("metric", "quantized_value_loss"))
+    generations = int(tuning_obj.get("generations", 1))
+    population = int(tuning_obj.get("population", 4))
+    metric = str(tuning_obj.get("metric", "quantized_value_loss"))
     if metric not in {
         "quantized_value_loss",
         "quantized_value_accuracy",
@@ -423,32 +429,32 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
         "test_value_accuracy",
         BORDA_COUNT_METRIC,
     }:
-        raise ValueError(f"{path}: unsupported es.metric {metric!r}")
-    lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(es_obj.get("lower_is_better", "loss" in metric))
-    seed = int(es_obj.get("seed", 1))
-    parameter_step_scale = float(es_obj.get("parameter_step_scale", 1.0))
-    save_rate = int(es_obj.get("save_rate", 1))
-    if "candidate_validation_rate" in es_obj or "candidate_quantized_validation_rate" in es_obj:
+        raise ValueError(f"{path}: unsupported tuning.metric {metric!r}")
+    lower_is_better = True if metric == BORDA_COUNT_METRIC else bool(tuning_obj.get("lower_is_better", "loss" in metric))
+    seed = int(tuning_obj.get("seed", 1))
+    parameter_step_scale = float(tuning_obj.get("parameter_step_scale", 1.0))
+    save_rate = int(tuning_obj.get("save_rate", 1))
+    if "candidate_validation_rate" in tuning_obj or "candidate_quantized_validation_rate" in tuning_obj:
         raise ValueError(
-            f"{path}: es.candidate_validation_rate / es.candidate_quantized_validation_rate were renamed to "
-            "es.validation_rate / es.quantized_validation_rate"
+            f"{path}: tuning.candidate_validation_rate / tuning.candidate_quantized_validation_rate were renamed to "
+            "tuning.validation_rate / tuning.quantized_validation_rate"
         )
-    validation_rate = int(es_obj.get("validation_rate", 1))
-    quantized_validation_rate = int(es_obj.get("quantized_validation_rate", 1))
+    validation_rate = int(tuning_obj.get("validation_rate", 1))
+    quantized_validation_rate = int(tuning_obj.get("quantized_validation_rate", 1))
 
     if generations <= 0:
-        raise ValueError("es.generations must be > 0")
+        raise ValueError("tuning.generations must be > 0")
     if population <= 0:
-        raise ValueError("es.population must be > 0")
+        raise ValueError("tuning.population must be > 0")
     if not math.isfinite(parameter_step_scale) or parameter_step_scale < 0.0:
-        raise ValueError("es.parameter_step_scale must be finite and >= 0")
+        raise ValueError("tuning.parameter_step_scale must be finite and >= 0")
     if save_rate < 0:
-        raise ValueError("es.save_rate must be >= 0")
+        raise ValueError("tuning.save_rate must be >= 0")
     if validation_rate < -1:
-        raise ValueError("es.validation_rate must be >= -1; -1 disables f32 validation")
+        raise ValueError("tuning.validation_rate must be >= -1; -1 disables f32 validation")
     if quantized_validation_rate < -1:
         raise ValueError(
-            "es.quantized_validation_rate must be >= -1; -1 disables quantized validation"
+            "tuning.quantized_validation_rate must be >= -1; -1 disables quantized validation"
         )
     metric_needs_validation = metric in {"test_value_loss", "test_value_accuracy", BORDA_COUNT_METRIC}
     metric_needs_quantized_validation = metric in {
@@ -458,41 +464,42 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     }
     if metric_needs_validation and validation_rate < 0:
         raise ValueError(
-            f"es.metric {metric!r} requires f32 validation; "
+            f"tuning.metric {metric!r} requires f32 validation; "
             "use 0 for trial-end-only validation"
         )
     if metric_needs_quantized_validation and quantized_validation_rate < 0:
         raise ValueError(
-            f"es.metric {metric!r} requires quantized validation; "
+            f"tuning.metric {metric!r} requires quantized validation; "
             "use 0 for trial-end-only quantized validation"
         )
 
-    beam_raw = es_obj.get("beam")
+    beam_raw = tuning_obj.get("beam")
     if beam_raw is None:
-        candidate_sbs = int(es_obj.get("candidate_sbs", 8))
+        candidate_sbs = int(tuning_obj.get("candidate_sbs", 8))
         beam = [BeamStage(after_sbs=candidate_sbs, keep=1)]
     elif isinstance(beam_raw, list):
         beam = []
         for i, item in enumerate(beam_raw):
             if not isinstance(item, dict):
-                raise ValueError(f"es.beam[{i}] must be an object")
+                raise ValueError(f"tuning.beam[{i}] must be an object")
             beam.append(BeamStage(after_sbs=int(item["after_sbs"]), keep=int(item["keep"])))
     else:
-        raise ValueError("es.beam must be a list")
+        raise ValueError("tuning.beam must be a list")
 
     if not beam:
-        raise ValueError("es.beam must not be empty")
+        raise ValueError("tuning.beam must not be empty")
     prev_after = 0
     for stage in beam:
         if stage.after_sbs <= prev_after:
-            raise ValueError("es.beam after_sbs must be strictly increasing")
+            raise ValueError("tuning.beam after_sbs must be strictly increasing")
         if stage.keep <= 0:
-            raise ValueError("es.beam keep must be > 0")
+            raise ValueError("tuning.beam keep must be > 0")
         prev_after = stage.after_sbs
     if beam[-1].keep != 1:
-        raise ValueError("final es.beam entry must keep exactly 1 candidate")
+        raise ValueError("final tuning.beam entry must keep exactly 1 candidate")
 
-    settings = EsSettings(
+    settings = TuningSettings(
+        method=method,
         enabled=enabled,
         use_worker=use_worker,
         generations=generations,
@@ -512,11 +519,11 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     unknown_run = sorted(set(run_obj) - {"exe", "bulletou_settings_file", "base_checkpoint", "output_folder", "temp_folder", "tag_prefix"})
     if unknown_run:
         raise ValueError(f"{path}: unknown run field(s): {', '.join(unknown_run)}")
-    exe = es_settings_path(path, run_obj.get("exe"), "exe")
-    bulletou_settings_file = es_settings_path(path, run_obj.get("bulletou_settings_file"), "bulletou_settings_file")
-    base_checkpoint = es_settings_path(path, run_obj.get("base_checkpoint"), "base_checkpoint", required=False)
-    output_folder = es_settings_path(path, run_obj.get("output_folder"), "output_folder", required=enabled)
-    temp_folder = es_settings_path(path, run_obj.get("temp_folder"), "temp_folder", required=False)
+    exe = settings_path(path, run_obj.get("exe"), "exe")
+    bulletou_settings_file = settings_path(path, run_obj.get("bulletou_settings_file"), "bulletou_settings_file")
+    base_checkpoint = settings_path(path, run_obj.get("base_checkpoint"), "base_checkpoint", required=False)
+    output_folder = settings_path(path, run_obj.get("output_folder"), "output_folder", required=enabled)
+    temp_folder = settings_path(path, run_obj.get("temp_folder"), "temp_folder", required=False)
     tag_prefix = run_obj.get("tag_prefix")
     if enabled and (not isinstance(tag_prefix, str) or not tag_prefix.strip()):
         raise ValueError(f"{path}: run.tag_prefix must be a non-empty string")
@@ -526,7 +533,7 @@ def load_parameters(path: Path) -> tuple[dict[str, Any], dict[str, ParameterSpec
     assert bulletou_settings_file is not None
     if enabled:
         assert output_folder is not None
-        validate_bulletou_settings_for_es(bulletou_settings_file)
+        validate_bulletou_settings_for_tuning(bulletou_settings_file)
     run = RunSettings(
         exe=exe,
         bulletou_settings_file=bulletou_settings_file,
@@ -569,7 +576,7 @@ def write_current_parameters(path: Path, root: dict[str, Any], specs: dict[str, 
         obj["max"] = spec.maximum
         params_obj[name] = obj
     root["parameters"] = params_obj
-    root["version"] = ES_SETTINGS_VERSION
+    root["version"] = TUNING_SETTINGS_VERSION
     atomic_write_json(path, root)
 
 
@@ -738,7 +745,7 @@ def import_ordinary_run_summaries(
     summary_path: Path,
     accepted_summary_path: Path,
     ordinary_output: Path,
-    settings: EsSettings,
+    settings: TuningSettings,
     params: dict[str, float],
     base_accepted_sbs: int,
     color: bool,
@@ -826,9 +833,9 @@ def sync_ordinary_accepted_checkpoints(
     accepted_root: Path,
     current_dir: Path,
     ordinary_output: Path,
-    settings: EsSettings,
+    settings: TuningSettings,
     accepted_offset: int,
-    es_settings_file: Path,
+    tuning_settings_file: Path,
     bulletou_settings_file: Path,
     color: bool,
 ) -> int:
@@ -858,12 +865,12 @@ def sync_ordinary_accepted_checkpoints(
                 raise RuntimeError(f"accepted checkpoint exists but has no state.bin: {public_dir}")
             continue
         copy_dir_new(checkpoint, public_dir)
-        copy_settings_files(public_dir, es_settings_file, bulletou_settings_file)
+        copy_settings_files(public_dir, tuning_settings_file, bulletou_settings_file)
         copied += 1
 
     if latest_checkpoint is not None:
         copy_dir_replace(latest_checkpoint, current_dir)
-        copy_settings_files(current_dir, es_settings_file, bulletou_settings_file)
+        copy_settings_files(current_dir, tuning_settings_file, bulletou_settings_file)
 
     event(
         color,
@@ -952,9 +959,9 @@ def remove_dir_quiet(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def copy_settings_files(dst: Path, es_settings_file: Path, bulletou_settings_file: Path) -> None:
+def copy_settings_files(dst: Path, tuning_settings_file: Path, bulletou_settings_file: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(es_settings_file, dst / "es-settings.json")
+    shutil.copy2(tuning_settings_file, dst / "tuning-settings.json")
     shutil.copy2(bulletou_settings_file, dst / "bulletou-settings.json")
 
 
@@ -1121,7 +1128,7 @@ def build_train_args(
     checkpoint: Path | None,
     output_dir: Path,
     stage_delta_sbs: int,
-    settings: EsSettings,
+    settings: TuningSettings,
     *,
     include_initial_state: bool,
 ) -> list[str]:
@@ -1174,7 +1181,7 @@ def build_train_command(
     checkpoint: Path,
     output_dir: Path,
     stage_delta_sbs: int,
-    settings: EsSettings,
+    settings: TuningSettings,
 ) -> list[str]:
     return [
         str(run.exe),
@@ -1193,7 +1200,7 @@ def build_train_command(
 def train_candidate_stage(
     args: argparse.Namespace,
     run: RunSettings,
-    settings: EsSettings,
+    settings: TuningSettings,
     summary_path: Path,
     base_metric: Metric,
     generation: int,
@@ -1324,7 +1331,7 @@ def train_candidate_stage_worker(
     args: argparse.Namespace,
     worker: WorkerClient | None,
     run: RunSettings,
-    settings: EsSettings,
+    settings: TuningSettings,
     summary_path: Path,
     base_metric: Metric,
     generation: int,
@@ -1481,7 +1488,7 @@ def assign_borda_count_scores(candidates: list[Candidate]) -> None:
         candidate.score = scores[id(candidate)]
 
 
-def rank_candidates(candidates: list[Candidate], settings: EsSettings) -> list[Candidate]:
+def rank_candidates(candidates: list[Candidate], settings: TuningSettings) -> list[Candidate]:
     if settings.metric == BORDA_COUNT_METRIC:
         assign_borda_count_scores(candidates)
         return sorted(candidates, key=lambda candidate: candidate.score if candidate.score is not None else math.inf)
@@ -1547,7 +1554,7 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     atomic_write_json(path, state)
 
 
-def metric_direction_text(settings: EsSettings) -> str:
+def metric_direction_text(settings: TuningSettings) -> str:
     if settings.metric == BORDA_COUNT_METRIC:
         return "lower rank sum is better"
     return "lower is better" if settings.lower_is_better else "higher is better"
@@ -1566,7 +1573,7 @@ def public_checkpoint_name(accepted_sbs: int) -> str:
 def run_once_from_settings(
     args: argparse.Namespace,
     run: RunSettings,
-    settings: EsSettings,
+    settings: TuningSettings,
     specs: dict[str, ParameterSpec],
     color: bool,
 ) -> int:
@@ -1589,7 +1596,7 @@ def run_once_from_settings(
     if managed:
         assert run.output_folder is not None
         assert run.tag_prefix is not None
-        runner_root = run.output_folder / f"es-{run.tag_prefix}"
+        runner_root = run.output_folder / f"tuning-{run.tag_prefix}"
         ordinary_output = runner_root / "bulletou-run"
         log_dir = runner_root / "logs"
         accepted_root = runner_root / "accepted-checkpoints"
@@ -1603,7 +1610,7 @@ def run_once_from_settings(
             accepted_root.mkdir(parents=True, exist_ok=True)
             ensure_csv(summary_path, SUMMARY_FIELDS)
             ensure_csv(accepted_summary_path, ACCEPTED_FIELDS)
-            copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
+            copy_settings_files(runner_root, args.tuning_settings_file, run.bulletou_settings_file)
         log_path = log_dir / "bulletou-settings-run.stdout.log"
         if state_path.exists():
             state = load_state(state_path)
@@ -1661,7 +1668,7 @@ def run_once_from_settings(
         color,
         "[RUN]",
         (
-            "es.enabled=false; launching one managed ordinary bulletou.exe run "
+            "tuning.enabled=false; launching one managed ordinary bulletou.exe run "
             f"(superbatches={epoch_sbs}, max_epochs={settings.generations})"
         ),
         "cyan",
@@ -1702,7 +1709,7 @@ def run_once_from_settings(
             ordinary_output=ordinary_output,
             settings=settings,
             accepted_offset=accepted_offset,
-            es_settings_file=args.es_settings_file,
+            tuning_settings_file=args.tuning_settings_file,
             bulletou_settings_file=run.bulletou_settings_file,
             color=color,
         )
@@ -1720,7 +1727,7 @@ def run_once_from_settings(
                     "test_value_loss": latest_metric.test_loss,
                     "test_value_accuracy": latest_metric.test_acc,
                 },
-                "es_settings_file": str(args.es_settings_file.resolve()),
+                "tuning_settings_file": str(args.tuning_settings_file.resolve()),
                 "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
             }
             save_state(state_path, state)
@@ -1747,15 +1754,15 @@ def main() -> int:
     args = parse_args()
     LOG_WRITES_ENABLED = not args.dry_run
     color = color_enabled(args.color)
-    root, specs, settings, run = load_parameters(args.es_settings_file)
+    root, specs, settings, run = load_parameters(args.tuning_settings_file)
 
     if not settings.enabled:
         return run_once_from_settings(args, run, settings, specs, color)
 
     assert run.output_folder is not None
     assert run.tag_prefix is not None
-    runner_root = run.output_folder / f"es-{run.tag_prefix}"
-    temp_root = run.temp_folder / f"es-{run.tag_prefix}" if run.temp_folder else runner_root / "temp"
+    runner_root = run.output_folder / f"tuning-{run.tag_prefix}"
+    temp_root = run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "temp"
     log_dir = runner_root / "logs"
     accepted_root = runner_root / "accepted-checkpoints"
     current_dir = runner_root / "current"
@@ -1783,7 +1790,7 @@ def main() -> int:
         if state_path.exists():
             raise RuntimeError(f"{state_path} already exists; use --resume or choose a new run.tag_prefix")
         if run.base_checkpoint is None:
-            raise RuntimeError(f"{args.es_settings_file}: run.base_checkpoint is required unless --resume is specified")
+            raise RuntimeError(f"{args.tuning_settings_file}: run.base_checkpoint is required unless --resume is specified")
         validate_checkpoint_dir(run.base_checkpoint)
         # Do not eagerly copy the initial checkpoint into the runner directory.
         # A full SFNN state.bin can be several GiB, and doing this before the
@@ -1797,13 +1804,13 @@ def main() -> int:
             "generation": 0,
             "accepted_sbs": 0,
             "current_checkpoint": str(current_checkpoint),
-            "es_settings_file": str(args.es_settings_file.resolve()),
+            "tuning_settings_file": str(args.tuning_settings_file.resolve()),
             "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
         }
         if not args.dry_run:
             save_state(state_path, state)
-            write_current_parameters(args.es_settings_file, root, specs)
-            copy_settings_files(runner_root, args.es_settings_file, run.bulletou_settings_file)
+            write_current_parameters(args.tuning_settings_file, root, specs)
+            copy_settings_files(runner_root, args.tuning_settings_file, run.bulletou_settings_file)
         event(color, "[START]", f"base_checkpoint={current_checkpoint}", "green")
 
     validate_checkpoint_dir(current_checkpoint)
@@ -2060,15 +2067,15 @@ def main() -> int:
 
             set_current_values(specs, survivor.params)
             if not args.dry_run:
-                write_current_parameters(args.es_settings_file, root, specs)
-                copy_settings_files(current_dir, args.es_settings_file, run.bulletou_settings_file)
+                write_current_parameters(args.tuning_settings_file, root, specs)
+                copy_settings_files(current_dir, args.tuning_settings_file, run.bulletou_settings_file)
 
             saved_checkpoint = ""
             if settings.save_rate > 0 and (generation % settings.save_rate == 0):
                 public_dir = accepted_root / public_checkpoint_name(accepted_sbs)
                 if not args.dry_run:
                     copy_dir_new(current_dir, public_dir)
-                    copy_settings_files(public_dir, args.es_settings_file, run.bulletou_settings_file)
+                    copy_settings_files(public_dir, args.tuning_settings_file, run.bulletou_settings_file)
                 saved_checkpoint = public_dir.name
 
             params_json = json.dumps(survivor.params, ensure_ascii=False, sort_keys=True)
@@ -2120,7 +2127,7 @@ def main() -> int:
                     "test_value_loss": metric.test_loss,
                     "test_value_accuracy": metric.test_acc,
                 },
-                "es_settings_file": str(args.es_settings_file.resolve()),
+                "tuning_settings_file": str(args.tuning_settings_file.resolve()),
                 "bulletou_settings_file": str(run.bulletou_settings_file.resolve()),
             }
             if not args.dry_run:
@@ -2170,6 +2177,6 @@ if __name__ == "__main__":
             raise
         print(f"error: {exc}", file=sys.stderr)
         if "already exists; use --resume" in str(exc):
-            print("hint: add --resume to continue the existing ES run, or change run.tag_prefix for a new run.", file=sys.stderr)
+            print("hint: add --resume to continue the existing tuning run, or change run.tag_prefix for a new run.", file=sys.stderr)
         print("hint: rerun with --debug for a Python traceback.", file=sys.stderr)
         raise SystemExit(1)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Dependency-free Optuna-style local runner for BulletOu.
 
 This is intentionally not the Optuna package.  It is a small local sampler for
@@ -27,13 +27,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import es_local_runner as es
+import bulletou_tuner as tuner
 
 
 SETTINGS_VERSION = 1
 
 SPECIAL_TRAIN_PARAMETERS = {"lr", "lr_min", "lr_min_ratio"}
-KNOWN_SEARCH_PARAMETERS = set(es.KNOWN_PARAMETERS) | SPECIAL_TRAIN_PARAMETERS
+KNOWN_SEARCH_PARAMETERS = set(tuner.KNOWN_PARAMETERS) | SPECIAL_TRAIN_PARAMETERS
 
 SUMMARY_FIELDS = [
     "trial",
@@ -121,7 +121,7 @@ class RunSettings:
 class TrialResult:
     trial: int
     params: dict[str, float]
-    metric: es.Metric
+    metric: tuner.Metric
     score: float
     checkpoint: Path
     output_dir: Path
@@ -160,7 +160,7 @@ def resolve_path(base: Path, raw: Any, name: str, *, required: bool = True) -> P
 
 
 def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSettings, dict[str, SearchParameter]]:
-    root = es.load_json_object(path)
+    root = tuner.load_json_object(path)
     version = int(root.get("version", SETTINGS_VERSION))
     if version != SETTINGS_VERSION:
         raise ValueError(f"{path}: unsupported version {version}; expected {SETTINGS_VERSION}")
@@ -227,7 +227,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     assert exe is not None
     assert bulletou_settings_file is not None
     assert output_folder is not None
-    es.validate_bulletou_settings_for_es(bulletou_settings_file)
+    tuner.validate_bulletou_settings_for_tuning(bulletou_settings_file)
     run = RunSettings(
         exe=exe,
         bulletou_settings_file=bulletou_settings_file,
@@ -258,7 +258,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
             current = float(raw["current"]) if "current" in raw else None
             minimum = float(raw["min"]) if "min" in raw else None
             maximum = float(raw["max"]) if "max" in raw else None
-            log = bool(raw.get("log", name in SPECIAL_TRAIN_PARAMETERS or name in es.KNOWN_PARAMETERS))
+            log = bool(raw.get("log", name in SPECIAL_TRAIN_PARAMETERS or name in tuner.KNOWN_PARAMETERS))
             spec = SearchParameter(
                 name=name,
                 tune=tune,
@@ -376,10 +376,10 @@ def train_args(run: RunSettings, params: dict[str, float], output_dir: Path, set
                 str(run.base_checkpoint / "dataloader_pos.txt"),
             ]
         )
-    alpha_values = {k: v for k, v in params.items() if k in es.ALPHA_PARAMETERS}
+    alpha_values = {k: v for k, v in params.items() if k in tuner.ALPHA_PARAMETERS}
     if alpha_values:
-        cmd.extend(["--sfnn-factorizer-alpha", es.alpha_arg(alpha_values)])
-    for name, flag in es.CONFIDENCE_FLAGS.items():
+        cmd.extend(["--sfnn-factorizer-alpha", tuner.alpha_arg(alpha_values)])
+    for name, flag in tuner.CONFIDENCE_FLAGS.items():
         if name in params and abs(params[name]) > 0.0:
             cmd.extend([flag, f"{params[name]:.12g}"])
     if "lr" in params:
@@ -389,7 +389,7 @@ def train_args(run: RunSettings, params: dict[str, float], output_dir: Path, set
     return cmd
 
 
-def metric_score(metric: es.Metric, name: str) -> float:
+def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
 
 
@@ -402,7 +402,7 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
             if row.get("status") != "finished":
                 continue
             try:
-                metric = es.metric_from_summary_row(row)
+                metric = tuner.metric_from_summary_row(row)
                 params = json.loads(row["parameters"])
                 out.append(
                     TrialResult(
@@ -420,7 +420,7 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
 
 
 def write_json(path: Path, obj: dict[str, Any]) -> None:
-    es.atomic_write_json(path, obj)
+    tuner.atomic_write_json(path, obj)
 
 
 def recommended_params(
@@ -457,10 +457,10 @@ def recommended_params(
 
 def bulletou_override_preview(params: dict[str, float]) -> dict[str, Any]:
     preview: dict[str, Any] = {}
-    alpha_values = {k: v for k, v in params.items() if k in es.ALPHA_PARAMETERS}
+    alpha_values = {k: v for k, v in params.items() if k in tuner.ALPHA_PARAMETERS}
     if alpha_values:
-        preview["sfnn_factorizer_alpha"] = es.alpha_arg(alpha_values)
-    for name, flag in es.CONFIDENCE_FLAGS.items():
+        preview["sfnn_factorizer_alpha"] = tuner.alpha_arg(alpha_values)
+    for name, flag in tuner.CONFIDENCE_FLAGS.items():
         if name in params and abs(params[name]) > 0.0:
             preview[flag.removeprefix("--").replace("-", "_")] = params[name]
     if "lr" in params:
@@ -538,7 +538,7 @@ def main() -> int:
             runner_root.mkdir(parents=True, exist_ok=True)
             trials_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
-            es.ensure_csv(summary_path, SUMMARY_FIELDS)
+            tuner.ensure_csv(summary_path, SUMMARY_FIELDS)
             shutil.copy2(args.settings_file, runner_root / args.settings_file.name)
             shutil.copy2(run.bulletou_settings_file, runner_root / run.bulletou_settings_file.name)
 
@@ -548,7 +548,7 @@ def main() -> int:
         best = None
         if completed:
             best = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)[0]
-        es.event(
+        tuner.event(
             color,
             "[CONFIG]",
             (
@@ -560,18 +560,18 @@ def main() -> int:
             "cyan",
         )
         if completed:
-            es.event(color, "[RESUME]", f"completed={len(completed)} next_trial={next_trial}", "yellow")
+            tuner.event(color, "[RESUME]", f"completed={len(completed)} next_trial={next_trial}", "yellow")
         if best:
-            es.event(
+            tuner.event(
                 color,
                 "[BEST]",
-                f"trial={best.trial} score={best.score:.9g} {es.metric_status_text(best.metric)}",
+                f"trial={best.trial} score={best.score:.9g} {tuner.metric_status_text(best.metric)}",
                 "green",
             )
         if not args.dry_run:
             rec = write_recommendation(recommendation_path, specs, completed, settings)
             if rec.get("best_observed"):
-                es.event(color, "[RECOMMEND]", f"parameters={recommendation_path}", "green")
+                tuner.event(color, "[RECOMMEND]", f"parameters={recommendation_path}", "green")
 
         for trial in range(next_trial, settings.trials + 1):
             params = sample_params(specs, rng, completed, settings)
@@ -579,7 +579,7 @@ def main() -> int:
             if out_dir.exists() and not args.dry_run:
                 shutil.rmtree(out_dir)
             log_path = log_dir / f"trial{trial:04d}.stdout.log"
-            es.event(
+            tuner.event(
                 color,
                 f"[TRIAL {trial:04d} START]",
                 " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
@@ -589,14 +589,14 @@ def main() -> int:
             if args.dry_run:
                 print("  " + subprocess.list2cmdline(cmd), flush=True)
                 continue
-            code, elapsed = es.run_command(
+            code, elapsed = tuner.run_command(
                 cmd,
                 log_path,
                 stream=not args.no_stream_child_output,
-                stream_prefix=es.paint(color, f"[T{trial:04d}] ", "magenta"),
+                stream_prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
             )
             if code != 0:
-                es.append_csv(
+                tuner.append_csv(
                     summary_path,
                     SUMMARY_FIELDS,
                     {
@@ -613,33 +613,33 @@ def main() -> int:
                     },
                 )
                 raise RuntimeError(f"trial {trial} failed; see {log_path}")
-            row = es.latest_summary_row(out_dir)
-            metric = es.metric_from_summary_row(row)
+            row = tuner.latest_summary_row(out_dir)
+            metric = tuner.metric_from_summary_row(row)
             score = metric_score(metric, settings.metric)
-            checkpoint = es.latest_checkpoint_dir(out_dir)
+            checkpoint = tuner.latest_checkpoint_dir(out_dir)
             result = TrialResult(trial=trial, params=params, metric=metric, score=score, checkpoint=checkpoint, output_dir=out_dir)
             completed.append(result)
             is_best = best is None or ((score < best.score) if settings.lower_is_better else (score > best.score))
-            es.append_csv(
+            tuner.append_csv(
                 summary_path,
                 SUMMARY_FIELDS,
                 {
                     "trial": trial,
                     "status": "finished",
-                    "score": es.format_float(score),
-                    "test_value_accuracy": es.format_float(metric.test_acc),
-                    "test_value_loss": es.format_float(metric.test_loss),
-                    "quantized_value_accuracy": es.format_float(metric.qacc),
-                    "quantized_value_loss": es.format_float(metric.qloss),
+                    "score": tuner.format_float(score),
+                    "test_value_accuracy": tuner.format_float(metric.test_acc),
+                    "test_value_loss": tuner.format_float(metric.test_loss),
+                    "quantized_value_accuracy": tuner.format_float(metric.qacc),
+                    "quantized_value_loss": tuner.format_float(metric.qloss),
                     "checkpoint": str(best_dir if is_best else checkpoint),
                     "output_dir": str(out_dir),
                     "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
                 },
             )
-            es.event(
+            tuner.event(
                 color,
                 f"[TRIAL {trial:04d} END]",
-                f"score={score:.9g} {es.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
+                f"score={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
                 "green" if is_best else "cyan",
             )
             if is_best:
@@ -655,7 +655,7 @@ def main() -> int:
                 result.output_dir = best_dir
                 best = result
             elif not settings.keep_all_trials and not args.keep_temp:
-                es.remove_dir_quiet(out_dir)
+                tuner.remove_dir_quiet(out_dir)
             state = {
                 "version": SETTINGS_VERSION,
                 "next_trial": trial + 1,
@@ -668,7 +668,7 @@ def main() -> int:
             write_json(state_path, state)
             rec = write_recommendation(recommendation_path, specs, completed, settings)
             rec_params = rec["recommended"]["parameters"]
-            es.event(
+            tuner.event(
                 color,
                 "[RECOMMEND]",
                 " ".join(f"{k}={v:.9g}" for k, v in sorted(rec_params.items())),

@@ -1,10 +1,10 @@
-# Automatic ES tuning
+# Automatic tuning
 
 <a href="../../ja/advanced/auto-tuning.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-This page explains how to tune SFNN factorizer alpha values and count-confidence values with `es_local_runner.py`.
+This page explains how to tune SFNN factorizer alpha values and count-confidence values with `bulletou_tuner.py`.
 
-Here, ES means evolution strategy. Each generation creates `population` candidates with slightly different hyperparameters, trains every candidate for a fixed trial length, and selects the candidate that ranks best by the configured metric. It does not estimate a gradient and then apply a separate small update. The selected candidate's NN weights and hyperparameter values directly become the next generation's starting point.
+Population search means that the runner trains several short candidate runs and uses the best candidate as the next starting point. Each generation creates `population` candidates with slightly different hyperparameters, trains every candidate for a fixed trial length, and selects the candidate that ranks best by the configured metric. It does not estimate a gradient and then apply a separate small update. The selected candidate's NN weights and hyperparameter values directly become the next generation's starting point.
 
 ## JSON files
 
@@ -12,27 +12,28 @@ The runner uses two JSON files.
 
 | File | Purpose |
 | --- | --- |
-| `es-settings.json` | ES generations, population, trial length, tunable parameters, and current values |
+| `tuning-settings.json` | population search generations, population, trial length, tunable parameters, and current values |
 | `bulletou-settings.json` | Normal `bulletou.exe` training options |
 
-`es-settings.json` points to `bulletou-settings.json`. You normally pass only `--es-settings-file` to the runner.
+`tuning-settings.json` points to `bulletou-settings.json`. You normally pass only `--tuning-settings-file` to the runner.
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 ```
 
 To continue the same runner, add `--resume`.
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resume
 ```
 
-## `es-settings.json` example
+## `tuning-settings.json` example
 
 ```json
 {
   "version": 1,
-  "es": {
+  "tuning": {
+    "method": "population_search",
     "enabled": true,
     "generations": 100,
     "population": 16,
@@ -56,7 +57,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "bulletou_settings_file": "./bulletou-settings.json",
     "base_checkpoint": "C:/shogi/YaneuraOuWorks/BulletOu/checkpoints/.../0256",
     "output_folder": "D:/BulletOu-snapshots/20260820",
-    "temp_folder": "C:/BulletOu-es-temp",
+    "temp_folder": "C:/BulletOu-tuning-temp",
     "tag_prefix": "pair2-qloss"
   },
   "parameters": {
@@ -105,7 +106,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
 }
 ```
 
-During ES, the runner owns these candidate-specific values, so do not put them in `bulletou-settings.json`.
+During population search, the runner owns these candidate-specific values, so do not put them in `bulletou-settings.json`.
 
 | Runner-controlled setting | Why |
 | --- | --- |
@@ -115,13 +116,13 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | The runner sets candidate evaluation cadence |
 | `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
-| `lr`, `lr_min` | Optional. If these are written in `es-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min` and writes accepted values back to `current` |
+| `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min` and writes accepted values back to `current` |
 
-## `es` fields
+## `tuning` fields
 
 | Field | Meaning |
 | --- | --- |
-| `enabled` | `true` runs ES. `false` runs one normal `bulletou.exe` job using `parameters.current` values |
+| `enabled` | `true` runs population search. `false` runs one normal `bulletou.exe` job using `parameters.current` values |
 | `generations` | Number of generations. One candidate is accepted per generation |
 | `population` | Number of candidates at the start of each generation |
 | `beam` | Candidate trial length. The final `after_sbs` value is used |
@@ -131,8 +132,8 @@ During ES, the runner owns these candidate-specific values, so do not put them i
 | `seed` | Random seed for candidate generation |
 | `parameter_step_scale` | Global multiplier for every `parameters.*.step`. `1.0` uses each step as written; `10.0` makes all candidate perturbations 10 times wider without changing `current` |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
-| `validation_rate` | f32 validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
-| `quantized_validation_rate` | Quantized validation cadence. With ES enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
+| `validation_rate` | f32 validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
+| `quantized_validation_rate` | Quantized validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
 
 You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want trial-end-only validation.
 
@@ -185,7 +186,7 @@ If a candidate is worse than an already evaluated candidate in all four metrics,
 | `temp_folder` | Temporary candidate checkpoint directory. A fast SSD is recommended |
 | `tag_prefix` | Name used in the runner root |
 
-The runner root is `output_folder/es-<tag_prefix>`.
+The runner root is `output_folder/tuning-<tag_prefix>`.
 
 ## Common `parameters` fields
 
@@ -200,12 +201,12 @@ Each parameter is written like this:
 | Field | Meaning |
 | --- | --- |
 | `current` | Current value. Candidates are sampled around it |
-| `tune` | If `true`, ES may change it. If `false`, it is fixed |
+| `tune` | If `true`, population search may change it. If `false`, it is fixed |
 | `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` |
 | `min` | Lower bound |
 | `max` | Upper bound |
 
-`step` is not an additive width. With `parameter_step_scale = 1.0`, `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. If you temporarily want a wider search, set `es.parameter_step_scale` instead of editing every `step` by hand. For example, `step = 0.005` and `parameter_step_scale = 10.0` behaves like an effective step of `0.05`. This multiplier is not written back into each parameter and does not change `current`. Parameters with `tune = true` must have `current > 0`.
+`step` is not an additive width. With `parameter_step_scale = 1.0`, `step = 0.02` samples roughly within ±2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. If you temporarily want a wider search, set `tuning.parameter_step_scale` instead of editing every `step` by hand. For example, `step = 0.005` and `parameter_step_scale = 10.0` behaves like an effective step of `0.05`. This multiplier is not written back into each parameter and does not change `current`. Parameters with `tune = true` must have `current > 0`.
 
 When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
 
@@ -236,7 +237,7 @@ Alpha values are multipliers for factorizer terms.
 
 Changing `shared` moves the global base term, so keeping `shared = 1.0` fixed is often easier to interpret.
 
-In `bulletou.exe`, `--sfnn-factorizer-alpha pair=...` is a shortcut that sets all three pair alpha values to the same value. In ES settings, tune `king_hand_pair`, `king_progress_pair`, and `hand_progress_pair` separately.
+In `bulletou.exe`, `--sfnn-factorizer-alpha pair=...` is a shortcut that sets all three pair alpha values to the same value. In population search settings, tune `king_hand_pair`, `king_progress_pair`, and `hand_progress_pair` separately.
 
 ## Count-confidence parameters
 
@@ -254,14 +255,15 @@ Count confidence uses a `count.bin` file created by `bucket-count`. It weakens t
 
 `0.0` disables that confidence. Larger values require more observations before the corresponding term is trusted strongly.
 
-Plain `bulletou.exe` still has shared options for all axis terms or all pair terms. ES `parameters` intentionally use only the explicit fields listed above, so it is always clear which component is being tuned.
+Plain `bulletou.exe` still has shared options for all axis terms or all pair terms. population search `parameters` intentionally use only the explicit fields listed above, so it is always clear which component is being tuned.
 
-## Use current values without ES
+## Use current values without population search
 
-If you want to use the tuned `parameters.current` values without running ES, set `es.enabled` to `false`.
+If you want to use the tuned `parameters.current` values without running population search, set `tuning.enabled` to `false`.
 
 ```json
-"es": {
+"tuning": {
+    "method": "population_search",
   "enabled": false
 }
 ```
@@ -269,18 +271,18 @@ If you want to use the tuned `parameters.current` values without running ES, set
 Then launch the runner once:
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 ```
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
-In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `es` section of `es-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
+In this mode, the runner fills `superbatches` from the final `beam.after_sbs` value and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
 
-With `enabled: false`, the runner does not create ES candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
+With `enabled: false`, the runner does not create population search candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 
-The ordinary training output is written under `output_folder/es-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.log` into `output_folder/es-<tag_prefix>/summary-learn.log` and `accepted-summary-learn.log`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
+The ordinary training output is written under `output_folder/tuning-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.log` into `output_folder/tuning-<tag_prefix>/summary-learn.log` and `accepted-summary-learn.log`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
 
-After that, you can set `enabled` back to `true` and run with `--resume`. ES resumes from the updated `current/`. The runner also writes the ordinary-training progress into `runner-state.json`, so `accepted_sbs`, `generation`, and public checkpoint numbering do not roll back.
+After that, you can set `enabled` back to `true` and run with `--resume`. population search resumes from the updated `current/`. The runner also writes the ordinary-training progress into `runner-state.json`, so `accepted_sbs`, `generation`, and public checkpoint numbering do not roll back.
 
 ## `bulletou.exe --settings-file`
 
@@ -300,7 +302,7 @@ Explicit CLI arguments override values from the settings file.
 
 ## Output layout
 
-The runner root is `output_folder/es-<tag_prefix>`.
+The runner root is `output_folder/tuning-<tag_prefix>`.
 
 | Path | Purpose |
 | --- | --- |
@@ -313,14 +315,14 @@ The runner root is `output_folder/es-<tag_prefix>`.
 | `logs/` | Per-candidate stdout logs |
 | `temp/` | Temporary candidate checkpoints, unless `temp_folder` is set |
 
-ES writes metric columns in `summary-learn.log` and `accepted-summary-learn.log` in the same order as normal BulletOu summaries: `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss`.
+population search writes metric columns in `summary-learn.log` and `accepted-summary-learn.log` in the same order as normal BulletOu summaries: `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss`.
 
-The runner copies the current `es-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
+The runner copies the current `tuning-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
 
 If you want to stop the runner manually, the safe point is immediately after `[SAFE TO STOP]` appears. `[GEN RANK]` only means candidate evaluation and ranking for the generation finished; it does not mean a public checkpoint has been fully saved.
 
-During ES, the runner uses one long-lived `bulletou worker` process by default. This avoids rebuilding the CUDA context, validation cache, qvalid cache, and worker warmup for every candidate.
+During population search, the runner uses one long-lived `bulletou worker` process by default. This avoids rebuilding the CUDA context, validation cache, qvalid cache, and worker warmup for every candidate.
 
-If `use_worker` is `false`, candidates are run as short `bulletou.exe` child jobs. In that mode, `[epoch] start epoch 1/1` belongs to the child job, not to the whole ES run. The runner prefixes streamed child output with labels such as `[G0002 S0032 C001]`, meaning generation 2, 32sb trial, candidate 1.
+If `use_worker` is `false`, candidates are run as short `bulletou.exe` child jobs. In that mode, `[epoch] start epoch 1/1` belongs to the child job, not to the whole population search run. The runner prefixes streamed child output with labels such as `[G0002 S0032 C001]`, meaning generation 2, 32sb trial, candidate 1.
 
 When normal training uses `bulletou.exe --settings-file`, each BulletOu checkpoint gets a copy of `bulletou-settings.json`.

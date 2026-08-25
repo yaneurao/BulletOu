@@ -134,27 +134,28 @@ axis / pair factorizer の行も count に応じて弱めたい場合は、必�
 
 `count.bin` の作り方、式、読み込み buffer の調整は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
-## 3.7 ES で決まった値を使って通常学習する
+## 3.7 population search で決まった値を使って通常学習する
 
-ES で調整した `es-settings.json` の `parameters.current` だけを使い、ES の候補探索は行わずに通常学習を続けたい場合があります。その場合は `es.enabled` を `false` にします。
+population search で調整した `tuning-settings.json` の `parameters.current` だけを使い、population search の候補探索は行わずに通常学習を続けたい場合があります。その場合は `tuning.enabled` を `false` にします。
 
 ```json
-"es": {
+"tuning": {
+    "method": "population_search",
   "enabled": false
 }
 ```
 
-この状態で `es_local_runner.py` を起動すると、runner は `bulletou.exe` を 1 回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
+この状態で `bulletou_tuner.py` を起動すると、runner は `bulletou.exe` を 1 回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
 
 ```powershell
-python .\es_local_runner.py `
-  --es-settings-file D:\BulletOu-snapshots\settings\es-settings-20260821.json `
+python .\bulletou_tuner.py `
+  --tuning-settings-file D:\BulletOu-snapshots\settings\tuning-settings-20260821.json `
   --resume
 ```
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
 
-詳しい ES 設定や `parameters` の意味は [応用編: ES による自動調整](../advanced/auto-tuning.md) を参照してください。
+詳しい population search 設定や `parameters` の意味は [応用編: population search による自動調整](../advanced/auto-tuning.md) を参照してください。
 
 ---
 

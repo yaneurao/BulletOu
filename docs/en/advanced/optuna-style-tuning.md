@@ -4,9 +4,9 @@
 
 It does not depend on the Optuna Python package. It is a small BulletOu-specific sampler: random trials first, then samples near the best completed trials.
 
-## Difference from the ES runner
+## Difference from the population search runner
 
-The ES runner continues from the accepted checkpoint. If you change factorizer or count-confidence values in the middle of training, the result mixes two effects: the parameter value itself, and the transient damage from changing the training dynamics.
+The population search runner continues from the accepted checkpoint. If you change factorizer or count-confidence values in the middle of training, the result mixes two effects: the parameter value itself, and the transient damage from changing the training dynamics.
 
 The Optuna-style runner starts every trial from scratch or from the same fixed base checkpoint. Parameters stay fixed during the trial.
 
@@ -19,7 +19,7 @@ Use it when you want to:
 
 ## Settings example
 
-For compatibility with ES settings, ranges are written as `min` / `max`.
+For compatibility with population search settings, ranges are written as `min` / `max`.
 
 ```json
 {

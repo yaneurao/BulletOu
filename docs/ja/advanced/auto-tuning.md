@@ -1,10 +1,10 @@
-# ES による自動調整
+# population search による自動調整
 
 <a href="../../en/advanced/auto-tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-2563EB?style=flat-square"></a>
 
-このページでは、`es_local_runner.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
+このページでは、`bulletou_tuner.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
 
-ここでいう ES は evolution strategy です。各世代で `population` 本の候補を少し違うパラメーターで学習させ、設定した指標で一番良い候補を選びます。勾配を推定して別の小さな更新を行う方式ではありません。選ばれた候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
+ここでいう population search は、複数の候補を実際に短く学習させ、その結果が一番良かった候補を次の開始点にする方式です。各世代で `population` 本の候補を少し違うパラメーターで学習させ、設定した指標で一番良い候補を選びます。勾配を推定して別の小さな更新を行う方式ではありません。選ばれた候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
 
 ## 使う JSON ファイル
 
@@ -12,27 +12,28 @@ runner は 2 つの JSON ファイルを使います。
 
 | ファイル | 役割 |
 | --- | --- |
-| `es-settings.json` | ES の世代数、population、trial 長、調整するパラメーター、現在値を書く |
+| `tuning-settings.json` | population search の世代数、population、trial 長、調整するパラメーター、現在値を書く |
 | `bulletou-settings.json` | 通常の `bulletou.exe` 学習オプションを書く |
 
-`es-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--es-settings-file` だけを渡します。
+`tuning-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--tuning-settings-file` だけを渡します。
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 ```
 
 同じ runner を再開するときは `--resume` を付けます。
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resume
 ```
 
-## `es-settings.json` の例
+## `tuning-settings.json` の例
 
 ```json
 {
   "version": 1,
-  "es": {
+  "tuning": {
+    "method": "population_search",
     "enabled": true,
     "generations": 100,
     "population": 16,
@@ -56,7 +57,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
     "bulletou_settings_file": "./bulletou-settings.json",
     "base_checkpoint": "C:/shogi/YaneuraOuWorks/BulletOu/checkpoints/.../0256",
     "output_folder": "D:/BulletOu-snapshots/20260820",
-    "temp_folder": "C:/BulletOu-es-temp",
+    "temp_folder": "C:/BulletOu-tuning-temp",
     "tag_prefix": "pair2-es"
   },
   "parameters": {
@@ -106,7 +107,7 @@ python .\es_local_runner.py --es-settings-file .\es-settings.json --resume
 }
 ```
 
-ES 実行時は runner が候補ごとに次の値を決めます。そのため、これらは `bulletou-settings.json` には書かないでください。
+population search 実行時は runner が候補ごとに次の値を決めます。そのため、これらは `bulletou-settings.json` には書かないでください。
 
 | runner が決める項目 | 理由 |
 | --- | --- |
@@ -114,17 +115,17 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `output`, `output_folder`, `tag` | 候補ごとに出力先を分ける |
 | `superbatches`, `max_epochs` | 候補 trial の長さを runner が決める |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
-| `sfnn_factorizer_alpha` | ES の `parameters` から候補ごとに作る |
-| `sfnn_*_count_confidence` | ES の `parameters` から候補ごとに作る |
-| `lr`, `lr_min` | 任意。`es-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡し、採用時に `current` へ書き戻す |
+| `sfnn_factorizer_alpha` | population search の `parameters` から候補ごとに作る |
+| `sfnn_*_count_confidence` | population search の `parameters` から候補ごとに作る |
+| `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡し、採用時に `current` へ書き戻す |
 
 `progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
 
-## `es` の項目
+## `tuning` の項目
 
 | 項目 | 意味 |
 | --- | --- |
-| `enabled` | `true` なら ES を実行する。`false` なら `parameters.current` だけを使って通常学習を 1 回起動する |
+| `enabled` | `true` なら population search を実行する。`false` なら `parameters.current` だけを使って通常学習を 1 回起動する |
 | `generations` | 世代数。1 世代ごとに 1 つの候補を採用する |
 | `population` | 世代開始時に作る候補数 |
 | `beam` | 候補 1 本あたり何 sb 学習するか。最後の `after_sbs` が trial 長になる |
@@ -134,8 +135,8 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `seed` | 候補生成用の乱数 seed |
 | `parameter_step_scale` | すべての `parameters.*.step` に掛ける全体倍率。`1.0` なら各 `step` をそのまま使い、`10.0` なら `current` は変えずに候補の揺らし幅だけを 10 倍にする |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
-| `validation_rate` | f32 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
-| `quantized_validation_rate` | 量子化 validation 間隔。ES 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
+| `validation_rate` | f32 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
+| `quantized_validation_rate` | 量子化 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
 
 `metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。trial 末尾だけでよい場合は `0` を指定します。
 
@@ -191,7 +192,7 @@ ES 実行時は runner が候補ごとに次の値を決めます。そのため
 | `temp_folder` | 候補の一時 checkpoint を作る場所。高速な SSD 推奨 |
 | `tag_prefix` | runner root 名に使う名前 |
 
-runner root は `output_folder/es-<tag_prefix>` です。
+runner root は `output_folder/tuning-<tag_prefix>` です。
 
 ## `parameters` の書き方
 
@@ -206,12 +207,12 @@ runner root は `output_folder/es-<tag_prefix>` です。
 | 項目 | 意味 |
 | --- | --- |
 | `current` | 現在値。候補はこの値の周辺から作られる |
-| `tune` | `true` なら ES が動かす。`false` なら固定 |
+| `tune` | `true` なら population search が動かす。`false` なら固定 |
 | `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step * parameter_step_scale, step * parameter_step_scale))` で作られる |
 | `min` | 下限 |
 | `max` | 上限 |
 
-`step` は加算幅ではありません。`parameter_step_scale = 1.0` なら、`step = 0.02` でおおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。一時的に探索幅を広げたいときは、各 `step` を手で書き換えずに `es.parameter_step_scale` を使います。たとえば `step = 0.005`、`parameter_step_scale = 10.0` なら、実効 step は `0.05` です。この倍率は各パラメーターへ書き戻されず、`current` も変えません。`tune = true` のパラメーターは `current > 0` である必要があります。
+`step` は加算幅ではありません。`parameter_step_scale = 1.0` なら、`step = 0.02` でおおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。一時的に探索幅を広げたいときは、各 `step` を手で書き換えずに `tuning.parameter_step_scale` を使います。たとえば `step = 0.005`、`parameter_step_scale = 10.0` なら、実効 step は `0.05` です。この倍率は各パラメーターへ書き戻されず、`current` も変えません。`tune = true` のパラメーターは `current > 0` である必要があります。
 
 候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
 
@@ -222,7 +223,7 @@ runner root は `output_folder/es-<tag_prefix>` です。
 "lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
 ```
 
-この 2 つを `parameters` に書いた場合、runner は各 `bulletou.exe` 起動時に `--lr` と `--lr-min` を追加します。そのため、`bulletou-settings.json` に `lr` / `lr_min` が残っていても、ES 側の値が上書きします。`parameters` に書かなければ、学習率は `bulletou-settings.json` 側の固定値を使います。
+この 2 つを `parameters` に書いた場合、runner は各 `bulletou.exe` 起動時に `--lr` と `--lr-min` を追加します。そのため、`bulletou-settings.json` に `lr` / `lr_min` が残っていても、population search 側の値が上書きします。`parameters` に書かなければ、学習率は `bulletou-settings.json` 側の固定値を使います。
 
 `lr` と `lr_min` の両方を調整対象にする場合は、候補生成の範囲全体で必ず `lr_min <= lr` になるように `current` / `min` / `max` を設定してください。runner はこの関係を勝手に丸めず、破れている場合は起動時にエラーにします。
 
@@ -242,7 +243,7 @@ alpha は factorizer 成分の強さです。
 
 `shared` を動かすと全体の土台が動くので、最初は `shared = 1.0` で固定したほうが結果を読みやすいです。
 
-`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3 つの pair alpha に同じ値を入れる短縮指定です。ES では `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
+`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3 つの pair alpha に同じ値を入れる短縮指定です。population search では `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
 
 ## count confidence パラメーター
 
@@ -260,14 +261,15 @@ count confidence は `bucket-count` で作った `count.bin` を使います。�
 
 `0.0` なら、その confidence は無効です。大きい値にすると、十分な出現回数がある成分だけを強く信用します。
 
-通常の `bulletou.exe` には axis 系や pair 系をまとめて指定する共通オプションもあります。ただし ES の `parameters` では、どの成分を動かしているのかを明確にするため、上の表にある個別項目だけを扱います。
+通常の `bulletou.exe` には axis 系や pair 系をまとめて指定する共通オプションもあります。ただし population search の `parameters` では、どの成分を動かしているのかを明確にするため、上の表にある個別項目だけを扱います。
 
-## ES を回さず `current` の値だけ使う
+## population search を回さず `current` の値だけ使う
 
-ES で調整済みの `parameters.current` だけを使い、ES 自体は回したくない場合は、`es.enabled` を `false` にします。
+population search で調整済みの `parameters.current` だけを使い、population search 自体は回したくない場合は、`tuning.enabled` を `false` にします。
 
 ```json
-"es": {
+"tuning": {
+    "method": "population_search",
   "enabled": false
 }
 ```
@@ -275,18 +277,18 @@ ES で調整済みの `parameters.current` だけを使い、ES 自体は回し�
 その状態で runner を 1 回起動します。
 
 ```powershell
-python .\es_local_runner.py --es-settings-file .\es-settings.json
+python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
 ```
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
-このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `es-settings.json` の `es` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
+このモードでは、`superbatches` は `beam` の最後の `after_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
 
-`enabled: false` では ES の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/es-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
+`enabled: false` では population search の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 
-普通学習の出力本体は `output_folder/es-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.log` を読み、`output_folder/es-<tag_prefix>/summary-learn.log` と `accepted-summary-learn.log` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
+普通学習の出力本体は `output_folder/tuning-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.log` を読み、`output_folder/tuning-<tag_prefix>/summary-learn.log` と `accepted-summary-learn.log` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
 
-そのあと `enabled` を `true` に戻して `--resume` すると、ES は更新済みの `current/` から続行します。`enabled=false` で進めたぶんの `accepted_sbs` と `generation` も `runner-state.json` に保存されるので、公開 checkpoint の番号も巻き戻りません。
+そのあと `enabled` を `true` に戻して `--resume` すると、population search は更新済みの `current/` から続行します。`enabled=false` で進めたぶんの `accepted_sbs` と `generation` も `runner-state.json` に保存されるので、公開 checkpoint の番号も巻き戻りません。
 
 ## `bulletou.exe --settings-file`
 
@@ -306,7 +308,7 @@ CLI で明示した値は settings JSON より優先されます。
 
 ## 出力先
 
-runner root は `output_folder/es-<tag_prefix>` です。
+runner root は `output_folder/tuning-<tag_prefix>` です。
 
 | path | 役割 |
 | --- | --- |
@@ -319,14 +321,14 @@ runner root は `output_folder/es-<tag_prefix>` です。
 | `logs/` | 候補ごとの stdout log |
 | `temp/` | `temp_folder` 未指定時の一時 checkpoint |
 
-ES の `summary-learn.log` と `accepted-summary-learn.log` は、通常の BulletOu の `summary-learn.log` と同じく `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` の順で指標を書きます。
+population search の `summary-learn.log` と `accepted-summary-learn.log` は、通常の BulletOu の `summary-learn.log` と同じく `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` の順で指標を書きます。
 
-runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `es-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
+runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `tuning-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 
 手動停止するなら、`[SAFE TO STOP]` が表示された直後が安全です。`[GEN RANK]` はその世代の候補評価と順位付けが終わったという意味で、公開 checkpoint の保存完了を意味しません。
 
-ES 実行中は、標準では `bulletou worker` を 1 回だけ起動し、その中で候補を試します。これにより、CUDA context、validation cache、qvalid cache、worker warmup を候補ごとに作り直す時間を避けられます。
+population search 実行中は、標準では `bulletou worker` を 1 回だけ起動し、その中で候補を試します。これにより、CUDA context、validation cache、qvalid cache、worker warmup を候補ごとに作り直す時間を避けられます。
 
-`use_worker` を `false` にした場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「ES 全体の epoch」ではありません。runner は画面出力に `[G0002 S0032 C001]` のような prefix を付けます。これは「generation 2、32 sb trial、candidate 1」の意味です。
+`use_worker` を `false` にした場合は、候補ごとに短い `bulletou.exe` job を起動します。その場合、子プロセスの `[epoch] start epoch 1/1` は「population search 全体の epoch」ではありません。runner は画面出力に `[G0002 S0032 C001]` のような prefix を付けます。これは「generation 2、32 sb trial、candidate 1」の意味です。
 
 通常学習で `bulletou.exe --settings-file` を使った場合も、各 BulletOu checkpoint には `bulletou-settings.json` がコピーされます。
