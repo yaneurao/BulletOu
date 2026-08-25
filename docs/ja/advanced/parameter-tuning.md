@@ -2,14 +2,14 @@
 
 `tuning_parameters.py` は、同じ開始地点から短い学習 trial を多数走らせ、`lr` / `lr_min` / factorizer / count confidence のよさそうな値を探すための runner です。
 
-外部 package は使っていません。BulletOu 用の軽量な sampler です。最初はランダムに試し、その後は良かった trial の近くを重点的に試します。
+外部 package は使っていません。BulletOu 用の軽量な TPE-style sampler です。最初はランダムに試し、その後は良かった trial の分布と悪かった trial の分布を比べ、有望そうな範囲を重点的に試します。
 
 ## 何をする runner か
 
 - 各 trial は scratch、または指定した同じ checkpoint から始まります。
-- 1 trial の長さは `tuning.trial_sbs` で指定します。
+- 1 trial の長さは `tuning.trial_sbs` で指定します。数値または配列で書けます。
 - trial 中はパラメーターを変えません。
-- `population` 本の trial を走らせ、指定した metric が良いものを記録します。
+- generation ごとに `population` 本の trial を走らせ、指定した metric が良いものを記録します。
 - `recommended-parameters.json` に、上位 trial から推定した推奨パラメーターを書き出します。
 
 短い trial では「たまたま良かった1本」をそのまま採用するとノイズを拾いやすいです。そのため、最終的に使う値は `best_observed` だけでなく、`recommended` も確認してください。
@@ -24,22 +24,38 @@
 
 factorizer alpha や count confidence で `0` を許したい場合は、`log` を書かないか、`log: false` にしてください。`min` が `0` 以下なら、runner は省略時に線形探索として扱います。
 
-## `startup_trials` / `elite_fraction` / `elite_sigma`
+## generation と TPE sampler
 
-この3つは学習そのもののパラメーターではなく、「次にどの候補を試すか」を決める sampler 側の設定です。
+`tuning_parameters.py` は generation 単位で候補を作ります。同じ generation 内の trial 結果は、その generation の候補生成には使いません。次の generation から反映します。
+
+```json
+"tuning": {
+  "generations": 3,
+  "population": [100, 50],
+  "trial_sbs": [4, 8],
+  "sampler": "tpe"
+}
+```
+
+この例では、
+
+- generation 1: 100 trial、各 trial 4 sb
+- generation 2 以降: 50 trial、各 trial 8 sb
+
+になります。`generations` を省略した場合は、`population` / `trial_sbs` の配列長から generation 数を決めます。`population` や `trial_sbs` の配列が `generations` より短い場合は、最後の値を使い続けます。
+
+TPE-style sampler は、前 generation までの結果を使って次の候補を作ります。完了済み trial を metric で並べ、上位を「良かった候補」、残りを「悪かった候補」として、各パラメーターの分布を作ります。そのうえで、良かった候補の分布に近く、悪かった候補の分布から遠い値を優先してサンプルします。
+
+## sampler の項目
+
+これらは学習そのもののパラメーターではなく、「次にどの候補を試すか」を決める sampler 側の設定です。
 
 | 項目 | 意味 | 省略時 |
 | --- | --- | --- |
-| `startup_trials` | 最初に完全ランダムで試す trial 数。この本数に到達するまでは、過去の良かった候補の近くを狙わず、探索範囲全体からサンプルします。 | `16` |
-| `elite_fraction` | `startup_trials` 後に、完了済み trial の上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
-| `elite_sigma` | 良かった候補の近くをサンプルするときの散らばり幅。線形探索では `(max - min) * elite_sigma`、`log: true` では log 空間の幅に対する割合です。 | `0.15` |
-
-つまり、次のような流れです。
-
-```text
-最初 startup_trials 本はランダムに試す
-その後は上位 elite_fraction の候補の近くを elite_sigma の幅で試す
-```
+| `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使います。 | `"tpe"` |
+| `startup_trials` | TPE を始める前に必要な完了済み trial 数。この本数に到達するまでは、探索範囲全体からランダムにサンプルします。 | `16` |
+| `elite_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
+| `elite_sigma` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
 
 ## 設定例
 
@@ -47,8 +63,10 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 {
   "version": 1,
   "tuning": {
-    "population": 100,
-    "trial_sbs": 4,
+    "generations": 3,
+    "population": [100, 50],
+    "trial_sbs": [4, 8],
+    "sampler": "tpe",
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,

@@ -2,14 +2,14 @@
 
 `tuning_parameters.py` runs many short fixed-parameter BulletOu trials to search over `lr`, `lr_min`, factorizer, and count-confidence settings.
 
-It does not depend on external Python packages. It is a small BulletOu-specific sampler: random trials first, then samples near the best completed trials.
+It does not depend on external Python packages. It is a small BulletOu-specific TPE-style sampler: random trials first, then it compares the distribution of good trials against the distribution of bad trials and samples promising regions more often.
 
 ## What this runner does
 
 - Each trial starts from scratch or from the same fixed checkpoint.
-- The length of one trial is `tuning.trial_sbs`.
+- The length of one trial is `tuning.trial_sbs`. It can be a number or an array.
 - Parameters stay fixed during a trial.
-- The runner evaluates `population` trials and records the metric.
+- For every generation, the runner evaluates `population` trials and records the metric.
 - `recommended-parameters.json` contains inferred parameters from the top trials.
 
 For short trials, the single best observed trial can be noisy. Check both `best_observed` and `recommended` before using the values in a longer run.
@@ -24,22 +24,38 @@ Parameter entries may include `log: true`.
 
 If you want to allow `0` for factorizer alpha or count confidence, omit `log` or set `log: false`. When `min` is non-positive and `log` is omitted, the runner defaults to linear sampling.
 
-## `startup_trials` / `elite_fraction` / `elite_sigma`
+## Generations and the TPE sampler
+
+`tuning_parameters.py` creates candidates generation by generation. Trial results from the current generation are not used to create more candidates in the same generation. They are used starting from the next generation.
+
+```json
+"tuning": {
+  "generations": 3,
+  "population": [100, 50],
+  "trial_sbs": [4, 8],
+  "sampler": "tpe"
+}
+```
+
+This means:
+
+- generation 1: 100 trials, 4 sb per trial
+- generation 2 and later: 50 trials, 8 sb per trial
+
+If `generations` is omitted, the runner infers it from the `population` / `trial_sbs` array length. If a `population` or `trial_sbs` array is shorter than `generations`, the last value is reused.
+
+The TPE-style sampler uses results from previous generations. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
+
+## Sampler fields
 
 These are sampler settings, not NNUE training parameters. They control how the runner chooses the next trial parameters.
 
 | Field | Meaning | Default |
 | --- | --- | --- |
-| `startup_trials` | Number of fully random trials at the beginning. Until this many trials complete, the runner samples from the whole search range instead of sampling near good trials. | `16` |
-| `elite_fraction` | Fraction of completed trials treated as good candidates after startup. `0.25` means the top 25% are used. | `0.25` |
-| `elite_sigma` | Spread used when sampling near a good candidate. For linear parameters this is `(max - min) * elite_sigma`; for `log: true` parameters it is the same fraction in log space. | `0.15` |
-
-The flow is:
-
-```text
-Run startup_trials random trials.
-Then sample near the top elite_fraction trials with spread elite_sigma.
-```
+| `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"`. | `"tpe"` |
+| `startup_trials` | Number of completed trials required before TPE starts. Until then, the runner samples from the whole search range. | `16` |
+| `elite_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
+| `elite_sigma` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
 
 ## Settings example
 
@@ -47,8 +63,10 @@ Then sample near the top elite_fraction trials with spread elite_sigma.
 {
   "version": 1,
   "tuning": {
-    "population": 100,
-    "trial_sbs": 4,
+    "generations": 3,
+    "population": [100, 50],
+    "trial_sbs": [4, 8],
+    "sampler": "tpe",
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,

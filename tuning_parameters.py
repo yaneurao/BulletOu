@@ -8,8 +8,8 @@ This is a small local sampler for expensive BulletOu trials:
 * lr / lr-min and factorizer/count parameters can be sampled together,
 * only the current best checkpoint is kept by default.
 
-The sampler starts with uniform random trials, then samples around the best
-completed trials in the transformed search space.
+The sampler starts with uniform random trials, then uses a small TPE-style
+sampler over completed generations.
 """
 
 from __future__ import annotations
@@ -47,6 +47,8 @@ SUMMARY_FIELDS = [
     "output_dir",
     "parameters",
 ]
+
+TPE_CANDIDATES = 64
 
 
 @dataclass
@@ -94,10 +96,12 @@ class SearchParameter:
 
 @dataclass
 class StudySettings:
-    trials: int
-    trial_sbs: int
+    generations: int
+    population_schedule: list[int]
+    trial_sbs_schedule: list[int]
     metric: str
     lower_is_better: bool
+    sampler: str
     seed: int
     startup_trials: int
     elite_fraction: float
@@ -106,6 +110,16 @@ class StudySettings:
     quantized_validation_rate: int
     keep_all_trials: bool
     use_worker: bool
+
+    def population_for_generation(self, generation: int) -> int:
+        return self.population_schedule[min(generation - 1, len(self.population_schedule) - 1)]
+
+    def trial_sbs_for_generation(self, generation: int) -> int:
+        return self.trial_sbs_schedule[min(generation - 1, len(self.trial_sbs_schedule) - 1)]
+
+    @property
+    def trials(self) -> int:
+        return sum(self.population_for_generation(generation) for generation in range(1, self.generations + 1))
 
 
 @dataclass
@@ -160,6 +174,40 @@ def resolve_path(base: Path, raw: Any, name: str, *, required: bool = True) -> P
     return path
 
 
+def parse_positive_int_schedule(raw: Any, name: str, default: int) -> list[int]:
+    if raw is None:
+        values = [default]
+    elif isinstance(raw, list):
+        if not raw:
+            raise ValueError(f"{name} must not be an empty array")
+        values = [int(value) for value in raw]
+    else:
+        values = [int(raw)]
+    if any(value <= 0 for value in values):
+        raise ValueError(f"{name} must contain only positive integers")
+    return values
+
+
+def generation_for_trial(settings: StudySettings, trial: int) -> tuple[int, int]:
+    if trial <= 0:
+        raise ValueError("trial must be >= 1")
+    first_trial = 1
+    for generation in range(1, settings.generations + 1):
+        population = settings.population_for_generation(generation)
+        last_trial = first_trial + population - 1
+        if trial <= last_trial:
+            return generation, trial - first_trial + 1
+        first_trial = last_trial + 1
+    return settings.generations, settings.population_for_generation(settings.generations)
+
+
+def first_trial_of_generation(settings: StudySettings, generation: int) -> int:
+    first = 1
+    for prior in range(1, generation):
+        first += settings.population_for_generation(prior)
+    return first
+
+
 def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSettings, dict[str, SearchParameter]]:
     root = tuner.load_json_object(path)
     version = int(root.get("version", SETTINGS_VERSION))
@@ -180,10 +228,12 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
             "Use tuning.trial_sbs and per-parameter ranges instead."
         )
     allowed_tuning_keys = {
+        "generations",
         "population",
         "trial_sbs",
         "metric",
         "lower_is_better",
+        "sampler",
         "seed",
         "startup_trials",
         "elite_fraction",
@@ -205,11 +255,22 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     }:
         raise ValueError(f"{path}: unsupported tuning.metric {metric!r}")
     lower_is_better = bool(tuning_obj.get("lower_is_better", "loss" in metric))
+    sampler = str(tuning_obj.get("sampler", "tpe"))
+    if sampler not in {"tpe", "random"}:
+        raise ValueError(f"{path}: unsupported tuning.sampler {sampler!r}; expected 'tpe' or 'random'")
+    population_schedule = parse_positive_int_schedule(tuning_obj.get("population"), "tuning.population", 1)
+    trial_sbs_schedule = parse_positive_int_schedule(tuning_obj.get("trial_sbs"), "tuning.trial_sbs", 16)
+    default_generations = max(len(population_schedule), len(trial_sbs_schedule), 1)
+    generations = int(tuning_obj.get("generations", default_generations))
+    if generations <= 0:
+        raise ValueError("tuning.generations must be > 0")
     settings = StudySettings(
-        trials=int(tuning_obj.get("population", 1)),
-        trial_sbs=int(tuning_obj.get("trial_sbs", 16)),
+        generations=generations,
+        population_schedule=population_schedule,
+        trial_sbs_schedule=trial_sbs_schedule,
         metric=metric,
         lower_is_better=lower_is_better,
+        sampler=sampler,
         seed=int(tuning_obj.get("seed", 1)),
         startup_trials=int(tuning_obj.get("startup_trials", 16)),
         elite_fraction=float(tuning_obj.get("elite_fraction", 0.25)),
@@ -219,10 +280,6 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
         use_worker=bool(tuning_obj.get("use_worker", True)),
     )
-    if settings.trials <= 0:
-        raise ValueError("tuning.population must be > 0")
-    if settings.trial_sbs <= 0:
-        raise ValueError("tuning.trial_sbs must be > 0")
     if settings.startup_trials < 0:
         raise ValueError("tuning.startup_trials must be >= 0")
     if not (0.0 < settings.elite_fraction <= 1.0):
@@ -322,23 +379,72 @@ def current_fixed_values(params: dict[str, SearchParameter]) -> dict[str, float]
     return out
 
 
-def sample_params(
-    specs: dict[str, SearchParameter],
-    rng: random.Random,
-    completed: list[TrialResult],
-    settings: StudySettings,
-) -> dict[str, float]:
+def transformed_bounds(spec: SearchParameter) -> tuple[float, float]:
+    assert spec.minimum is not None and spec.maximum is not None
+    if spec.log:
+        return math.log(spec.minimum), math.log(spec.maximum)
+    return spec.minimum, spec.maximum
+
+
+def transform_value(spec: SearchParameter, value: float) -> float:
+    if spec.log:
+        assert spec.minimum is not None
+        return math.log(max(value, spec.minimum))
+    return value
+
+
+def untransform_value(spec: SearchParameter, value: float) -> float:
+    lo, hi = transformed_bounds(spec)
+    value = min(max(value, lo), hi)
+    if spec.log:
+        return math.exp(value)
+    return value
+
+
+def gaussian_log_pdf(x: float, mean: float, sigma: float) -> float:
+    sigma = max(sigma, 1e-12)
+    z = (x - mean) / sigma
+    return -0.5 * z * z - math.log(sigma) - 0.5 * math.log(2.0 * math.pi)
+
+
+def logsumexp(values: list[float]) -> float:
+    if not values:
+        return -math.inf
+    m = max(values)
+    if not math.isfinite(m):
+        return m
+    return m + math.log(sum(math.exp(value - m) for value in values))
+
+
+def kde_bandwidth(values: list[float], lo: float, hi: float, sigma_ratio: float) -> float:
+    width = max(hi - lo, 1e-12)
+    if len(values) <= 1:
+        return max(width * sigma_ratio, 1e-12)
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / max(1, len(values) - 1)
+    std = math.sqrt(max(0.0, variance))
+    return max(width * sigma_ratio, std * 0.5, 1e-12)
+
+
+def kde_log_density(x: float, values: list[float], lo: float, hi: float, sigma_ratio: float) -> float:
+    if not values:
+        return -math.inf
+    sigma = kde_bandwidth(values, lo, hi, sigma_ratio)
+    return logsumexp([gaussian_log_pdf(x, value, sigma) for value in values]) - math.log(len(values))
+
+
+def split_good_bad(completed: list[TrialResult], settings: StudySettings) -> tuple[list[TrialResult], list[TrialResult]]:
+    ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
+    good_count = max(1, math.ceil(len(ordered) * settings.elite_fraction))
+    good_count = min(good_count, max(1, len(ordered) - 1))
+    return ordered[:good_count], ordered[good_count:]
+
+
+def sample_params_random(specs: dict[str, SearchParameter], rng: random.Random) -> dict[str, float]:
     out = current_fixed_values(specs)
     tuned = [spec for spec in specs.values() if spec.tune]
     # Sample lr_min after lr so lr_min can be constrained to the sampled lr.
     tuned.sort(key=lambda spec: 1 if spec.name == "lr_min" else 0)
-    use_elite = len(completed) >= settings.startup_trials and completed
-    elite: list[TrialResult] = []
-    if use_elite:
-        ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
-        keep = max(1, math.ceil(len(ordered) * settings.elite_fraction))
-        elite = ordered[:keep]
-
     for spec in tuned:
         sample_spec = spec
         if spec.name == "lr_min" and "lr" in out and spec.maximum is not None:
@@ -354,12 +460,7 @@ def sample_params(
                 maximum=maximum,
                 log=spec.log,
             )
-        if elite:
-            center_trial = rng.choice(elite)
-            center = center_trial.params[spec.name]
-            out[spec.name] = sample_spec.sample_near(rng, center, settings.elite_sigma)
-        else:
-            out[spec.name] = sample_spec.sample_random(rng)
+        out[spec.name] = sample_spec.sample_random(rng)
 
     if "lr_min_ratio" in out:
         lr = out.get("lr")
@@ -375,20 +476,132 @@ def sample_params(
     return out
 
 
-def train_args(run: RunSettings, params: dict[str, float], output_dir: Path, settings: StudySettings) -> list[str]:
+def sample_one_parameter_tpe(
+    spec: SearchParameter,
+    rng: random.Random,
+    good: list[TrialResult],
+    *,
+    override_maximum: float | None = None,
+    sigma_ratio: float,
+) -> float:
+    lo, hi = transformed_bounds(spec)
+    if override_maximum is not None:
+        if spec.log:
+            assert spec.minimum is not None
+            hi = min(hi, math.log(max(override_maximum, spec.minimum)))
+        else:
+            hi = min(hi, override_maximum)
+    if hi < lo:
+        hi = lo
+    values = [transform_value(spec, trial.params[spec.name]) for trial in good if spec.name in trial.params]
+    if not values:
+        return spec.sample_random(rng)
+    center = rng.choice(values)
+    sigma = kde_bandwidth(values, lo, hi, sigma_ratio)
+    return untransform_value(spec, rng.gauss(center, sigma))
+
+
+def tpe_candidate_score(
+    candidate: dict[str, float],
+    specs: dict[str, SearchParameter],
+    good: list[TrialResult],
+    bad: list[TrialResult],
+    sigma_ratio: float,
+) -> float:
+    score = 0.0
+    for name, value in candidate.items():
+        spec = specs[name]
+        if not spec.tune or not bad:
+            continue
+        lo, hi = transformed_bounds(spec)
+        x = transform_value(spec, value)
+        good_values = [transform_value(spec, trial.params[name]) for trial in good if name in trial.params]
+        bad_values = [transform_value(spec, trial.params[name]) for trial in bad if name in trial.params]
+        if not good_values or not bad_values:
+            continue
+        score += kde_log_density(x, good_values, lo, hi, sigma_ratio) - kde_log_density(
+            x, bad_values, lo, hi, sigma_ratio
+        )
+    return score
+
+
+def sample_params_tpe(
+    specs: dict[str, SearchParameter],
+    rng: random.Random,
+    completed: list[TrialResult],
+    settings: StudySettings,
+) -> dict[str, float]:
+    if len(completed) < settings.startup_trials:
+        return sample_params_random(specs, rng)
+    good, bad = split_good_bad(completed, settings)
+    if not good or not bad:
+        return sample_params_random(specs, rng)
+
+    best_params: dict[str, float] | None = None
+    best_score = -math.inf
+    for _ in range(TPE_CANDIDATES):
+        out = current_fixed_values(specs)
+        tuned = [spec for spec in specs.values() if spec.tune]
+        tuned.sort(key=lambda spec: 1 if spec.name == "lr_min" else 0)
+        for spec in tuned:
+            override_maximum = out["lr"] if spec.name == "lr_min" and "lr" in out else None
+            out[spec.name] = sample_one_parameter_tpe(
+                spec,
+                rng,
+                good,
+                override_maximum=override_maximum,
+                sigma_ratio=settings.elite_sigma,
+            )
+        if "lr_min_ratio" in out:
+            lr = out.get("lr")
+            if lr is None:
+                lr_spec = specs.get("lr")
+                if lr_spec is None or lr_spec.current is None:
+                    raise ValueError("lr_min_ratio requires parameter `lr`")
+                lr = lr_spec.current
+                out["lr"] = lr
+            out["lr_min"] = lr * out.pop("lr_min_ratio")
+        if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
+            out["lr_min"] = out["lr"]
+        score = tpe_candidate_score(out, specs, good, bad, settings.elite_sigma)
+        if best_params is None or score > best_score:
+            best_params = out
+            best_score = score
+    assert best_params is not None
+    return best_params
+
+
+def sample_params(
+    specs: dict[str, SearchParameter],
+    rng: random.Random,
+    completed: list[TrialResult],
+    settings: StudySettings,
+) -> dict[str, float]:
+    if settings.sampler == "random":
+        return sample_params_random(specs, rng)
+    return sample_params_tpe(specs, rng, completed, settings)
+
+
+def train_args(
+    run: RunSettings,
+    params: dict[str, float],
+    output_dir: Path,
+    settings: StudySettings,
+    trial_sbs: int,
+) -> list[str]:
     validation_rate = (
         -1
         if settings.validation_rate < 0
-        else settings.trial_sbs
+        else trial_sbs
         if settings.validation_rate == 0
-        else max(1, min(settings.validation_rate, settings.trial_sbs))
+        else max(1, min(settings.validation_rate, trial_sbs))
     )
     quantized_validation_rate = (
         -1
         if settings.quantized_validation_rate < 0
-        else settings.trial_sbs
+        else trial_sbs
         if settings.quantized_validation_rate == 0
-        else max(1, min(settings.quantized_validation_rate, settings.trial_sbs))
+        else max(1, min(settings.quantized_validation_rate, trial_sbs))
     )
     cmd = [
         str(run.exe),
@@ -397,11 +610,11 @@ def train_args(run: RunSettings, params: dict[str, float], output_dir: Path, set
         "--output",
         str(output_dir),
         "--superbatches",
-        str(settings.trial_sbs),
+        str(trial_sbs),
         "--max-epochs",
         "1",
         "--save-rate",
-        str(settings.trial_sbs),
+        str(trial_sbs),
         "--validation-rate",
         str(validation_rate),
         "--quantized-validation-rate",
@@ -612,7 +825,9 @@ def main() -> int:
             color,
             "[CONFIG]",
             (
-                f"population={settings.trials} trial_sbs={settings.trial_sbs} metric={settings.metric} "
+                f"generations={settings.generations} total_trials={settings.trials} "
+                f"population={settings.population_schedule} trial_sbs={settings.trial_sbs_schedule} "
+                f"sampler={settings.sampler} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
                 f"startup_trials={settings.startup_trials} elite_fraction={settings.elite_fraction:g} "
                 f"elite_sigma={settings.elite_sigma:g} worker={'on' if settings.use_worker else 'off'}"
@@ -657,7 +872,8 @@ def main() -> int:
             if settings.use_worker:
                 open_dir = runner_root / "worker-session"
                 open_params = current_fixed_values(specs)
-                open_args = worker_args_from_train_args(train_args(run, open_params, open_dir, settings))
+                open_trial_sbs = settings.trial_sbs_for_generation(generation_for_trial(settings, next_trial)[0])
+                open_args = worker_args_from_train_args(train_args(run, open_params, open_dir, settings, open_trial_sbs))
                 if args.dry_run:
                     print("  worker open " + json.dumps({"args": open_args}, ensure_ascii=False), flush=True)
                 else:
@@ -685,19 +901,24 @@ def main() -> int:
                     )
 
             for trial in range(next_trial, settings.trials + 1):
-                params = sample_params(specs, rng, completed, settings)
+                generation, generation_trial = generation_for_trial(settings, trial)
+                generation_first_trial = first_trial_of_generation(settings, generation)
+                completed_for_sampling = [result for result in completed if result.trial < generation_first_trial]
+                trial_sbs = settings.trial_sbs_for_generation(generation)
+                params = sample_params(specs, rng, completed_for_sampling, settings)
                 out_dir = trials_root / f"trial{trial:04d}"
                 if out_dir.exists() and not args.dry_run:
                     shutil.rmtree(out_dir)
                 log_path = log_dir / f"trial{trial:04d}.stdout.log"
+                display_prefix = f"[GEN {generation}][TRIAL {generation_trial}]"
                 tuner.event(
                     color,
-                    f"[TRIAL {trial:04d} START]",
+                    f"{display_prefix} START",
                     " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
                     "magenta",
                 )
-                cmd = train_args(run, params, out_dir, settings)
-                cache_key = f"trial{trial:04d}"
+                cmd = train_args(run, params, out_dir, settings, trial_sbs)
+                cache_key = f"gen{generation}-trial{generation_trial}"
                 if args.dry_run:
                     if settings.use_worker:
                         print(
@@ -727,7 +948,7 @@ def main() -> int:
                             "keep": False,
                             "cache_key": cache_key,
                         },
-                        prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
+                        prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
                     )
                     elapsed = time.perf_counter() - started
                     metric = tuner.metric_from_worker_payload(payload)
@@ -738,7 +959,7 @@ def main() -> int:
                         cmd,
                         log_path,
                         stream=not args.no_stream_child_output,
-                        stream_prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
+                        stream_prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
                     )
                     if code != 0:
                         tuner.append_csv(
@@ -783,9 +1004,9 @@ def main() -> int:
                                 "cache_key": cache_key,
                                 "dir": str(best_dir),
                                 "epoch": 1,
-                                "superbatch": settings.trial_sbs,
+                                "superbatch": trial_sbs,
                             },
-                            prefix=tuner.paint(color, f"[T{trial:04d} SAVE] ", "green"),
+                            prefix=tuner.paint(color, f"{display_prefix}[SAVE] ", "green"),
                         )
                         result.checkpoint = best_dir
                         result.output_dir = best_dir
@@ -793,7 +1014,7 @@ def main() -> int:
                         worker.request(
                             "drop-cached-trials",
                             {"cache_keys": [cache_key]},
-                            prefix=tuner.paint(color, f"[T{trial:04d} DROP] ", "cyan"),
+                            prefix=tuner.paint(color, f"{display_prefix}[DROP] ", "cyan"),
                         )
 
                 tuner.append_csv(
@@ -814,7 +1035,7 @@ def main() -> int:
                 )
                 tuner.event(
                     color,
-                    f"[TRIAL {trial:04d} END]",
+                    f"{display_prefix} END",
                     f"score={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
                     "green" if is_best else "cyan",
                 )
