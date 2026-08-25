@@ -284,7 +284,16 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
             current = float(raw["current"]) if "current" in raw else None
             minimum = float(raw["min"]) if "min" in raw else None
             maximum = float(raw["max"]) if "max" in raw else None
-            log = bool(raw.get("log", name in SPECIAL_TRAIN_PARAMETERS or name in tuner.KNOWN_PARAMETERS))
+            if "log" in raw:
+                log = bool(raw["log"])
+            else:
+                # Factorizer/count parameters sometimes intentionally include 0.0
+                # in the search range to allow disabling a component.  Log-scale
+                # sampling cannot represent 0, so default to linear sampling
+                # whenever the lower bound is non-positive.
+                log = name in SPECIAL_TRAIN_PARAMETERS or name in tuner.KNOWN_PARAMETERS
+                if minimum is not None and minimum <= 0.0:
+                    log = False
             spec = SearchParameter(
                 name=name,
                 tune=tune,
@@ -298,20 +307,6 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         spec.validate()
         params[name] = spec
 
-    if "lr_min" in params and "lr" in params:
-        lr = params["lr"]
-        lr_min = params["lr_min"]
-        if (
-            lr.tune
-            and lr_min.tune
-            and lr.maximum is not None
-            and lr_min.maximum is not None
-            and lr.minimum is not None
-        ):
-            if lr_min.maximum > lr.minimum:
-                raise ValueError(
-                    "parameters.lr_min max can exceed parameters.lr min; use lr_min_ratio for unconstrained sampling"
-                )
     return root, settings, run, params
 
 
@@ -332,6 +327,8 @@ def sample_params(
 ) -> dict[str, float]:
     out = current_fixed_values(specs)
     tuned = [spec for spec in specs.values() if spec.tune]
+    # Sample lr_min after lr so lr_min can be constrained to the sampled lr.
+    tuned.sort(key=lambda spec: 1 if spec.name == "lr_min" else 0)
     use_elite = len(completed) >= settings.startup_trials and completed
     elite: list[TrialResult] = []
     if use_elite:
@@ -340,12 +337,26 @@ def sample_params(
         elite = ordered[:keep]
 
     for spec in tuned:
+        sample_spec = spec
+        if spec.name == "lr_min" and "lr" in out and spec.maximum is not None:
+            assert spec.minimum is not None
+            maximum = min(spec.maximum, out["lr"])
+            if maximum < spec.minimum:
+                maximum = spec.minimum
+            sample_spec = SearchParameter(
+                name=spec.name,
+                tune=spec.tune,
+                current=spec.current,
+                minimum=spec.minimum,
+                maximum=maximum,
+                log=spec.log,
+            )
         if elite:
             center_trial = rng.choice(elite)
             center = center_trial.params[spec.name]
-            out[spec.name] = spec.sample_near(rng, center, settings.elite_sigma)
+            out[spec.name] = sample_spec.sample_near(rng, center, settings.elite_sigma)
         else:
-            out[spec.name] = spec.sample_random(rng)
+            out[spec.name] = sample_spec.sample_random(rng)
 
     if "lr_min_ratio" in out:
         lr = out.get("lr")

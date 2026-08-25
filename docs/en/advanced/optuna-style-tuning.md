@@ -4,22 +4,44 @@
 
 It does not depend on the Optuna Python package. It is a small BulletOu-specific sampler: random trials first, then samples near the best completed trials.
 
-## Difference from the population search runner
+## What this runner does
 
-The population search runner continues from the accepted checkpoint. If you change factorizer or count-confidence values in the middle of training, the result mixes two effects: the parameter value itself, and the transient damage from changing the training dynamics.
+- Each trial starts from scratch or from the same fixed checkpoint.
+- The length of one trial is `tuning.trial_sbs`.
+- Parameters stay fixed during a trial.
+- The runner evaluates `population` trials and records the metric.
+- `recommended-parameters.json` contains inferred parameters from the top trials.
 
-The Optuna-style runner starts every trial from scratch or from the same fixed base checkpoint. Parameters stay fixed during the trial.
+For short trials, the single best observed trial can be noisy. Check both `best_observed` and `recommended` before using the values in a longer run.
 
-Use it when you want to:
+## What `log` means
 
-- compare fixed parameters from early training,
-- include `lr` and `lr_min` in the search,
-- run many short trials such as 4sb each,
-- get inferred recommended parameters, not just the single best observed trial.
+Parameter entries may include `log: true`.
+
+`log: true` means logarithmic sampling. This is useful for learning rates, where values such as `0.000001`, `0.00001`, `0.0001`, and `0.001` differ by ratio rather than by absolute distance.
+
+`log: true` cannot be used with `min=0`, because `log(0)` is undefined.
+
+If you want to allow `0` for factorizer alpha or count confidence, omit `log` or set `log: false`. When `min` is non-positive and `log` is omitted, the runner defaults to linear sampling.
+
+## `startup_trials` / `elite_fraction` / `elite_sigma`
+
+These are sampler settings, not NNUE training parameters. They control how the runner chooses the next trial parameters.
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `startup_trials` | Number of fully random trials at the beginning. Until this many trials complete, the runner samples from the whole search range instead of sampling near good trials. | `16` |
+| `elite_fraction` | Fraction of completed trials treated as good candidates after startup. `0.25` means the top 25% are used. | `0.25` |
+| `elite_sigma` | Spread used when sampling near a good candidate. For linear parameters this is `(max - min) * elite_sigma`; for `log: true` parameters it is the same fraction in log space. | `0.15` |
+
+The flow is:
+
+```text
+Run startup_trials random trials.
+Then sample near the top elite_fraction trials with spread elite_sigma.
+```
 
 ## Settings example
-
-For compatibility with population search settings, ranges are written as `min` / `max`.
 
 ```json
 {
@@ -46,35 +68,31 @@ For compatibility with population search settings, ranges are written as `min` /
     "tag_prefix": "tuning-scratch-4sb"
   },
   "parameters": {
-    "lr": { "tune": true, "min": 0.00003, "max": 0.001, "log": true },
-    "lr_min_ratio": { "tune": true, "min": 0.03, "max": 1.0, "log": true },
+    "lr": { "current": 0.0003, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
+    "lr_min": { "current": 0.0001, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
 
     "shared": 1.0,
-    "king_axis": 1.0,
-    "hand_axis": 1.0,
-    "progress_axis": 1.0,
-    "king_hand_pair": 1.0,
-    "king_progress_pair": 1.0,
-    "hand_progress_pair": 1.0,
 
-    "residual_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "king_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "hand_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "progress_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "king_hand_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "king_progress_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
-    "hand_progress_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true }
+    "king_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+
+    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+
+    "residual_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 }
   }
 }
 ```
 
-`lr_min_ratio` is converted to:
-
-```text
-lr_min = lr * lr_min_ratio
-```
-
-This avoids invalid samples such as `lr_min > lr`.
+When both `lr` and `lr_min` are tuned, the runner samples `lr_min` with the sampled `lr` as its upper bound, so generated trials satisfy `lr_min <= lr`.
 
 ## Run
 
@@ -107,11 +125,4 @@ The runner root is:
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
 
-## Best observed vs recommended
-
-`best_observed` is the single trial that produced the best metric.
-
-`recommended` is an inferred parameter set from the top trials. It uses a rank-weighted mean. Log-sampled parameters are averaged in log space, so values such as `lr` and count-confidence use a geometric-mean-like estimate.
-
-For short trials, the single best trial can be noisy. If you want fixed parameters for a longer confirmation run, `recommended.parameters` is usually the more stable value to inspect.
-
+`recommended-parameters.json` contains `best_observed` and `recommended`. `best_observed` is the single best trial. `recommended` is a rank-weighted estimate from top trials. Parameters with `log: true` are averaged in log space.
