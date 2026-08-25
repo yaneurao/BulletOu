@@ -171,7 +171,8 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 
 - このcacheは worker process のメモリ上だけにあります。workerを終了すると消えます。
 - `.psv` / `.bin` 専用です。`.hcpe3` や `.pack` には使えません。
-- trial が4sbなら `teacher_memory_cache_sbs` は4以上にしてください。足りない場合はエラーになります。
+- trial が4sbなら `teacher_memory_cache_sbs` は4以上にするとcacheが効きます。足りない場合は警告を出し、そのtrialではcacheを使わず通常のstreaming読み込みに戻ります。
+- `population: 0` の generation は候補比較ではなく1本の長い定着学習なので、runnerは teacher memory cache を自動的に無効化します。
 - `tuning_parameters.py` は標準で worker を使います。`tuning.use_worker: false` にした場合は、trialごとに `bulletou.exe` を起動するため、このcacheは効きません。
 - cache が有効な場合、起動時に `[CACHE] teacher_memory_cache_sbs=...` が表示され、worker側のログに `worker teacher memory cache = loading/ready` が出ます。
 

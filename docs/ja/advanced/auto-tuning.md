@@ -122,7 +122,8 @@ population search 実行時は runner が候補ごとに次の値を決めます
 注意点は次の通りです。
 
 - `.psv` / `.bin` 教師だけ対応します。`.hcpe` / `.hcpe3` / `.pack` では使えません。
-- `trial_sbs: 4` なら `teacher_memory_cache_sbs` は 4 以上にしてください。足りない場合はエラーになります。
+- `trial_sbs: 4` なら `teacher_memory_cache_sbs` は 4 以上にするとcacheが効きます。足りない場合は警告を出し、そのtrialではcacheを使わず通常のstreaming読み込みに戻ります。
+- `population: 0` の generation は候補比較ではなく1本の長い定着学習なので、runnerは teacher memory cache を自動的に無効化します。
 - 1 sb が `610 * 65536` 局面なら、4 sb は約 1.6 億局面で、RAM 使用量は約 6 GiB です。
 - worker mode で効く機能です。候補ごとに `bulletou.exe` を起動し直す方式では、process 終了時に cache も消えるため効果がありません。
 

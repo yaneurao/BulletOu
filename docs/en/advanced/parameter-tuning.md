@@ -171,7 +171,8 @@ Notes:
 
 - The cache lives only inside the worker process. It disappears when the worker exits.
 - It currently supports only `.psv` / `.bin` teachers.
-- If a trial runs for 4sb, set `teacher_memory_cache_sbs` to at least 4. Smaller values fail with an error.
+- If a trial runs for 4sb, set `teacher_memory_cache_sbs` to at least 4 to use the cache. If the cache is too small, BulletOu prints a warning and falls back to normal streaming for that trial.
+- A generation with `population: 0` is a single longer commit-only training run, not candidate evaluation, so the runner disables teacher memory cache automatically.
 - `tuning_parameters.py` uses worker mode by default. If you set `tuning.use_worker: false`, it starts a fresh `bulletou.exe` process for every trial, so this cache cannot help.
 - When the cache is enabled, startup prints `[CACHE] teacher_memory_cache_sbs=...`, and the worker log prints `worker teacher memory cache = loading/ready`.
 

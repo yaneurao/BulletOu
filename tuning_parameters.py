@@ -699,6 +699,7 @@ def train_args(
     *,
     include_initial_state: bool = True,
     save_checkpoint: bool = True,
+    disable_teacher_memory_cache: bool = False,
 ) -> list[str]:
     validation_rate = (
         -1
@@ -752,6 +753,8 @@ def train_args(
         cmd.extend(["--lr", f"{params['lr']:.12g}"])
     if "lr_min" in params:
         cmd.extend(["--lr-min", f"{params['lr_min']:.12g}"])
+    if disable_teacher_memory_cache:
+        cmd.extend(["--teacher-memory-cache-sbs", "0"])
     return cmd
 
 
@@ -1575,6 +1578,7 @@ def main() -> int:
                         trial_sbs,
                         include_initial_state=not settings.use_worker,
                         save_checkpoint=True,
+                        disable_teacher_memory_cache=(population == 0),
                     )
                     if settings.use_worker:
                         if worker is None:

@@ -10119,9 +10119,10 @@ impl WorkerSfnnSession {
             )
         })?;
         if cache_batches < train_steps {
-            return Err(format!(
-                "--teacher-memory-cache-sbs {cache_sbs} covers {cache_batches} batches, but this worker trial needs {train_steps} batches"
-            ));
+            eprintln!(
+                "  WARN: teacher memory cache disabled for this worker trial: --teacher-memory-cache-sbs {cache_sbs} covers {cache_batches} batches, but this worker trial needs {train_steps} batches"
+            );
+            return Ok(None);
         }
         let records = cache_batches.checked_mul(self.batch_size).ok_or_else(|| {
             format!(

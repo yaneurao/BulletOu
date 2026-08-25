@@ -122,7 +122,8 @@ This cache exists only inside the worker process. It disappears when the worker 
 Notes:
 
 - Only `.psv` / `.bin` teachers are supported. `.hcpe` / `.hcpe3` / `.pack` are not supported.
-- If `trial_sbs` is 4, set `teacher_memory_cache_sbs` to at least 4. Smaller values fail with an error.
+- If `trial_sbs` is 4, set `teacher_memory_cache_sbs` to at least 4 to use the cache. If the cache is too small, BulletOu prints a warning and falls back to normal streaming for that trial.
+- A generation with `population: 0` is a single longer commit-only training run, not candidate evaluation, so the runner disables teacher memory cache automatically.
 - If one superbatch is `610 * 65536` positions, four superbatches are about 160M records, or roughly 6 GiB of RAM.
 - This is a worker-mode feature. If the runner starts a fresh `bulletou.exe` process for every candidate, the process exits after every candidate and the RAM cache cannot persist.
 
