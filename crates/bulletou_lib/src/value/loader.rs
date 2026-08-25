@@ -70,6 +70,48 @@ pub trait DataLoader<T>: Clone + Send + Sync + 'static {
     fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, f: F);
 }
 
+#[derive(Clone)]
+pub struct MemoryDataLoader<T> {
+    data: Arc<[T]>,
+    chunk_size: usize,
+    paths: Vec<String>,
+}
+
+impl<T> MemoryDataLoader<T> {
+    pub fn new(data: Arc<[T]>, chunk_size: usize, label: impl Into<String>) -> Self {
+        Self { data, chunk_size: chunk_size.max(1), paths: vec![label.into()] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+}
+
+impl<T: Copy + Send + Sync + 'static> DataLoader<T> for MemoryDataLoader<T> {
+    fn data_file_paths(&self) -> &[String] {
+        &self.paths
+    }
+
+    fn count_positions(&self) -> Option<u64> {
+        Some(self.data.len() as u64)
+    }
+
+    fn map_chunks<F: FnMut(&[T]) -> bool>(&self, start_position: usize, mut f: F) {
+        if start_position >= self.data.len() {
+            return;
+        }
+        for chunk in self.data[start_position..].chunks(self.chunk_size) {
+            if f(chunk) {
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) type B<I> = fn(&<I as SparseInputType>::RequiredDataType, f32) -> f32;
 
 #[derive(Clone)]

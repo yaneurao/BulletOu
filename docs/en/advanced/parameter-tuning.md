@@ -94,6 +94,28 @@ Then sample near the top elite_fraction trials with spread elite_sigma.
 
 When both `lr` and `lr_min` are tuned, the runner samples `lr_min` with the sampled `lr` as its upper bound, so generated trials satisfy `lr_min <= lr`.
 
+## Keeping teacher data in RAM
+
+`bulletou.exe worker` can keep PSV-compatible teacher records (`.psv` / `.bin`) in the worker process RAM.
+When many trials run inside the same worker process, this avoids rereading the same teacher window from a USB HDD or other slow storage.
+
+Add this to `bulletou-settings.json`:
+
+```json
+{
+  "teacher_memory_cache_sbs": 4
+}
+```
+
+The value means "keep this many superbatches in RAM". If one superbatch is `610 * 65536` positions, four superbatches are about 160M records, or roughly 6 GiB of RAM.
+
+Notes:
+
+- The cache lives only inside the worker process. It disappears when the worker exits.
+- It currently supports only `.psv` / `.bin` teachers.
+- If a trial runs for 4sb, set `teacher_memory_cache_sbs` to at least 4. Smaller values fail with an error.
+- If the runner starts a fresh `bulletou.exe` process for every trial, the process exits after each trial and the RAM cache cannot persist.
+
 ## Run
 
 ```powershell

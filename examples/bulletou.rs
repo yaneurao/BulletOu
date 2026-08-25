@@ -4671,6 +4671,14 @@ struct Args {
     #[arg(long, default_value = "0")]
     teacher_shuffle_seed: u64,
 
+    /// Worker-mode only: keep this many superbatches of PSV-compatible
+    /// teacher records (`.psv` / `.bin`) in the long-lived worker process RAM.
+    /// The cache is rebuilt when the worker's accepted dataloader position
+    /// advances. `0` or omission disables it. This is intentionally not a
+    /// disk/temp cache; it disappears when the worker process exits.
+    #[arg(long)]
+    teacher_memory_cache_sbs: Option<usize>,
+
     /// HCPE decode parallelism. `0` (default) means auto = OS logical thread
     /// count (`available_parallelism()`). Use `--loader-threads 8` etc. to
     /// tune CPU pressure manually. The actual value is printed at startup as
@@ -9862,6 +9870,21 @@ struct WorkerSfnnCountSettings {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerTeacherMemoryCacheKey {
+    teacher: String,
+    base_dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+    batch_size: usize,
+    records: usize,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+struct WorkerTeacherMemoryCache {
+    key: WorkerTeacherMemoryCacheKey,
+    cache: bulletou_lib::value::PackedSfenMemoryTeacherCache,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnSession {
     args: Args,
     feature_kind: CudaCppSfnnFeatureKind,
@@ -9879,6 +9902,7 @@ struct WorkerSfnnSession {
     completed_steps: usize,
     optimizer_steps: usize,
     dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+    teacher_memory_cache: Option<WorkerTeacherMemoryCache>,
     cached_trial_states: std::collections::HashMap<String, WorkerSfnnCachedTrialState>,
 }
 
@@ -9963,6 +9987,7 @@ impl WorkerSfnnSession {
             completed_steps: initial_state.completed_steps,
             optimizer_steps: initial_state.optimizer_steps,
             dataloader_pos,
+            teacher_memory_cache: None,
             cached_trial_states: std::collections::HashMap::new(),
         })
     }
@@ -10023,6 +10048,72 @@ impl WorkerSfnnSession {
         self.residual_count_gates = count_settings.residual_count_gates;
         self.factorizer_axis_confidences = count_settings.factorizer_axis_confidences;
         Ok(())
+    }
+
+    fn teacher_memory_cache_for_trial(
+        &mut self,
+        trial_args: &Args,
+        config: &bulletou_lib::value::SfnnTeacherBatchConfig<'_>,
+        batches_per_superbatch: usize,
+        train_steps: usize,
+        base_dataloader_pos: Option<bulletou_lib::value::TeacherDataloaderPos>,
+    ) -> Result<Option<bulletou_lib::value::PackedSfenMemoryTeacherCache>, String> {
+        let Some(cache_sbs) = trial_args.teacher_memory_cache_sbs else {
+            return Ok(None);
+        };
+        if cache_sbs == 0 {
+            return Ok(None);
+        }
+        let cache_batches = cache_sbs.checked_mul(batches_per_superbatch).ok_or_else(|| {
+            format!(
+                "--teacher-memory-cache-sbs overflow: sbs={cache_sbs}, batches_per_superbatch={batches_per_superbatch}"
+            )
+        })?;
+        if cache_batches < train_steps {
+            return Err(format!(
+                "--teacher-memory-cache-sbs {cache_sbs} covers {cache_batches} batches, but this worker trial needs {train_steps} batches"
+            ));
+        }
+        let records = cache_batches.checked_mul(self.batch_size).ok_or_else(|| {
+            format!(
+                "teacher memory cache record count overflow: batches={cache_batches}, batch_size={}",
+                self.batch_size
+            )
+        })?;
+        let key = WorkerTeacherMemoryCacheKey {
+            teacher: trial_args.teacher.clone(),
+            base_dataloader_pos,
+            batch_size: self.batch_size,
+            records,
+        };
+        if let Some(existing) = self.teacher_memory_cache.as_ref()
+            && existing.key == key
+        {
+            return Ok(Some(existing.cache.clone()));
+        }
+
+        let mib =
+            records as f64 * std::mem::size_of::<bulletou_lib::shogi::PackedSfenValue>() as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "  worker teacher memory cache = loading: {cache_sbs} sb x {batches_per_superbatch} batches x {} = {} records ({mib:.1} MiB RAM)",
+            format_count(self.batch_size),
+            format_count(records)
+        );
+        let started = std::time::Instant::now();
+        let mut cache_config = config.clone();
+        cache_config.dataloader_resume_pos = base_dataloader_pos;
+        cache_config.batch_index = 0;
+        let cache = bulletou_lib::value::load_packed_sfen_memory_teacher_cache(&cache_config, records)
+            .map_err(|err| err.to_string())?;
+        eprintln!(
+            "  worker teacher memory cache = ready: {} records, {}, source={}, elapsed={}",
+            format_count(cache.len()),
+            format_bytes(cache.bytes() as u64),
+            cache.source(),
+            format_duration_secs(started.elapsed())
+        );
+        self.teacher_memory_cache = Some(WorkerTeacherMemoryCache { key, cache: cache.clone() });
+        Ok(Some(cache))
     }
 
     fn current_progress_params(&self) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
@@ -10264,6 +10355,13 @@ impl WorkerSfnnSession {
             teacher_shuffle_seed: trial_args.teacher_shuffle_seed,
             profile_prepare: false,
         };
+        let teacher_memory_cache = self.teacher_memory_cache_for_trial(
+            &trial_args,
+            &config,
+            schedule.batches_per_superbatch,
+            train_steps,
+            base_dataloader_pos,
+        )?;
         let loss_kind = cuda_cpp_scalar_loss_kind(&trial_args);
         let output_inv_scale = effective_output_inv_scale(&trial_args);
         let mut seen_steps = 0usize;
@@ -10294,7 +10392,8 @@ impl WorkerSfnnSession {
         let mut hard_progress_buckets =
             if frozen_progress_params.is_some() { vec![0; self.batch_size] } else { Vec::new() };
         let started = std::time::Instant::now();
-        for_each_cuda_cpp_sfnn_teacher_batch(self.feature_kind, &config, train_steps, |teacher_batch| {
+        let feature_kind = self.feature_kind;
+        let mut process_teacher_batch = |teacher_batch: bulletou_lib::value::SfnnTeacherBatch| -> Result<(), String> {
             seen_steps += 1;
             last_dataloader_pos = teacher_batch.dataloader_pos;
             let progress_for_step = schedule.progress_for_step(seen_steps);
@@ -10525,7 +10624,18 @@ impl WorkerSfnnSession {
                 );
             }
             Ok::<(), String>(())
-        })
+        };
+        if let Some(cache) = teacher_memory_cache {
+            for_each_cuda_cpp_sfnn_teacher_batch_from_memory(
+                feature_kind,
+                &config,
+                cache,
+                train_steps,
+                &mut process_teacher_batch,
+            )
+        } else {
+            for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, &mut process_teacher_batch)
+        }
         .map_err(|e| e.to_string())?;
         self.ctx.synchronize().map_err(|e| e.to_string())?;
         if checkpoint_chunk_idx != schedule.chunks.len() {
@@ -14144,6 +14254,56 @@ where
     F: FnMut(bulletou_lib::value::SfnnTeacherBatch) -> Result<(), String>,
 {
     for_each_cuda_cpp_sfnn_teacher_batch_with_epoch_mode(feature_kind, config, batch_count, false, visitor)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn for_each_cuda_cpp_sfnn_teacher_batch_from_memory<F>(
+    feature_kind: CudaCppSfnnFeatureKind,
+    config: &bulletou_lib::value::SfnnTeacherBatchConfig<'_>,
+    cache: bulletou_lib::value::PackedSfenMemoryTeacherCache,
+    batch_count: usize,
+    visitor: F,
+) -> Result<usize, String>
+where
+    F: FnMut(bulletou_lib::value::SfnnTeacherBatch) -> Result<(), String>,
+{
+    use bulletou_lib::value::for_each_sfnn_teacher_fast_batch_from_memory;
+
+    match feature_kind {
+        CudaCppSfnnFeatureKind::Halfka1hm => for_each_sfnn_teacher_fast_batch_from_memory(
+            ShogiHalfKaHm1,
+            feature_kind.input_label(),
+            config,
+            cache,
+            batch_count,
+            visitor,
+        ),
+        CudaCppSfnnFeatureKind::Halfka2hm => for_each_sfnn_teacher_fast_batch_from_memory(
+            ShogiHalfKaHm2,
+            feature_kind.input_label(),
+            config,
+            cache,
+            batch_count,
+            visitor,
+        ),
+        CudaCppSfnnFeatureKind::Halfka2 => for_each_sfnn_teacher_fast_batch_from_memory(
+            ShogiHalfKa2,
+            feature_kind.input_label(),
+            config,
+            cache,
+            batch_count,
+            visitor,
+        ),
+        CudaCppSfnnFeatureKind::Ka2 => for_each_sfnn_teacher_fast_batch_from_memory(
+            ShogiKa2,
+            feature_kind.input_label(),
+            config,
+            cache,
+            batch_count,
+            visitor,
+        ),
+    }
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -31370,16 +31530,18 @@ mod tests {
         assert!((gamma - expected).abs() < 1e-9, "expected {expected}, got {gamma}");
 
         let step_positions = effective_lr_step_positions(&args, batches_per_superbatch);
-        let period_positions = (15u64)
-            .saturating_mul(batches_per_superbatch as u64)
-            .saturating_mul(effective_batch_size(&args) as u64);
+        let period_positions =
+            (15u64).saturating_mul(batches_per_superbatch as u64).saturating_mul(effective_batch_size(&args) as u64);
         let last_superbatch_start = period_positions - step_positions;
-        let last_lr =
-            StepLR::lr_at_positions(args.lr, args.lr_min, gamma, step_positions, period_positions, last_superbatch_start);
-        assert!(
-            (last_lr - args.lr_min).abs() < 1e-9,
-            "last superbatch should start at lr_min; got {last_lr}"
+        let last_lr = StepLR::lr_at_positions(
+            args.lr,
+            args.lr_min,
+            gamma,
+            step_positions,
+            period_positions,
+            last_superbatch_start,
         );
+        assert!((last_lr - args.lr_min).abs() < 1e-9, "last superbatch should start at lr_min; got {last_lr}");
     }
 
     #[test]

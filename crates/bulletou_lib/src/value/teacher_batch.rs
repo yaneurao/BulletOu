@@ -5,7 +5,7 @@ use std::{
     collections::BTreeMap,
     error::Error,
     fmt,
-    sync::{atomic::Ordering, mpsc},
+    sync::{Arc, atomic::Ordering, mpsc},
 };
 
 use rayon::prelude::*;
@@ -28,7 +28,7 @@ use crate::{
         FastBatchHost, FastBatchLayout, FastBatchProgressHost, NoOutputBuckets,
         loader::{
             DataLoader, DefaultDataLoader, DirectSequentialDataLoader, Hcpe3DataLoader, HcpeDataLoader,
-            ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
+            MemoryDataLoader, ShogiPackLoader, WinRateModelTargetParams, load_and_map_shuffled_batches_with_prefetch,
             teacher_shuffle_window_records, win_rate_model_score_from_table, win_rate_model_score_table,
         },
     },
@@ -167,6 +167,47 @@ pub struct SfnnTeacherBatch {
     pub source: String,
     pub dataloader_pos: Option<TeacherDataloaderPos>,
     pub timing: TeacherBatchTiming,
+}
+
+#[derive(Clone)]
+pub struct PackedSfenMemoryTeacherCache {
+    data: Arc<[PackedSfenValue]>,
+    source: String,
+    base_record_index: u64,
+    total_records: u64,
+    record_size: usize,
+}
+
+impl PackedSfenMemoryTeacherCache {
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.data.len().saturating_mul(self.record_size)
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn dataloader_pos_after_batch(&self, batch_size: usize, visited_batches: usize) -> Option<TeacherDataloaderPos> {
+        fixed_record_dataloader_pos_after_batch(
+            self.base_record_index,
+            self.total_records,
+            self.record_size,
+            batch_size,
+            visited_batches,
+        )
+    }
+
+    fn loader(&self, chunk_size: usize) -> MemoryDataLoader<PackedSfenValue> {
+        MemoryDataLoader::new(self.data.clone(), chunk_size, self.source.clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1139,6 +1180,105 @@ where
     E: fmt::Display,
 {
     for_each_sfnn_teacher_fast_batch_with_epoch_mode(input_getter, input_label, config, batch_count, true, visitor)
+}
+
+pub fn load_packed_sfen_memory_teacher_cache(
+    config: &SfnnTeacherBatchConfig<'_>,
+    record_count: usize,
+) -> Result<PackedSfenMemoryTeacherCache, TeacherBatchError> {
+    validate_sfnn_config(config)?;
+    if record_count == 0 {
+        return Err(TeacherBatchError::invalid_input("teacher memory cache record count must be > 0"));
+    }
+
+    let data_files_owned = expand_teacher(config.teacher).map_err(TeacherBatchError::invalid_input)?;
+    let data_files_ref: Vec<&str> = data_files_owned.iter().map(String::as_str).collect();
+    let format = infer_data_format(&data_files_ref).map_err(TeacherBatchError::invalid_input)?;
+    if format != DataFormat::Psv {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "teacher memory cache currently supports only PSV-compatible .psv/.bin teachers; got {format:?}"
+        )));
+    }
+
+    let record_size = std::mem::size_of::<PackedSfenValue>();
+    let total_records = total_fixed_record_teacher_records("PSV", &data_files_owned, record_size)?;
+    let (loader_start_position, base_record_index) = match config.dataloader_resume_pos {
+        Some(pos) => {
+            let record_index = fixed_record_resume_start_position("PSV", pos, record_size)?;
+            (record_index, (record_index as u64) % total_records)
+        }
+        None => {
+            let record_index = checked_batch_start_position("PSV", config.batch_index, config.batch_size)?;
+            (record_index, (record_index as u64) % total_records)
+        }
+    };
+
+    let loader = DirectSequentialDataLoader::new(&data_files_ref).with_single_epoch(false);
+    let mut data = Vec::<PackedSfenValue>::with_capacity(record_count);
+    loader.map_chunks(loader_start_position, |chunk: &[PackedSfenValue]| {
+        let remaining = record_count.saturating_sub(data.len());
+        if remaining == 0 {
+            return true;
+        }
+        let take = remaining.min(chunk.len());
+        data.extend_from_slice(&chunk[..take]);
+        data.len() >= record_count
+    });
+    if data.len() != record_count {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "teacher memory cache loaded {} records, expected {record_count}",
+            data.len()
+        )));
+    }
+    let source = format!("memory-cache: {} records from {}", data.len(), config.teacher);
+    Ok(PackedSfenMemoryTeacherCache {
+        data: Arc::<[PackedSfenValue]>::from(data.into_boxed_slice()),
+        source,
+        base_record_index,
+        total_records,
+        record_size,
+    })
+}
+
+pub fn for_each_sfnn_teacher_fast_batch_from_memory<I, F, E>(
+    input_getter: I,
+    input_label: &'static str,
+    config: &SfnnTeacherBatchConfig<'_>,
+    cache: PackedSfenMemoryTeacherCache,
+    batch_count: usize,
+    visitor: F,
+) -> Result<usize, TeacherBatchError>
+where
+    I: SparseInputType<RequiredDataType = PackedSfenValue> + Send,
+    F: FnMut(SfnnTeacherBatch) -> Result<(), E>,
+    E: fmt::Display,
+{
+    validate_sfnn_config(config)?;
+    let required_records = batch_count.checked_mul(config.batch_size).ok_or_else(|| {
+        TeacherBatchError::invalid_input(format!(
+            "teacher memory cache required-record count overflow: batch_count={batch_count}, batch_size={}",
+            config.batch_size
+        ))
+    })?;
+    if cache.len() < required_records {
+        return Err(TeacherBatchError::invalid_input(format!(
+            "teacher memory cache has {} records but this trial needs {required_records}; increase --teacher-memory-cache-sbs",
+            cache.len()
+        )));
+    }
+    let loader = cache.loader(config.batch_size.saturating_mul(16).max(config.batch_size));
+    visit_sfnn_batches(
+        input_getter,
+        input_label,
+        loader,
+        DataFormat::Psv,
+        config,
+        batch_count,
+        false,
+        0,
+        move |visited_batches| cache.dataloader_pos_after_batch(config.batch_size, visited_batches),
+        visitor,
+    )
 }
 
 fn for_each_sfnn_teacher_fast_batch_with_epoch_mode<I, F, E>(
@@ -3020,6 +3160,39 @@ mod tests {
             teacher_shuffle_seed: 0,
             profile_prepare: false,
         }
+    }
+
+    fn write_tiny_psv(path: &std::path::Path, records: usize) {
+        let mut bytes = Vec::new();
+        for i in 0..records {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut()[32..34].copy_from_slice(&(i as i16).to_le_bytes());
+            bytes.extend_from_slice(psv.as_bytes());
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn packed_sfen_memory_cache_loads_psv_from_resume_position() {
+        let path = tmp_teacher_path("memory_cache_psv", "bin");
+        write_tiny_psv(&path, 5);
+        let mut config = sfnn_config();
+        config.teacher = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+        config.batch_size = 2;
+        config.dataloader_resume_pos =
+            Some(TeacherDataloaderPos { byte_offset: 2 * std::mem::size_of::<PackedSfenValue>() as u64, plies: 0 });
+
+        let cache = load_packed_sfen_memory_teacher_cache(&config, 4).unwrap();
+
+        assert_eq!(cache.len(), 4);
+        assert_eq!(
+            cache.dataloader_pos_after_batch(2, 0),
+            Some(TeacherDataloaderPos { byte_offset: 4 * std::mem::size_of::<PackedSfenValue>() as u64, plies: 0 })
+        );
+        assert_eq!(
+            cache.dataloader_pos_after_batch(2, 1),
+            Some(TeacherDataloaderPos { byte_offset: std::mem::size_of::<PackedSfenValue>() as u64, plies: 0 })
+        );
     }
 
     fn score_bin_index(score: i16) -> usize {

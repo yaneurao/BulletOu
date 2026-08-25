@@ -94,6 +94,28 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 
 `lr` と `lr_min` を両方 tune する場合、runner は `lr_min <= lr` になるように `lr_min` の上限をその trial の `lr` 以下に制限してサンプルします。
 
+## 教師データをRAMに保持する場合
+
+`bulletou.exe worker` では、PSV互換の教師データ (`.psv` / `.bin`) を worker process のRAMに保持できます。
+同じ worker process の中で複数の trial を走らせる場合、USB HDDなどから同じ教師範囲を何度も読み直す無駄を避けられます。
+
+`bulletou-settings.json` に次のように書きます。
+
+```json
+{
+  "teacher_memory_cache_sbs": 4
+}
+```
+
+`4` は「4 superbatch 分をRAMに保持する」という意味です。1 superbatch が `610 * 65536` 局面なら、4 superbatch は約 1.6 億局面で、RAM使用量は約 6 GiB です。
+
+注意点:
+
+- このcacheは worker process のメモリ上だけにあります。workerを終了すると消えます。
+- `.psv` / `.bin` 専用です。`.hcpe3` や `.pack` には使えません。
+- trial が4sbなら `teacher_memory_cache_sbs` は4以上にしてください。足りない場合はエラーになります。
+- workerを使わず、trialごとに `bulletou.exe` を起動する方式では、プロセス終了時にcacheも消えるため効果がありません。
+
 ## 実行
 
 ```powershell

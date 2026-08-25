@@ -38,11 +38,13 @@ pub use fast_sfnn::{
 pub use loader::WinRateModelTargetParams;
 pub use teacher_batch::{
     HalfkpTeacherBatch, HalfkpTeacherBatchConfig, KpTeacherBatch, KpTeacherBatchConfig, KpptTeacherBatch,
-    KpptTeacherBatchConfig, ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport, ScoreWinrateBinReport,
-    ScoreWinrateModelMetrics, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError, TeacherBatchTiming,
-    TeacherDataloaderPos, analyze_score_winrate_from_teacher, for_each_halfkp_teacher_fast_batch,
+    KpptTeacherBatchConfig, PackedSfenMemoryTeacherCache, ScoreWinrateAnalysisConfig, ScoreWinrateAnalysisReport,
+    ScoreWinrateBinReport, ScoreWinrateModelMetrics, SfnnTeacherBatch, SfnnTeacherBatchConfig, TeacherBatchError,
+    TeacherBatchTiming, TeacherDataloaderPos, analyze_score_winrate_from_teacher, for_each_halfkp_teacher_fast_batch,
     for_each_kp_teacher_fast_batch, for_each_kppt_teacher_fast_batch, for_each_sfnn_halfka2_teacher_fast_batch,
-    for_each_sfnn_teacher_fast_batch, for_each_sfnn_teacher_fast_batch_single_epoch, load_halfkp_teacher_fast_batch,
+    for_each_sfnn_teacher_fast_batch, for_each_sfnn_teacher_fast_batch_from_memory,
+    for_each_sfnn_teacher_fast_batch_single_epoch, load_halfkp_teacher_fast_batch,
+    load_packed_sfen_memory_teacher_cache,
 };
 
 use crate::{
