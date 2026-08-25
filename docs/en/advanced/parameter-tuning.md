@@ -125,4 +125,25 @@ The runner root is:
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
 
+## Checkpoint retention
+
+`keep_all_trials` controls how many trial checkpoints are kept.
+
+```json
+"metric": "quantized_value_loss",
+"lower_is_better": true,
+"keep_all_trials": false
+```
+
+With this setting, lower `quantized_value_loss` is better. The runner keeps only the current best trial under `best-checkpoint/`. Trial output directories and checkpoints that do not become the best are deleted after the trial finishes.
+
+Even when a non-best trial checkpoint is deleted, `summary-learn.log` and `logs/trialXXXX.stdout.log` remain, so you can still inspect the metric values and stdout later.
+
+To keep every trial checkpoint, use one of these:
+
+- `keep_all_trials: true`
+- `--keep-temp` at runtime
+
+For normal tuning, `keep_all_trials: false` is safer because it avoids rapid storage growth.
+
 `recommended-parameters.json` contains `best_observed` and `recommended`. `best_observed` is the single best trial. `recommended` is a rank-weighted estimate from top trials. Parameters with `log: true` are averaged in log space.

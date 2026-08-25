@@ -127,4 +127,25 @@ runner root は次の場所です。
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
 
+## checkpoint の保存と削除
+
+`keep_all_trials` は、trial ごとの checkpoint をどれだけ残すかを決めます。
+
+```json
+"metric": "quantized_value_loss",
+"lower_is_better": true,
+"keep_all_trials": false
+```
+
+この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。runner は、その時点で一番良い trial だけを `best-checkpoint/` に残します。best にならなかった trial の出力フォルダと checkpoint は、trial 終了後に削除します。
+
+削除しても、`summary-learn.log` と `logs/trialXXXX.stdout.log` は残るので、各 trial の指標と実行ログはあとから確認できます。
+
+すべての trial checkpoint を残したい場合は、次のどちらかを使います。
+
+- `keep_all_trials: true`
+- 実行時に `--keep-temp`
+
+通常は storage 消費を抑えるため、`keep_all_trials: false` のままにしておくのが安全です。
+
 `recommended-parameters.json` の `recommended.parameters` は、上位 trial から重み付き平均で推定した値です。`log: true` のパラメーターは log 空間で平均するため、学習率のように桁で効く値に向いています。
