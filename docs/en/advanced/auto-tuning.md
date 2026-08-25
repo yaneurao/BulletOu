@@ -95,6 +95,8 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
   "wrm_in_offset": 0,
   "wrm_target_offset": 0,
   "sfnn_dirty_bucket_update": true,
+  "sfnn_freeze_progress": true,
+  "teacher_memory_cache_sbs": 4,
   "sfnn_saturation_penalty": 1e-7
 }
 ```
@@ -110,6 +112,19 @@ During population search, the runner owns these candidate-specific values, so do
 | `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
 | `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min` and writes accepted values back to `current` |
+
+For progress-based architectures, put `sfnn_freeze_progress: true` in `bulletou-settings.json` when you want to keep the progress parameters fixed. Freezing progress makes validation caching easier and keeps qvalid lighter.
+
+`teacher_memory_cache_sbs` keeps teacher records in the worker process RAM. The value means how many superbatches to keep in RAM. For example, `4` loads four superbatches of `.psv` / `.bin` teacher records and reuses them for candidate evaluation inside the same worker process.
+
+This cache exists only inside the worker process. It disappears when the worker exits. It is not a feature that stages teacher data to SSD or `temp_folder`.
+
+Notes:
+
+- Only `.psv` / `.bin` teachers are supported. `.hcpe` / `.hcpe3` / `.pack` are not supported.
+- If `trial_sbs` is 4, set `teacher_memory_cache_sbs` to at least 4. Smaller values fail with an error.
+- If one superbatch is `610 * 65536` positions, four superbatches are about 160M records, or roughly 6 GiB of RAM.
+- This is a worker-mode feature. If the runner starts a fresh `bulletou.exe` process for every candidate, the process exits after every candidate and the RAM cache cannot persist.
 
 ## `tuning` fields
 

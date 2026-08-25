@@ -96,6 +96,7 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
   "wrm_target_offset": 0,
   "sfnn_dirty_bucket_update": true,
   "sfnn_freeze_progress": true,
+  "teacher_memory_cache_sbs": 4,
   "sfnn_saturation_penalty": 1e-7
 }
 ```
@@ -113,6 +114,17 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡し、採用時に `current` へ書き戻す |
 
 `progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
+
+`teacher_memory_cache_sbs` は、worker process の RAM に教師データを保持するための設定です。値は「何 superbatch 分を RAM に保持するか」です。たとえば `4` なら、trial で使う 4 sb 分の `.psv` / `.bin` 教師レコードを RAM に読み込み、同じ worker process 内の候補評価で再利用します。
+
+この cache は worker process の中だけに存在します。worker を終了すると消えます。SSD や `temp_folder` に教師データを退避する機能ではありません。
+
+注意点は次の通りです。
+
+- `.psv` / `.bin` 教師だけ対応します。`.hcpe` / `.hcpe3` / `.pack` では使えません。
+- `trial_sbs: 4` なら `teacher_memory_cache_sbs` は 4 以上にしてください。足りない場合はエラーになります。
+- 1 sb が `610 * 65536` 局面なら、4 sb は約 1.6 億局面で、RAM 使用量は約 6 GiB です。
+- worker mode で効く機能です。候補ごとに `bulletou.exe` を起動し直す方式では、process 終了時に cache も消えるため効果がありません。
 
 ## `tuning` の項目
 
