@@ -10773,6 +10773,64 @@ impl WorkerSfnnSession {
         Ok(cached.outcome)
     }
 
+    fn save_cached_trial_exact(
+        &mut self,
+        key: &str,
+        dir: std::path::PathBuf,
+        epoch: usize,
+        superbatch: usize,
+    ) -> Result<std::path::PathBuf, String> {
+        let cached = self
+            .cached_trial_states
+            .remove(key)
+            .ok_or_else(|| format!("worker cached trial state `{key}` does not exist"))?;
+        let base_args = self.args.clone();
+        let base_dataloader_pos = self.dataloader_pos;
+        let base_completed_steps = self.completed_steps;
+        let base_optimizer_steps = self.optimizer_steps;
+        let base_snapshot = self.snapshot_host_labeled("base snapshot before save-cached")?;
+
+        let restore_cached_result = match &cached.storage {
+            WorkerSfnnCachedTrialStorage::Memory(snapshot) => self.restore_host_snapshot(&cached.args, snapshot),
+            WorkerSfnnCachedTrialStorage::Disk(dir) => self.restore_disk_cached_trial_state(&cached.args, dir),
+        };
+        if let Err(err) = restore_cached_result {
+            let _ = self.restore_host_snapshot(&base_args, &base_snapshot);
+            self.args = base_args;
+            self.dataloader_pos = base_dataloader_pos;
+            self.completed_steps = base_completed_steps;
+            self.optimizer_steps = base_optimizer_steps;
+            Self::cleanup_cached_trial_storage(cached.storage);
+            return Err(err);
+        }
+        self.args = cached.args.clone();
+        self.dataloader_pos = Some(cached.dataloader_pos);
+        self.completed_steps = cached.completed_steps;
+        self.optimizer_steps = cached.optimizer_steps;
+
+        let save_result = self.save_exact(Some(cached.args.clone()), dir, epoch, superbatch);
+        let restore_base_result = self.restore_host_snapshot(&base_args, &base_snapshot);
+        self.args = base_args;
+        self.dataloader_pos = base_dataloader_pos;
+        self.completed_steps = base_completed_steps;
+        self.optimizer_steps = base_optimizer_steps;
+        Self::cleanup_cached_trial_storage(cached.storage);
+
+        match (save_result, restore_base_result) {
+            (Ok(path), Ok(())) => {
+                eprintln!("  worker saved cached trial state `{key}` and restored base state");
+                Ok(path)
+            }
+            (Err(err), Ok(())) => Err(err),
+            (Ok(_), Err(err)) => {
+                Err(format!("saved cached trial state `{key}`, but failed to restore base state: {err}"))
+            }
+            (Err(save_err), Err(restore_err)) => Err(format!(
+                "failed to save cached trial state `{key}`: {save_err}; also failed to restore base state: {restore_err}"
+            )),
+        }
+    }
+
     fn save(&mut self, args: Option<Args>, epoch: usize, superbatch: usize) -> Result<std::path::PathBuf, String> {
         self.save_impl(args.unwrap_or_else(|| self.args.clone()), None, epoch, superbatch)
     }
@@ -10961,7 +11019,7 @@ fn worker_handle_request(
                 serde_json::json!({
                     "worker": "bulletou",
                     "protocol_version": args.protocol_version,
-                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "accept-cached-trial", "drop-cached-trials", "save", "quit"],
+                    "capabilities": ["hello", "train", "quantized-test", "open", "trial", "accept-cached-trial", "save-cached-trial", "drop-cached-trials", "save", "quit"],
                     "note": "`open` creates one GPU-resident SFNN training session; `trial` measures from the current state, optionally caches the measured state in host RAM or cache_dir, and restores; `accept-cached-trial` keeps one cached probe without extra training.",
                 }),
             ),
@@ -11049,6 +11107,42 @@ fn worker_handle_request(
                     }
                     (worker_response_ok(id, cmd, payload), false)
                 }
+                Err(error) => (worker_response_error(id, error), false),
+            }
+        }
+        "save-cached-trial" => {
+            let Some(session) = session.as_mut() else {
+                return (worker_response_error(id, "worker command `save-cached-trial` requires `open` first"), false);
+            };
+            let cache_key = match worker_json_string_opt(request, "cache_key") {
+                Ok(Some(key)) => key,
+                Ok(None) => return (worker_response_error(id, "`save-cached-trial` requires `cache_key`"), false),
+                Err(error) => return (worker_response_error(id, error), false),
+            };
+            let dir = match worker_json_string_opt(request, "dir") {
+                Ok(Some(dir)) => std::path::PathBuf::from(dir),
+                Ok(None) => return (worker_response_error(id, "`save-cached-trial` requires `dir`"), false),
+                Err(error) => return (worker_response_error(id, error), false),
+            };
+            let epoch = request.get("epoch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+            let superbatch = request.get("superbatch").and_then(serde_json::Value::as_u64).unwrap_or(1) as usize;
+            match session.save_cached_trial_exact(&cache_key, dir, epoch, superbatch) {
+                Ok(checkpoint_dir) => (
+                    worker_response_ok(
+                        id,
+                        cmd,
+                        serde_json::json!({
+                            "checkpoint_dir": checkpoint_dir.display().to_string(),
+                            "state_bin": checkpoint_dir.join("state.bin").display().to_string(),
+                            "nn_bin": checkpoint_dir.join("nn.bin").display().to_string(),
+                            "cached_trial_states": session.cached_trial_states.len(),
+                            "summary": worker_last_summary_row(
+                                checkpoint_dir.parent().unwrap_or_else(|| std::path::Path::new("."))
+                            ).unwrap_or(None),
+                        }),
+                    ),
+                    false,
+                ),
                 Err(error) => (worker_response_error(id, error), false),
             }
         }
@@ -12615,6 +12709,13 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
     if schedule.production && train_steps == 0 {
         print_cuda_cpp_no_remaining_work(args);
         return Ok(());
+    }
+    if args.teacher_memory_cache_sbs.unwrap_or(0) > 0 {
+        print_startup_kv_colored(
+            "teacher memory cache",
+            "ignored: worker-mode only; direct trainer reads teacher through the normal dataloader",
+            ConsoleColor::Yellow,
+        );
     }
     cuda_cpp_print_teacher_shuffle_buffer(args, &schedule)?;
     let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;

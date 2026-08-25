@@ -22,6 +22,7 @@ import random
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,7 @@ class StudySettings:
     validation_rate: int
     quantized_validation_rate: int
     keep_all_trials: bool
+    use_worker: bool
 
 
 @dataclass
@@ -189,6 +191,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "validation_rate",
         "quantized_validation_rate",
         "keep_all_trials",
+        "use_worker",
     }
     unknown_tuning_keys = sorted(set(tuning_obj) - allowed_tuning_keys)
     if unknown_tuning_keys:
@@ -214,6 +217,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         validation_rate=int(tuning_obj.get("validation_rate", 0)),
         quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
+        use_worker=bool(tuning_obj.get("use_worker", True)),
     )
     if settings.trials <= 0:
         raise ValueError("tuning.population must be > 0")
@@ -425,6 +429,12 @@ def train_args(run: RunSettings, params: dict[str, float], output_dir: Path, set
     return cmd
 
 
+def worker_args_from_train_args(cmd: list[str]) -> list[str]:
+    if not cmd:
+        raise ValueError("empty bulletou command")
+    return cmd[1:]
+
+
 def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
 
@@ -457,6 +467,20 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
 
 def write_json(path: Path, obj: dict[str, Any]) -> None:
     tuner.atomic_write_json(path, obj)
+
+
+def configured_teacher_memory_cache_sbs(path: Path) -> int:
+    try:
+        obj = tuner.load_json_object(path)
+    except Exception:
+        return 0
+    raw = obj.get("teacher_memory_cache_sbs")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except Exception:
+        return 0
 
 
 def recommended_params(
@@ -591,10 +615,29 @@ def main() -> int:
                 f"population={settings.trials} trial_sbs={settings.trial_sbs} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
                 f"startup_trials={settings.startup_trials} elite_fraction={settings.elite_fraction:g} "
-                f"elite_sigma={settings.elite_sigma:g}"
+                f"elite_sigma={settings.elite_sigma:g} worker={'on' if settings.use_worker else 'off'}"
             ),
             "cyan",
         )
+        cache_sbs = configured_teacher_memory_cache_sbs(run.bulletou_settings_file)
+        if cache_sbs > 0 and settings.use_worker:
+            tuner.event(
+                color,
+                "[CACHE]",
+                f"teacher_memory_cache_sbs={cache_sbs} will be used by the long-lived worker process",
+                "green",
+            )
+        elif cache_sbs > 0:
+            tuner.event(
+                color,
+                "[WARN]",
+                (
+                    f"teacher_memory_cache_sbs={cache_sbs} is worker-mode only; "
+                    "tuning.use_worker=false starts a fresh bulletou.exe process for each trial, "
+                    "so the RAM teacher cache is not used here."
+                ),
+                "yellow",
+            )
         if completed:
             tuner.event(color, "[RESUME]", f"completed={len(completed)} next_trial={next_trial}", "yellow")
         if best:
@@ -609,107 +652,208 @@ def main() -> int:
             if rec.get("best_observed"):
                 tuner.event(color, "[RECOMMEND]", f"parameters={recommendation_path}", "green")
 
-        for trial in range(next_trial, settings.trials + 1):
-            params = sample_params(specs, rng, completed, settings)
-            out_dir = trials_root / f"trial{trial:04d}"
-            if out_dir.exists() and not args.dry_run:
-                shutil.rmtree(out_dir)
-            log_path = log_dir / f"trial{trial:04d}.stdout.log"
-            tuner.event(
-                color,
-                f"[TRIAL {trial:04d} START]",
-                " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
-                "magenta",
-            )
-            cmd = train_args(run, params, out_dir, settings)
-            if args.dry_run:
-                print("  " + subprocess.list2cmdline(cmd), flush=True)
-                continue
-            code, elapsed = tuner.run_command(
-                cmd,
-                log_path,
-                stream=not args.no_stream_child_output,
-                stream_prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
-            )
-            if code != 0:
+        worker: tuner.WorkerClient | None = None
+        try:
+            if settings.use_worker:
+                open_dir = runner_root / "worker-session"
+                open_params = current_fixed_values(specs)
+                open_args = worker_args_from_train_args(train_args(run, open_params, open_dir, settings))
+                if args.dry_run:
+                    print("  worker open " + json.dumps({"args": open_args}, ensure_ascii=False), flush=True)
+                else:
+                    tuner.event(color, "[WORKER OPEN]", f"checkpoint={run.base_checkpoint or 'scratch'}", "yellow")
+                    worker = tuner.WorkerClient(
+                        run.exe,
+                        log_dir / "worker.stderr.log",
+                        stream=not args.no_stream_child_output,
+                        color=color,
+                    )
+                    worker.request("hello", prefix=tuner.paint(color, "[WORKER] ", "magenta"))
+                    payload = worker.request(
+                        "open",
+                        {"args": open_args},
+                        prefix=tuner.paint(color, "[WORKER OPEN] ", "magenta"),
+                    )
+                    tuner.event(
+                        color,
+                        "[WORKER READY]",
+                        (
+                            f"arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
+                            f"completed_steps={payload.get('completed_steps')}"
+                        ),
+                        "green",
+                    )
+
+            for trial in range(next_trial, settings.trials + 1):
+                params = sample_params(specs, rng, completed, settings)
+                out_dir = trials_root / f"trial{trial:04d}"
+                if out_dir.exists() and not args.dry_run:
+                    shutil.rmtree(out_dir)
+                log_path = log_dir / f"trial{trial:04d}.stdout.log"
+                tuner.event(
+                    color,
+                    f"[TRIAL {trial:04d} START]",
+                    " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
+                    "magenta",
+                )
+                cmd = train_args(run, params, out_dir, settings)
+                cache_key = f"trial{trial:04d}"
+                if args.dry_run:
+                    if settings.use_worker:
+                        print(
+                            "  worker trial "
+                            + json.dumps(
+                                {
+                                    "args": worker_args_from_train_args(cmd),
+                                    "keep": False,
+                                    "cache_key": cache_key,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        print("  " + subprocess.list2cmdline(cmd), flush=True)
+                    continue
+
+                if settings.use_worker:
+                    if worker is None:
+                        raise RuntimeError("worker client is not open")
+                    started = time.perf_counter()
+                    payload = worker.request(
+                        "trial",
+                        {
+                            "args": worker_args_from_train_args(cmd),
+                            "keep": False,
+                            "cache_key": cache_key,
+                        },
+                        prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
+                    )
+                    elapsed = time.perf_counter() - started
+                    metric = tuner.metric_from_worker_payload(payload)
+                    score = metric_score(metric, settings.metric)
+                    checkpoint = Path(f"worker-cache:{cache_key}")
+                else:
+                    code, elapsed = tuner.run_command(
+                        cmd,
+                        log_path,
+                        stream=not args.no_stream_child_output,
+                        stream_prefix=tuner.paint(color, f"[T{trial:04d}] ", "magenta"),
+                    )
+                    if code != 0:
+                        tuner.append_csv(
+                            summary_path,
+                            SUMMARY_FIELDS,
+                            {
+                                "trial": trial,
+                                "status": "failed",
+                                "score": "",
+                                "test_value_accuracy": "",
+                                "test_value_loss": "",
+                                "quantized_value_accuracy": "",
+                                "quantized_value_loss": "",
+                                "checkpoint": "",
+                                "output_dir": str(out_dir),
+                                "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
+                            },
+                        )
+                        raise RuntimeError(f"trial {trial} failed; see {log_path}")
+                    row = tuner.latest_summary_row(out_dir)
+                    metric = tuner.metric_from_summary_row(row)
+                    score = metric_score(metric, settings.metric)
+                    checkpoint = tuner.latest_checkpoint_dir(out_dir)
+
+                result = TrialResult(
+                    trial=trial,
+                    params=params,
+                    metric=metric,
+                    score=score,
+                    checkpoint=checkpoint,
+                    output_dir=out_dir,
+                )
+                completed.append(result)
+                is_best = best is None or ((score < best.score) if settings.lower_is_better else (score > best.score))
+                if settings.use_worker:
+                    if worker is None:
+                        raise RuntimeError("worker client is not open")
+                    if is_best:
+                        worker.request(
+                            "save-cached-trial",
+                            {
+                                "cache_key": cache_key,
+                                "dir": str(best_dir),
+                                "epoch": 1,
+                                "superbatch": settings.trial_sbs,
+                            },
+                            prefix=tuner.paint(color, f"[T{trial:04d} SAVE] ", "green"),
+                        )
+                        result.checkpoint = best_dir
+                        result.output_dir = best_dir
+                    else:
+                        worker.request(
+                            "drop-cached-trials",
+                            {"cache_keys": [cache_key]},
+                            prefix=tuner.paint(color, f"[T{trial:04d} DROP] ", "cyan"),
+                        )
+
                 tuner.append_csv(
                     summary_path,
                     SUMMARY_FIELDS,
                     {
                         "trial": trial,
-                        "status": "failed",
-                        "score": "",
-                        "test_value_accuracy": "",
-                        "test_value_loss": "",
-                        "quantized_value_accuracy": "",
-                        "quantized_value_loss": "",
-                        "checkpoint": "",
-                        "output_dir": str(out_dir),
+                        "status": "finished",
+                        "score": tuner.format_float(score),
+                        "test_value_accuracy": tuner.format_float(metric.test_acc),
+                        "test_value_loss": tuner.format_float(metric.test_loss),
+                        "quantized_value_accuracy": tuner.format_float(metric.qacc),
+                        "quantized_value_loss": tuner.format_float(metric.qloss),
+                        "checkpoint": str(best_dir if is_best else checkpoint),
+                        "output_dir": str(result.output_dir),
                         "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
                     },
                 )
-                raise RuntimeError(f"trial {trial} failed; see {log_path}")
-            row = tuner.latest_summary_row(out_dir)
-            metric = tuner.metric_from_summary_row(row)
-            score = metric_score(metric, settings.metric)
-            checkpoint = tuner.latest_checkpoint_dir(out_dir)
-            result = TrialResult(trial=trial, params=params, metric=metric, score=score, checkpoint=checkpoint, output_dir=out_dir)
-            completed.append(result)
-            is_best = best is None or ((score < best.score) if settings.lower_is_better else (score > best.score))
-            tuner.append_csv(
-                summary_path,
-                SUMMARY_FIELDS,
-                {
-                    "trial": trial,
-                    "status": "finished",
-                    "score": tuner.format_float(score),
-                    "test_value_accuracy": tuner.format_float(metric.test_acc),
-                    "test_value_loss": tuner.format_float(metric.test_loss),
-                    "quantized_value_accuracy": tuner.format_float(metric.qacc),
-                    "quantized_value_loss": tuner.format_float(metric.qloss),
-                    "checkpoint": str(best_dir if is_best else checkpoint),
-                    "output_dir": str(out_dir),
-                    "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
-                },
-            )
-            tuner.event(
-                color,
-                f"[TRIAL {trial:04d} END]",
-                f"score={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
-                "green" if is_best else "cyan",
-            )
-            if is_best:
-                old_best = best_dir.with_name("best-checkpoint.old")
-                if old_best.exists():
-                    shutil.rmtree(old_best)
-                if best_dir.exists():
-                    best_dir.rename(old_best)
-                shutil.move(str(out_dir), str(best_dir))
-                if old_best.exists():
-                    shutil.rmtree(old_best)
-                result.checkpoint = best_dir
-                result.output_dir = best_dir
-                best = result
-            elif not settings.keep_all_trials and not args.keep_temp:
-                tuner.remove_dir_quiet(out_dir)
-            state = {
-                "version": SETTINGS_VERSION,
-                "next_trial": trial + 1,
-                "best_trial": best.trial if best else None,
-                "best_score": best.score if best else None,
-                "best_checkpoint": str(best_dir) if best else None,
-                "recommended_parameters": str(recommendation_path),
-                "settings_file": str(args.settings_file.resolve()),
-            }
-            write_json(state_path, state)
-            rec = write_recommendation(recommendation_path, specs, completed, settings)
-            rec_params = rec["recommended"]["parameters"]
-            tuner.event(
-                color,
-                "[RECOMMEND]",
-                " ".join(f"{k}={v:.9g}" for k, v in sorted(rec_params.items())),
-                "green",
-            )
+                tuner.event(
+                    color,
+                    f"[TRIAL {trial:04d} END]",
+                    f"score={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
+                    "green" if is_best else "cyan",
+                )
+                if is_best:
+                    if not settings.use_worker:
+                        old_best = best_dir.with_name("best-checkpoint.old")
+                        if old_best.exists():
+                            shutil.rmtree(old_best)
+                        if best_dir.exists():
+                            best_dir.rename(old_best)
+                        shutil.move(str(out_dir), str(best_dir))
+                        if old_best.exists():
+                            shutil.rmtree(old_best)
+                        result.checkpoint = best_dir
+                        result.output_dir = best_dir
+                    best = result
+                elif not settings.use_worker and not settings.keep_all_trials and not args.keep_temp:
+                    tuner.remove_dir_quiet(out_dir)
+                state = {
+                    "version": SETTINGS_VERSION,
+                    "next_trial": trial + 1,
+                    "best_trial": best.trial if best else None,
+                    "best_score": best.score if best else None,
+                    "best_checkpoint": str(best_dir) if best else None,
+                    "recommended_parameters": str(recommendation_path),
+                    "settings_file": str(args.settings_file.resolve()),
+                }
+                write_json(state_path, state)
+                rec = write_recommendation(recommendation_path, specs, completed, settings)
+                rec_params = rec["recommended"]["parameters"]
+                tuner.event(
+                    color,
+                    "[RECOMMEND]",
+                    " ".join(f"{k}={v:.9g}" for k, v in sorted(rec_params.items())),
+                    "green",
+                )
+        finally:
+            if worker is not None:
+                worker.close()
         return 0
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)

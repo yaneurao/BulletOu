@@ -114,7 +114,8 @@ Notes:
 - The cache lives only inside the worker process. It disappears when the worker exits.
 - It currently supports only `.psv` / `.bin` teachers.
 - If a trial runs for 4sb, set `teacher_memory_cache_sbs` to at least 4. Smaller values fail with an error.
-- If the runner starts a fresh `bulletou.exe` process for every trial, the process exits after each trial and the RAM cache cannot persist.
+- `tuning_parameters.py` uses worker mode by default. If you set `tuning.use_worker: false`, it starts a fresh `bulletou.exe` process for every trial, so this cache cannot help.
+- When the cache is enabled, startup prints `[CACHE] teacher_memory_cache_sbs=...`, and the worker log prints `worker teacher memory cache = loading/ready`.
 
 ## Run
 

@@ -114,7 +114,8 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 - このcacheは worker process のメモリ上だけにあります。workerを終了すると消えます。
 - `.psv` / `.bin` 専用です。`.hcpe3` や `.pack` には使えません。
 - trial が4sbなら `teacher_memory_cache_sbs` は4以上にしてください。足りない場合はエラーになります。
-- workerを使わず、trialごとに `bulletou.exe` を起動する方式では、プロセス終了時にcacheも消えるため効果がありません。
+- `tuning_parameters.py` は標準で worker を使います。`tuning.use_worker: false` にした場合は、trialごとに `bulletou.exe` を起動するため、このcacheは効きません。
+- cache が有効な場合、起動時に `[CACHE] teacher_memory_cache_sbs=...` が表示され、worker側のログに `worker teacher memory cache = loading/ready` が出ます。
 
 ## 実行
 
