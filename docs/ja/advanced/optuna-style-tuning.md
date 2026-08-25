@@ -19,6 +19,8 @@ Optuna風 runner は、各 trial を scratch または同じ base checkpoint か
 
 ## 設定例
 
+ES settings と合わせるため、探索範囲は `min` / `max` で指定します。
+
 ```json
 {
   "version": 1,
@@ -44,8 +46,8 @@ Optuna風 runner は、各 trial を scratch または同じ base checkpoint か
     "tag_prefix": "optuna-scratch-16sb"
   },
   "parameters": {
-    "lr": { "tune": true, "low": 0.00003, "high": 0.001, "log": true },
-    "lr_min_ratio": { "tune": true, "low": 0.03, "high": 1.0, "log": true },
+    "lr": { "tune": true, "min": 0.00003, "max": 0.001, "log": true },
+    "lr_min_ratio": { "tune": true, "min": 0.03, "max": 1.0, "log": true },
 
     "shared": 1.0,
     "king_axis": 1.0,
@@ -55,13 +57,13 @@ Optuna風 runner は、各 trial を scratch または同じ base checkpoint か
     "king_progress_pair": 1.0,
     "hand_progress_pair": 1.0,
 
-    "residual_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "king_axis_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "hand_axis_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "progress_axis_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "king_hand_pair_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "king_progress_pair_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true },
-    "hand_progress_pair_count": { "tune": true, "low": 0.3, "high": 3.0, "log": true }
+    "residual_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "king_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "hand_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "progress_axis_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "king_hand_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "king_progress_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true },
+    "hand_progress_pair_count": { "tune": true, "min": 0.3, "max": 3.0, "log": true }
   }
 }
 ```

@@ -54,20 +54,20 @@ class SearchParameter:
     name: str
     tune: bool
     current: float | None
-    low: float | None
-    high: float | None
+    minimum: float | None
+    maximum: float | None
     log: bool
 
     def validate(self) -> None:
         if self.tune:
-            if self.low is None or self.high is None:
-                raise ValueError(f"parameters.{self.name}: tune=true requires low/high")
-            if not math.isfinite(self.low) or not math.isfinite(self.high):
-                raise ValueError(f"parameters.{self.name}: low/high must be finite")
-            if self.low > self.high:
-                raise ValueError(f"parameters.{self.name}: low must be <= high")
-            if self.log and self.low <= 0.0:
-                raise ValueError(f"parameters.{self.name}: log sampling requires low > 0")
+            if self.minimum is None or self.maximum is None:
+                raise ValueError(f"parameters.{self.name}: tune=true requires min/max")
+            if not math.isfinite(self.minimum) or not math.isfinite(self.maximum):
+                raise ValueError(f"parameters.{self.name}: min/max must be finite")
+            if self.minimum > self.maximum:
+                raise ValueError(f"parameters.{self.name}: min must be <= max")
+            if self.log and self.minimum <= 0.0:
+                raise ValueError(f"parameters.{self.name}: log sampling requires min > 0")
         else:
             if self.current is None:
                 raise ValueError(f"parameters.{self.name}: tune=false requires current")
@@ -75,21 +75,21 @@ class SearchParameter:
                 raise ValueError(f"parameters.{self.name}: current must be finite")
 
     def sample_random(self, rng: random.Random) -> float:
-        assert self.low is not None and self.high is not None
+        assert self.minimum is not None and self.maximum is not None
         if self.log:
-            return math.exp(rng.uniform(math.log(self.low), math.log(self.high)))
-        return rng.uniform(self.low, self.high)
+            return math.exp(rng.uniform(math.log(self.minimum), math.log(self.maximum)))
+        return rng.uniform(self.minimum, self.maximum)
 
     def sample_near(self, rng: random.Random, center: float, sigma_ratio: float) -> float:
-        assert self.low is not None and self.high is not None
+        assert self.minimum is not None and self.maximum is not None
         if self.log:
-            lo = math.log(self.low)
-            hi = math.log(self.high)
-            c = math.log(max(center, self.low))
+            lo = math.log(self.minimum)
+            hi = math.log(self.maximum)
+            c = math.log(max(center, self.minimum))
             x = rng.gauss(c, max(1e-12, (hi - lo) * sigma_ratio))
             return math.exp(min(max(x, lo), hi))
-        x = rng.gauss(center, max(1e-12, (self.high - self.low) * sigma_ratio))
-        return min(max(x, self.low), self.high)
+        x = rng.gauss(center, max(1e-12, (self.maximum - self.minimum) * sigma_ratio))
+        return min(max(x, self.minimum), self.maximum)
 
 
 @dataclass
@@ -249,14 +249,24 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     params: dict[str, SearchParameter] = {}
     for name, raw in params_obj.items():
         if isinstance(raw, (int, float)):
-            spec = SearchParameter(name=name, tune=False, current=float(raw), low=None, high=None, log=False)
+            spec = SearchParameter(name=name, tune=False, current=float(raw), minimum=None, maximum=None, log=False)
         elif isinstance(raw, dict):
-            tune = bool(raw.get("tune", "low" in raw or "high" in raw))
+            unknown_fields = sorted(set(raw) - {"tune", "current", "min", "max", "log"})
+            if unknown_fields:
+                raise ValueError(f"parameters.{name}: unknown field(s): {', '.join(unknown_fields)}")
+            tune = bool(raw.get("tune", "min" in raw or "max" in raw))
             current = float(raw["current"]) if "current" in raw else None
-            low = float(raw["low"]) if "low" in raw else None
-            high = float(raw["high"]) if "high" in raw else None
+            minimum = float(raw["min"]) if "min" in raw else None
+            maximum = float(raw["max"]) if "max" in raw else None
             log = bool(raw.get("log", name in SPECIAL_TRAIN_PARAMETERS or name in es.KNOWN_PARAMETERS))
-            spec = SearchParameter(name=name, tune=tune, current=current, low=low, high=high, log=log)
+            spec = SearchParameter(
+                name=name,
+                tune=tune,
+                current=current,
+                minimum=minimum,
+                maximum=maximum,
+                log=log,
+            )
         else:
             raise ValueError(f"parameters.{name} must be a number or object")
         spec.validate()
@@ -265,10 +275,16 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     if "lr_min" in params and "lr" in params:
         lr = params["lr"]
         lr_min = params["lr_min"]
-        if lr.tune and lr_min.tune and lr.high is not None and lr_min.high is not None and lr.low is not None:
-            if lr_min.high > lr.low:
+        if (
+            lr.tune
+            and lr_min.tune
+            and lr.maximum is not None
+            and lr_min.maximum is not None
+            and lr.minimum is not None
+        ):
+            if lr_min.maximum > lr.minimum:
                 raise ValueError(
-                    "parameters.lr_min high can exceed parameters.lr low; use lr_min_ratio for unconstrained sampling"
+                    "parameters.lr_min max can exceed parameters.lr min; use lr_min_ratio for unconstrained sampling"
                 )
     return root, settings, run, params
 
