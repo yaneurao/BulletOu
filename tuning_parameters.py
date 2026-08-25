@@ -1027,6 +1027,11 @@ def main() -> int:
                             prefix=tuner.paint(color, f"{display_prefix}[DROP] ", "cyan"),
                         )
 
+                keep_non_best_checkpoint = (
+                    (not settings.use_worker) and (settings.keep_all_trials or args.keep_temp)
+                )
+                summary_checkpoint = str(best_dir) if is_best else (str(result.checkpoint) if keep_non_best_checkpoint else "")
+                summary_output_dir = str(result.output_dir) if (is_best or keep_non_best_checkpoint) else ""
                 tuner.append_csv(
                     summary_path,
                     SUMMARY_FIELDS,
@@ -1038,8 +1043,8 @@ def main() -> int:
                         "test_value_loss": tuner.format_float(metric.test_loss),
                         "quantized_value_accuracy": tuner.format_float(metric.qacc),
                         "quantized_value_loss": tuner.format_float(metric.qloss),
-                        "checkpoint": str(best_dir if is_best else checkpoint),
-                        "output_dir": str(result.output_dir),
+                        "checkpoint": summary_checkpoint,
+                        "output_dir": summary_output_dir,
                         "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
                     },
                 )
