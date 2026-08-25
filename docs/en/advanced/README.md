@@ -9,8 +9,8 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | Page | Topic |
 | --- | --- |
 | [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, and loss |
-| [Automatic population search tuning](auto-tuning.md) | Automatic factorizer / count-confidence tuning with `tuning-settings.json` and `bulletou-settings.json` |
-| [Optuna-style fixed trial search](optuna-style-tuning.md) | Short fixed-parameter trials for `lr`, `lr_min`, factorizer, and count confidence |
+| [Fixed-length trial parameter tuning](parameter-tuning.md) | Short fixed-parameter trials for `lr`, `lr_min`, factorizer, and count confidence |
+| [Automatic population search tuning](auto-tuning.md) | Tuning that continues from accepted checkpoints |
 | [Loss scale and `FV_SCALE`](scale-and-fv-scale.md) | WRM loss, plain sigmoid loss, and quantized output scale |
 | [Continued training](additional-training.md) | Add epochs after a finished run, or continue with a new teacher or LR |
 | [LayerStack](layerstack.md) | SFNN hand / king / progress buckets |

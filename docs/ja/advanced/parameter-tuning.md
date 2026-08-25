@@ -1,8 +1,8 @@
-# Optuna風の固定長 trial 探索
+# 固定長 trial によるパラメーター調整
 
-`optuna_style_runner.py` は、同じ開始地点から短い学習 trial を多数走らせ、`lr` / `lr_min` / factorizer / count confidence のよさそうな値を探すための runner です。
+`tuning_parameters.py` は、同じ開始地点から短い学習 trial を多数走らせ、`lr` / `lr_min` / factorizer / count confidence のよさそうな値を探すための runner です。
 
-外部の Optuna package は使っていません。BulletOu 用の軽量な sampler です。最初はランダムに試し、その後は良かった trial の近くを重点的に試します。
+外部 package は使っていません。BulletOu 用の軽量な sampler です。最初はランダムに試し、その後は良かった trial の近くを重点的に試します。
 
 ## 何をする runner か
 
@@ -97,14 +97,14 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 ## 実行
 
 ```powershell
-python .\optuna_style_runner.py `
+python .\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 中断後に再開する場合:
 
 ```powershell
-python .\optuna_style_runner.py `
+python .\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```

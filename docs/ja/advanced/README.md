@@ -9,7 +9,8 @@
 | ページ | 内容 |
 | --- | --- |
 | [学習設定を調整する](tuning.md) | learning rate、保存頻度、検証頻度、loss |
-| [population search による自動調整](auto-tuning.md) | `tuning-settings.json` と `bulletou-settings.json` を使った factorizer / count confidence の自動調整 |
+| [固定長 trial によるパラメーター調整](parameter-tuning.md) | `tuning-settings.json` と `bulletou-settings.json` を使った `lr` / factorizer / count confidence の探索 |
+| [population search による自動調整](auto-tuning.md) | 採用したcheckpointから次の候補へ進む方式の自動調整 |
 | [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、sigmoid loss、量子化後の出力 scale |
 | [追加学習](additional-training.md) | 完了済み checkpoint からさらに学習する方法 |
 | [LayerStack](layerstack.md) | SFNN の hand / king / progress bucket |

@@ -1,8 +1,8 @@
-# Optuna-style fixed-length trial search
+# Fixed-length trial parameter tuning
 
-`optuna_style_runner.py` runs many short fixed-parameter BulletOu trials to search over `lr`, `lr_min`, factorizer, and count-confidence settings.
+`tuning_parameters.py` runs many short fixed-parameter BulletOu trials to search over `lr`, `lr_min`, factorizer, and count-confidence settings.
 
-It does not depend on the Optuna Python package. It is a small BulletOu-specific sampler: random trials first, then samples near the best completed trials.
+It does not depend on external Python packages. It is a small BulletOu-specific sampler: random trials first, then samples near the best completed trials.
 
 ## What this runner does
 
@@ -97,14 +97,14 @@ When both `lr` and `lr_min` are tuned, the runner samples `lr_min` with the samp
 ## Run
 
 ```powershell
-python .\optuna_style_runner.py `
+python .\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 Resume:
 
 ```powershell
-python .\optuna_style_runner.py `
+python .\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```

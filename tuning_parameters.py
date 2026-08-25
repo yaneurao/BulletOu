@@ -1,8 +1,7 @@
 ﻿#!/usr/bin/env python3
-"""Dependency-free Optuna-style local tuner for BulletOu.
+"""Dependency-free fixed-trial parameter tuner for BulletOu.
 
-This is intentionally not the Optuna package.  It is a small local sampler for
-expensive BulletOu trials:
+This is a small local sampler for expensive BulletOu trials:
 
 * each trial starts from scratch or a fixed checkpoint,
 * each trial runs for a fixed number of superbatches,
@@ -128,7 +127,7 @@ class TrialResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run fixed-length Optuna-style BulletOu tuning trials.")
+    parser = argparse.ArgumentParser(description="Run fixed-length BulletOu parameter tuning trials.")
     parser.add_argument("--settings-file", type=Path, default=Path("tuning-settings.json"))
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
