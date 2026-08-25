@@ -3,10 +3,12 @@
 
 This is a small local sampler for expensive BulletOu trials:
 
-* each trial starts from scratch or a fixed checkpoint,
+* each generation starts from scratch or the current checkpoint,
+* each trial in a generation starts from that generation's checkpoint,
 * each trial runs for a fixed number of superbatches,
 * lr / lr-min and factorizer/count parameters can be sampled together,
-* only the current best checkpoint is kept by default.
+* one generation-end commit run creates the next generation's checkpoint,
+* only the current checkpoint and the observed best checkpoint are kept by default.
 
 The sampler starts with uniform random trials, then uses a small TPE-style
 sampler over completed generations.
@@ -18,6 +20,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
 import shutil
 import subprocess
@@ -109,6 +112,7 @@ class StudySettings:
     quantized_validation_rate: int
     keep_all_trials: bool
     use_worker: bool
+    commit_source: str
 
     def population_for_generation(self, generation: int) -> int:
         return self.population_schedule[min(generation - 1, len(self.population_schedule) - 1)]
@@ -250,6 +254,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "quantized_validation_rate",
         "keep_all_trials",
         "use_worker",
+        "commit_source",
     }
     unknown_tuning_keys = sorted(set(tuning_obj) - allowed_tuning_keys)
     if unknown_tuning_keys:
@@ -266,6 +271,9 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
     sampler = str(tuning_obj.get("sampler", "tpe"))
     if sampler not in {"tpe", "random"}:
         raise ValueError(f"{path}: unsupported tuning.sampler {sampler!r}; expected 'tpe' or 'random'")
+    commit_source = str(tuning_obj.get("commit_source", "best"))
+    if commit_source not in {"best", "recommended"}:
+        raise ValueError(f"{path}: unsupported tuning.commit_source {commit_source!r}; expected 'best' or 'recommended'")
     population_schedule = parse_positive_int_schedule(tuning_obj.get("population"), "tuning.population", 1)
     trial_sbs_schedule = parse_positive_int_schedule(tuning_obj.get("trial_sbs"), "tuning.trial_sbs", 16)
     default_generations = max(len(population_schedule), len(trial_sbs_schedule), 1)
@@ -287,6 +295,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
         use_worker=bool(tuning_obj.get("use_worker", True)),
+        commit_source=commit_source,
     )
     if settings.tpe_startup_trials < 0:
         raise ValueError("tuning.tpe_startup_trials must be >= 0")
@@ -593,9 +602,13 @@ def sample_params(
 def train_args(
     run: RunSettings,
     params: dict[str, float],
+    base_checkpoint: Path | None,
     output_dir: Path,
     settings: StudySettings,
     trial_sbs: int,
+    *,
+    include_initial_state: bool = True,
+    save_checkpoint: bool = True,
 ) -> list[str]:
     validation_rate = (
         -1
@@ -622,19 +635,21 @@ def train_args(
         "--max-epochs",
         "1",
         "--save-rate",
-        str(trial_sbs),
+        str(trial_sbs if save_checkpoint else 999999999),
         "--validation-rate",
         str(validation_rate),
         "--quantized-validation-rate",
         str(quantized_validation_rate),
     ]
-    if run.base_checkpoint is not None:
+    if not save_checkpoint:
+        cmd.append("--no-save-epoch-end")
+    if include_initial_state and base_checkpoint is not None:
         cmd.extend(
             [
                 "--initial-state",
-                str(run.base_checkpoint / "state.bin"),
+                str(base_checkpoint / "state.bin"),
                 "--initial-dataloader-pos",
-                str(run.base_checkpoint / "dataloader_pos.txt"),
+                str(base_checkpoint / "dataloader_pos.txt"),
             ]
         )
     alpha_values = {k: v for k, v in params.items() if k in tuner.ALPHA_PARAMETERS}
@@ -658,6 +673,57 @@ def worker_args_from_train_args(cmd: list[str]) -> list[str]:
 
 def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
+
+
+def move_dir_replace(src: Path, dst: Path) -> None:
+    if not src.exists():
+        raise RuntimeError(f"source directory does not exist: {src}")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    old = dst.with_name(dst.name + ".old")
+    if old.exists():
+        shutil.rmtree(old)
+    if dst.exists():
+        os.replace(dst, old)
+    try:
+        try:
+            os.replace(src, dst)
+        except OSError:
+            # os.replace cannot move directories across drives.  This is mainly
+            # for non-worker mode when temp_folder and output_folder live on
+            # different volumes.
+            shutil.move(str(src), str(dst))
+    except Exception:
+        if old.exists() and not dst.exists():
+            os.replace(old, dst)
+        raise
+    if old.exists():
+        shutil.rmtree(old)
+
+
+def is_better_score(score: float, best_score: float | None, lower_is_better: bool) -> bool:
+    if best_score is None:
+        return True
+    return score < best_score if lower_is_better else score > best_score
+
+
+def result_generation(settings: StudySettings, result: TrialResult) -> int:
+    return generation_for_trial(settings, result.trial)[0]
+
+
+def generation_results(settings: StudySettings, completed: list[TrialResult], generation: int) -> list[TrialResult]:
+    return [result for result in completed if result_generation(settings, result) == generation]
+
+
+def latest_generation_with_results(settings: StudySettings, completed: list[TrialResult]) -> int | None:
+    if not completed:
+        return None
+    return max(result_generation(settings, result) for result in completed)
+
+
+def best_result(results: list[TrialResult], settings: StudySettings) -> TrialResult | None:
+    if not results:
+        return None
+    return sorted(results, key=lambda r: r.score, reverse=not settings.lower_is_better)[0]
 
 
 def upgrade_summary_csv(path: Path) -> None:
@@ -733,6 +799,39 @@ def configured_teacher_memory_cache_sbs(path: Path) -> int:
         return 0
 
 
+def open_worker_session(
+    *,
+    worker: tuner.WorkerClient,
+    run: RunSettings,
+    specs: dict[str, SearchParameter],
+    current_checkpoint: Path | None,
+    runner_root: Path,
+    settings: StudySettings,
+    trial_sbs: int,
+    color: bool,
+) -> None:
+    open_dir = runner_root / "worker-session"
+    open_params = current_fixed_values(specs)
+    open_args = worker_args_from_train_args(
+        train_args(run, open_params, current_checkpoint, open_dir, settings, trial_sbs)
+    )
+    tuner.event(color, "[WORKER OPEN]", f"checkpoint={current_checkpoint or 'scratch'}", "yellow")
+    payload = worker.request(
+        "open",
+        {"args": open_args},
+        prefix=tuner.paint(color, "[WORKER OPEN] ", "magenta"),
+    )
+    tuner.event(
+        color,
+        "[WORKER READY]",
+        (
+            f"arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
+            f"completed_steps={payload.get('completed_steps')}"
+        ),
+        "green",
+    )
+
+
 def recommended_params(
     specs: dict[str, SearchParameter], completed: list[TrialResult], settings: StudySettings
 ) -> dict[str, float]:
@@ -786,30 +885,42 @@ def write_recommendation(
     completed: list[TrialResult],
     settings: StudySettings,
 ) -> dict[str, Any]:
+    latest_generation = latest_generation_with_results(settings, completed)
+    recommendation_trials = (
+        generation_results(settings, completed, latest_generation) if latest_generation is not None else []
+    )
     if not completed:
         obj = {
             "trial_count": 0,
             "metric": settings.metric,
             "lower_is_better": settings.lower_is_better,
             "best_observed": None,
+            "recommendation_scope": "none",
             "recommended": {"parameters": current_fixed_values(specs), "bulletou_overrides": {}},
         }
         write_json(path, obj)
         return obj
     ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
     best = ordered[0]
-    params = recommended_params(specs, completed, settings)
+    params = recommended_params(specs, recommendation_trials, settings)
     obj = {
         "trial_count": len(completed),
+        "recommended_trial_count": len(recommendation_trials),
         "metric": settings.metric,
         "lower_is_better": settings.lower_is_better,
         "recommendation_method": (
-            "rank-weighted TPE-good mean; log-scale parameters use weighted geometric mean"
+            "latest-generation rank-weighted TPE-good mean; log-scale parameters use weighted geometric mean"
+        ),
+        "recommendation_scope": (
+            f"generation {latest_generation}" if latest_generation is not None else "none"
         ),
         "tpe_good_fraction": settings.tpe_good_fraction,
-        "tpe_good_count": max(1, math.ceil(len(completed) * settings.tpe_good_fraction)),
+        "tpe_good_count": max(1, math.ceil(len(recommendation_trials) * settings.tpe_good_fraction))
+        if recommendation_trials
+        else 0,
         "best_observed": {
             "trial": best.trial,
+            "generation": result_generation(settings, best),
             "selection_metric": best.score,
             "checkpoint": str(best.checkpoint),
             "parameters": best.params,
@@ -840,6 +951,8 @@ def main() -> int:
         summary_path = runner_root / "summary-learn.log"
         state_path = runner_root / "runner-state.json"
         recommendation_path = runner_root / "recommended-parameters.json"
+        current_dir = runner_root / "current-checkpoint"
+        pending_commit_dir = runner_root / "pending-commit-checkpoint"
         best_dir = runner_root / "best-checkpoint"
 
         if runner_root.exists() and not args.resume and not args.dry_run:
@@ -854,11 +967,52 @@ def main() -> int:
             shutil.copy2(run.bulletou_settings_file, runner_root / run.bulletou_settings_file.name)
 
         completed = load_completed(summary_path) if args.resume else []
-        next_trial = 1 + max((r.trial for r in completed), default=0)
+        state: dict[str, Any] = {}
+        if args.resume and state_path.exists():
+            state = tuner.load_json_object(state_path)
+            current_checkpoint_raw = state.get("current_checkpoint")
+            current_checkpoint = Path(current_checkpoint_raw) if current_checkpoint_raw else (
+                current_dir if current_dir.exists() else run.base_checkpoint
+            )
+            next_trial = int(state.get("next_trial", 1 + max((r.trial for r in completed), default=0)))
+            if next_trial < 1:
+                next_trial = 1
+            completed = [result for result in completed if result.trial < next_trial]
+        elif args.resume:
+            current_checkpoint = current_dir if current_dir.exists() else (best_dir if best_dir.exists() else run.base_checkpoint)
+            next_trial = 1 + max((r.trial for r in completed), default=0)
+        else:
+            current_checkpoint = run.base_checkpoint
+            next_trial = 1
+            state = {
+                "version": SETTINGS_VERSION,
+                "next_trial": next_trial,
+                "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                "best_trial": None,
+                "best_selection_metric": None,
+                "best_checkpoint": None,
+                "best_commit_generation": None,
+                "best_commit_selection_metric": None,
+                "pending_commit_generation": None,
+                "pending_commit_source": None,
+                "pending_commit_params": None,
+                "recommended_parameters": str(recommendation_path),
+                "settings_file": str(args.settings_file.resolve()),
+            }
+            if not args.dry_run:
+                write_json(state_path, state)
+        if current_checkpoint is not None:
+            tuner.validate_checkpoint_dir(current_checkpoint)
         rng = random.Random(settings.seed + next_trial * 1_000_003)
         best = None
         if completed:
             best = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)[0]
+        best_commit_score = None
+        if state.get("best_commit_selection_metric") is not None:
+            best_commit_score = float(state["best_commit_selection_metric"])
+        elif state.get("best_selection_metric") is not None and best_dir.exists():
+            # Older state files used best_selection_metric for the saved best checkpoint.
+            best_commit_score = float(state["best_selection_metric"])
         tuner.event(
             color,
             "[CONFIG]",
@@ -867,6 +1021,7 @@ def main() -> int:
                 f"population={settings.population_schedule} trial_sbs={settings.trial_sbs_schedule} "
                 f"sampler={settings.sampler} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
+                f"commit_source={settings.commit_source} "
                 f"tpe_startup_trials={settings.tpe_startup_trials} "
                 f"tpe_good_fraction={settings.tpe_good_fraction:g} "
                 f"tpe_bandwidth={settings.tpe_bandwidth:g} worker={'on' if settings.use_worker else 'off'}"
@@ -893,7 +1048,12 @@ def main() -> int:
                 "yellow",
             )
         if completed:
-            tuner.event(color, "[RESUME]", f"completed={len(completed)} next_trial={next_trial}", "yellow")
+            tuner.event(
+                color,
+                "[RESUME]",
+                f"completed={len(completed)} next_trial={next_trial} current_checkpoint={current_checkpoint or 'scratch'}",
+                "yellow",
+            )
         if best:
             tuner.event(
                 color,
@@ -909,14 +1069,15 @@ def main() -> int:
         worker: tuner.WorkerClient | None = None
         try:
             if settings.use_worker:
-                open_dir = runner_root / "worker-session"
-                open_params = current_fixed_values(specs)
                 open_trial_sbs = settings.trial_sbs_for_generation(generation_for_trial(settings, next_trial)[0])
-                open_args = worker_args_from_train_args(train_args(run, open_params, open_dir, settings, open_trial_sbs))
                 if args.dry_run:
+                    open_dir = runner_root / "worker-session"
+                    open_params = current_fixed_values(specs)
+                    open_args = worker_args_from_train_args(
+                        train_args(run, open_params, current_checkpoint, open_dir, settings, open_trial_sbs)
+                    )
                     print("  worker open " + json.dumps({"args": open_args}, ensure_ascii=False), flush=True)
                 else:
-                    tuner.event(color, "[WORKER OPEN]", f"checkpoint={run.base_checkpoint or 'scratch'}", "yellow")
                     worker = tuner.WorkerClient(
                         run.exe,
                         log_dir / "worker.stderr.log",
@@ -924,183 +1085,429 @@ def main() -> int:
                         color=color,
                     )
                     worker.request("hello", prefix=tuner.paint(color, "[WORKER] ", "magenta"))
-                    payload = worker.request(
-                        "open",
-                        {"args": open_args},
-                        prefix=tuner.paint(color, "[WORKER OPEN] ", "magenta"),
+                    open_worker_session(
+                        worker=worker,
+                        run=run,
+                        specs=specs,
+                        current_checkpoint=current_checkpoint,
+                        runner_root=runner_root,
+                        settings=settings,
+                        trial_sbs=open_trial_sbs,
+                        color=color,
+                    )
+
+            pending_commit_generation = state.get("pending_commit_generation")
+            if pending_commit_generation is not None:
+                start_generation = int(pending_commit_generation)
+            else:
+                start_generation = (
+                    generation_for_trial(settings, next_trial)[0]
+                    if next_trial <= settings.trials
+                    else settings.generations + 1
+                )
+            for generation in range(start_generation, settings.generations + 1):
+                generation_first_trial = first_trial_of_generation(settings, generation)
+                population = settings.population_for_generation(generation)
+                generation_last_trial = generation_first_trial + population - 1
+                trial_sbs = settings.trial_sbs_for_generation(generation)
+                previous_generation_trials = (
+                    generation_results(settings, completed, generation - 1) if generation > 1 else []
+                )
+                rng = random.Random(settings.seed + generation * 1_000_003)
+                tuner.event(
+                    color,
+                    f"[GEN {generation} START]",
+                    (
+                        f"population={population} trial_sbs={trial_sbs} "
+                        f"base={current_checkpoint or 'scratch'} "
+                        f"sampler_trials={len(previous_generation_trials)}"
+                    ),
+                    "magenta",
+                )
+
+                generation_best = best_result(generation_results(settings, completed, generation), settings)
+                if generation_best is not None:
+                    tuner.event(
+                        color,
+                        f"[GEN {generation} RESUME]",
+                        (
+                            f"completed_trials={len(generation_results(settings, completed, generation))} "
+                            f"best_trial={generation_best.trial} "
+                            f"best_selection_metric={generation_best.score:.9g}"
+                        ),
+                        "yellow",
+                    )
+                trial_start = max(next_trial, generation_first_trial)
+                for _ in range(generation_first_trial, trial_start):
+                    sample_params(specs, rng, previous_generation_trials, settings)
+                for trial in range(trial_start, generation_last_trial + 1):
+                    generation_trial = trial - generation_first_trial + 1
+                    params = sample_params(specs, rng, previous_generation_trials, settings)
+                    out_dir = trials_root / f"trial{trial:04d}"
+                    if out_dir.exists() and not args.dry_run:
+                        shutil.rmtree(out_dir)
+                    log_path = log_dir / f"trial{trial:04d}.stdout.log"
+                    display_prefix = f"[GEN {generation}][TRIAL {generation_trial}]"
+                    tuner.event(
+                        color,
+                        f"{display_prefix} START",
+                        " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
+                        "magenta",
+                    )
+                    cmd = train_args(
+                        run,
+                        params,
+                        current_checkpoint,
+                        out_dir,
+                        settings,
+                        trial_sbs,
+                        include_initial_state=not settings.use_worker,
+                        save_checkpoint=(not settings.use_worker) and (settings.keep_all_trials or args.keep_temp),
+                    )
+                    if args.dry_run:
+                        if settings.use_worker:
+                            print(
+                                "  worker trial "
+                                + json.dumps(
+                                    {
+                                        "args": worker_args_from_train_args(cmd),
+                                        "keep": False,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                                flush=True,
+                            )
+                        else:
+                            print("  " + subprocess.list2cmdline(cmd), flush=True)
+                        continue
+
+                    if settings.use_worker:
+                        if worker is None:
+                            raise RuntimeError("worker client is not open")
+                        started = time.perf_counter()
+                        payload = worker.request(
+                            "trial",
+                            {
+                                "args": worker_args_from_train_args(cmd),
+                                "keep": False,
+                            },
+                            prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
+                        )
+                        elapsed = time.perf_counter() - started
+                        metric = tuner.metric_from_worker_payload(payload)
+                        score = metric_score(metric, settings.metric)
+                        checkpoint = Path("")
+                    else:
+                        code, elapsed = tuner.run_command(
+                            cmd,
+                            log_path,
+                            stream=not args.no_stream_child_output,
+                            stream_prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
+                        )
+                        if code != 0:
+                            tuner.append_csv(
+                                summary_path,
+                                SUMMARY_FIELDS,
+                                {
+                                    "trial": trial,
+                                    "status": "failed",
+                                    "test_value_accuracy": "",
+                                    "test_value_loss": "",
+                                    "quantized_value_accuracy": "",
+                                    "quantized_value_loss": "",
+                                    "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
+                                    "selection_metric": "",
+                                    "checkpoint": "",
+                                },
+                            )
+                            raise RuntimeError(f"trial {trial} failed; see {log_path}")
+                        row = tuner.latest_summary_row(out_dir)
+                        metric = tuner.metric_from_summary_row(row)
+                        score = metric_score(metric, settings.metric)
+                        checkpoint = (
+                            tuner.latest_checkpoint_dir(out_dir)
+                            if settings.keep_all_trials or args.keep_temp
+                            else Path("")
+                        )
+
+                    result = TrialResult(
+                        trial=trial,
+                        params=params,
+                        metric=metric,
+                        score=score,
+                        checkpoint=checkpoint,
+                        output_dir=out_dir,
+                    )
+                    completed.append(result)
+
+                    is_generation_best = is_better_score(
+                        score,
+                        generation_best.score if generation_best is not None else None,
+                        settings.lower_is_better,
+                    )
+                    if is_generation_best:
+                        generation_best = result
+                    if (
+                        not settings.use_worker
+                        and not settings.keep_all_trials
+                        and not args.keep_temp
+                        and out_dir.exists()
+                    ):
+                        tuner.remove_dir_quiet(out_dir)
+                    if is_better_score(score, best.score if best is not None else None, settings.lower_is_better):
+                        best = result
+
+                    keep_non_best_checkpoint = (
+                        (not settings.use_worker) and (settings.keep_all_trials or args.keep_temp)
+                    )
+                    summary_checkpoint = str(result.checkpoint) if keep_non_best_checkpoint else ""
+                    tuner.append_csv(
+                        summary_path,
+                        SUMMARY_FIELDS,
+                        {
+                            "trial": trial,
+                            "status": "finished",
+                            "test_value_accuracy": tuner.format_float(metric.test_acc),
+                            "test_value_loss": tuner.format_float(metric.test_loss),
+                            "quantized_value_accuracy": tuner.format_float(metric.qacc),
+                            "quantized_value_loss": tuner.format_float(metric.qloss),
+                            "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
+                            "selection_metric": tuner.format_float(score),
+                            "checkpoint": summary_checkpoint,
+                        },
                     )
                     tuner.event(
                         color,
-                        "[WORKER READY]",
+                        f"{display_prefix} END",
                         (
-                            f"arch={payload.get('arch')} batch_size={payload.get('batch_size')} "
-                            f"completed_steps={payload.get('completed_steps')}"
+                            f"selection_metric={score:.9g} {tuner.metric_status_text(metric)} "
+                            f"elapsed={elapsed:.1f}s generation_best={'yes' if is_generation_best else 'no'}"
+                        ),
+                        "green" if is_generation_best else "cyan",
+                    )
+                    state = {
+                        "version": SETTINGS_VERSION,
+                        "next_trial": trial + 1,
+                        "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                        "generation_best_trial": generation_best.trial if generation_best else None,
+                        "generation_best_selection_metric": generation_best.score if generation_best else None,
+                        "pending_commit_generation": generation if trial == generation_last_trial else None,
+                        "pending_commit_source": settings.commit_source if trial == generation_last_trial else None,
+                        "pending_commit_params": None,
+                        "best_trial": best.trial if best else None,
+                        "best_selection_metric": best.score if best else None,
+                        "best_commit_selection_metric": best_commit_score,
+                        "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
+                        "recommended_parameters": str(recommendation_path),
+                        "settings_file": str(args.settings_file.resolve()),
+                    }
+                    write_json(state_path, state)
+                    rec = write_recommendation(recommendation_path, specs, completed, settings)
+                    rec_params = rec["recommended"]["parameters"]
+                    tuner.event(
+                        color,
+                        "[RECOMMEND]",
+                        " ".join(f"{k}={v:.9g}" for k, v in sorted(rec_params.items())),
+                        "green",
+                    )
+
+                if args.dry_run:
+                    continue
+                if generation_best is None:
+                    raise RuntimeError(f"generation {generation} produced no completed trials")
+
+                generation_completed = generation_results(settings, completed, generation)
+                rec = write_recommendation(recommendation_path, specs, completed, settings)
+                rec_params = rec["recommended"]["parameters"]
+                pending_matches = state.get("pending_commit_generation") is not None and int(
+                    state.get("pending_commit_generation")
+                ) == generation
+                pending_params = state.get("pending_commit_params") if pending_matches else None
+                if isinstance(pending_params, dict):
+                    commit_params = {str(k): float(v) for k, v in pending_params.items()}
+                    commit_source = str(state.get("pending_commit_source") or settings.commit_source)
+                elif settings.commit_source == "recommended":
+                    commit_params = rec_params
+                    commit_source = "recommended"
+                else:
+                    commit_params = generation_best.params
+                    commit_source = "best"
+                commit_source_trial = generation_best.trial if commit_source == "best" else None
+
+                tuner.event(
+                    color,
+                    f"[GEN {generation} SELECT]",
+                    (
+                        f"best_trial={generation_best.trial} best_selection_metric={generation_best.score:.9g} "
+                        f"commit_source={commit_source} completed_trials={len(generation_completed)}"
+                    ),
+                    "green",
+                )
+
+                state = {
+                    "version": SETTINGS_VERSION,
+                    "next_trial": generation_last_trial + 1,
+                    "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
+                    "pending_commit_generation": generation,
+                    "pending_commit_source": commit_source,
+                    "pending_commit_params": commit_params,
+                    "generation_best_trial": generation_best.trial,
+                    "generation_best_selection_metric": generation_best.score,
+                    "best_trial": best.trial if best else None,
+                    "best_selection_metric": best.score if best else None,
+                    "best_commit_selection_metric": best_commit_score,
+                    "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
+                    "recommended_parameters": str(recommendation_path),
+                    "settings_file": str(args.settings_file.resolve()),
+                }
+                write_json(state_path, state)
+
+                commit_metric: tuner.Metric | None = None
+                commit_score: float | None = None
+                pending_has_checkpoint = (pending_commit_dir / "state.bin").exists()
+                if pending_matches and pending_has_checkpoint:
+                    commit_metric = tuner.latest_learn_log_metric(pending_commit_dir)
+                    commit_score = metric_score(commit_metric, settings.metric)
+                    tuner.event(
+                        color,
+                        f"[GEN {generation} COMMIT RESUME]",
+                        f"using existing {pending_commit_dir} selection_metric={commit_score:.9g}",
+                        "yellow",
+                    )
+                else:
+                    tuner.remove_dir_quiet(pending_commit_dir)
+                    commit_out_dir = trials_root / f"gen{generation:04d}-commit"
+                    if commit_out_dir.exists():
+                        tuner.remove_dir_quiet(commit_out_dir)
+                    tuner.event(
+                        color,
+                        f"[GEN {generation} COMMIT START]",
+                        (
+                            f"source={commit_source} "
+                            f"from={current_checkpoint or 'scratch'} "
+                            f"params="
+                            + " ".join(f"{k}={v:.9g}" for k, v in sorted(commit_params.items()))
+                        ),
+                        "magenta",
+                    )
+                    commit_cmd = train_args(
+                        run,
+                        commit_params,
+                        current_checkpoint,
+                        commit_out_dir,
+                        settings,
+                        trial_sbs,
+                        include_initial_state=not settings.use_worker,
+                        save_checkpoint=True,
+                    )
+                    if settings.use_worker:
+                        if worker is None:
+                            raise RuntimeError("worker client is not open")
+                        started = time.perf_counter()
+                        payload = worker.request(
+                            "trial",
+                            {
+                                "args": worker_args_from_train_args(commit_cmd),
+                                "keep": True,
+                            },
+                            prefix=tuner.paint(color, f"[GEN {generation} COMMIT] ", "magenta"),
+                        )
+                        elapsed = time.perf_counter() - started
+                        commit_metric = tuner.metric_from_worker_payload(payload)
+                        commit_score = metric_score(commit_metric, settings.metric)
+                        save_args = worker_args_from_train_args(
+                            train_args(
+                                run,
+                                commit_params,
+                                None,
+                                runner_root / "worker-save-output",
+                                settings,
+                                trial_sbs,
+                                include_initial_state=False,
+                                save_checkpoint=True,
+                            )
+                        )
+                        worker.request(
+                            "save",
+                            {
+                                "args": save_args,
+                                "dir": str(pending_commit_dir),
+                                "epoch": generation,
+                                "superbatch": trial_sbs,
+                            },
+                            prefix=tuner.paint(color, f"[GEN {generation} SAVE] ", "green"),
+                        )
+                    else:
+                        code, elapsed = tuner.run_command(
+                            commit_cmd,
+                            log_dir / f"generation{generation:04d}-commit.stdout.log",
+                            stream=not args.no_stream_child_output,
+                            stream_prefix=tuner.paint(color, f"[GEN {generation} COMMIT] ", "magenta"),
+                        )
+                        if code != 0:
+                            raise RuntimeError(
+                                f"generation {generation} commit run failed; "
+                                f"see {log_dir / f'generation{generation:04d}-commit.stdout.log'}"
+                            )
+                        row = tuner.latest_summary_row(commit_out_dir)
+                        commit_metric = tuner.metric_from_summary_row(row)
+                        commit_score = metric_score(commit_metric, settings.metric)
+                        move_dir_replace(tuner.latest_checkpoint_dir(commit_out_dir), pending_commit_dir)
+                        if not args.keep_temp:
+                            tuner.remove_dir_quiet(commit_out_dir)
+                    tuner.event(
+                        color,
+                        f"[GEN {generation} COMMIT END]",
+                        (
+                            f"source={commit_source} selection_metric={commit_score:.9g} "
+                            f"{tuner.metric_status_text(commit_metric)} elapsed={elapsed:.1f}s"
                         ),
                         "green",
                     )
 
-            for trial in range(next_trial, settings.trials + 1):
-                generation, generation_trial = generation_for_trial(settings, trial)
-                generation_first_trial = first_trial_of_generation(settings, generation)
-                completed_for_sampling = [result for result in completed if result.trial < generation_first_trial]
-                trial_sbs = settings.trial_sbs_for_generation(generation)
-                params = sample_params(specs, rng, completed_for_sampling, settings)
-                out_dir = trials_root / f"trial{trial:04d}"
-                if out_dir.exists() and not args.dry_run:
-                    shutil.rmtree(out_dir)
-                log_path = log_dir / f"trial{trial:04d}.stdout.log"
-                display_prefix = f"[GEN {generation}][TRIAL {generation_trial}]"
-                tuner.event(
-                    color,
-                    f"{display_prefix} START",
-                    " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
-                    "magenta",
-                )
-                cmd = train_args(run, params, out_dir, settings, trial_sbs)
-                cache_key = f"gen{generation}-trial{generation_trial}"
-                if args.dry_run:
-                    if settings.use_worker:
-                        print(
-                            "  worker trial "
-                            + json.dumps(
-                                {
-                                    "args": worker_args_from_train_args(cmd),
-                                    "keep": False,
-                                    "cache_key": cache_key,
-                                },
-                                ensure_ascii=False,
-                            ),
-                            flush=True,
-                        )
-                    else:
-                        print("  " + subprocess.list2cmdline(cmd), flush=True)
-                    continue
+                assert commit_metric is not None
+                assert commit_score is not None
+                move_dir_replace(pending_commit_dir, current_dir)
+                current_checkpoint = current_dir
 
-                if settings.use_worker:
-                    if worker is None:
-                        raise RuntimeError("worker client is not open")
-                    started = time.perf_counter()
-                    payload = worker.request(
-                        "trial",
-                        {
-                            "args": worker_args_from_train_args(cmd),
-                            "keep": False,
-                            "cache_key": cache_key,
-                        },
-                        prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
-                    )
-                    elapsed = time.perf_counter() - started
-                    metric = tuner.metric_from_worker_payload(payload)
-                    score = metric_score(metric, settings.metric)
-                    checkpoint = Path(f"worker-cache:{cache_key}")
-                else:
-                    code, elapsed = tuner.run_command(
-                        cmd,
-                        log_path,
-                        stream=not args.no_stream_child_output,
-                        stream_prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
-                    )
-                    if code != 0:
-                        tuner.append_csv(
-                            summary_path,
-                            SUMMARY_FIELDS,
-                            {
-                                "trial": trial,
-                                "status": "failed",
-                                "test_value_accuracy": "",
-                                "test_value_loss": "",
-                                "quantized_value_accuracy": "",
-                                "quantized_value_loss": "",
-                                "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
-                                "selection_metric": "",
-                                "checkpoint": "",
-                            },
-                        )
-                        raise RuntimeError(f"trial {trial} failed; see {log_path}")
-                    row = tuner.latest_summary_row(out_dir)
-                    metric = tuner.metric_from_summary_row(row)
-                    score = metric_score(metric, settings.metric)
-                    checkpoint = tuner.latest_checkpoint_dir(out_dir)
-
-                result = TrialResult(
-                    trial=trial,
-                    params=params,
-                    metric=metric,
-                    score=score,
-                    checkpoint=checkpoint,
-                    output_dir=out_dir,
-                )
-                completed.append(result)
-                is_best = best is None or ((score < best.score) if settings.lower_is_better else (score > best.score))
-                if settings.use_worker:
-                    if worker is None:
-                        raise RuntimeError("worker client is not open")
-                    if is_best:
-                        worker.request(
-                            "save-cached-trial",
-                            {
-                                "cache_key": cache_key,
-                                "dir": str(best_dir),
-                                "epoch": 1,
-                                "superbatch": trial_sbs,
-                            },
-                            prefix=tuner.paint(color, f"{display_prefix}[SAVE] ", "green"),
-                        )
-                        result.checkpoint = best_dir
-                        result.output_dir = best_dir
-                    else:
-                        worker.request(
-                            "drop-cached-trials",
-                            {"cache_keys": [cache_key]},
-                            prefix=tuner.paint(color, f"{display_prefix}[DROP] ", "cyan"),
-                        )
-
-                keep_non_best_checkpoint = (
-                    (not settings.use_worker) and (settings.keep_all_trials or args.keep_temp)
-                )
-                summary_checkpoint = str(best_dir) if is_best else (str(result.checkpoint) if keep_non_best_checkpoint else "")
                 tuner.append_csv(
                     summary_path,
                     SUMMARY_FIELDS,
                     {
-                        "trial": trial,
-                        "status": "finished",
-                        "test_value_accuracy": tuner.format_float(metric.test_acc),
-                        "test_value_loss": tuner.format_float(metric.test_loss),
-                        "quantized_value_accuracy": tuner.format_float(metric.qacc),
-                        "quantized_value_loss": tuner.format_float(metric.qloss),
-                        "parameters": json.dumps(params, ensure_ascii=False, sort_keys=True),
-                        "selection_metric": tuner.format_float(score),
-                        "checkpoint": summary_checkpoint,
+                        "trial": f"gen{generation}-commit",
+                        "status": f"commit_{commit_source}",
+                        "test_value_accuracy": tuner.format_float(commit_metric.test_acc),
+                        "test_value_loss": tuner.format_float(commit_metric.test_loss),
+                        "quantized_value_accuracy": tuner.format_float(commit_metric.qacc),
+                        "quantized_value_loss": tuner.format_float(commit_metric.qloss),
+                        "parameters": json.dumps(commit_params, ensure_ascii=False, sort_keys=True),
+                        "selection_metric": tuner.format_float(commit_score),
+                        "checkpoint": str(current_dir),
                     },
                 )
-                tuner.event(
-                    color,
-                    f"{display_prefix} END",
-                    f"selection_metric={score:.9g} {tuner.metric_status_text(metric)} elapsed={elapsed:.1f}s best={'yes' if is_best else 'no'}",
-                    "green" if is_best else "cyan",
-                )
-                if is_best:
-                    if not settings.use_worker:
-                        old_best = best_dir.with_name("best-checkpoint.old")
-                        if old_best.exists():
-                            shutil.rmtree(old_best)
-                        if best_dir.exists():
-                            best_dir.rename(old_best)
-                        shutil.move(str(out_dir), str(best_dir))
-                        if old_best.exists():
-                            shutil.rmtree(old_best)
-                        result.checkpoint = best_dir
-                        result.output_dir = best_dir
-                    best = result
-                elif not settings.use_worker and not settings.keep_all_trials and not args.keep_temp:
-                    tuner.remove_dir_quiet(out_dir)
+
+                if is_better_score(commit_score, best_commit_score, settings.lower_is_better):
+                    tuner.copy_dir_replace(current_dir, best_dir)
+                    best_commit_score = commit_score
+
+                next_trial = generation_last_trial + 1
                 state = {
                     "version": SETTINGS_VERSION,
-                    "next_trial": trial + 1,
+                    "next_trial": next_trial,
+                    "current_checkpoint": str(current_checkpoint),
+                    "current_generation": generation,
+                    "current_generation_trial": commit_source_trial,
+                    "current_generation_selection_metric": commit_score,
+                    "current_generation_commit_source": commit_source,
+                    "generation_best_trial": None,
+                    "generation_best_selection_metric": None,
+                    "pending_commit_generation": None,
+                    "pending_commit_source": None,
+                    "pending_commit_params": None,
                     "best_trial": best.trial if best else None,
                     "best_selection_metric": best.score if best else None,
-                    "best_checkpoint": str(best_dir) if best else None,
+                    "best_commit_selection_metric": best_commit_score,
+                    "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
                     "recommended_parameters": str(recommendation_path),
                     "settings_file": str(args.settings_file.resolve()),
                 }
@@ -1113,6 +1520,18 @@ def main() -> int:
                     " ".join(f"{k}={v:.9g}" for k, v in sorted(rec_params.items())),
                     "green",
                 )
+                if settings.use_worker and worker is not None and generation < settings.generations:
+                    next_trial_sbs = settings.trial_sbs_for_generation(generation + 1)
+                    open_worker_session(
+                        worker=worker,
+                        run=run,
+                        specs=specs,
+                        current_checkpoint=current_checkpoint,
+                        runner_root=runner_root,
+                        settings=settings,
+                        trial_sbs=next_trial_sbs,
+                        color=color,
+                    )
         finally:
             if worker is not None:
                 worker.close()

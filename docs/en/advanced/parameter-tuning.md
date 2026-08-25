@@ -1,15 +1,17 @@
 # Fixed-length trial parameter tuning
 
-`tuning_parameters.py` runs many short fixed-parameter BulletOu trials to search over `lr`, `lr_min`, factorizer, and count-confidence settings.
+`tuning_parameters.py` runs many short fixed-parameter BulletOu trials to search over `lr`, `lr_min`, factorizer, and count-confidence settings while training moves forward generation by generation.
 
 It does not depend on external Python packages. It is a small BulletOu-specific TPE-style sampler: random trials first, then it compares the distribution of good trials against the distribution of bad trials and samples promising regions more often.
 
 ## What this runner does
 
-- Each trial starts from scratch or from the same fixed checkpoint.
+- Trials in the same generation start from the same checkpoint.
 - The length of one trial is `tuning.trial_sbs`. It can be a number or an array.
 - Parameters stay fixed during a trial.
 - For every generation, the runner evaluates `population` trials and records the metric.
+- At the end of a generation, the runner performs one commit run with the selected parameters and saves that checkpoint as `current-checkpoint/`.
+- `best-checkpoint/` stores the best checkpoint among completed commit runs. It is separate from the next generation's starting point.
 - `recommended-parameters.json` contains inferred parameters from the top trials.
 
 For short trials, the single best observed trial can be noisy. Check both `best_observed` and `recommended` before using the values in a longer run.
@@ -44,7 +46,11 @@ This means:
 
 If `generations` is omitted, the runner infers it from the `population` / `trial_sbs` array length. If a `population` or `trial_sbs` array is shorter than `generations`, the last value is reused.
 
-The TPE-style sampler uses results from previous generations. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
+The TPE-style sampler uses results from the immediately previous generation. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
+
+For example, generation 2 trials continue from the best checkpoint from generation 1, and their candidate parameters are sampled from generation 1 results. Generation 3 then continues from the best checkpoint from generation 2 and samples from generation 2 results.
+
+The runner does not mix all generations for TPE, because each generation starts from a different checkpoint. Mixing metrics from different training stages would make older generations unfairly worse and distort the sampler.
 
 ## Sampler fields
 
@@ -56,6 +62,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | `tpe_startup_trials` | Number of completed trials required before TPE starts. Until then, the runner samples from the whole search range. | `16` |
 | `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
+| `commit_source` | Parameters used for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred value from the top trials. | `"best"` |
 
 ## Settings example
 
@@ -73,6 +80,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
     "tpe_startup_trials": 16,
     "tpe_good_fraction": 0.25,
     "tpe_bandwidth": 0.15,
+    "commit_source": "best",
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false
@@ -161,7 +169,9 @@ The runner root is:
 | path | Meaning |
 | --- | --- |
 | `summary-learn.log` | Every trial result |
-| `best-checkpoint/` | Checkpoint from the best observed trial |
+| `current-checkpoint/` | Checkpoint accepted at the latest completed generation; the next generation starts from here |
+| `pending-commit-checkpoint/` | Temporary checkpoint after the commit run and before it is moved to `current-checkpoint/`; normally it does not remain |
+| `best-checkpoint/` | Best checkpoint among completed commit runs |
 | `recommended-parameters.json` | Inferred parameters from top trials |
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
@@ -176,11 +186,11 @@ The runner root is:
 | `recommended.parameters` | Inferred values from the top completed trials |
 
 `best_observed` is the best trial that actually ran. With short trials, it can be noisy.
-`recommended.parameters` averages the top trials and is often the more useful value to inspect before a longer run.
+`recommended.parameters` averages the top trials from the latest generation and is often the more useful value to inspect before a longer run.
 
 The recommendation is computed as follows:
 
-1. Sort completed trials by the configured metric.
+1. Sort completed trials from the latest generation by the configured metric.
 2. Keep the top fraction specified by `tpe_good_fraction`.
 3. Average those top trials with rank weights.
 
@@ -223,7 +233,9 @@ The TPE sampler compares the distributions of good and bad trials to generate ca
 "keep_all_trials": false
 ```
 
-With this setting, lower `quantized_value_loss` is better. The runner keeps only the current best trial under `best-checkpoint/`. Trial output directories and checkpoints that do not become the best are deleted after the trial finishes.
+With this setting, lower `quantized_value_loss` is better. By default, trial checkpoints are not saved. The runner records each trial's metrics and parameters in `summary-learn.log`, then runs one generation-end commit run using the parameters selected by `commit_source`. That commit run becomes `current-checkpoint/`.
+
+With `commit_source: "best"`, the commit run uses the parameters from the best measured trial in that generation. With `commit_source: "recommended"`, it uses the same inferred parameters written to `recommended-parameters.json` for the latest generation. `recommended` is an unevaluated estimate, so the safer default is `"best"`.
 
 Even when a non-best trial checkpoint is deleted, `summary-learn.log` and `logs/trialXXXX.stdout.log` remain, so you can still inspect the metric values and stdout later.
 

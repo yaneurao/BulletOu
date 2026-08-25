@@ -1,15 +1,17 @@
 # 固定長 trial によるパラメーター調整
 
-`tuning_parameters.py` は、同じ開始地点から短い学習 trial を多数走らせ、`lr` / `lr_min` / factorizer / count confidence のよさそうな値を探すための runner です。
+`tuning_parameters.py` は、短い学習 trial を多数走らせ、`lr` / `lr_min` / factorizer / count confidence のよさそうな値を探しながら学習を進めるための runner です。
 
 外部 package は使っていません。BulletOu 用の軽量な TPE-style sampler です。最初はランダムに試し、その後は良かった trial の分布と悪かった trial の分布を比べ、有望そうな範囲を重点的に試します。
 
 ## 何をする runner か
 
-- 各 trial は scratch、または指定した同じ checkpoint から始まります。
+- 同じ generation 内の trial は、同じ checkpoint から始まります。
 - 1 trial の長さは `tuning.trial_sbs` で指定します。数値または配列で書けます。
 - trial 中はパラメーターを変えません。
 - generation ごとに `population` 本の trial を走らせ、指定した metric が良いものを記録します。
+- generation の最後に、選ばれたパラメーターで commit run を1回だけ実行し、その checkpoint を `current-checkpoint/` に保存します。
+- `best-checkpoint/` には、これまでの commit run の中で一番良かった checkpoint を保存します。これは次 generation の開始地点とは別です。
 - `recommended-parameters.json` に、上位 trial から推定した推奨パラメーターを書き出します。
 
 短い trial では「たまたま良かった1本」をそのまま採用するとノイズを拾いやすいです。そのため、最終的に使う値は `best_observed` だけでなく、`recommended` も確認してください。
@@ -44,7 +46,11 @@ factorizer alpha や count confidence で `0` を許したい場合は、`log` �
 
 になります。`generations` を省略した場合は、`population` / `trial_sbs` の配列長から generation 数を決めます。`population` や `trial_sbs` の配列が `generations` より短い場合は、最後の値を使い続けます。
 
-TPE-style sampler は、前 generation までの結果を使って次の候補を作ります。完了済み trial を metric で並べ、上位を「良かった候補」、残りを「悪かった候補」として、各パラメーターの分布を作ります。そのうえで、良かった候補の分布に近く、悪かった候補の分布から遠い値を優先してサンプルします。
+TPE-style sampler は、直前 generation の結果を使って次の候補を作ります。完了済み trial を metric で並べ、上位を「良かった候補」、残りを「悪かった候補」として、各パラメーターの分布を作ります。そのうえで、良かった候補の分布に近く、悪かった候補の分布から遠い値を優先してサンプルします。
+
+たとえば generation 2 の trial は、generation 1 の best checkpoint から追加学習します。また、generation 2 の候補パラメーターは generation 1 の trial 結果をもとに作ります。generation 3 では generation 2 の best checkpoint から追加学習し、候補パラメーターは generation 2 の結果をもとに作ります。
+
+全世代の trial を混ぜて TPE しないのは、generation が進むほど開始 checkpoint が変わり、metric の土台も変わるためです。違う学習段階の trial を同じ尺度として混ぜると、古い generation が不利になりやすく、TPE の判断が歪みます。
 
 ## sampler の項目
 
@@ -56,6 +62,7 @@ TPE-style sampler は、前 generation までの結果を使って次の候補�
 | `tpe_startup_trials` | TPE を始める前に必要な完了済み trial 数。この本数に到達するまでは、探索範囲全体からランダムにサンプルします。 | `16` |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
+| `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |
 
 ## 設定例
 
@@ -73,6 +80,7 @@ TPE-style sampler は、前 generation までの結果を使って次の候補�
     "tpe_startup_trials": 16,
     "tpe_good_fraction": 0.25,
     "tpe_bandwidth": 0.15,
+    "commit_source": "best",
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false
@@ -163,7 +171,9 @@ runner root は次の場所です。
 | path | 意味 |
 | --- | --- |
 | `summary-learn.log` | 各 trial の結果 |
-| `best-checkpoint/` | 観測上の best trial の checkpoint |
+| `current-checkpoint/` | 最新 generation で採用された checkpoint。次 generation の開始地点 |
+| `pending-commit-checkpoint/` | commit run 完了後、`current-checkpoint/` へ反映する前の一時 checkpoint。通常は残りません |
+| `best-checkpoint/` | これまでの commit run の中で一番良かった checkpoint |
 | `recommended-parameters.json` | 上位 trial から推定した推奨パラメーター |
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
@@ -178,11 +188,11 @@ runner root は次の場所です。
 | `recommended.parameters` | 上位 trial から推定した、次に使う候補値 |
 
 `best_observed` は「観測された1本の best」です。短い trial では偶然良かっただけの可能性があります。
-一方、`recommended.parameters` は上位 trial をならした値です。長めの本番学習へ使う候補としてはこちらも確認してください。
+一方、`recommended.parameters` は最新 generation の上位 trial をならした値です。長めの本番学習へ使う候補としてはこちらも確認してください。
 
 `recommended.parameters` は、次の手順で計算します。
 
-1. 完了済み trial を metric の良い順に並べます。
+1. 最新 generation の完了済み trial を metric の良い順に並べます。
 2. `tpe_good_fraction` で指定した上位割合だけを使います。
 3. その上位 trial を、順位に応じた重み付き平均にします。
 
@@ -225,7 +235,9 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 "keep_all_trials": false
 ```
 
-この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。runner は、その時点で一番良い trial だけを `best-checkpoint/` に残します。best にならなかった trial の出力フォルダと checkpoint は、trial 終了後に削除します。
+この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。現在の標準動作では、trial ごとの checkpoint は保存しません。各 trial の metric とパラメーターだけを `summary-learn.log` に記録し、generation の最後に `commit_source` で選んだパラメーターを使って commit run を1回だけ実行します。その commit run の checkpoint が `current-checkpoint/` になります。
+
+`commit_source: "best"` では、その generation で実測 metric が一番良かった trial のパラメーターを使います。`commit_source: "recommended"` では、最新 generation の上位 trial から `recommended-parameters.json` と同じ式で推定したパラメーターを使います。`recommended` は未評価の推定値なので、標準ではより安全な `"best"` を使います。
 
 削除しても、`summary-learn.log` と `logs/trialXXXX.stdout.log` は残るので、各 trial の指標と実行ログはあとから確認できます。
 
