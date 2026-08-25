@@ -103,9 +103,9 @@ class StudySettings:
     lower_is_better: bool
     sampler: str
     seed: int
-    startup_trials: int
-    elite_fraction: float
-    elite_sigma: float
+    tpe_startup_trials: int
+    tpe_good_fraction: float
+    tpe_bandwidth: float
     validation_rate: int
     quantized_validation_rate: int
     keep_all_trials: bool
@@ -227,6 +227,15 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
             f"{path}: obsolete tuning key(s): {', '.join(removed_tuning_keys)}. "
             "Use tuning.trial_sbs and per-parameter ranges instead."
         )
+    renamed_tuning_keys = {
+        "startup_trials": "tpe_startup_trials",
+        "elite_fraction": "tpe_good_fraction",
+        "elite_sigma": "tpe_bandwidth",
+    }
+    present_renamed_keys = [key for key in renamed_tuning_keys if key in tuning_obj]
+    if present_renamed_keys:
+        replacements = ", ".join(f"{key}->{renamed_tuning_keys[key]}" for key in present_renamed_keys)
+        raise ValueError(f"{path}: renamed tuning key(s): {replacements}")
     allowed_tuning_keys = {
         "generations",
         "population",
@@ -235,9 +244,9 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "lower_is_better",
         "sampler",
         "seed",
-        "startup_trials",
-        "elite_fraction",
-        "elite_sigma",
+        "tpe_startup_trials",
+        "tpe_good_fraction",
+        "tpe_bandwidth",
         "validation_rate",
         "quantized_validation_rate",
         "keep_all_trials",
@@ -272,20 +281,20 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         lower_is_better=lower_is_better,
         sampler=sampler,
         seed=int(tuning_obj.get("seed", 1)),
-        startup_trials=int(tuning_obj.get("startup_trials", 16)),
-        elite_fraction=float(tuning_obj.get("elite_fraction", 0.25)),
-        elite_sigma=float(tuning_obj.get("elite_sigma", 0.15)),
+        tpe_startup_trials=int(tuning_obj.get("tpe_startup_trials", 16)),
+        tpe_good_fraction=float(tuning_obj.get("tpe_good_fraction", 0.25)),
+        tpe_bandwidth=float(tuning_obj.get("tpe_bandwidth", 0.15)),
         validation_rate=int(tuning_obj.get("validation_rate", 0)),
         quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
         use_worker=bool(tuning_obj.get("use_worker", True)),
     )
-    if settings.startup_trials < 0:
-        raise ValueError("tuning.startup_trials must be >= 0")
-    if not (0.0 < settings.elite_fraction <= 1.0):
-        raise ValueError("tuning.elite_fraction must be in (0, 1]")
-    if settings.elite_sigma <= 0.0 or not math.isfinite(settings.elite_sigma):
-        raise ValueError("tuning.elite_sigma must be finite and > 0")
+    if settings.tpe_startup_trials < 0:
+        raise ValueError("tuning.tpe_startup_trials must be >= 0")
+    if not (0.0 < settings.tpe_good_fraction <= 1.0):
+        raise ValueError("tuning.tpe_good_fraction must be in (0, 1]")
+    if settings.tpe_bandwidth <= 0.0 or not math.isfinite(settings.tpe_bandwidth):
+        raise ValueError("tuning.tpe_bandwidth must be finite and > 0")
     if settings.validation_rate < -1 or settings.quantized_validation_rate < -1:
         raise ValueError("tuning.validation_rate / quantized_validation_rate must be >= -1")
     if metric.startswith("test_value_") and settings.validation_rate < 0:
@@ -435,7 +444,7 @@ def kde_log_density(x: float, values: list[float], lo: float, hi: float, sigma_r
 
 def split_good_bad(completed: list[TrialResult], settings: StudySettings) -> tuple[list[TrialResult], list[TrialResult]]:
     ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
-    good_count = max(1, math.ceil(len(ordered) * settings.elite_fraction))
+    good_count = max(1, math.ceil(len(ordered) * settings.tpe_good_fraction))
     good_count = min(good_count, max(1, len(ordered) - 1))
     return ordered[:good_count], ordered[good_count:]
 
@@ -531,7 +540,7 @@ def sample_params_tpe(
     completed: list[TrialResult],
     settings: StudySettings,
 ) -> dict[str, float]:
-    if len(completed) < settings.startup_trials:
+    if len(completed) < settings.tpe_startup_trials:
         return sample_params_random(specs, rng)
     good, bad = split_good_bad(completed, settings)
     if not good or not bad:
@@ -550,7 +559,7 @@ def sample_params_tpe(
                 rng,
                 good,
                 override_maximum=override_maximum,
-                sigma_ratio=settings.elite_sigma,
+                sigma_ratio=settings.tpe_bandwidth,
             )
         if "lr_min_ratio" in out:
             lr = out.get("lr")
@@ -563,7 +572,7 @@ def sample_params_tpe(
             out["lr_min"] = lr * out.pop("lr_min_ratio")
         if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
             out["lr_min"] = out["lr"]
-        score = tpe_candidate_score(out, specs, good, bad, settings.elite_sigma)
+        score = tpe_candidate_score(out, specs, good, bad, settings.tpe_bandwidth)
         if best_params is None or score > best_score:
             best_params = out
             best_score = score
@@ -702,7 +711,7 @@ def recommended_params(
     if not completed:
         return current_fixed_values(specs)
     ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
-    keep = max(1, math.ceil(len(ordered) * settings.elite_fraction))
+    keep = max(1, math.ceil(len(ordered) * settings.tpe_good_fraction))
     elite = ordered[:keep]
     weights = [float(keep - i) for i in range(keep)]
     weight_sum = sum(weights)
@@ -767,10 +776,10 @@ def write_recommendation(
         "metric": settings.metric,
         "lower_is_better": settings.lower_is_better,
         "recommendation_method": (
-            "rank-weighted elite mean; log-scale parameters use weighted geometric mean"
+            "rank-weighted TPE-good mean; log-scale parameters use weighted geometric mean"
         ),
-        "elite_fraction": settings.elite_fraction,
-        "elite_count": max(1, math.ceil(len(completed) * settings.elite_fraction)),
+        "tpe_good_fraction": settings.tpe_good_fraction,
+        "tpe_good_count": max(1, math.ceil(len(completed) * settings.tpe_good_fraction)),
         "best_observed": {
             "trial": best.trial,
             "score": best.score,
@@ -829,8 +838,9 @@ def main() -> int:
                 f"population={settings.population_schedule} trial_sbs={settings.trial_sbs_schedule} "
                 f"sampler={settings.sampler} metric={settings.metric} "
                 f"direction={'minimize' if settings.lower_is_better else 'maximize'} "
-                f"startup_trials={settings.startup_trials} elite_fraction={settings.elite_fraction:g} "
-                f"elite_sigma={settings.elite_sigma:g} worker={'on' if settings.use_worker else 'off'}"
+                f"tpe_startup_trials={settings.tpe_startup_trials} "
+                f"tpe_good_fraction={settings.tpe_good_fraction:g} "
+                f"tpe_bandwidth={settings.tpe_bandwidth:g} worker={'on' if settings.use_worker else 'off'}"
             ),
             "cyan",
         )

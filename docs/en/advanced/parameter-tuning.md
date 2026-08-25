@@ -53,9 +53,9 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | Field | Meaning | Default |
 | --- | --- | --- |
 | `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"`. | `"tpe"` |
-| `startup_trials` | Number of completed trials required before TPE starts. Until then, the runner samples from the whole search range. | `16` |
-| `elite_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
-| `elite_sigma` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
+| `tpe_startup_trials` | Number of completed trials required before TPE starts. Until then, the runner samples from the whole search range. | `16` |
+| `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
+| `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
 
 ## Settings example
 
@@ -70,9 +70,9 @@ These are sampler settings, not NNUE training parameters. They control how the r
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,
-    "startup_trials": 16,
-    "elite_fraction": 0.25,
-    "elite_sigma": 0.15,
+    "tpe_startup_trials": 16,
+    "tpe_good_fraction": 0.25,
+    "tpe_bandwidth": 0.15,
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false

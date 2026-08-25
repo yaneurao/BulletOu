@@ -53,9 +53,9 @@ TPE-style sampler は、前 generation までの結果を使って次の候補�
 | 項目 | 意味 | 省略時 |
 | --- | --- | --- |
 | `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使います。 | `"tpe"` |
-| `startup_trials` | TPE を始める前に必要な完了済み trial 数。この本数に到達するまでは、探索範囲全体からランダムにサンプルします。 | `16` |
-| `elite_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
-| `elite_sigma` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
+| `tpe_startup_trials` | TPE を始める前に必要な完了済み trial 数。この本数に到達するまでは、探索範囲全体からランダムにサンプルします。 | `16` |
+| `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
+| `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
 
 ## 設定例
 
@@ -70,9 +70,9 @@ TPE-style sampler は、前 generation までの結果を使って次の候補�
     "metric": "quantized_value_loss",
     "lower_is_better": true,
     "seed": 20260825,
-    "startup_trials": 16,
-    "elite_fraction": 0.25,
-    "elite_sigma": 0.15,
+    "tpe_startup_trials": 16,
+    "tpe_good_fraction": 0.25,
+    "tpe_bandwidth": 0.15,
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false
