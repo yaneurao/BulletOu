@@ -9865,6 +9865,7 @@ struct WorkerSfnnCachedTrialState {
 
 #[cfg(feature = "cuda-cpp-backend")]
 struct WorkerSfnnCountSettings {
+    residual_count_decay: Option<Vec<f32>>,
     residual_count_gates: Option<Vec<f32>>,
     factorizer_axis_confidences: Option<Vec<f32>>,
 }
@@ -9992,11 +9993,9 @@ impl WorkerSfnnSession {
         })
     }
 
-    fn apply_count_settings_to_runner(
+    fn compute_count_settings(
         args: &Args,
         shape: bulletou_cuda_cpp::SfnnForwardShape,
-        ctx: &bulletou_cuda_cpp::Context,
-        runner: &mut bulletou_cuda_cpp::SfnnTrainStepRunner,
     ) -> Result<WorkerSfnnCountSettings, String> {
         let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
         let sfnn_bucket_counts = if let Some(path) = args.sfnn_bucket_counts.as_deref() {
@@ -10007,46 +10006,96 @@ impl WorkerSfnnSession {
             None
         };
         let effective_residual_count_decay = effective_sfnn_residual_count_decay(args);
-        if effective_residual_count_decay != 0.0 {
+        let residual_count_decay = if effective_residual_count_decay != 0.0 {
             let counts = sfnn_bucket_counts
                 .as_ref()
                 .ok_or_else(|| "--sfnn-residual-count-decay requires --sfnn-bucket-counts".to_string())?;
             let (effective_k, _) = effective_sfnn_residual_count_decay_k(args, shape)?;
-            let lambdas = sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?;
+            Some(sfnn_bucket_count_decay_lambdas(counts, effective_residual_count_decay, effective_k)?)
+        } else {
+            None
+        };
+        let residual_count_gates = sfnn_residual_count_gates_from_counts(args, shape, sfnn_bucket_counts.as_ref())?;
+        let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+            let spec = effective_sfnn_factorizer_spec(args);
+            sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, sfnn_bucket_counts.as_ref())?
+        } else {
+            None
+        };
+        Ok(WorkerSfnnCountSettings { residual_count_decay, residual_count_gates, factorizer_axis_confidences })
+    }
+
+    fn upload_count_settings_to_runner(
+        ctx: &bulletou_cuda_cpp::Context,
+        runner: &mut bulletou_cuda_cpp::SfnnTrainStepRunner,
+        count_settings: &WorkerSfnnCountSettings,
+    ) -> Result<(), String> {
+        if let Some(lambdas) = count_settings.residual_count_decay.as_ref() {
             runner.set_residual_count_decay_by_stack(ctx, Some(lambdas.as_slice())).map_err(|e| e.to_string())?;
         } else {
             runner.set_residual_count_decay_by_stack(ctx, None).map_err(|e| e.to_string())?;
         }
-        let residual_count_gates = sfnn_residual_count_gates_from_counts(args, shape, sfnn_bucket_counts.as_ref())?;
-        if let Some(gates) = residual_count_gates.as_ref() {
+        if let Some(gates) = count_settings.residual_count_gates.as_ref() {
             runner.set_residual_count_gates_by_stack(ctx, Some(gates.as_slice())).map_err(|e| e.to_string())?;
         } else {
             runner.set_residual_count_gates_by_stack(ctx, None).map_err(|e| e.to_string())?;
         }
-        let factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
-            let spec = effective_sfnn_factorizer_spec(args);
-            let confidences =
-                sfnn_factorizer_axis_confidences_from_counts(args, shape, spec, sfnn_bucket_counts.as_ref())?;
-            if let Some(confidences) = confidences.as_ref() {
-                runner.set_factorizer_axis_confidences(ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
-            } else {
-                runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
-            }
-            confidences
+        if let Some(confidences) = count_settings.factorizer_axis_confidences.as_ref() {
+            runner.set_factorizer_axis_confidences(ctx, Some(confidences.as_slice())).map_err(|e| e.to_string())?;
         } else {
             runner.set_factorizer_axis_confidences(ctx, None).map_err(|e| e.to_string())?;
-            None
-        };
-        Ok(WorkerSfnnCountSettings { residual_count_gates, factorizer_axis_confidences })
+        }
+        Ok(())
     }
 
-    fn apply_args_to_runner(&mut self, args: &Args) -> Result<(), String> {
+    fn apply_count_settings_to_runner(
+        args: &Args,
+        shape: bulletou_cuda_cpp::SfnnForwardShape,
+        ctx: &bulletou_cuda_cpp::Context,
+        runner: &mut bulletou_cuda_cpp::SfnnTrainStepRunner,
+    ) -> Result<WorkerSfnnCountSettings, String> {
+        let count_settings = Self::compute_count_settings(args, shape)?;
+        Self::upload_count_settings_to_runner(ctx, runner, &count_settings)?;
+        Ok(count_settings)
+    }
+
+    fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
+        let old_args = self.args.clone();
+        let new_count_settings = Self::compute_count_settings(args, self.shape)?;
+        if rebase_axis_factorizer {
+            let old_factorizer = effective_sfnn_factorizer_spec(&old_args);
+            let new_factorizer = effective_sfnn_factorizer_spec(args);
+            if old_factorizer.any_axis() || new_factorizer.any_axis() {
+                let (ratios, stats) = cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
+                    self.shape,
+                    old_factorizer,
+                    effective_sfnn_factorizer_alpha(&old_args),
+                    self.factorizer_axis_confidences.as_deref(),
+                    new_factorizer,
+                    effective_sfnn_factorizer_alpha(args),
+                    new_count_settings.factorizer_axis_confidences.as_deref(),
+                )?;
+                if stats.changed_axes != 0 {
+                    self.runner
+                        .rebase_axis_factorizer_terms(&self.ctx, ratios.as_slice())
+                        .map_err(|e| e.to_string())?;
+                    eprintln!(
+                        "  SFNN factorizer rebase = axis terms: changed_axes={}/{}, ratio=[{:.6},{:.6}], clamped={}",
+                        stats.changed_axes,
+                        self.shape.factorizer_axis_count(),
+                        stats.min_ratio,
+                        stats.max_ratio,
+                        stats.clamped_axes
+                    );
+                }
+            }
+        }
         self.runner
             .set_factorizer_config(cuda_cpp_sfnn_factorizer_active(args), cuda_cpp_sfnn_factorizer_alpha(args))
             .map_err(|e| e.to_string())?;
-        let count_settings = Self::apply_count_settings_to_runner(args, self.shape, &self.ctx, &mut self.runner)?;
-        self.residual_count_gates = count_settings.residual_count_gates;
-        self.factorizer_axis_confidences = count_settings.factorizer_axis_confidences;
+        Self::upload_count_settings_to_runner(&self.ctx, &mut self.runner, &new_count_settings)?;
+        self.residual_count_gates = new_count_settings.residual_count_gates;
+        self.factorizer_axis_confidences = new_count_settings.factorizer_axis_confidences;
         Ok(())
     }
 
@@ -10200,7 +10249,7 @@ impl WorkerSfnnSession {
             )
             .map_err(|e| e.to_string())?;
         self.progress_state = snapshot.progress_state.clone();
-        self.apply_args_to_runner(args)?;
+        self.apply_args_to_runner(args, false)?;
         eprintln!("  worker restore = host RAM -> existing GPU buffers: {}", format_duration_secs(started.elapsed()));
         Ok(())
     }
@@ -10223,7 +10272,7 @@ impl WorkerSfnnSession {
             )
             .map_err(|e| e.to_string())?;
         self.progress_state = state.progress;
-        self.apply_args_to_runner(args)?;
+        self.apply_args_to_runner(args, false)?;
         eprintln!(
             "  worker restore = disk cache -> existing GPU buffers: {} ({})",
             format_duration_secs(started.elapsed()),
@@ -10331,7 +10380,7 @@ impl WorkerSfnnSession {
         let snapshot = if keep { None } else { Some(self.snapshot_host_labeled("base snapshot")?) };
         let base_args = self.args.clone();
         let base_dataloader_pos = self.dataloader_pos;
-        self.apply_args_to_runner(&trial_args)?;
+        self.apply_args_to_runner(&trial_args, true)?;
 
         let teacher_threads = cuda_cpp_effective_teacher_threads(&trial_args);
         let loader_threads = cuda_cpp_effective_loader_threads(&trial_args);
@@ -19183,6 +19232,113 @@ fn cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
 ) -> f32 {
     let confidence = factorizer_axis_confidences.and_then(|values| values.get(axis)).copied().unwrap_or(1.0);
     cuda_cpp_sfnn_factorizer_axis_alpha(shape, axis, alpha) * confidence
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy)]
+struct SfnnAxisFactorizerRebaseStats {
+    changed_axes: usize,
+    clamped_axes: usize,
+    min_ratio: f32,
+    max_ratio: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+const SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER: f32 = 1.0e-6;
+
+#[cfg(feature = "cuda-cpp-backend")]
+const SFNN_AXIS_REBASE_MAX_RATIO: f32 = 100.0;
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    old_factorizer: SfnnFactorizerSpec,
+    old_alpha: SfnnFactorizerAlphaSpec,
+    old_confidences: Option<&[f32]>,
+    new_factorizer: SfnnFactorizerSpec,
+    new_alpha: SfnnFactorizerAlphaSpec,
+    new_confidences: Option<&[f32]>,
+) -> Result<(Vec<f32>, SfnnAxisFactorizerRebaseStats), String> {
+    let axis_count = shape.factorizer_axis_count();
+    if let Some(values) = old_confidences {
+        if values.len() != axis_count {
+            return Err(format!(
+                "SFNN factorizer rebase old confidence length mismatch: got {}, expected {axis_count}",
+                values.len()
+            ));
+        }
+    }
+    if let Some(values) = new_confidences {
+        if values.len() != axis_count {
+            return Err(format!(
+                "SFNN factorizer rebase new confidence length mismatch: got {}, expected {axis_count}",
+                values.len()
+            ));
+        }
+    }
+
+    let mut old_active = vec![false; axis_count];
+    for axis in cuda_cpp_sfnn_factorizer_axis_indices(shape, old_factorizer) {
+        if axis < old_active.len() {
+            old_active[axis] = true;
+        }
+    }
+    let mut new_active = vec![false; axis_count];
+    for axis in cuda_cpp_sfnn_factorizer_axis_indices(shape, new_factorizer) {
+        if axis < new_active.len() {
+            new_active[axis] = true;
+        }
+    }
+
+    let mut ratios = vec![1.0f32; axis_count];
+    let mut changed_axes = 0usize;
+    let mut clamped_axes = 0usize;
+    let mut min_ratio = f32::INFINITY;
+    let mut max_ratio = f32::NEG_INFINITY;
+    for axis in 0..axis_count {
+        if !new_active[axis] {
+            continue;
+        }
+        let old_effective = if old_active[axis] {
+            cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(shape, axis, old_alpha, old_confidences)
+        } else {
+            0.0
+        };
+        let new_effective =
+            cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(shape, axis, new_alpha, new_confidences);
+        let mut ratio = if new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER {
+            if old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER {
+                1.0
+            } else {
+                SFNN_AXIS_REBASE_MAX_RATIO
+            }
+        } else {
+            old_effective / new_effective
+        };
+        if !(ratio.is_finite() && ratio >= 0.0) {
+            ratio = 1.0;
+            clamped_axes += 1;
+        }
+        if ratio > SFNN_AXIS_REBASE_MAX_RATIO {
+            ratio = SFNN_AXIS_REBASE_MAX_RATIO;
+            clamped_axes += 1;
+        }
+        if ratio < 0.0 {
+            ratio = 0.0;
+            clamped_axes += 1;
+        }
+        if (ratio - 1.0).abs() > 1.0e-6 {
+            changed_axes += 1;
+        }
+        min_ratio = min_ratio.min(ratio);
+        max_ratio = max_ratio.max(ratio);
+        ratios[axis] = ratio;
+    }
+    if axis_count == 0 {
+        min_ratio = 1.0;
+        max_ratio = 1.0;
+    }
+    Ok((ratios, SfnnAxisFactorizerRebaseStats { changed_axes, clamped_axes, min_ratio, max_ratio }))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]

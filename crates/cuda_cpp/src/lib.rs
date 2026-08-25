@@ -520,6 +520,39 @@ pub fn axpy_device(ctx: &Context, len: usize, a: f32, x: &F32Buffer, y: &F32Buff
     check(unsafe { ffi::bulletou_cuda_cpp_axpy_device(ctx.as_ptr(), len, a, x.as_ptr(), y.as_ptr(), out.as_ptr()) })
 }
 
+fn scale_axis_rows_f32_device(
+    ctx: &Context,
+    values: &F32Buffer,
+    row_scales: &F32Buffer,
+    row_count: usize,
+    row_len: usize,
+) -> Result<()> {
+    if row_len == 0 {
+        return Err(CudaCppError::message("axis row scaling row_len must be greater than zero"));
+    }
+    let expected = row_count
+        .checked_mul(row_len)
+        .ok_or_else(|| CudaCppError::message("axis row scaling length overflow"))?;
+    if values.len() != expected {
+        return Err(CudaCppError::message(format!(
+            "axis row scaling value length mismatch: values={}, expected {expected} ({row_count} x {row_len})",
+            values.len()
+        )));
+    }
+    expect_len("axis row scaling factors", row_count, row_scales.len())?;
+    // SAFETY: backend validates buffer lengths and device ownership.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_scale_axis_rows_f32_device(
+            ctx.as_ptr(),
+            values.as_ptr(),
+            values.len(),
+            row_scales.as_ptr(),
+            row_count,
+            row_len,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NnueForwardShape {
     pub input_size: usize,
@@ -6134,6 +6167,13 @@ enum SfnnUpdateParamKind {
     Bias,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SfnnAxisRebaseStateKind {
+    SlowParams,
+    Momentum,
+    Velocity,
+}
+
 impl SfnnUpdateScope {
     fn allows(self, layer: SfnnUpdateLayer, kind: SfnnUpdateParamKind) -> bool {
         match self {
@@ -6416,6 +6456,176 @@ impl SfnnTrainStepRunner {
             }
         }
         Ok(())
+    }
+
+    fn scale_optional_axis_rows(
+        ctx: &Context,
+        values: Option<&F32Buffer>,
+        row_scales: &F32Buffer,
+        row_count: usize,
+        row_len: usize,
+    ) -> Result<()> {
+        if let Some(values) = values {
+            scale_axis_rows_f32_device(ctx, values, row_scales, row_count, row_len)?;
+        }
+        Ok(())
+    }
+
+    fn scale_optional_axis_optimizer_rows(
+        ctx: &Context,
+        state: Option<&RangerParamState>,
+        row_scales: &F32Buffer,
+        row_count: usize,
+        row_len: usize,
+        kind: SfnnAxisRebaseStateKind,
+    ) -> Result<()> {
+        let Some(state) = state else {
+            return Ok(());
+        };
+        match kind {
+            SfnnAxisRebaseStateKind::SlowParams => {
+                scale_axis_rows_f32_device(ctx, &state.slow_params, row_scales, row_count, row_len)?;
+            }
+            SfnnAxisRebaseStateKind::Momentum => {
+                scale_axis_rows_f32_device(ctx, &state.momentum, row_scales, row_count, row_len)?;
+            }
+            SfnnAxisRebaseStateKind::Velocity => {
+                scale_axis_rows_f32_device(ctx, &state.velocity, row_scales, row_count, row_len)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn scale_axis_factorizer_weight_rows(&self, ctx: &Context, row_scales: &F32Buffer) -> Result<()> {
+        let axes = self.shape.factorizer_axis_count();
+        if axes == 0 {
+            return Ok(());
+        }
+        if !self.shape.has_compact_l1() {
+            Self::scale_optional_axis_rows(
+                ctx,
+                self.weights.l1axw.as_ref(),
+                row_scales,
+                axes,
+                checked_product("sfnn l1 axis rebase row", &[self.shape.ft_size, self.shape.l1_out()])?,
+            )?;
+            Self::scale_optional_axis_rows(ctx, self.weights.l1axb.as_ref(), row_scales, axes, self.shape.l1_out())?;
+        }
+        Self::scale_optional_axis_rows(
+            ctx,
+            self.weights.l2axw.as_ref(),
+            row_scales,
+            axes,
+            checked_product("sfnn l2 axis rebase row", &[self.shape.l2_size, self.shape.l2_in()])?,
+        )?;
+        Self::scale_optional_axis_rows(ctx, self.weights.l2axb.as_ref(), row_scales, axes, self.shape.l2_size)?;
+        Self::scale_optional_axis_rows(ctx, self.weights.l3axw.as_ref(), row_scales, axes, self.shape.l2_size)?;
+        Self::scale_optional_axis_rows(ctx, self.weights.l3axb.as_ref(), row_scales, axes, 1)
+    }
+
+    fn scale_axis_factorizer_optimizer_rows(
+        &self,
+        ctx: &Context,
+        row_scales: &F32Buffer,
+        kind: SfnnAxisRebaseStateKind,
+    ) -> Result<()> {
+        let axes = self.shape.factorizer_axis_count();
+        if axes == 0 {
+            return Ok(());
+        }
+        if !self.shape.has_compact_l1() {
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                self.optimizer_states.l1axw.as_ref(),
+                row_scales,
+                axes,
+                checked_product("sfnn l1 axis optimizer rebase row", &[self.shape.ft_size, self.shape.l1_out()])?,
+                kind,
+            )?;
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                self.optimizer_states.l1axb.as_ref(),
+                row_scales,
+                axes,
+                self.shape.l1_out(),
+                kind,
+            )?;
+        }
+        Self::scale_optional_axis_optimizer_rows(
+            ctx,
+            self.optimizer_states.l2axw.as_ref(),
+            row_scales,
+            axes,
+            checked_product("sfnn l2 axis optimizer rebase row", &[self.shape.l2_size, self.shape.l2_in()])?,
+            kind,
+        )?;
+        Self::scale_optional_axis_optimizer_rows(
+            ctx,
+            self.optimizer_states.l2axb.as_ref(),
+            row_scales,
+            axes,
+            self.shape.l2_size,
+            kind,
+        )?;
+        Self::scale_optional_axis_optimizer_rows(
+            ctx,
+            self.optimizer_states.l3axw.as_ref(),
+            row_scales,
+            axes,
+            self.shape.l2_size,
+            kind,
+        )?;
+        Self::scale_optional_axis_optimizer_rows(
+            ctx,
+            self.optimizer_states.l3axb.as_ref(),
+            row_scales,
+            axes,
+            1,
+            kind,
+        )
+    }
+
+    pub fn rebase_axis_factorizer_terms(&mut self, ctx: &Context, weight_ratios: &[f32]) -> Result<()> {
+        let axes = self.shape.factorizer_axis_count();
+        expect_len("SFNN axis factorizer rebase ratios", axes, weight_ratios.len())?;
+        if axes == 0 || weight_ratios.iter().all(|&ratio| ratio == 1.0) {
+            return Ok(());
+        }
+        for &ratio in weight_ratios {
+            if !(ratio.is_finite() && ratio >= 0.0) {
+                return Err(CudaCppError::message(
+                    "SFNN axis factorizer rebase ratios must be finite and non-negative",
+                ));
+            }
+        }
+
+        let momentum_ratios = weight_ratios
+            .iter()
+            .map(|&ratio| if ratio > 0.0 { 1.0 / ratio } else { 0.0 })
+            .collect::<Vec<_>>();
+        let velocity_ratios = momentum_ratios.iter().map(|&ratio| ratio * ratio).collect::<Vec<_>>();
+
+        self.factorizer_axis_confidences.upload(ctx, weight_ratios)?;
+        self.scale_axis_factorizer_weight_rows(ctx, &self.factorizer_axis_confidences)?;
+        self.scale_axis_factorizer_optimizer_rows(
+            ctx,
+            &self.factorizer_axis_confidences,
+            SfnnAxisRebaseStateKind::SlowParams,
+        )?;
+
+        self.factorizer_axis_confidences.upload(ctx, momentum_ratios.as_slice())?;
+        self.scale_axis_factorizer_optimizer_rows(
+            ctx,
+            &self.factorizer_axis_confidences,
+            SfnnAxisRebaseStateKind::Momentum,
+        )?;
+
+        self.factorizer_axis_confidences.upload(ctx, velocity_ratios.as_slice())?;
+        self.scale_axis_factorizer_optimizer_rows(
+            ctx,
+            &self.factorizer_axis_confidences,
+            SfnnAxisRebaseStateKind::Velocity,
+        )
     }
 
     fn factorizer_axis_confidences(&self) -> Option<&F32Buffer> {
@@ -8724,6 +8934,14 @@ mod ffi {
             dst: *mut BulletOuCudaCppF32Buffer,
             value: f32,
             len: usize,
+        ) -> i32;
+        pub fn bulletou_cuda_cpp_scale_axis_rows_f32_device(
+            ctx: *mut BulletOuCudaCppContext,
+            values: *mut BulletOuCudaCppF32Buffer,
+            value_len: usize,
+            row_scales: *mut BulletOuCudaCppF32Buffer,
+            row_count: usize,
+            row_len: usize,
         ) -> i32;
         pub fn bulletou_cuda_cpp_axpy_device(
             ctx: *mut BulletOuCudaCppContext,

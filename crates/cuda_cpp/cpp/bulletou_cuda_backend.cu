@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -315,6 +316,14 @@ __global__ void fill_f32_kernel(size_t len, float value, float* out) {
         return;
     }
     out[idx] = value;
+}
+
+__global__ void scale_axis_rows_f32_kernel(size_t len, size_t row_len, const float* row_scales, float* values) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    values[idx] *= row_scales[idx / row_len];
 }
 
 __device__ __forceinline__ void radam_update_one(
@@ -7679,6 +7688,42 @@ extern "C" int bulletou_cuda_cpp_f32_fill(
     int blocks = static_cast<int>((len + threads - 1) / threads);
     fill_f32_kernel<<<blocks, threads, 0, ctx->stream>>>(len, value, dst->ptr);
     if (check_kernel_launch("fill_f32_kernel launch") != 0) {
+        return -1;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_scale_axis_rows_f32_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* values,
+    size_t value_len,
+    const BulletOuCudaCppF32Buffer* row_scales,
+    size_t row_count,
+    size_t row_len) {
+    if (row_len == 0) {
+        return fail_message("scale_axis_rows row_len must be greater than zero");
+    }
+    if (row_count != 0 && row_len > SIZE_MAX / row_count) {
+        return fail_message("scale_axis_rows row_count * row_len overflow");
+    }
+    const size_t expected_len = row_count * row_len;
+    if (value_len != expected_len) {
+        return fail_message("scale_axis_rows value length does not match row_count * row_len");
+    }
+    if (validate_buffer(ctx, values, value_len, "values") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(row_scales), row_count, "row_scales") != 0) {
+        return -1;
+    }
+    if (set_context_device(ctx) != 0) {
+        return -1;
+    }
+    if (value_len == 0) {
+        return ok();
+    }
+    int threads = 256;
+    int blocks = static_cast<int>((value_len + threads - 1) / threads);
+    scale_axis_rows_f32_kernel<<<blocks, threads, 0, ctx->stream>>>(value_len, row_len, row_scales->ptr, values->ptr);
+    if (check_kernel_launch("scale_axis_rows_f32_kernel launch") != 0) {
         return -1;
     }
     return ok();

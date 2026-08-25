@@ -175,6 +175,22 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 - `tuning_parameters.py` は標準で worker を使います。`tuning.use_worker: false` にした場合は、trialごとに `bulletou.exe` を起動するため、このcacheは効きません。
 - cache が有効な場合、起動時に `[CACHE] teacher_memory_cache_sbs=...` が表示され、worker側のログに `worker teacher memory cache = loading/ready` が出ます。
 
+## factorizer parameter の簡易 rebase
+
+worker mode では、trial や commit run の開始時に factorizer alpha / axis・pair count confidence が前回 state から変わると、axis/pair factorizer tensor をその場で簡易 rebase します。
+
+例えば `alpha_old * K_old` から `alpha_new * K_new` に切り替えるとき、開始時点の有効寄与がなるべく変わらないように、factorizer tensor 側へ次のスケールを掛けます。
+
+```text
+scale = (alpha_old * K_old) / (alpha_new * K_new)
+```
+
+ここで `K` は count confidence から作られる axis/pair multiplier です。これにより、パラメーターを変えた瞬間に出力だけが急に跳ねるのを抑え、「その設定でその後の学習が進むか」を見やすくします。
+
+この処理は GPU 上の既存 tensor を in-place でスケールします。大きな追加 VRAM buffer は確保しません。Ranger の slow params / momentum / velocity も同じ変数変換に合わせて更新します。
+
+対象は axis/pair factorizer tensor です。shared factorizer と residual count gate は rebase しません。
+
 ## 実行
 
 ```powershell

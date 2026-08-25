@@ -175,6 +175,22 @@ Notes:
 - `tuning_parameters.py` uses worker mode by default. If you set `tuning.use_worker: false`, it starts a fresh `bulletou.exe` process for every trial, so this cache cannot help.
 - When the cache is enabled, startup prints `[CACHE] teacher_memory_cache_sbs=...`, and the worker log prints `worker teacher memory cache = loading/ready`.
 
+## Lightweight factorizer rebase
+
+In worker mode, when a trial or commit run changes factorizer alpha or axis/pair count-confidence parameters from the previous state, BulletOu lightly rebases axis/pair factorizer tensors in place.
+
+When switching from `alpha_old * K_old` to `alpha_new * K_new`, BulletOu scales the stored factorizer tensor so that the effective contribution at the start of the run is approximately preserved:
+
+```text
+scale = (alpha_old * K_old) / (alpha_new * K_new)
+```
+
+Here `K` is the axis/pair multiplier produced by count confidence. This reduces loss jumps caused only by parameter rescaling and makes the trial measure whether learning proceeds under the new setting.
+
+The rebase scales existing GPU tensors in place and does not allocate a large extra VRAM buffer. Ranger slow params, momentum, and velocity are transformed consistently.
+
+The rebase currently applies to axis/pair factorizer tensors only. It does not rebase the shared factorizer or residual count gate.
+
 ## Run
 
 ```powershell
