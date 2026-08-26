@@ -124,7 +124,24 @@ If needed, split them by factorizer family, for example `--sfnn-king-axis-count-
 
 The same `count.bin` file is used for residual, axis, and pair confidence. For the count command and the exact formulas, see [Advanced: SFNN factorizer](../advanced/sfnn-factorizer.md).
 
-When the architecture contains `progressN`, such as `progress4`, the progress calculation parameters are trained and saved into the Progress section of `nn.bin`. The count command also needs an `nn.bin` for the same architecture so it can use the same progress bucket assignment.
+When the architecture contains `progressN`, such as `progress4`, the progress calculation parameters decide the progress bucket. BulletOu saves those parameters to `progress.bin` next to each checkpoint. Use that file when you build `count.bin`:
+
+```powershell
+.\target\release\examples\bulletou.exe bucket-count `
+  --teacher D:\sojoteam_datasets `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --progress-bin D:\path\to\checkpoint\progress.bin `
+  --output D:\BulletOu-snapshots\counts\count.bin
+```
+
+If you only have an existing `state.bin` or `nn.bin`, extract `progress.bin` first:
+
+```powershell
+.\target\release\examples\bulletou.exe export-progress-bin `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --state-bin D:\path\to\checkpoint\state.bin `
+  --output D:\path\to\checkpoint\progress.bin
+```
 
 For a `progressN` architecture, BulletOu updates the progress parameters by default. That training path uses neighboring progress buckets during training, so it is much slower than an ordinary hard-bucket path.
 
@@ -135,6 +152,16 @@ Once you no longer want to move the progress parameters, resume with:
 ```
 
 This freezes the progress parameters and trains with the same hard bucket assignment that is exported to `nn.bin`. It also makes validation caching cheaper. Do not pass this option at the start if you still want BulletOu to learn the progress parameters.
+
+For count-aware fine-tuning, usually pass the same `progress.bin` during training:
+
+```powershell
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-progress-bin D:\path\to\checkpoint\progress.bin `
+--sfnn-freeze-progress
+```
+
+If `--sfnn-progress-bin` is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch. `count.bin` and `progress.bin` are not strictly paired, so you can intentionally mix provisional files during experiments.
 
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
 

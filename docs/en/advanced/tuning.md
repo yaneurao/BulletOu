@@ -374,12 +374,12 @@ With many bucket stacks, rare stacks can sometimes learn unstable residuals. You
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
-  --nn-bin C:\path\to\same-arch\nn.bin `
+  --progress-bin C:\path\to\same-progress\progress.bin `
   --positions 500000000 `
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
-For arch names containing `progressN`, `--nn-bin` is required. Bucket-count uses the Progress section from that `nn.bin`, so the count file matches the actual progress bucket assignment.
+For arch names containing `progressN`, `--progress-bin` or `--nn-bin` is required. The progress bucket is determined by the Progress section parameters, so normally pass the `progress.bin` saved next to the checkpoint. Use `export-progress-bin` to extract one from an existing checkpoint.
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once.
 
@@ -388,8 +388,12 @@ Then pass it during training:
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-progress-bin C:\path\to\same-progress\progress.bin `
+--sfnn-freeze-progress
 ```
+
+If `--sfnn-progress-bin` is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch. For count-aware fine-tuning, usually pass the same `progress.bin` that was used to create the count file and freeze progress.
 
 When `--sfnn-bucket-counts` is set and an SFNN factorizer is active, the residual count gate is enabled by default. It changes the forward formula to `W_effective = gate * W_residual + factorizer terms`.
 

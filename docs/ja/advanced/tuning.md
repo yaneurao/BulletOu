@@ -360,12 +360,12 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
-  --nn-bin C:\path\to\same-arch\nn.bin `
+  --progress-bin C:\path\to\same-progress\progress.bin `
   --positions 500000000 `
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`progressN` を含む arch では `--nn-bin` が必須です。Progress section の進行度パラメーターで bucket が決まるため、count.bin は実際に使う `nn.bin` に合わせて作ります。
+`progressN` を含む arch では `--progress-bin` または `--nn-bin` が必要です。progress bucket は Progress section の進行度パラメーターで決まるため、通常は checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から `progress.bin` を取り出すには `export-progress-bin` を使います。
 
 `--positions` を省略すると、teacher path 内の全ファイルを1回だけ読んで count します。
 
@@ -374,8 +374,12 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 ```powershell
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
---sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin
+--sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
+--sfnn-progress-bin C:\path\to\same-progress\progress.bin `
+--sfnn-freeze-progress
 ```
+
+`--sfnn-progress-bin` を指定しない場合、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。count-aware な追加学習では、count を作ったときと同じ `progress.bin` を指定し、`--sfnn-freeze-progress` で固定するのが基本です。
 
 `--sfnn-bucket-counts` を指定し、SFNN factorizer が有効な場合、residual count gate はデフォルトで有効です。これは `W_effective = gate * W_residual + factorizer成分` という形で、forward から bucket 固有 residual を弱めます。
 

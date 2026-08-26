@@ -1534,6 +1534,32 @@ struct AverageSfnnStateArgs {
 
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
+#[command(name = "bulletou export-progress-bin")]
+#[command(about = "Extract SFNN progress bucket parameters from state.bin or nn.bin into progress.bin")]
+struct ExportProgressBinArgs {
+    /// SFNN architecture. Must contain progress2/3/4/8/16/32.
+    #[arg(long)]
+    arch: NnueArch,
+
+    /// cuda-cpp SFNN training state (`state.bin`) to read.
+    #[arg(long = "state-bin", conflicts_with = "nn_bin")]
+    state_bin: Option<PathBuf>,
+
+    /// Exported YaneuraOu-compatible quantized `nn.bin` to read.
+    #[arg(long = "nn-bin", conflicts_with = "state_bin")]
+    nn_bin: Option<PathBuf>,
+
+    /// Output progress.bin path.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Allow overwriting --output.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou bucket-stats")]
 #[command(about = "Measure SFNN LayerStack bucket dispersion on teacher batches without training")]
 struct BucketStatsArgs {
@@ -1548,6 +1574,11 @@ struct BucketStatsArgs {
     /// nn.bin used to read the Progress section for progressN architectures.
     #[arg(long = "nn-bin")]
     nn_bin: Option<PathBuf>,
+
+    /// progress.bin used to read the Progress section for progressN architectures.
+    /// Prefer this over --nn-bin when you want to manage the progress classifier separately.
+    #[arg(long = "progress-bin", conflicts_with = "nn_bin")]
+    progress_bin: Option<PathBuf>,
 
     /// Number of mini-batches to scan.
     #[arg(long, default_value = "32")]
@@ -1611,6 +1642,11 @@ struct BucketCountArgs {
     #[arg(long = "nn-bin")]
     nn_bin: Option<PathBuf>,
 
+    /// progress.bin used to read the Progress section for progressN architectures.
+    /// Prefer this over --nn-bin when you want to manage the progress classifier separately.
+    #[arg(long = "progress-bin", conflicts_with = "nn_bin")]
+    progress_bin: Option<PathBuf>,
+
     /// Number of teacher positions to scan. If omitted, scan every record in the teacher path once.
     #[arg(long)]
     positions: Option<usize>,
@@ -1664,6 +1700,48 @@ struct BucketCountArgs {
     /// Allow overwriting --output.
     #[arg(long)]
     overwrite: bool,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+impl ExportProgressBinArgs {
+    fn effective_layerstack(&self) -> LayerStackMode {
+        self.arch.layerstack.unwrap_or(LayerStackMode::Kingrank3by3)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.arch.family != NnueArchFamily::Sfnn {
+            return Err(format!(
+                "--arch {} is not an SFNN architecture; export-progress-bin supports only SFNN progressN layouts",
+                self.arch.cli_name()
+            ));
+        }
+        let layerstack = self.effective_layerstack();
+        if layerstack.progress_bucket_count() <= 1 {
+            return Err(format!(
+                "--arch {} has no progress bucket axis; export-progress-bin requires progressN",
+                self.arch.cli_name()
+            ));
+        }
+        match (&self.state_bin, &self.nn_bin) {
+            (Some(_), Some(_)) => return Err("--state-bin and --nn-bin are mutually exclusive".to_string()),
+            (None, None) => return Err("export-progress-bin requires either --state-bin or --nn-bin".to_string()),
+            _ => {}
+        }
+        if let Some(path) = &self.state_bin {
+            if !path.exists() {
+                return Err(format!("--state-bin {} does not exist", path.display()));
+            }
+        }
+        if let Some(path) = &self.nn_bin {
+            if !path.exists() {
+                return Err(format!("--nn-bin {} does not exist", path.display()));
+            }
+        }
+        if self.output.exists() && !self.overwrite {
+            return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -1878,11 +1956,16 @@ impl BucketStatsArgs {
             ));
         }
         let layerstack = self.effective_layerstack();
-        if layerstack.progress_bucket_count() > 1 && self.nn_bin.is_none() {
+        if layerstack.progress_bucket_count() > 1 && self.nn_bin.is_none() && self.progress_bin.is_none() {
             return Err(format!(
-                "--nn-bin is required for --arch {} because progressN bucket assignment is read from nn.bin",
+                "--progress-bin or --nn-bin is required for --arch {} because progressN bucket assignment needs progress parameters",
                 self.arch.cli_name()
             ));
+        }
+        if let Some(path) = &self.progress_bin {
+            if !path.exists() {
+                return Err(format!("--progress-bin {} does not exist", path.display()));
+            }
         }
         if let Some(path) = &self.nn_bin {
             if !path.exists() {
@@ -1916,11 +1999,16 @@ impl BucketCountArgs {
             ));
         }
         let layerstack = self.effective_layerstack();
-        if layerstack.progress_bucket_count() > 1 && self.nn_bin.is_none() {
+        if layerstack.progress_bucket_count() > 1 && self.nn_bin.is_none() && self.progress_bin.is_none() {
             return Err(format!(
-                "--nn-bin is required for --arch {} because progressN bucket assignment is read from nn.bin",
+                "--progress-bin or --nn-bin is required for --arch {} because progressN bucket assignment needs progress parameters",
                 self.arch.cli_name()
             ));
+        }
+        if let Some(path) = &self.progress_bin {
+            if !path.exists() {
+                return Err(format!("--progress-bin {} does not exist", path.display()));
+            }
         }
         if let Some(path) = &self.nn_bin {
             if !path.exists() {
@@ -4171,7 +4259,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(about = "BulletOu unified trainer")]
 #[command(args_override_self = true)]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  export-progress-bin        Extract SFNN progress parameters from state.bin or nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Read BulletOu training options from a JSON file. Keys use snake_case
@@ -4256,9 +4344,18 @@ struct Args {
     /// For progressN architectures this switches training from soft progress
     /// interpolation to fixed hard buckets computed from the current Progress
     /// section, so bucket-count based regularization remains aligned with the
-    /// nn.bin used to create the count file.
+    /// progress parameters used to create the count file.
     #[arg(long = "sfnn-freeze-progress")]
     sfnn_freeze_progress: bool,
+
+    /// Load SFNN progress bucket parameters from a standalone progress.bin.
+    /// If omitted, BulletOu uses the progress parameters already present in
+    /// the initial/resumed state, or scratch-initialises them for a fresh
+    /// progressN run. This option intentionally does not check
+    /// --sfnn-bucket-counts; you may pair provisional count.bin/progress.bin
+    /// files during experiments.
+    #[arg(long = "sfnn-progress-bin")]
+    sfnn_progress_bin: Option<PathBuf>,
 
     /// Restrict which SFNN parameter groups receive optimizer updates.
     /// Default `all` keeps normal training. Use `l3-only`, `bias-only`, or
@@ -5147,6 +5244,21 @@ impl Args {
                     "--sfnn-freeze-progress requires a progressN architecture; arch {} has no progress bucket axis",
                     self.arch().cli_name()
                 ));
+            }
+        }
+        if let Some(path) = self.sfnn_progress_bin.as_deref() {
+            if !eval_type.uses_layerstack() {
+                return Err("--sfnn-progress-bin applies to SFNN / LayerStack eval types only".to_string());
+            }
+            let layerstack = self.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+            if layerstack.progress_bucket_count() <= 1 {
+                return Err(format!(
+                    "--sfnn-progress-bin requires a progressN architecture; arch {} has no progress bucket axis",
+                    self.arch().cli_name()
+                ));
+            }
+            if !path.exists() {
+                return Err(format!("--sfnn-progress-bin {} does not exist", path.display()));
             }
         }
         if self.sfnn_update_scope != SfnnUpdateScopeArg::All && !eval_type.uses_layerstack() {
@@ -6715,6 +6827,112 @@ fn read_sfnn_progress_params_from_nn_bin(
         weights_q16.push(read_i32_le_from_reader(&mut reader, path, &format!("SFNN progress weight[{index}]"))?);
     }
     Ok(Some(ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)?))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_sfnn_progress_params_from_progress_bin(path: &Path) -> Result<ShogiSfnnProgressQ16Params, String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let progress_hash = read_u32_le_from_reader(&mut reader, path, "SFNN progress hash")?;
+    if progress_hash != SHOGI_SFNN_PROGRESS_HASH {
+        return Err(format!(
+            "{} is not a BulletOu/YaneuraOu SFNN progress.bin: expected Progress hash 0x{SHOGI_SFNN_PROGRESS_HASH:08X}, got 0x{progress_hash:08X}",
+            path.display()
+        ));
+    }
+    let bias_q16 = read_i32_le_from_reader(&mut reader, path, "SFNN progress bias")?;
+    let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+    for index in 0..SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
+        weights_q16.push(read_i32_le_from_reader(&mut reader, path, &format!("SFNN progress weight[{index}]"))?);
+    }
+    let mut trailing = [0u8; 1];
+    let trailing_len = reader
+        .read(&mut trailing)
+        .map_err(|err| format!("failed to check trailing data in {}: {err}", path.display()))?;
+    if trailing_len != 0 {
+        return Err(format!("{} has trailing byte(s) after the SFNN progress payload", path.display()));
+    }
+    ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_sfnn_progress_params_bin(path: &Path, params: &ShogiSfnnProgressQ16Params) -> Result<(), String> {
+    use std::io::Write as _;
+
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create progress.bin output directory {}: {err}", parent.display()))?;
+    }
+    let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    writer
+        .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
+        .and_then(|_| writer.write_all(&params.bias_q16.to_le_bytes()))
+        .map_err(|err| format!("failed to write SFNN progress header {}: {err}", path.display()))?;
+    for &weight in params.weights_q16.iter() {
+        writer
+            .write_all(&weight.to_le_bytes())
+            .map_err(|err| format!("failed to write SFNN progress weights {}: {err}", path.display()))?;
+    }
+    writer.flush().map_err(|err| format!("failed to flush {}: {err}", path.display()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn maybe_write_sfnn_progress_params_bin(
+    dir: &Path,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
+) -> Result<(), String> {
+    if let Some(params) = progress_params {
+        write_sfnn_progress_params_bin(&dir.join("progress.bin"), params)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn read_sfnn_progress_params_from_state_bin(
+    path: &Path,
+    arch: NnueArch,
+    layerstack: LayerStackMode,
+) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
+    if layerstack.progress_bucket_count() <= 1 {
+        return Ok(None);
+    }
+    let mut sections = load_cuda_cpp_component_state_sections(path, "nnue", &["weights"], true)?;
+    let weights_records = sections.remove("weights").unwrap_or_default();
+    let values = weights_records.get("progress").ok_or_else(|| {
+        format!("{} has no nnue/weights/progress record, but --arch {} uses progressN", path.display(), arch.cli_name())
+    })?;
+    let progress_state = CudaCppSfnnProgressTrainState::from_params(values.clone(), None)?;
+    cuda_cpp_sfnn_progress_params_for_state(Some(&progress_state))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_sfnn_progress_params_from_external_input(
+    progress_bin: Option<&Path>,
+    nn_bin: Option<&Path>,
+    arch: NnueArch,
+    layerstack: LayerStackMode,
+) -> Result<(ShogiSfnnProgressQ16Params, String), String> {
+    if let Some(path) = progress_bin {
+        let params = read_sfnn_progress_params_from_progress_bin(path)?;
+        return Ok((params, format!("progress.bin: {}", path.display())));
+    }
+    if let Some(path) = nn_bin {
+        let params = read_sfnn_progress_params_from_nn_bin(path, arch, layerstack)?.ok_or_else(|| {
+            format!(
+                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
+                arch.cli_name(),
+                path.display()
+            )
+        })?;
+        return Ok((params, format!("nn.bin Progress section: {}", path.display())));
+    }
+    Err(format!(
+        "--progress-bin or --nn-bin is required for --arch {} because progressN bucket assignment needs progress parameters",
+        arch.cli_name()
+    ))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -10999,6 +11217,7 @@ impl WorkerSfnnSession {
                     self.factorizer_axis_confidences.as_deref(),
                     progress_params.as_ref(),
                 )?;
+                maybe_write_sfnn_progress_params_bin(&tmp_dir, progress_params.as_ref())?;
                 write_cuda_cpp_sfnn_weights_bin(
                     &tmp_dir.join("state.bin"),
                     &weights,
@@ -11231,6 +11450,7 @@ fn worker_handle_request(
                             "checkpoint_dir": checkpoint_dir.display().to_string(),
                             "state_bin": checkpoint_dir.join("state.bin").display().to_string(),
                             "nn_bin": checkpoint_dir.join("nn.bin").display().to_string(),
+                            "progress_bin": checkpoint_dir.join("progress.bin").display().to_string(),
                             "cached_trial_states": session.cached_trial_states.len(),
                             "summary": worker_last_summary_row(
                                 checkpoint_dir.parent().unwrap_or_else(|| std::path::Path::new("."))
@@ -11295,6 +11515,7 @@ fn worker_handle_request(
                             "checkpoint_dir": checkpoint_dir.display().to_string(),
                             "state_bin": checkpoint_dir.join("state.bin").display().to_string(),
                             "nn_bin": checkpoint_dir.join("nn.bin").display().to_string(),
+                            "progress_bin": checkpoint_dir.join("progress.bin").display().to_string(),
                             "summary": worker_last_summary_row(
                                 checkpoint_dir.parent().unwrap_or_else(|| std::path::Path::new("."))
                             ).unwrap_or(None),
@@ -11470,6 +11691,26 @@ fn main() {
         #[cfg(not(feature = "cuda-cpp-backend"))]
         {
             eprintln!("error: average-sfnn-state requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("export-progress-bin")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou export-progress-bin");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = ExportProgressBinArgs::parse_from(raw_args);
+            if let Err(e) = run_export_progress_bin(&args) {
+                eprintln!("error: export-progress-bin failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: export-progress-bin requires building with --features cuda-cpp-backend");
             std::process::exit(2);
         }
         return;
@@ -15908,16 +16149,18 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
     let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
     let layerstack = args.effective_layerstack();
     let stack_count = layerstack.num_stacks();
-    if layerstack.progress_bucket_count() > 1 {
-        let nn_bin = args
-            .nn_bin
-            .as_deref()
-            .ok_or_else(|| format!("--nn-bin is required for --arch {}", args.arch.cli_name()))?;
-        let params = read_sfnn_progress_params_from_nn_bin(nn_bin, args.arch, layerstack)?.ok_or_else(|| {
-            format!("{} has no Progress section, but --arch {} uses progressN", nn_bin.display(), args.arch.cli_name())
-        })?;
+    let progress_params_source = if layerstack.progress_bucket_count() > 1 {
+        let (params, source) = load_sfnn_progress_params_from_external_input(
+            args.progress_bin.as_deref(),
+            args.nn_bin.as_deref(),
+            args.arch,
+            layerstack,
+        )?;
         set_shogi_sfnn_progress_q16_params(params)?;
-    }
+        Some(source)
+    } else {
+        None
+    };
     let teacher_threads = match args.threads {
         Some(0) | None => cuda_cpp_default_cpu_threads(),
         Some(threads) => threads,
@@ -15951,6 +16194,9 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
         feature_kind.source_label(),
         format_count(stack_count)
     );
+    if let Some(source) = &progress_params_source {
+        eprintln!("  progress     = {source}");
+    }
     eprintln!(
         "  scan         = {} batch(es) x {} positions, batches_per_update={}, shuffle_window={} batch(es)",
         format_count(args.batches),
@@ -16096,6 +16342,36 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn run_export_progress_bin(args: &ExportProgressBinArgs) -> Result<(), String> {
+    args.validate()?;
+    let layerstack = args.effective_layerstack();
+    let (params, source) = if let Some(path) = args.state_bin.as_deref() {
+        let params = read_sfnn_progress_params_from_state_bin(path, args.arch, layerstack)?.ok_or_else(|| {
+            format!("{} has no progress parameters for --arch {}", path.display(), args.arch.cli_name())
+        })?;
+        (params, format!("state.bin: {}", path.display()))
+    } else if let Some(path) = args.nn_bin.as_deref() {
+        let params = read_sfnn_progress_params_from_nn_bin(path, args.arch, layerstack)?
+            .ok_or_else(|| format!("{} has no Progress section for --arch {}", path.display(), args.arch.cli_name()))?;
+        (params, format!("nn.bin Progress section: {}", path.display()))
+    } else {
+        return Err("export-progress-bin requires either --state-bin or --nn-bin".to_string());
+    };
+
+    write_sfnn_progress_params_bin(&args.output, &params)?;
+    println!("export-progress-bin complete:");
+    println!("  arch         = {}", args.arch.cli_name());
+    println!("  layerstack   = {}", layerstack.cli_name());
+    println!("  source       = {source}");
+    println!("  output       = {}", args.output.display());
+    println!(
+        "  format       = Progress section payload (hash + bias_q16 + {} weights_q16)",
+        SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     use bulletou_lib::value::{SfnnTeacherBatchConfig, WinRateModelTargetParams};
 
@@ -16104,19 +16380,14 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
     let layerstack = args.effective_layerstack();
     let stack_count = layerstack.num_stacks();
     let progress_params_source = if layerstack.progress_bucket_count() > 1 {
-        let nn_bin = args
-            .nn_bin
-            .as_deref()
-            .ok_or_else(|| format!("--nn-bin is required for --arch {}", args.arch.cli_name()))?;
-        let params = read_sfnn_progress_params_from_nn_bin(nn_bin, args.arch, layerstack)?.ok_or_else(|| {
-            format!(
-                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
-                args.arch.cli_name(),
-                nn_bin.display()
-            )
-        })?;
+        let (params, source) = load_sfnn_progress_params_from_external_input(
+            args.progress_bin.as_deref(),
+            args.nn_bin.as_deref(),
+            args.arch,
+            layerstack,
+        )?;
         set_shogi_sfnn_progress_q16_params(params)?;
-        Some(nn_bin.display().to_string())
+        Some(source)
     } else {
         None
     };
@@ -16166,7 +16437,7 @@ fn run_bucket_count(args: &BucketCountArgs) -> Result<(), String> {
         format_count(stack_count)
     );
     if let Some(source) = &progress_params_source {
-        eprintln!("  progress    = nn.bin Progress section: {source}");
+        eprintln!("  progress    = {source}");
     }
     eprintln!(
         "  scan        = {} positions ({}), shuffle_window={} batch(es)",
@@ -16693,12 +16964,19 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::Magenta,
         );
     }
-    if progress_trainable {
-        let source = if initial_state.completed_steps > 0 { "state.bin" } else { "scratch tiny-random" };
+    if progress_enabled {
+        let source = if let Some(path) = args.sfnn_progress_bin.as_deref() {
+            format!("progress.bin {}", path.display())
+        } else if initial_state.completed_steps > 0 {
+            "state.bin".to_string()
+        } else {
+            "scratch tiny-random".to_string()
+        };
+        let mode = if progress_trainable { "trainable soft bucket" } else { "hard-bucket fixed" };
         print_startup_kv_colored(
             "SFNN progress",
             format!(
-                "trainable soft bucket: buckets={}, params={} ({source}), export=q16 Progress section",
+                "{mode}: buckets={}, params={} ({source}), export=q16 Progress section + progress.bin",
                 progress_bucket_count,
                 format_count(sfnn_progress_parameter_count())
             ),
@@ -18698,6 +18976,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             factorizer_axis_confidences,
             progress_params,
         )?;
+        maybe_write_sfnn_progress_params_bin(&tmp_dir, progress_params)?;
         write_cuda_cpp_sfnn_weights_bin(
             &tmp_dir.join("state.bin"),
             weights,
@@ -20033,22 +20312,45 @@ fn build_sfnn_initial_state_for_cuda_cpp(
     args: &Args,
     feature_kind: CudaCppSfnnFeatureKind,
 ) -> Result<CudaCppSfnnInitialState, String> {
-    if let Some(path) = args.initial_state.as_deref() {
-        return load_cuda_cpp_sfnn_initial_state(path, args, feature_kind);
-    }
-    if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
-        return load_cuda_cpp_sfnn_initial_state(&path, args, feature_kind);
-    }
+    let mut state = if let Some(path) = args.initial_state.as_deref() {
+        load_cuda_cpp_sfnn_initial_state(path, args, feature_kind)?
+    } else if let Some(path) = cuda_cpp_auto_resume_state_bin(args) {
+        load_cuda_cpp_sfnn_initial_state(&path, args, feature_kind)?
+    } else {
+        CudaCppSfnnInitialState {
+            weights: build_sfnn_initial_weights_for_cuda_cpp(args, feature_kind)?,
+            optimizer_states: None,
+            progress: build_cuda_cpp_sfnn_progress_train_state_for_scratch(
+                args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
+            )?,
+            completed_steps: 0,
+            optimizer_steps: 0,
+        }
+    };
 
-    Ok(CudaCppSfnnInitialState {
-        weights: build_sfnn_initial_weights_for_cuda_cpp(args, feature_kind)?,
-        optimizer_states: None,
-        progress: build_cuda_cpp_sfnn_progress_train_state_for_scratch(
-            args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3),
-        )?,
-        completed_steps: 0,
-        optimizer_steps: 0,
-    })
+    apply_cuda_cpp_sfnn_progress_bin_override(args, &mut state)?;
+    Ok(state)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn apply_cuda_cpp_sfnn_progress_bin_override(args: &Args, state: &mut CudaCppSfnnInitialState) -> Result<(), String> {
+    let Some(path) = args.sfnn_progress_bin.as_deref() else {
+        return Ok(());
+    };
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    if layerstack.progress_bucket_count() <= 1 {
+        return Err(format!(
+            "--sfnn-progress-bin requires a progressN architecture; arch {} has no progress bucket axis",
+            args.arch().cli_name()
+        ));
+    }
+    let params = read_sfnn_progress_params_from_progress_bin(path)?;
+    state.progress = Some(CudaCppSfnnProgressTrainState::from_q16_params(&params)?);
+    eprintln!(
+        "  initial progress params = {} (loaded from --sfnn-progress-bin; progress optimizer state reset)",
+        path.display()
+    );
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -21962,6 +22264,13 @@ impl CudaCppSfnnProgressTrainState {
         Ok(Self { gradients: vec![0.0; params.len()], params, optimizer })
     }
 
+    fn from_q16_params(params: &ShogiSfnnProgressQ16Params) -> Result<Self, String> {
+        let mut values = Vec::with_capacity(sfnn_progress_parameter_count());
+        values.push(params.bias_q16 as f32 / 65_536.0);
+        values.extend(params.weights_q16.iter().map(|&weight| weight as f32 / 65_536.0));
+        Self::from_params(values, None)
+    }
+
     fn scratch() -> Result<Self, String> {
         let mut params = cuda_cpp_tatara_uniform_abs_init(sfnn_progress_parameter_count(), 0x5f11_e0f0, 0.001);
         // Keep the global prior neutral; the tiny random weights only break
@@ -22623,6 +22932,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         factorizer_axis_confidences,
         progress_params,
     )?;
+    maybe_write_sfnn_progress_params_bin(dir, progress_params)?;
     write_cuda_cpp_sfnn_weights_bin(
         &dir.join("weights.bin"),
         weights,
@@ -24225,6 +24535,13 @@ fn resume_signature(args: &Args) -> String {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "none".to_string())
         ),
+        format!(
+            "sfnn_progress_bin={}",
+            args.sfnn_progress_bin
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
         format!("sfnn_residual_count_decay={residual_count_decay_signature:.9}"),
         format!("sfnn_residual_count_confidence={:.9}", effective_sfnn_residual_count_confidence(args)),
         format!("sfnn_residual_count_gate_confidence={:.9}", effective_sfnn_residual_count_gate_confidence(args)),
@@ -24379,6 +24696,7 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_factorizer_residual_decay=0.000000000",
     );
     ensure_line_after(&mut out, "sfnn_bucket_counts=", "sfnn_factorizer_residual_decay=", "sfnn_bucket_counts=none");
+    ensure_line_after(&mut out, "sfnn_progress_bin=", "sfnn_bucket_counts=", "sfnn_progress_bin=none");
     ensure_line_after(
         &mut out,
         "sfnn_residual_count_decay=",
@@ -24474,6 +24792,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
+    let signature = resume_signature_without_line(&signature, "sfnn_progress_bin=");
     let signature = resume_signature_without_line(&signature, "sfnn_residual_count_decay_k=");
     resume_signature_without_line(&signature, "sfnn_residual_count_decay_k_ratio=")
 }

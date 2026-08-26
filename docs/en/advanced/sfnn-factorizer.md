@@ -274,25 +274,39 @@ First, create a count.bin file:
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
-  --nn-bin C:\path\to\same-arch\nn.bin `
+  --progress-bin C:\path\to\same-progress\progress.bin `
   --positions 500000000 `
   --buffer-mb 1024 `
   --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
-For architectures containing `progressN`, `--nn-bin` is required. The progress bucket is determined by the `bias_q16` / `weights_q16` values in the Progress section of `nn.bin`, so count.bin must be built against the same `nn.bin`. Architectures without `progressN` do not need `--nn-bin`.
+For architectures containing `progressN`, `--progress-bin` or `--nn-bin` is required. The progress bucket is determined by the `bias_q16` / `weights_q16` values in the Progress section. In normal workflows, use the `progress.bin` saved next to the checkpoint. If you only have an existing `state.bin` or `nn.bin`, extract `progress.bin` first:
 
-When you use count.bin with a `progressN` architecture, keep the progress bucket assignment aligned with the `nn.bin` used to create the count file. If the progress parameters keep changing after count.bin is built, the bucket distribution represented by count.bin drifts away from the buckets used during training.
+```powershell
+.\target\release\examples\bulletou.exe export-progress-bin `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --state-bin C:\path\to\checkpoint\state.bin `
+  --output C:\path\to\checkpoint\progress.bin
+```
+
+`--nn-bin` is still accepted for convenience, but `progress.bin` makes it easier to manage the progress classifier separately from the evaluation weights. Architectures without `progressN` do not need `--progress-bin` or `--nn-bin`.
+
+When you use count.bin with a `progressN` architecture, keep the progress bucket assignment aligned with the parameters used to create the count file. If the progress parameters keep changing after count.bin is built, the bucket distribution represented by count.bin drifts away from the buckets used during training.
 
 For count-aware fine-tuning from the checkpoint that produced count.bin, freeze progress:
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
+--sfnn-progress-bin C:\path\to\checkpoint\progress.bin `
 --sfnn-freeze-progress
 ```
 
+With `--sfnn-progress-bin`, BulletOu loads the given progress parameters at training start. If it is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch.
+
 With `--sfnn-freeze-progress`, BulletOu does not update the progress parameters. Training also uses the same hard q16 Progress bucket rule that is exported to `nn.bin`. Validation batches can keep their GPU cache as long as the progress parameters do not change.
+
+`count.bin` and `progress.bin` are not strictly paired. This is intentional: experiments sometimes need a provisional count file and a provisional progress classifier. For ordinary use, pass the same `progress.bin` that was used to build the count file.
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once. Keep `--positions` when you want to sample only a prefix of a very large teacher set.
 
@@ -457,7 +471,7 @@ This is useful when you want `shared` to remain as the broad prior, while axis o
 
 ### `count.bin` file format
 
-Normally you create this file with `bulletou.exe bucket-count`; you do not need to write it by hand. If you want to inspect it from another tool, the layout is below. All integer fields are little-endian.
+Normally you create this file with `bulletou.exe bucket-count`; you do not need to write it by hand. If you want to inspect it from another tool, the layout is below. All integer fields are little-endian. `count.bin` does not contain progress parameters; keep the progress classifier in a separate `progress.bin`.
 
 | Order | Type | Meaning |
 |---:|---|---|
@@ -472,3 +486,24 @@ Normally you create this file with `bulletou.exe bucket-count`; you do not need 
 `counts[i]` is the occurrence count for LayerStack bucket index `i`. When you pass the file with `--sfnn-bucket-counts`, BulletOu checks that the architecture name and stack count match the current `--arch`.
 
 Counts are stored as `u32`, so one bucket cannot exceed 4,294,967,295 occurrences. If a bucket would overflow, count a smaller prefix with `--positions`.
+
+### `progress.bin` file format
+
+`progress.bin` stores only the progress-bucket classifier for `progressN` SFNN architectures. BulletOu writes it next to each checkpoint. Use `export-progress-bin` if you need to extract it from an existing `state.bin` or `nn.bin`:
+
+```powershell
+.\target\release\examples\bulletou.exe export-progress-bin `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --state-bin D:\...\0029\state.bin `
+  --output D:\...\0029\progress.bin
+```
+
+The payload is the same as the YaneuraOu `nn.bin` Progress section:
+
+| Order | Type | Meaning |
+|---:|---|---|
+| 1 | `u32` | Progress section hash |
+| 2 | `i32` | `bias_q16` |
+| 3 | `i32[progress_weight_count]` | `weights_q16` |
+
+The file is intentionally separate from `count.bin`. BulletOu does not enforce that the two files were produced together, so you can swap progress classifiers during experiments.

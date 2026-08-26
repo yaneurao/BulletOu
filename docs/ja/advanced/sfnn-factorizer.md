@@ -274,25 +274,39 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 .\target\release\examples\bulletou.exe bucket-count `
   --teacher D:\sojoteam_datasets `
   --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
-  --nn-bin C:\path\to\same-arch\nn.bin `
+  --progress-bin C:\path\to\same-progress\progress.bin `
   --positions 500000000 `
   --buffer-mb 1024 `
   --read-buffers 3 `
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
-`progressN` を含む architecture では、`--nn-bin` が必須です。progress bucket は `nn.bin` 内の Progress section に入っている `bias_q16` / `weights_q16` で決まるため、count.bin も同じ `nn.bin` を基準に作ります。`progressN` を含まない architecture では `--nn-bin` は不要です。
+`progressN` を含む architecture では、`--progress-bin` または `--nn-bin` が必要です。progress bucket は Progress section の `bias_q16` / `weights_q16` で決まります。通常は、checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から取り出す場合は次のようにします。
 
-`progressN` 付きの学習で count.bin を使う場合は、count.bin を作った `nn.bin` の progress 判定と、学習中の progress 判定を揃える必要があります。count.bin 作成後に progress parameter も動かし続けると、count.bin が表している bucket 分布と学習中の bucket 分布がずれていきます。
+```powershell
+.\target\release\examples\bulletou.exe export-progress-bin `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --state-bin C:\path\to\checkpoint\state.bin `
+  --output C:\path\to\checkpoint\progress.bin
+```
+
+`--nn-bin` も指定できますが、`progress.bin` のほうが「count に使った progress 分類器」を分離して管理しやすいです。`progressN` を含まない architecture では、progress 分類器は使わないので `--progress-bin` も `--nn-bin` も不要です。
+
+`progressN` 付きの学習で count.bin を使う場合は、count.bin を作ったときの progress 判定と、学習中の progress 判定を揃える必要があります。count.bin 作成後に progress parameter も動かし続けると、count.bin が表している bucket 分布と学習中の bucket 分布がずれていきます。
 
 そのため、count.bin を作った checkpoint から count-aware な追加学習をする場合は、次のように progress を固定します。
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
+--sfnn-progress-bin C:\path\to\checkpoint\progress.bin `
 --sfnn-freeze-progress
 ```
 
+`--sfnn-progress-bin` を指定すると、学習開始時にその progress parameter を読み込みます。指定しない場合は、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。
+
 `--sfnn-freeze-progress` を指定すると、progress parameter は更新されません。学習時の bucket も `nn.bin` に書き出される q16 Progress section と同じ hard bucket 判定になります。validation 用の局面データも、progress parameter が変わらない限り GPU cache を再利用します。
+
+`count.bin` と `progress.bin` は厳密な一致チェックをしません。仮の count と仮の progress 分類器を意図的に組み合わせたい実験があるためです。通常運用では、count を作ったときと同じ `progress.bin` を学習にも指定してください。
 
 `--positions` を省略すると、指定した teacher path に含まれる全ファイルを1回だけ読んで count します。大きな教師データから一部だけサンプリングしたい場合は、上の例のように `--positions` を指定します。
 
@@ -449,7 +463,7 @@ W_effective =
 
 ### `count.bin` のファイル形式
 
-通常は `bulletou.exe bucket-count` で作るので、手で書く必要はありません。外部ツールで読む場合の形式は次の通りです。整数はすべて little-endian です。
+通常は `bulletou.exe bucket-count` で作るので、手で書く必要はありません。外部ツールで読む場合の形式は次の通りです。整数はすべて little-endian です。`count.bin` には progress parameter は入りません。progress 分類器は別ファイルの `progress.bin` として管理します。
 
 | 順序 | 型 | 内容 |
 |---:|---|---|
@@ -464,3 +478,24 @@ W_effective =
 `counts[i]` は LayerStack bucket index `i` の出現回数です。学習時に `--sfnn-bucket-counts` で指定すると、BulletOu はファイル内のarchitecture名と stack数が現在の `--arch` と一致するか確認します。
 
 出現回数は `u32` なので、1つのbucketに 4,294,967,295 回を超えて入るような集計はできません。その場合は `--positions` を減らして集計範囲を小さくしてください。
+
+### `progress.bin` のファイル形式
+
+`progress.bin` は、`progressN` 付き SFNN の progress bucket を決める分類器だけを保存するファイルです。checkpoint 保存時に自動で書き出されます。既存の `state.bin` や `nn.bin` から作る場合は `export-progress-bin` を使います。
+
+```powershell
+.\target\release\examples\bulletou.exe export-progress-bin `
+  --arch SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4 `
+  --state-bin D:\...\0029\state.bin `
+  --output D:\...\0029\progress.bin
+```
+
+形式は、やねうら王 `nn.bin` の Progress section と同じ payload です。
+
+| 順序 | 型 | 内容 |
+|---:|---|---|
+| 1 | `u32` | Progress section hash |
+| 2 | `i32` | `bias_q16` |
+| 3 | `i32[progress_weight_count]` | `weights_q16` |
+
+`progress.bin` は `count.bin` に埋め込まれていません。差し替えて使いたい場合があるため、BulletOu は `count.bin` と `progress.bin` の由来が同じかどうかを強制チェックしません。
