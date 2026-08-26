@@ -56,6 +56,10 @@ For example, generation 2 trials continue from the commit checkpoint produced at
 
 The runner does not mix all generations for TPE, because each generation starts from a different checkpoint. Mixing metrics from different training stages would make older generations unfairly worse and distort the sampler.
 
+`max_parameter_change_ratio` limits how far generation 2 and later may move a candidate away from the currently accepted value. For example, `2.0` clips a parameter with current value `1.0` to the range `0.5` through `2.0`. Generation 1 from scratch has no accepted checkpoint yet, so it still explores the full `min` to `max` range.
+
+If the current value is `0`, the ratio limit keeps it at `0`. This is intentional: `0` means the component is disabled. For factorizer alpha and count-confidence parameters, prefer `min: 0.1` unless you explicitly want to test disabled components.
+
 ## Search generations and commit-only generations
 
 `population` is the number of candidate trials in that generation. A generation with `population=0` does not create candidate trials. It keeps the currently accepted parameters, trains for `trial_sbs`, and updates `current-checkpoint/`.
@@ -94,6 +98,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | `tpe_startup_trials` | Number of completed trials required for TPE density estimation. This can be a number or an array. Arrays are interpreted per generation, like `population` and `trial_sbs`. With `schedule_repeat: false`, the last value is reused when the array is shorter than `generations`; with `true`, the array is repeated cyclically. In generation 1, trials are sampled from the full range until there are enough observations. In generation 2 and later, if the previous generation has too few trials, candidates are sampled around the previous generation's `recommended` parameters instead. | `16` |
 | `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
+| `max_parameter_change_ratio` | In generation 2 and later, limits candidate values to a ratio around the currently accepted value. `2.0` means from `current/2` to `current*2`. `null` or omission disables this limit. | none |
 | `commit_source` | Parameters used for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred value from the top trials. | `"best"` |
 
 ## Settings example
@@ -112,6 +117,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
     "tpe_startup_trials": [16, 8],
     "tpe_good_fraction": 0.25,
     "tpe_bandwidth": 0.15,
+    "max_parameter_change_ratio": 2.0,
     "commit_source": "best",
     "validation_rate": 0,
     "quantized_validation_rate": 0,
@@ -131,21 +137,21 @@ These are sampler settings, not NNUE training parameters. They control how the r
 
     "shared": 1.0,
 
-    "king_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
 
-    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
 
-    "residual_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 }
+    "residual_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 }
   }
 }
 ```

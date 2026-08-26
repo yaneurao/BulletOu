@@ -111,6 +111,7 @@ class StudySettings:
     tpe_startup_trials_schedule: list[int]
     tpe_good_fraction: float
     tpe_bandwidth: float
+    max_parameter_change_ratio: float | None
     validation_rate: int
     quantized_validation_rate: int
     keep_all_trials: bool
@@ -278,6 +279,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "tpe_startup_trials",
         "tpe_good_fraction",
         "tpe_bandwidth",
+        "max_parameter_change_ratio",
         "validation_rate",
         "quantized_validation_rate",
         "keep_all_trials",
@@ -323,6 +325,11 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         tpe_startup_trials_schedule=tpe_startup_trials_schedule,
         tpe_good_fraction=float(tuning_obj.get("tpe_good_fraction", 0.25)),
         tpe_bandwidth=float(tuning_obj.get("tpe_bandwidth", 0.15)),
+        max_parameter_change_ratio=(
+            None
+            if tuning_obj.get("max_parameter_change_ratio") is None
+            else float(tuning_obj.get("max_parameter_change_ratio"))
+        ),
         validation_rate=int(tuning_obj.get("validation_rate", 0)),
         quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
@@ -333,6 +340,10 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError("tuning.tpe_good_fraction must be in (0, 1]")
     if settings.tpe_bandwidth <= 0.0 or not math.isfinite(settings.tpe_bandwidth):
         raise ValueError("tuning.tpe_bandwidth must be finite and > 0")
+    if settings.max_parameter_change_ratio is not None and (
+        not math.isfinite(settings.max_parameter_change_ratio) or settings.max_parameter_change_ratio < 1.0
+    ):
+        raise ValueError("tuning.max_parameter_change_ratio must be finite and >= 1.0")
     if settings.validation_rate < -1 or settings.quantized_validation_rate < -1:
         raise ValueError("tuning.validation_rate / quantized_validation_rate must be >= -1")
     if metric.startswith("test_value_") and settings.validation_rate < 0:
@@ -576,6 +587,48 @@ def sample_params_near(
     return out
 
 
+def clamp_params_to_current_range(
+    params: dict[str, float],
+    specs: dict[str, SearchParameter],
+    center: dict[str, float] | None,
+    max_ratio: float | None,
+) -> dict[str, float]:
+    if center is None or max_ratio is None:
+        return params
+    out = dict(params)
+    for name, spec in specs.items():
+        if not spec.tune or name not in out:
+            continue
+        center_value = center.get(name)
+        if center_value is None or not math.isfinite(float(center_value)):
+            continue
+        center_value = float(center_value)
+        if center_value > 0.0:
+            local_min = center_value / max_ratio
+            local_max = center_value * max_ratio
+        elif center_value == 0.0:
+            # A zero factorizer/count parameter means the component is effectively disabled.
+            # Do not move away from zero through a relative-change limiter; enabling it should be a
+            # deliberate new run, not an accidental TPE jump.
+            local_min = 0.0
+            local_max = 0.0
+        else:
+            continue
+        if spec.minimum is not None:
+            local_min = max(local_min, spec.minimum)
+        if spec.maximum is not None:
+            local_max = min(local_max, spec.maximum)
+        if local_min > local_max:
+            # This can happen when an old checkpoint has current=0 but the new settings set
+            # min>0. Keep the old disabled value rather than forcing an unsafe 0 -> nonzero jump.
+            out[name] = center_value
+        else:
+            out[name] = min(max(out[name], local_min), local_max)
+    if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
+        out["lr_min"] = out["lr"]
+    return out
+
+
 def sample_one_parameter_tpe(
     spec: SearchParameter,
     rng: random.Random,
@@ -635,12 +688,22 @@ def sample_params_tpe(
 ) -> dict[str, float]:
     if len(completed) < tpe_startup_trials:
         if center is not None:
-            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
+            return clamp_params_to_current_range(
+                sample_params_near(specs, rng, center, settings.tpe_bandwidth),
+                specs,
+                center,
+                settings.max_parameter_change_ratio,
+            )
         return sample_params_random(specs, rng)
     good, bad = split_good_bad(completed, settings)
     if not good or not bad:
         if center is not None:
-            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
+            return clamp_params_to_current_range(
+                sample_params_near(specs, rng, center, settings.tpe_bandwidth),
+                specs,
+                center,
+                settings.max_parameter_change_ratio,
+            )
         return sample_params_random(specs, rng)
 
     best_params: dict[str, float] | None = None
@@ -669,6 +732,7 @@ def sample_params_tpe(
             out["lr_min"] = lr * out.pop("lr_min_ratio")
         if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
             out["lr_min"] = out["lr"]
+        out = clamp_params_to_current_range(out, specs, center, settings.max_parameter_change_ratio)
         score = tpe_candidate_score(out, specs, good, bad, settings.tpe_bandwidth)
         if best_params is None or score > best_score:
             best_params = out
@@ -686,7 +750,12 @@ def sample_params(
     center: dict[str, float] | None = None,
 ) -> dict[str, float]:
     if settings.sampler == "random":
-        return sample_params_random(specs, rng)
+        return clamp_params_to_current_range(
+            sample_params_random(specs, rng),
+            specs,
+            center,
+            settings.max_parameter_change_ratio,
+        )
     return sample_params_tpe(specs, rng, completed, settings, tpe_startup_trials, center)
 
 
@@ -1176,7 +1245,9 @@ def main() -> int:
                 f"commit_source={settings.commit_source} "
                 f"tpe_startup_trials={settings.tpe_startup_trials_schedule} "
                 f"tpe_good_fraction={settings.tpe_good_fraction:g} "
-                f"tpe_bandwidth={settings.tpe_bandwidth:g} worker={'on' if settings.use_worker else 'off'}"
+                f"tpe_bandwidth={settings.tpe_bandwidth:g} "
+                f"max_parameter_change_ratio={settings.max_parameter_change_ratio or '-'} "
+                f"worker={'on' if settings.use_worker else 'off'}"
             ),
             "cyan",
         )

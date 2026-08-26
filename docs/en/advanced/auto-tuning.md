@@ -2,9 +2,9 @@
 
 <a href="../../ja/advanced/auto-tuning.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-This page explains how to tune SFNN factorizer alpha values and count-confidence values with `bulletou_tuner.py`.
+This page explains how to tune SFNN factorizer alpha values and count-confidence values with `tuning_parameters.py`.
 
-Population search means that the runner trains several short candidate runs and uses the best candidate as the next starting point. Each generation creates `population` candidates with slightly different hyperparameters, trains every candidate for a fixed trial length, and selects the candidate that ranks best by the configured metric. It does not estimate a gradient and then apply a separate small update. The selected candidate's NN weights and hyperparameter values directly become the next generation's starting point.
+Population search means that the runner trains several short candidate runs and uses the results to choose the next hyperparameters. Each generation creates `population` candidates with slightly different hyperparameters and ranks them by the configured metric. At the end of the generation, the runner performs one commit run with the selected hyperparameters and uses that checkpoint as the next generation's starting point. It does not estimate a gradient and then apply a separate small update.
 
 ## JSON files
 
@@ -15,16 +15,16 @@ The runner uses two JSON files.
 | `tuning-settings.json` | population search generations, population, trial length, tunable parameters, and current values |
 | `bulletou-settings.json` | Normal `bulletou.exe` training options |
 
-`tuning-settings.json` points to `bulletou-settings.json`. You normally pass only `--tuning-settings-file` to the runner.
+`tuning-settings.json` points to `bulletou-settings.json`. You normally pass only `--settings-file` to the runner.
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
+python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 To continue the same runner, add `--resume`.
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resume
+python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
 ```
 
 ## `tuning-settings.json` example
@@ -41,6 +41,12 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
+    "sampler": "tpe",
+    "tpe_startup_trials": 16,
+    "tpe_good_fraction": 0.25,
+    "tpe_bandwidth": 0.05,
+    "max_parameter_change_ratio": 2.0,
+    "commit_source": "best",
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -54,22 +60,22 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
     "tag_prefix": "pair2-qloss"
   },
   "parameters": {
-    "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 100.0 },
-    "king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_hand_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
-    "lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+    "shared": 1.0,
+    "king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "residual_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "lr": { "current": 0.000030, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
+    "lr_min": { "current": 0.000010, "tune": true, "min": 0.000001, "max": 0.001, "log": true }
   }
 }
 ```
@@ -111,7 +117,7 @@ During population search, the runner owns these candidate-specific values, so do
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | The runner sets candidate evaluation cadence |
 | `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
-| `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min` and writes accepted values back to `current` |
+| `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min`. Accepted values during search are stored in `runner-state.json` |
 
 For progress-based architectures, put `sfnn_freeze_progress: true` in `bulletou-settings.json` when you want to keep the progress parameters fixed. Freezing progress makes validation caching easier and keeps qvalid lighter.
 
@@ -139,6 +145,12 @@ Notes:
 | `lower_is_better` | `true` if smaller metric values are better. Ignored for `borda_count` because lower rank sum is always better |
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
+| `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"` |
+| `tpe_startup_trials` | Minimum completed-trial count used for TPE density estimation. Generation 1 samples broadly until this count is reached |
+| `tpe_good_fraction` | Fraction of trials treated as good trials by TPE |
+| `tpe_bandwidth` | Lower bound for the TPE distribution width. Larger values spread candidates more broadly |
+| `max_parameter_change_ratio` | In generation 2 and later, limits candidate values to a ratio around the currently accepted value. `2.0` means from `current/2` to `current*2` |
+| `commit_source` | Parameter source for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred top-trial value |
 | `save_rate` | Copy a public checkpoint to `accepted-checkpoints/` every N accepted generations |
 | `validation_rate` | f32 validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
 | `quantized_validation_rate` | Quantized validation cadence. With population search enabled, it applies to each candidate; with `enabled: false`, it applies to the ordinary training run. `0` measures only at the end of each trial. `-1` disables it |
@@ -146,6 +158,8 @@ Notes:
 You cannot disable a validation that the selected `metric` needs. For example, `metric: "borda_count"` uses all f32/quantized accuracy/loss values, so both validation rates must be enabled. Use `0` when you want trial-end-only validation.
 
 `trial_sbs` is the training length for one candidate. With `trial_sbs: 4`, every candidate trains for 4 sb, and the runner ranks candidates after the full `population` has finished.
+
+`max_parameter_change_ratio` is a guardrail against moving hyperparameters too far after a checkpoint has already adapted to previous values. Generation 1 from scratch still explores the full `min` to `max` range. Later generations are clipped around the currently accepted value. If the current value is `0`, the runner keeps it at `0`; `0` means the component is disabled. Unless you intentionally want to disable a factorizer alpha or count-confidence term, prefer `min: 0.1`.
 
 Supported metrics:
 
@@ -194,31 +208,31 @@ When `shared` is fixed, the main tuning set has 13 parameters: three axis alpha 
 Each parameter is written like this:
 
 ```json
-"king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 }
 ```
 
 | Field | Meaning |
 | --- | --- |
-| `current` | Current value. Candidates are sampled around it |
+| `current` | Initial value. With `enabled: false`, the runner uses this value directly. When resuming a search, accepted values are loaded from `runner-state.json` |
 | `tune` | If `true`, population search may change it. If `false`, it is fixed |
-| `step` | Multiplicative sampling radius. Candidate values are drawn as `current * exp(random(-step, step))` |
 | `min` | Lower bound |
 | `max` | Upper bound |
+| `log` | If `true`, sample in log space. Use this for values such as learning rates |
 
-`step` is not an additive width. `step = 0.02` samples roughly within ?2% of `current`; `step = 0.10` samples roughly from 0.90x to 1.11x. To widen the search, edit the `step` value of the parameters you want to move. Parameters with `tune = true` must have `current > 0`.
+Candidate values are sampled within `min` to `max`. Parameters with `log: true` are sampled in log space. In generation 2 and later, if `max_parameter_change_ratio` is set, candidates are also clipped near the currently accepted value.
 
-When a candidate is accepted, its parameter values are written back to `current`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
+The runner does not rewrite `tuning-settings.json` itself. Accepted values are stored in `runner-state.json`, and human-readable recommendations are written to `recommended-parameters.json`. You do not need to paste long values such as `king_axis=...` by hand when resuming.
 
 `lr` and `lr_min` can also be written in `parameters` when you want the runner to own the current learning-rate values:
 
 ```json
-"lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
-"lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+"lr": { "current": 0.000030, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
+"lr_min": { "current": 0.000010, "tune": true, "min": 0.000001, "max": 0.001, "log": true }
 ```
 
 If you put them in `parameters`, the runner appends `--lr` and `--lr-min` to every `bulletou.exe` run, so those values override any learning rates in `bulletou-settings.json`. If they are omitted from `parameters`, `bulletou-settings.json` owns the learning rates.
 
-When tuning both learning-rate values, choose `current`/`min`/`max` so that every sampled candidate satisfies `lr_min <= lr`. The runner reports an error instead of silently clamping this relationship.
+When tuning both learning-rate values, the runner samples `lr_min` with the sampled `lr` as its upper bound, so generated trials satisfy `lr_min <= lr`.
 
 ## Alpha parameters
 
@@ -269,7 +283,7 @@ If you want to use the tuned `parameters.current` values without running populat
 Then launch the runner once:
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
+python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.

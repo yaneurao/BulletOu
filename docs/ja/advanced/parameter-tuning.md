@@ -56,6 +56,10 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 
 全世代の trial を混ぜて TPE しないのは、generation が進むほど開始 checkpoint が変わり、metric の土台も変わるためです。違う学習段階の trial を同じ尺度として混ぜると、古い generation が不利になりやすく、TPE の判断が歪みます。
 
+`max_parameter_change_ratio` を指定すると、generation 2 以降の候補を「現在採用中の値から何倍まで動かしてよいか」で制限できます。たとえば `2.0` なら、現在値が `1.0` のパラメーターは `0.5` から `2.0` の範囲に収まるように切り詰めます。generation 1 を scratch から始める場合は、まだ採用済み checkpoint がないのでこの制限はかからず、`min` から `max` の範囲を広く探索します。
+
+現在値が `0` のパラメーターは、`max_parameter_change_ratio` の制限中は `0` のままにします。`0` は「その成分を無効にする」という特別な意味を持つためです。factorizer alpha や count confidence を探索する場合は、意図して無効化したいのでなければ `min: 0.1` のように 0 を避ける設定を推奨します。
+
 ## 探索 generation と commit-only generation
 
 `population` は、その generation で試す候補数です。`population=0` を指定した generation は候補探索を行いません。現在採用中の parameter をそのまま使い、`trial_sbs` だけ追加学習して `current-checkpoint/` を更新します。
@@ -94,6 +98,7 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 | `tpe_startup_trials` | TPE の密度推定に必要な完了済み trial 数。数値または配列で指定できます。配列なら `population` / `trial_sbs` と同じく generation ごとに使います。`schedule_repeat: false` なら配列が短い場合は最後の値を使い続け、`true` なら周期的に繰り返します。generation 1 ではこの本数に届くまで探索範囲全体からランダムにサンプルします。generation 2 以降で直前 generation の trial 数が足りない場合は、直前 generation の `recommended` parameter 周辺をサンプルします。 | `16` |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
+| `max_parameter_change_ratio` | generation 2 以降で、候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` に制限します。`null` または省略ならこの制限を使いません。 | なし |
 | `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |
 
 ## 設定例
@@ -112,6 +117,7 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
     "tpe_startup_trials": [16, 8],
     "tpe_good_fraction": 0.25,
     "tpe_bandwidth": 0.15,
+    "max_parameter_change_ratio": 2.0,
     "commit_source": "best",
     "validation_rate": 0,
     "quantized_validation_rate": 0,
@@ -131,21 +137,21 @@ TPE-style sampler は、直前 generation の結果を使って次の候補を�
 
     "shared": 1.0,
 
-    "king_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
 
-    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
 
-    "residual_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0, "max": 10.0 }
+    "residual_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 }
   }
 }
 ```

@@ -2,9 +2,9 @@
 
 <a href="../../en/advanced/auto-tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-2563EB?style=flat-square"></a>
 
-このページでは、`bulletou_tuner.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
+このページでは、`tuning_parameters.py` を使って SFNN の factorizer alpha と count confidence を自動調整する方法を説明します。
 
-ここでいう population search は、複数の候補を実際に短く学習させ、その結果が一番良かった候補を次の開始点にする方式です。各世代で `population` 本の候補を少し違うパラメーターで学習させ、設定した指標で一番良い候補を選びます。勾配を推定して別の小さな更新を行う方式ではありません。選ばれた候補の NN 重みとパラメーター値を、そのまま次の世代の開始点にします。
+ここでいう population search は、複数の候補を実際に短く学習させ、その結果を見て次に使うパラメーターを決める方式です。各世代で `population` 本の候補を少し違うパラメーターで学習させ、設定した指標で比較します。世代の最後に、選ばれたパラメーターで commit run を1回実行し、その checkpoint を次の世代の開始点にします。勾配を推定して別の小さな更新を行う方式ではありません。
 
 ## 使う JSON ファイル
 
@@ -15,16 +15,16 @@ runner は 2 つの JSON ファイルを使います。
 | `tuning-settings.json` | population search の世代数、population、trial 長、調整するパラメーター、現在値を書く |
 | `bulletou-settings.json` | 通常の `bulletou.exe` 学習オプションを書く |
 
-`tuning-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--tuning-settings-file` だけを渡します。
+`tuning-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--settings-file` だけを渡します。
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
+python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 同じ runner を再開するときは `--resume` を付けます。
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resume
+python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
 ```
 
 ## `tuning-settings.json` の例
@@ -41,6 +41,12 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
     "lower_is_better": true,
     "use_worker": true,
     "seed": 1,
+    "sampler": "tpe",
+    "tpe_startup_trials": 16,
+    "tpe_good_fraction": 0.25,
+    "tpe_bandwidth": 0.05,
+    "max_parameter_change_ratio": 2.0,
+    "commit_source": "best",
     "save_rate": 1,
     "validation_rate": 1,
     "quantized_validation_rate": 1
@@ -54,22 +60,22 @@ python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json --resum
     "tag_prefix": "pair2-es"
   },
   "parameters": {
-    "shared": { "current": 1.0, "tune": false, "step": 0.0, "min": 0.0, "max": 100.0 },
-    "king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "progress_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_hand_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "residual_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "progress_axis_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_hand_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "king_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "hand_progress_pair_count": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 },
-    "lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
-    "lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+    "shared": 1.0,
+    "king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "residual_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "progress_axis_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_hand_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "king_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "hand_progress_pair_count": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 },
+    "lr": { "current": 0.000030, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
+    "lr_min": { "current": 0.000010, "tune": true, "min": 0.000001, "max": 0.001, "log": true }
   }
 }
 ```
@@ -111,7 +117,7 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
 | `sfnn_factorizer_alpha` | population search の `parameters` から候補ごとに作る |
 | `sfnn_*_count_confidence` | population search の `parameters` から候補ごとに作る |
-| `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡し、採用時に `current` へ書き戻す |
+| `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡す。探索中の採用値は `runner-state.json` に保存する |
 
 `progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
 
@@ -139,6 +145,12 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `lower_is_better` | 小さいほど良い指標なら `true`。`borda_count` では常に順位和が小さいほど良いので、この値は使われない |
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
+| `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使う |
+| `tpe_startup_trials` | TPE の分布推定に使う最低 trial 数。generation 1 ではこの本数までは広くランダム探索する |
+| `tpe_good_fraction` | TPE が上位何割を「良かった候補」として扱うか |
+| `tpe_bandwidth` | TPE の分布幅の下限。大きいほど候補が広めに散る |
+| `max_parameter_change_ratio` | generation 2 以降で、候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` に制限する |
+| `commit_source` | 世代末の commit run に使う値。`"best"` は実測1位、`"recommended"` は上位 trial から推定した値 |
 | `save_rate` | 何回採用するごとに `accepted-checkpoints/` へ公開 checkpoint を保存するか |
 | `validation_rate` | f32 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
 | `quantized_validation_rate` | 量子化 validation 間隔。population search 有効時は候補ごと、`enabled: false` では通常学習に使う。`0` なら各 trial の末尾だけで測る。`-1` なら無効 |
@@ -146,6 +158,8 @@ population search 実行時は runner が候補ごとに次の値を決めます
 `metric` が必要とする validation を `-1` にすることはできません。例えば `metric: "borda_count"` は f32/量子化の accuracy/loss をすべて使うので、両方の validation rate を有効にしてください。trial 末尾だけでよい場合は `0` を指定します。
 
 `trial_sbs` は候補 1 本あたりの学習長です。`trial_sbs: 4` なら、各候補を 4 sb だけ学習し、`population` 本すべてが終わってから指標で順位を付けます。
+
+`max_parameter_change_ratio` は、学習が進んだ checkpoint に対してパラメーターを急に大きく動かしすぎるのを防ぐ安全弁です。scratch から始める generation 1 では広く探索し、commit checkpoint ができた後の generation では現在値の近くを探索します。現在値が `0` のパラメーターは `0` のままにします。`0` は成分無効化という特別な意味を持つため、通常は factorizer alpha / count confidence の `min` を `0.1` 以上にしておくほうが扱いやすいです。
 
 ## `metric`
 
@@ -197,31 +211,31 @@ runner root は `output_folder/tuning-<tag_prefix>` です。
 各パラメーターは次の形で書きます。
 
 ```json
-"king_axis": { "current": 1.0, "tune": true, "step": 0.005, "min": 0.0, "max": 100.0 }
+"king_axis": { "current": 1.0, "tune": true, "min": 0.1, "max": 10.0 }
 ```
 
 | 項目 | 意味 |
 | --- | --- |
-| `current` | 現在値。候補はこの値の周辺から作られる |
+| `current` | 初回開始値。`enabled: false` ではこの値をそのまま使う。探索再開時の採用値は `runner-state.json` から読む |
 | `tune` | `true` なら population search が動かす。`false` なら固定 |
-| `step` | 乗算的な揺らし幅。候補値は `current * exp(random(-step, step))` で作られる |
 | `min` | 下限 |
 | `max` | 上限 |
+| `log` | `true` なら対数空間で探索する。学習率のように桁で効く値に使う |
 
-`step` は加算幅ではありません。`step = 0.02` なら、おおむね `current` の ±2% の範囲からサンプリングします。`step = 0.10` なら、おおむね 0.90 倍から 1.11 倍です。探索幅を広げたいときは、調整したい各パラメーターの `step` を直接変更します。`tune = true` のパラメーターは `current > 0` である必要があります。
+候補値は、基本的には `min` から `max` の範囲で作られます。`log: true` のパラメーターは対数空間で作られます。generation 2 以降で `max_parameter_change_ratio` を指定している場合は、さらに現在採用中の値の近くに制限されます。
 
-候補が採用されると、その候補のパラメーター値が `current` に書き戻されます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
+runner は `tuning-settings.json` 自体には書き戻しません。採用中の値は `runner-state.json` に保存され、確認用の値は `recommended-parameters.json` に書かれます。再開時に `king_axis=...` のような長い値を手で転記する必要はありません。
 
 学習率も runner に現在値として保持させたい場合は、`lr` と `lr_min` を `parameters` に書けます。
 
 ```json
-"lr": { "current": 0.000030, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 },
-"lr_min": { "current": 0.000010, "tune": false, "step": 0.005, "min": 0.000001, "max": 0.001 }
+"lr": { "current": 0.000030, "tune": true, "min": 0.000001, "max": 0.001, "log": true },
+"lr_min": { "current": 0.000010, "tune": true, "min": 0.000001, "max": 0.001, "log": true }
 ```
 
 この 2 つを `parameters` に書いた場合、runner は各 `bulletou.exe` 起動時に `--lr` と `--lr-min` を追加します。そのため、`bulletou-settings.json` に `lr` / `lr_min` が残っていても、population search 側の値が上書きします。`parameters` に書かなければ、学習率は `bulletou-settings.json` 側の固定値を使います。
 
-`lr` と `lr_min` の両方を調整対象にする場合は、候補生成の範囲全体で必ず `lr_min <= lr` になるように `current` / `min` / `max` を設定してください。runner はこの関係を勝手に丸めず、破れている場合は起動時にエラーにします。
+`lr` と `lr_min` の両方を調整対象にする場合、runner は `lr_min <= lr` になるように `lr_min` の候補をその trial の `lr` 以下に制限して作ります。
 
 ## alpha パラメーター
 
@@ -272,7 +286,7 @@ population search で調整済みの `parameters.current` だけを使い、popu
 その状態で runner を 1 回起動します。
 
 ```powershell
-python .\bulletou_tuner.py --tuning-settings-file .\tuning-settings.json
+python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。

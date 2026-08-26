@@ -144,11 +144,11 @@ population search で調整した `tuning-settings.json` の `parameters.current
 }
 ```
 
-この状態で `bulletou_tuner.py` を起動すると、runner は `bulletou.exe` を 1 回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
+この状態で `tuning_parameters.py` を起動すると、runner は `bulletou.exe` を 1 回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
 
 ```powershell
-python .\bulletou_tuner.py `
-  --tuning-settings-file D:\BulletOu-snapshots\settings\tuning-settings-20260821.json `
+python .\tuning_parameters.py `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
 
