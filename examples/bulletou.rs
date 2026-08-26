@@ -10080,12 +10080,13 @@ impl WorkerSfnnSession {
                         .rebase_axis_factorizer_terms(&self.ctx, ratios.as_slice())
                         .map_err(|e| e.to_string())?;
                     eprintln!(
-                        "  SFNN factorizer rebase = axis terms: changed_axes={}/{}, ratio=[{:.6},{:.6}], clamped={}",
+                        "  SFNN factorizer rebase = axis terms: changed_axes={}/{}, ratio=[{:.6},{:.6}], clamped={}, zeroed={}",
                         stats.changed_axes,
                         self.shape.factorizer_axis_count(),
                         stats.min_ratio,
                         stats.max_ratio,
-                        stats.clamped_axes
+                        stats.clamped_axes,
+                        stats.zeroed_axes
                     );
                 }
             }
@@ -19240,6 +19241,7 @@ fn cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(
 struct SfnnAxisFactorizerRebaseStats {
     changed_axes: usize,
     clamped_axes: usize,
+    zeroed_axes: usize,
     min_ratio: f32,
     max_ratio: f32,
 }
@@ -19294,6 +19296,7 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
     let mut ratios = vec![1.0f32; axis_count];
     let mut changed_axes = 0usize;
     let mut clamped_axes = 0usize;
+    let mut zeroed_axes = 0usize;
     let mut min_ratio = f32::INFINITY;
     let mut max_ratio = f32::NEG_INFINITY;
     for axis in 0..axis_count {
@@ -19307,12 +19310,18 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
         };
         let new_effective =
             cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(shape, axis, new_alpha, new_confidences);
-        let mut ratio = if new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER {
-            if old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER {
-                1.0
-            } else {
-                SFNN_AXIS_REBASE_MAX_RATIO
-            }
+        let old_is_zero = old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
+        let new_is_zero = new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
+        let mut ratio = if old_is_zero && new_is_zero {
+            1.0
+        } else if old_is_zero || new_is_zero {
+            // Enabling a previously inactive axis is singular:
+            //   old_effective * W_old == 0
+            // so the only output-preserving initialization is W_new = 0.
+            // Disabling an axis also zeroes the latent term/optimizer state,
+            // avoiding a hidden oversized value if the axis is enabled later.
+            zeroed_axes += 1;
+            0.0
         } else {
             old_effective / new_effective
         };
@@ -19339,7 +19348,10 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
         min_ratio = 1.0;
         max_ratio = 1.0;
     }
-    Ok((ratios, SfnnAxisFactorizerRebaseStats { changed_axes, clamped_axes, min_ratio, max_ratio }))
+    Ok((
+        ratios,
+        SfnnAxisFactorizerRebaseStats { changed_axes, clamped_axes, zeroed_axes, min_ratio, max_ratio },
+    ))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]

@@ -945,6 +945,7 @@ def open_worker_session(
     worker: tuner.WorkerClient,
     run: RunSettings,
     specs: dict[str, SearchParameter],
+    current_parameters: dict[str, float],
     current_checkpoint: Path | None,
     runner_root: Path,
     settings: StudySettings,
@@ -952,7 +953,7 @@ def open_worker_session(
     color: bool,
 ) -> None:
     open_dir = runner_root / "worker-session"
-    open_params = current_fixed_values(specs)
+    open_params = dict(current_parameters)
     open_args = worker_args_from_train_args(
         train_args(run, open_params, current_checkpoint, open_dir, settings, trial_sbs)
     )
@@ -1228,7 +1229,7 @@ def main() -> int:
                 open_trial_sbs = settings.trial_sbs_for_generation(start_generation)
                 if args.dry_run:
                     open_dir = runner_root / "worker-session"
-                    open_params = current_fixed_values(specs)
+                    open_params = dict(current_parameters)
                     open_args = worker_args_from_train_args(
                         train_args(run, open_params, current_checkpoint, open_dir, settings, open_trial_sbs)
                     )
@@ -1245,6 +1246,7 @@ def main() -> int:
                         worker=worker,
                         run=run,
                         specs=specs,
+                        current_parameters=current_parameters,
                         current_checkpoint=current_checkpoint,
                         runner_root=runner_root,
                         settings=settings,
@@ -1722,6 +1724,7 @@ def main() -> int:
                         worker=worker,
                         run=run,
                         specs=specs,
+                        current_parameters=current_parameters,
                         current_checkpoint=current_checkpoint,
                         runner_root=runner_root,
                         settings=settings,
