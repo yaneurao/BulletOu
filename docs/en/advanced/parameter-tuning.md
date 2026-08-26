@@ -28,7 +28,7 @@ If you want to allow `0` for factorizer alpha or count confidence, omit `log` or
 
 ## Generations and the TPE sampler
 
-`tuning_parameters.py` creates candidates generation by generation. Trial results from the current generation are not used to create more candidates in the same generation. They are used starting from the next generation.
+`tuning_parameters.py` creates candidates generation by generation. Completed trials from the current generation are used immediately when creating later candidates in that same generation. For example, with `tpe_startup_trials: 16`, the first 16 trials explore broadly, and trial 17 starts using current-generation observations for TPE.
 
 ```json
 "tuning": {
@@ -48,11 +48,11 @@ If `generations` is omitted, the runner infers it from the `population` / `trial
 
 Set `schedule_repeat: true` to repeat the arrays cyclically instead of reusing the last value. For example, `population: [100, 0]` and `trial_sbs: [4, 128]` means odd generations do short search trials and even generations do long stabilization training.
 
-The TPE-style sampler uses results from the immediately previous generation. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
+The TPE-style sampler uses trials that have already completed in the same generation. It sorts completed trials by the configured metric, treats the top fraction as good trials and the rest as bad trials, builds per-parameter distributions, and prefers values that are likely under the good distribution and unlikely under the bad distribution.
 
-If the previous generation has fewer than that generation's `tpe_startup_trials` completed trials, or if it has only one trial and cannot form a bad distribution, the runner does not fall back to fully uniform random sampling. Instead, it samples with Gaussian noise around the previous generation's `recommended` parameters. In other words, generation 1 explores broadly, and generation 2 and later explore around what the previous generation learned.
+At the start of each generation there are not enough current-generation observations yet. In generation 1, the runner samples from the full configured range until `tpe_startup_trials` trials are complete. In generation 2 and later, a checkpoint already exists, so before enough observations exist the runner samples with Gaussian noise around the currently accepted parameter values.
 
-For example, generation 2 trials continue from the commit checkpoint produced at the end of generation 1, and their candidate parameters are sampled from generation 1 results. Generation 3 then continues from the commit checkpoint produced at the end of generation 2 and samples from generation 2 results.
+For example, with `tpe_startup_trials: 16`, generation 1 trials 1 through 16 are random, and trials 17 through 100 use TPE based on completed generation 1 trials. In a later search generation that starts from a checkpoint, the first 16 trials sample around the current values, and trial 17 starts using TPE based on that generation's completed trials.
 
 The runner does not mix all generations for TPE, because each generation starts from a different checkpoint. Mixing metrics from different training stages would make older generations unfairly worse and distort the sampler.
 
@@ -95,7 +95,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | --- | --- | --- |
 | `schedule_repeat` | If `true`, array-valued `population` / `trial_sbs` / `tpe_startup_trials` are repeated by generation. If `false`, the last array value is reused. | `false` |
 | `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"`. | `"tpe"` |
-| `tpe_startup_trials` | Number of completed trials required for TPE density estimation. This can be a number or an array. Arrays are interpreted per generation, like `population` and `trial_sbs`. With `schedule_repeat: false`, the last value is reused when the array is shorter than `generations`; with `true`, the array is repeated cyclically. In generation 1, trials are sampled from the full range until there are enough observations. In generation 2 and later, if the previous generation has too few trials, candidates are sampled around the previous generation's `recommended` parameters instead. | `16` |
+| `tpe_startup_trials` | Number of completed trials from the same generation required for TPE density estimation. This can be a number or an array, interpreted per generation like `population` and `trial_sbs`. In generation 1, trials are sampled from the full range until enough observations exist. In generation 2 and later, candidates are sampled around the currently accepted parameter values until enough current-generation observations exist. | `16` |
 | `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
 | `max_parameter_change_ratio` | In generation 2 and later, limits candidate values to a ratio around the currently accepted value. `2.0` means from `current/2` to `current*2`. `null` or omission disables this limit. | none |

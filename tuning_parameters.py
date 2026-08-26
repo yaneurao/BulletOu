@@ -877,6 +877,19 @@ def generation_results(settings: StudySettings, completed: list[TrialResult], ge
     return [result for result in completed if result_generation(settings, result) == generation]
 
 
+def generation_results_before_trial(
+    settings: StudySettings,
+    completed: list[TrialResult],
+    generation: int,
+    trial: int,
+) -> list[TrialResult]:
+    return [
+        result
+        for result in completed
+        if result.trial < trial and result_generation(settings, result) == generation
+    ]
+
+
 def latest_generation_with_results(settings: StudySettings, completed: list[TrialResult]) -> int | None:
     if not completed:
         return None
@@ -1331,27 +1344,31 @@ def main() -> int:
                 generation_last_trial = generation_first_trial + population - 1
                 trial_sbs = settings.trial_sbs_for_generation(generation)
                 tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
-                sampler_generation = latest_prior_generation_with_results(settings, completed, generation)
-                sampler_trials = (
-                    generation_results(settings, completed, sampler_generation)
-                    if sampler_generation is not None
+                prior_sampler_generation = latest_prior_generation_with_results(settings, completed, generation)
+                prior_sampler_trials = (
+                    generation_results(settings, completed, prior_sampler_generation)
+                    if prior_sampler_generation is not None
                     else []
                 )
-                sampler_center_params = dict(current_parameters) if sampler_trials else None
+                generation_sampler_trials = generation_results(settings, completed, generation)
+                sampler_center_params = (
+                    dict(current_parameters)
+                    if current_checkpoint is not None or prior_sampler_trials
+                    else None
+                )
                 if population == 0:
                     sampler_center = "commit-only"
-                elif settings.sampler == "random" or not sampler_trials:
+                elif settings.sampler == "random":
                     sampler_center = "random"
                 elif (
-                    sampler_center_params is not None
-                    and (
-                        len(sampler_trials) < tpe_startup_trials
-                        or len(sampler_trials) < 2
-                    )
+                    len(generation_sampler_trials) >= tpe_startup_trials
+                    and len(generation_sampler_trials) >= 2
                 ):
+                    sampler_center = "tpe-current-generation"
+                elif sampler_center_params is not None:
                     sampler_center = "current-parameters"
                 else:
-                    sampler_center = "tpe"
+                    sampler_center = "random"
                 rng = random.Random(settings.seed + generation * 1_000_003)
                 tuner.event(
                     color,
@@ -1360,8 +1377,9 @@ def main() -> int:
                         f"population={population} trial_sbs={trial_sbs} "
                         f"tpe_startup_trials={tpe_startup_trials} "
                         f"base={current_checkpoint or 'scratch'} "
-                        f"sampler_generation={sampler_generation or '-'} "
-                        f"sampler_trials={len(sampler_trials)} "
+                        f"prior_sampler_generation={prior_sampler_generation or '-'} "
+                        f"prior_sampler_trials={len(prior_sampler_trials)} "
+                        f"current_generation_trials={len(generation_sampler_trials)} "
                         f"sampler_center={sampler_center}"
                     ),
                     "magenta",
@@ -1380,21 +1398,32 @@ def main() -> int:
                         "yellow",
                     )
                 trial_start = max(next_trial, generation_first_trial)
-                for _ in range(generation_first_trial, trial_start):
+                for burn_trial in range(generation_first_trial, trial_start):
                     sample_params(
                         specs,
                         rng,
-                        sampler_trials,
+                        generation_results_before_trial(settings, completed, generation, burn_trial),
                         settings,
                         tpe_startup_trials,
                         sampler_center_params,
                     )
                 for trial in range(trial_start, generation_last_trial + 1):
                     generation_trial = trial - generation_first_trial + 1
+                    trial_sampler_trials = generation_results_before_trial(
+                        settings, completed, generation, trial
+                    )
+                    if settings.sampler == "random":
+                        trial_sampler_mode = "random"
+                    elif len(trial_sampler_trials) >= tpe_startup_trials and len(trial_sampler_trials) >= 2:
+                        trial_sampler_mode = "tpe"
+                    elif sampler_center_params is not None:
+                        trial_sampler_mode = "current-parameters"
+                    else:
+                        trial_sampler_mode = "random"
                     params = sample_params(
                         specs,
                         rng,
-                        sampler_trials,
+                        trial_sampler_trials,
                         settings,
                         tpe_startup_trials,
                         sampler_center_params,
@@ -1407,7 +1436,8 @@ def main() -> int:
                     tuner.event(
                         color,
                         f"{display_prefix} START",
-                        " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
+                        f"sampler={trial_sampler_mode} observations={len(trial_sampler_trials)} "
+                        + " ".join(f"{k}={v:.9g}" for k, v in sorted(params.items())),
                         "magenta",
                     )
                     cmd = train_args(

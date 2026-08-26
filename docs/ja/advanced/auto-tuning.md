@@ -146,7 +146,7 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `use_worker` | 長寿命の `bulletou worker` を使う。省略時は `true` |
 | `seed` | 候補生成用の乱数 seed |
 | `sampler` | `"tpe"` または `"random"`。通常は `"tpe"` を使う |
-| `tpe_startup_trials` | TPE の分布推定に使う最低 trial 数。generation 1 ではこの本数までは広くランダム探索する |
+| `tpe_startup_trials` | 同じ generation 内でTPEの分布推定に使う最低 trial 数。generation 1ではこの本数までは広くランダム探索し、その後は同じgenerationの完了済みtrialを使う。checkpointから始まるgenerationでは、この本数までは現在値周辺を探索する |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として扱うか |
 | `tpe_bandwidth` | TPE の分布幅の下限。大きいほど候補が広めに散る |
 | `max_parameter_change_ratio` | generation 2 以降で、候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` に制限する |

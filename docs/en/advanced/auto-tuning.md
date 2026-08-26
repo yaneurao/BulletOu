@@ -146,7 +146,7 @@ Notes:
 | `use_worker` | Use a long-lived `bulletou worker` process. The default is `true` when omitted |
 | `seed` | Random seed for candidate generation |
 | `sampler` | `"tpe"` or `"random"`. Usually use `"tpe"` |
-| `tpe_startup_trials` | Minimum completed-trial count used for TPE density estimation. Generation 1 samples broadly until this count is reached |
+| `tpe_startup_trials` | Minimum completed-trial count from the same generation used for TPE density estimation. Generation 1 samples broadly until this count is reached, then uses completed trials from the same generation. Later checkpoint-based generations sample around current values until enough observations exist |
 | `tpe_good_fraction` | Fraction of trials treated as good trials by TPE |
 | `tpe_bandwidth` | Lower bound for the TPE distribution width. Larger values spread candidates more broadly |
 | `max_parameter_change_ratio` | In generation 2 and later, limits candidate values to a ratio around the currently accepted value. `2.0` means from `current/2` to `current*2` |
