@@ -19,7 +19,8 @@ use crate::{
         },
         outputs::{
             SHOGI_SFNN_PROGRESS_MAX_ACTIVE, ShogiProgressKPAbs, ShogiSfnnLayerStackBucket,
-            ShogiSfnnLayerStackBucketKind,
+            ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressQ16Params,
+            shogi_sfnn_progress_0_to_255_from_board_with_params, shogi_sfnn_progress_bucket_from_value,
         },
     },
     shogi::{PackedSfenValue, ShogiBoard},
@@ -154,6 +155,10 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub scale: f32,
     pub win_rate_model: bool,
     pub wrm_target: WinRateModelTargetParams,
+    /// If set for a progressN SFNN architecture, materialise the final hard
+    /// progress bucket directly and skip the trainable-progress feature buffer.
+    /// This is intended for `--sfnn-freeze-progress`.
+    pub hard_progress_params: Option<ShogiSfnnProgressQ16Params>,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
     pub teacher_shuffle_seed: u64,
@@ -2863,6 +2868,8 @@ fn prepare_sfnn_fast_batch_from_board_features(
     let sparse_len = max_active * batch_size;
     let progress_bucket_count = config.layerstack_bucket.progress_bucket_count();
     let progress_enabled = progress_bucket_count > 1;
+    let hard_progress_params = config.hard_progress_params.as_ref();
+    let collect_progress_features = progress_enabled && hard_progress_params.is_none();
     let mut batch = FastBatchHost {
         layout: FastBatchLayout { batch_size, max_active, output_size: 1, hand_count_dim: 0 },
         stm: vec![-1; sparse_len],
@@ -2871,7 +2878,7 @@ fn prepare_sfnn_fast_batch_from_board_features(
         targets: vec![0.0; batch_size],
         weights: vec![0.0; batch_size],
         hand_count: None,
-        progress: progress_enabled.then(|| FastBatchProgressHost {
+        progress: collect_progress_features.then(|| FastBatchProgressHost {
             base_buckets: vec![0; batch_size],
             active_indices: vec![-1; batch_size * SHOGI_SFNN_PROGRESS_MAX_ACTIVE],
             max_active: SHOGI_SFNN_PROGRESS_MAX_ACTIVE,
@@ -2922,31 +2929,37 @@ fn prepare_sfnn_fast_batch_from_board_features(
 
             if progress_enabled {
                 let base_bucket = layerstack_bucket.hand_king_bucket_from_board(&board);
-                if let Some(base_chunk) = progress_base_chunk.as_deref_mut() {
-                    base_chunk[i] = base_bucket as i32;
-                }
-                if let Some(active_chunk) = progress_active_chunk.as_deref_mut() {
-                    let progress_offset = SHOGI_SFNN_PROGRESS_MAX_ACTIVE * i;
-                    let progress_slice =
-                        &mut active_chunk[progress_offset..progress_offset + SHOGI_SFNN_PROGRESS_MAX_ACTIVE];
-                    progress_slice.fill(-1);
-                    ShogiProgressKPAbs::collect_active_indices_from_board(&board, &mut progress_indices);
-                    assert!(
-                        progress_indices.len() <= SHOGI_SFNN_PROGRESS_MAX_ACTIVE,
-                        "SFNN/{input_label} progress active feature count {} exceeded max_active {}",
-                        progress_indices.len(),
-                        SHOGI_SFNN_PROGRESS_MAX_ACTIVE
-                    );
-                    for (dst, &idx) in progress_slice.iter_mut().zip(progress_indices.iter()) {
-                        *dst = idx as i32;
+                if let Some(params) = hard_progress_params {
+                    let progress_value = shogi_sfnn_progress_0_to_255_from_board_with_params(&board, params);
+                    let progress_bucket = shogi_sfnn_progress_bucket_from_value(progress_value, progress_bucket_count);
+                    buckets_chunk[i] = (base_bucket * progress_bucket_count + progress_bucket) as i32;
+                } else {
+                    if let Some(base_chunk) = progress_base_chunk.as_deref_mut() {
+                        base_chunk[i] = base_bucket as i32;
                     }
-                    progress_indices.clear();
+                    if let Some(active_chunk) = progress_active_chunk.as_deref_mut() {
+                        let progress_offset = SHOGI_SFNN_PROGRESS_MAX_ACTIVE * i;
+                        let progress_slice =
+                            &mut active_chunk[progress_offset..progress_offset + SHOGI_SFNN_PROGRESS_MAX_ACTIVE];
+                        progress_slice.fill(-1);
+                        ShogiProgressKPAbs::collect_active_indices_from_board(&board, &mut progress_indices);
+                        assert!(
+                            progress_indices.len() <= SHOGI_SFNN_PROGRESS_MAX_ACTIVE,
+                            "SFNN/{input_label} progress active feature count {} exceeded max_active {}",
+                            progress_indices.len(),
+                            SHOGI_SFNN_PROGRESS_MAX_ACTIVE
+                        );
+                        for (dst, &idx) in progress_slice.iter_mut().zip(progress_indices.iter()) {
+                            *dst = idx as i32;
+                        }
+                        progress_indices.clear();
+                    }
+                    // Existing hard-bucket field is retained for consumers that do
+                    // not use trainable progress.  With no process-global progress
+                    // parameters installed this maps to the neutral progress
+                    // bucket; trainable progress code uses `progress` above.
+                    buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
                 }
-                // Existing hard-bucket field is retained for consumers that do
-                // not use trainable progress.  With no process-global progress
-                // parameters installed this maps to the neutral progress
-                // bucket; trainable progress code uses `progress` above.
-                buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
             } else {
                 buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
             }
@@ -3155,6 +3168,7 @@ mod tests {
             scale: 400.0,
             win_rate_model: false,
             wrm_target: WinRateModelTargetParams::DEFAULT,
+            hard_progress_params: None,
             score_drop_abs: Some(32_000),
             teacher_shuffle_buffer_batches: 0,
             teacher_shuffle_seed: 0,
