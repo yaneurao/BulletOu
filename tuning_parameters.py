@@ -52,6 +52,26 @@ SUMMARY_FIELDS = [
     "checkpoint",
 ]
 
+GENERATION_BEST_FIELDS_BASE = [
+    "generation",
+    "population",
+    "trial_sbs",
+    "source",
+    "trial",
+    "test_value_accuracy",
+    "test_value_loss",
+    "quantized_value_accuracy",
+    "quantized_value_loss",
+    "selection_metric",
+    "committed",
+    "commit_source",
+    "commit_test_value_accuracy",
+    "commit_test_value_loss",
+    "commit_quantized_value_accuracy",
+    "commit_quantized_value_loss",
+    "commit_selection_metric",
+]
+
 TPE_CANDIDATES = 64
 
 
@@ -990,6 +1010,49 @@ def latest_commit_params(summary_path: Path) -> dict[str, float] | None:
     return latest
 
 
+def generation_best_fields(specs: dict[str, SearchParameter]) -> list[str]:
+    return GENERATION_BEST_FIELDS_BASE + sorted(specs) + ["checkpoint"]
+
+
+def write_generation_best_csv_row(
+    path: Path,
+    fields: list[str],
+    row: dict[str, Any],
+) -> None:
+    """Write one human-readable aggregate row per generation.
+
+    This is intentionally replace-by-generation instead of append-only so an
+    interrupted generation-end commit can be resumed without leaving duplicate
+    generation rows behind.
+    """
+    if not tuner.LOG_WRITES_ENABLED:
+        return
+    generation = str(row["generation"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            old_fields = reader.fieldnames or []
+            if old_fields and set(old_fields) != set(fields):
+                raise RuntimeError(
+                    f"{path} has incompatible header\n"
+                    f"  existing: {','.join(old_fields)}\n"
+                    f"  expected: {','.join(fields)}"
+                )
+            for old_row in reader:
+                if str(old_row.get("generation", "")) != generation:
+                    rows.append(old_row)
+    rows.append({field: row.get(field, "") for field in fields})
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for out_row in rows:
+            writer.writerow({field: out_row.get(field, "") for field in fields})
+    os.replace(tmp, path)
+
+
 def starting_generation(settings: StudySettings, state: dict[str, Any], next_trial: int) -> int:
     pending_commit_generation = state.get("pending_commit_generation")
     if pending_commit_generation is not None:
@@ -1176,11 +1239,13 @@ def main() -> int:
         trials_root = (run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
         log_dir = runner_root / "logs"
         summary_path = runner_root / "summary-learn.log"
+        generation_best_path = runner_root / "generation-best-parameters.csv"
         state_path = runner_root / "runner-state.json"
         recommendation_path = runner_root / "recommended-parameters.json"
         current_dir = runner_root / "current-checkpoint"
         pending_commit_dir = runner_root / "pending-commit-checkpoint"
         best_dir = runner_root / "best-checkpoint"
+        generation_best_fields_list = generation_best_fields(specs)
 
         if runner_root.exists() and not args.resume and not args.dry_run:
             raise RuntimeError(f"{runner_root} already exists; use --resume or choose a new run.tag_prefix")
@@ -1190,6 +1255,7 @@ def main() -> int:
             log_dir.mkdir(parents=True, exist_ok=True)
             upgrade_summary_csv(summary_path)
             tuner.ensure_csv(summary_path, SUMMARY_FIELDS)
+            tuner.ensure_csv(generation_best_path, generation_best_fields_list)
             shutil.copy2(args.settings_file, runner_root / args.settings_file.name)
             shutil.copy2(run.bulletou_settings_file, runner_root / run.bulletou_settings_file.name)
 
@@ -1782,6 +1848,48 @@ def main() -> int:
                         "selection_metric": tuner.format_float(commit_score),
                         "checkpoint": str(current_dir),
                     },
+                )
+
+                if generation_best is not None:
+                    best_source = "generation_best"
+                    best_trial_cell = generation_best.trial
+                    best_metric = generation_best.metric
+                    best_score_for_row = generation_best.score
+                    best_params_for_row = generation_best.params
+                    best_committed = commit_source == "best"
+                else:
+                    best_source = "current"
+                    best_trial_cell = ""
+                    best_metric = commit_metric
+                    best_score_for_row = commit_score
+                    best_params_for_row = commit_params
+                    best_committed = True
+                generation_row: dict[str, Any] = {
+                    "generation": generation,
+                    "population": population,
+                    "trial_sbs": trial_sbs,
+                    "source": best_source,
+                    "trial": best_trial_cell,
+                    "test_value_accuracy": tuner.format_float(best_metric.test_acc),
+                    "test_value_loss": tuner.format_float(best_metric.test_loss),
+                    "quantized_value_accuracy": tuner.format_float(best_metric.qacc),
+                    "quantized_value_loss": tuner.format_float(best_metric.qloss),
+                    "selection_metric": tuner.format_float(best_score_for_row),
+                    "committed": "yes" if best_committed else "no",
+                    "commit_source": commit_source,
+                    "commit_test_value_accuracy": tuner.format_float(commit_metric.test_acc),
+                    "commit_test_value_loss": tuner.format_float(commit_metric.test_loss),
+                    "commit_quantized_value_accuracy": tuner.format_float(commit_metric.qacc),
+                    "commit_quantized_value_loss": tuner.format_float(commit_metric.qloss),
+                    "commit_selection_metric": tuner.format_float(commit_score),
+                    "checkpoint": str(current_dir) if best_committed else "",
+                }
+                for name in sorted(specs):
+                    generation_row[name] = tuner.format_float(best_params_for_row.get(name))
+                write_generation_best_csv_row(
+                    generation_best_path,
+                    generation_best_fields_list,
+                    generation_row,
                 )
 
                 if is_better_score(commit_score, best_commit_score, settings.lower_is_better):

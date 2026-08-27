@@ -228,8 +228,16 @@ The runner root is:
 | `pending-commit-checkpoint/` | Temporary checkpoint after the commit run and before it is moved to `current-checkpoint/`; normally it does not remain |
 | `best-checkpoint/` | Best checkpoint among completed commit runs |
 | `recommended-parameters.json` | Inferred parameters from top trials |
+| `generation-best-parameters.csv` | Wide CSV summary of the best trial parameters for each generation |
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
+
+`generation-best-parameters.csv` is updated once after each generation-end commit run.
+If the same generation is resumed, the row for that generation is replaced instead of duplicated.
+
+With the usual `commit_source: "best"` setting, the parameter columns in this CSV are the values passed to the next generation.
+With `commit_source: "recommended"`, the CSV still records the best measured trial parameters, while the commit-run result is written separately in the `commit_*` columns.
+In that case, the best trial parameters themselves may not have a saved checkpoint.
 
 ## How to read `recommended-parameters.json`
 

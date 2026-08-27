@@ -230,8 +230,16 @@ runner root は次の場所です。
 | `pending-commit-checkpoint/` | commit run 完了後、`current-checkpoint/` へ反映する前の一時 checkpoint。通常は残りません |
 | `best-checkpoint/` | これまでの commit run の中で一番良かった checkpoint |
 | `recommended-parameters.json` | 上位 trial から推定した推奨パラメーター |
+| `generation-best-parameters.csv` | generation ごとの best trial パラメーターを横持ちでまとめたCSV |
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
+
+`generation-best-parameters.csv` は、generation の commit run が終わるたびに1行更新されます。
+同じ generation を resume した場合は、その generation の行を置き換えるので、同じ generation の行が二重に増えません。
+
+通常の `commit_source: "best"` では、このCSVのパラメーターが次 generation へ渡った値です。
+`commit_source: "recommended"` を使った場合は、CSVには best trial の値を書き、commit run の結果は `commit_*` 列に分けて書きます。
+この場合、best trial の値そのものは checkpoint として保存されていないことがあります。
 
 ## `recommended-parameters.json` の読み方
 
