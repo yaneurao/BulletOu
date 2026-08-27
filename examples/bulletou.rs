@@ -10630,7 +10630,14 @@ impl WorkerSfnnSession {
             scale: effective_scale(&trial_args),
             win_rate_model: effective_win_rate_model(&trial_args),
             wrm_target: effective_wrm_target_params(&trial_args),
-            hard_progress_params: frozen_progress_params.clone(),
+            // Keep progress feature preparation pipelined with CUDA work even
+            // when the progress model is frozen.  If we pass the frozen params
+            // into the teacher producer, the producer computes q16 hard
+            // buckets before enqueueing each batch and the GPU stalls on
+            // teacher_prepare.  Leaving this as None makes the producer emit
+            // progress active indices; the consumer converts them to hard
+            // buckets below, where it can overlap with producer work.
+            hard_progress_params: None,
             score_drop_abs: (trial_args.score_drop_abs > 0).then_some(trial_args.score_drop_abs),
             teacher_shuffle_buffer_batches,
             teacher_shuffle_seed: trial_args.teacher_shuffle_seed,
@@ -17194,7 +17201,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         scale: effective_scale(args),
         win_rate_model: effective_win_rate_model(args),
         wrm_target: effective_wrm_target_params(args),
-        hard_progress_params: frozen_progress_params.clone(),
+        // See the worker path above: for frozen progress during training, keep
+        // progress active indices in the prepared batch and compute hard
+        // buckets in the consumer so CPU preparation can overlap CUDA work.
+        hard_progress_params: None,
         score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
         teacher_shuffle_buffer_batches,
         teacher_shuffle_seed: args.teacher_shuffle_seed,
@@ -17260,7 +17270,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     scale: effective_scale(args),
                     win_rate_model: effective_win_rate_model(args),
                     wrm_target: effective_wrm_target_params(args),
-                    hard_progress_params: frozen_progress_params.clone(),
+                    // See the main training config: do not compute frozen
+                    // progress hard buckets in the teacher producer.
+                    hard_progress_params: None,
                     score_drop_abs: (args.score_drop_abs > 0).then_some(args.score_drop_abs),
                     teacher_shuffle_buffer_batches,
                     teacher_shuffle_seed: args.teacher_shuffle_seed,
