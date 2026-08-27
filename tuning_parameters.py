@@ -1187,6 +1187,11 @@ def write_generation_best_csv_row(
         return
     generation = str(row["generation"])
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    def is_mutable_runner_checkpoint(value: str) -> bool:
+        normalized = value.replace("\\", "/").rstrip("/")
+        return normalized.endswith("/current-checkpoint") or normalized.endswith("/best-checkpoint")
+
     rows: list[dict[str, Any]] = []
     if path.exists() and path.stat().st_size > 0:
         with path.open("r", encoding="utf-8", newline="") as f:
@@ -1200,6 +1205,13 @@ def write_generation_best_csv_row(
                 )
             for old_row in reader:
                 if str(old_row.get("generation", "")) != generation:
+                    # current-checkpoint and best-checkpoint are mutable runner
+                    # aliases, not historical per-generation snapshots.  Do
+                    # not leave them on old rows where they would point at a
+                    # newer model after later generations overwrite them.
+                    checkpoint = str(old_row.get("checkpoint", ""))
+                    if is_mutable_runner_checkpoint(checkpoint):
+                        old_row["checkpoint"] = ""
                     rows.append(old_row)
     rows.append({field: row.get(field, "") for field in fields})
     tmp = path.with_name(path.name + ".tmp")
@@ -2015,7 +2027,7 @@ def main() -> int:
                         "quantized_value_loss": tuner.format_float(commit_metric.qloss),
                         "parameters": json.dumps(commit_params, ensure_ascii=False, sort_keys=True),
                         "selection_metric": tuner.format_float(commit_score),
-                        "checkpoint": str(current_dir),
+                        "checkpoint": "",
                     },
                 )
 
@@ -2051,7 +2063,11 @@ def main() -> int:
                     "commit_quantized_value_accuracy": tuner.format_float(commit_metric.qacc),
                     "commit_quantized_value_loss": tuner.format_float(commit_metric.qloss),
                     "commit_selection_metric": tuner.format_float(commit_score),
-                    "checkpoint": str(current_dir) if best_committed else "",
+                    # current-checkpoint is a mutable runner alias overwritten
+                    # by later generations.  generation-best-parameters.csv is
+                    # historical, so do not write that alias as if it were a
+                    # stable per-generation snapshot.
+                    "checkpoint": "",
                 }
                 for name in sorted(specs):
                     generation_row[name] = tuner.format_float(best_params_for_row.get(name))
