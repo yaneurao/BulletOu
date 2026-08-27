@@ -111,11 +111,23 @@ class SearchParameter:
         if self.log:
             lo = math.log(self.minimum)
             hi = math.log(self.maximum)
+            if hi <= lo:
+                return math.exp(lo)
             c = math.log(max(center, self.minimum))
-            x = rng.gauss(c, max(1e-12, (hi - lo) * sigma_ratio))
-            return math.exp(min(max(x, lo), hi))
-        x = rng.gauss(center, max(1e-12, (self.maximum - self.minimum) * sigma_ratio))
-        return min(max(x, self.minimum), self.maximum)
+            sigma = max(1e-12, (hi - lo) * sigma_ratio)
+            for _ in range(32):
+                x = rng.gauss(c, sigma)
+                if lo <= x <= hi:
+                    return math.exp(x)
+            return math.exp(rng.uniform(lo, hi))
+        if self.maximum <= self.minimum:
+            return self.minimum
+        sigma = max(1e-12, (self.maximum - self.minimum) * sigma_ratio)
+        for _ in range(32):
+            x = rng.gauss(center, sigma)
+            if self.minimum <= x <= self.maximum:
+                return x
+        return rng.uniform(self.minimum, self.maximum)
 
 
 @dataclass
@@ -607,45 +619,64 @@ def sample_params_near(
     return out
 
 
-def clamp_params_to_current_range(
-    params: dict[str, float],
+def specs_limited_to_current_range(
     specs: dict[str, SearchParameter],
     center: dict[str, float] | None,
     max_ratio: float | None,
-) -> dict[str, float]:
+) -> dict[str, SearchParameter]:
     if center is None or max_ratio is None:
-        return params
-    out = dict(params)
+        return specs
+    out: dict[str, SearchParameter] = {}
     for name, spec in specs.items():
-        if not spec.tune or name not in out:
+        if not spec.tune:
+            out[name] = spec
             continue
         center_value = center.get(name)
         if center_value is None or not math.isfinite(float(center_value)):
+            out[name] = spec
             continue
         center_value = float(center_value)
         if center_value > 0.0:
             local_min = center_value / max_ratio
             local_max = center_value * max_ratio
         elif center_value == 0.0:
-            # A zero factorizer/count parameter means the component is effectively disabled.
-            # Do not move away from zero through a relative-change limiter; enabling it should be a
-            # deliberate new run, not an accidental TPE jump.
-            local_min = 0.0
-            local_max = 0.0
-        else:
+            out[name] = SearchParameter(
+                name=spec.name,
+                tune=False,
+                current=0.0,
+                minimum=None,
+                maximum=None,
+                log=False,
+            )
             continue
+        else:
+            out[name] = spec
+            continue
+
         if spec.minimum is not None:
             local_min = max(local_min, spec.minimum)
         if spec.maximum is not None:
             local_max = min(local_max, spec.maximum)
         if local_min > local_max:
-            # This can happen when an old checkpoint has current=0 but the new settings set
-            # min>0. Keep the old disabled value rather than forcing an unsafe 0 -> nonzero jump.
-            out[name] = center_value
+            # Keep the current value rather than forcing a boundary jump when
+            # old state and new settings disagree.
+            out[name] = SearchParameter(
+                name=spec.name,
+                tune=False,
+                current=center_value,
+                minimum=None,
+                maximum=None,
+                log=False,
+            )
         else:
-            out[name] = min(max(out[name], local_min), local_max)
-    if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
-        out["lr_min"] = out["lr"]
+            out[name] = SearchParameter(
+                name=spec.name,
+                tune=spec.tune,
+                current=spec.current,
+                minimum=local_min,
+                maximum=local_max,
+                log=spec.log,
+            )
     return out
 
 
@@ -671,7 +702,13 @@ def sample_one_parameter_tpe(
         return spec.sample_random(rng)
     center = rng.choice(values)
     sigma = kde_bandwidth(values, lo, hi, sigma_ratio)
-    return untransform_value(spec, rng.gauss(center, sigma))
+    if hi <= lo:
+        return untransform_value(spec, lo)
+    for _ in range(32):
+        x = rng.gauss(center, sigma)
+        if lo <= x <= hi:
+            return untransform_value(spec, x)
+    return spec.sample_random(rng)
 
 
 def tpe_candidate_score(
@@ -708,22 +745,12 @@ def sample_params_tpe(
 ) -> dict[str, float]:
     if len(completed) < tpe_startup_trials:
         if center is not None:
-            return clamp_params_to_current_range(
-                sample_params_near(specs, rng, center, settings.tpe_bandwidth),
-                specs,
-                center,
-                settings.max_parameter_change_ratio,
-            )
+            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
         return sample_params_random(specs, rng)
     good, bad = split_good_bad(completed, settings)
     if not good or not bad:
         if center is not None:
-            return clamp_params_to_current_range(
-                sample_params_near(specs, rng, center, settings.tpe_bandwidth),
-                specs,
-                center,
-                settings.max_parameter_change_ratio,
-            )
+            return sample_params_near(specs, rng, center, settings.tpe_bandwidth)
         return sample_params_random(specs, rng)
 
     best_params: dict[str, float] | None = None
@@ -752,7 +779,6 @@ def sample_params_tpe(
             out["lr_min"] = lr * out.pop("lr_min_ratio")
         if "lr" in out and "lr_min" in out and out["lr_min"] > out["lr"]:
             out["lr_min"] = out["lr"]
-        out = clamp_params_to_current_range(out, specs, center, settings.max_parameter_change_ratio)
         score = tpe_candidate_score(out, specs, good, bad, settings.tpe_bandwidth)
         if best_params is None or score > best_score:
             best_params = out
@@ -769,14 +795,10 @@ def sample_params(
     tpe_startup_trials: int,
     center: dict[str, float] | None = None,
 ) -> dict[str, float]:
+    sampling_specs = specs_limited_to_current_range(specs, center, settings.max_parameter_change_ratio)
     if settings.sampler == "random":
-        return clamp_params_to_current_range(
-            sample_params_random(specs, rng),
-            specs,
-            center,
-            settings.max_parameter_change_ratio,
-        )
-    return sample_params_tpe(specs, rng, completed, settings, tpe_startup_trials, center)
+        return sample_params_random(sampling_specs, rng)
+    return sample_params_tpe(sampling_specs, rng, completed, settings, tpe_startup_trials, center)
 
 
 def train_args(

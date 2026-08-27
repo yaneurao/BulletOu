@@ -56,7 +56,7 @@ TPE-style sampler は、同じ generation 内ですでに完了した trial を�
 
 全世代の trial を混ぜて TPE しないのは、generation が進むほど開始 checkpoint が変わり、metric の土台も変わるためです。違う学習段階の trial を同じ尺度として混ぜると、古い generation が不利になりやすく、TPE の判断が歪みます。
 
-`max_parameter_change_ratio` を指定すると、generation 2 以降の候補を「現在採用中の値から何倍まで動かしてよいか」で制限できます。たとえば `2.0` なら、現在値が `1.0` のパラメーターは `0.5` から `2.0` の範囲に収まるように切り詰めます。generation 1 を scratch から始める場合は、まだ採用済み checkpoint がないのでこの制限はかからず、`min` から `max` の範囲を広く探索します。
+`max_parameter_change_ratio` を指定すると、候補を「現在採用中の値から何倍まで動かしてよいか」で制限できます。たとえば `2.0` なら、現在値が `1.0` のパラメーターは `0.5` から `2.0` の範囲を使ってサンプルします。サンプル後に境界へ貼り付けるのではないので、`0.5` や `2.0` に値が不自然に集中しません。generation 1 を scratch から始める場合は、まだ採用済み checkpoint がないのでこの制限はかからず、`min` から `max` の範囲を広く探索します。
 
 現在値が `0` のパラメーターは、`max_parameter_change_ratio` の制限中は `0` のままにします。`0` は「その成分を無効にする」という特別な意味を持つためです。factorizer alpha や count confidence を探索する場合は、意図して無効化したいのでなければ `min: 0.1` のように 0 を避ける設定を推奨します。
 
@@ -98,7 +98,7 @@ TPE-style sampler は、同じ generation 内ですでに完了した trial を�
 | `tpe_startup_trials` | 同じ generation 内で、TPE の密度推定に必要な完了済み trial 数。数値または配列で指定できます。配列なら `population` / `trial_sbs` と同じく generation ごとに使います。generation 1 ではこの本数に届くまで探索範囲全体からランダムにサンプルします。generation 2 以降では、この本数に届くまで現在採用中の parameter 周辺をサンプルします。 | `16` |
 | `tpe_good_fraction` | TPE が上位何割を「良かった候補」として使うか。`0.25` なら上位25%を使います。 | `0.25` |
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
-| `max_parameter_change_ratio` | generation 2 以降で、候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` に制限します。`null` または省略ならこの制限を使いません。 | なし |
+| `max_parameter_change_ratio` | 候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` をサンプリング範囲にします。`null` または省略ならこの制限を使いません。 | なし |
 | `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |
 
 ## 設定例

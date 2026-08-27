@@ -56,7 +56,7 @@ For example, with `tpe_startup_trials: 16`, generation 1 trials 1 through 16 are
 
 The runner does not mix all generations for TPE, because each generation starts from a different checkpoint. Mixing metrics from different training stages would make older generations unfairly worse and distort the sampler.
 
-`max_parameter_change_ratio` limits how far generation 2 and later may move a candidate away from the currently accepted value. For example, `2.0` clips a parameter with current value `1.0` to the range `0.5` through `2.0`. Generation 1 from scratch has no accepted checkpoint yet, so it still explores the full `min` to `max` range.
+`max_parameter_change_ratio` limits how far a candidate may move away from the currently accepted value. For example, `2.0` samples a parameter with current value `1.0` from the range `0.5` through `2.0`. The runner applies this limit before sampling rather than clipping sampled values afterward, so values do not artificially pile up at exactly `0.5` or `2.0`. Generation 1 from scratch has no accepted checkpoint yet, so it still explores the full `min` to `max` range.
 
 If the current value is `0`, the ratio limit keeps it at `0`. This is intentional: `0` means the component is disabled. For factorizer alpha and count-confidence parameters, prefer `min: 0.1` unless you explicitly want to test disabled components.
 
@@ -98,7 +98,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | `tpe_startup_trials` | Number of completed trials from the same generation required for TPE density estimation. This can be a number or an array, interpreted per generation like `population` and `trial_sbs`. In generation 1, trials are sampled from the full range until enough observations exist. In generation 2 and later, candidates are sampled around the currently accepted parameter values until enough current-generation observations exist. | `16` |
 | `tpe_good_fraction` | Fraction of completed trials treated as good candidates. `0.25` means the top 25% are used. | `0.25` |
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
-| `max_parameter_change_ratio` | In generation 2 and later, limits candidate values to a ratio around the currently accepted value. `2.0` means from `current/2` to `current*2`. `null` or omission disables this limit. | none |
+| `max_parameter_change_ratio` | Limits candidate values to a ratio around the currently accepted value. `2.0` means the sampling range is `current/2` to `current*2`. `null` or omission disables this limit. | none |
 | `commit_source` | Parameters used for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred value from the top trials. | `"best"` |
 
 ## Settings example
