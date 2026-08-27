@@ -11,7 +11,7 @@ It does not depend on external Python packages. It is a small BulletOu-specific 
 - Parameters stay fixed during a trial.
 - For every generation, the runner evaluates `population` trials and records the metric.
 - At the end of a generation, the runner performs one commit run with the selected parameters and saves that checkpoint as `current-checkpoint/`.
-- `best-checkpoint/` stores the best checkpoint among completed commit runs. It is separate from the next generation's starting point.
+- Depending on `tuning.save_rate`, committed generation checkpoints are also saved to stable paths such as `generation-checkpoints/gen0001/`.
 - `recommended-parameters.json` contains inferred parameters from the top trials.
 
 For short trials, the single best observed trial can be noisy. Check both `best_observed` and `recommended` before using the values in a longer run.
@@ -100,6 +100,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
 | `tpe_bandwidth` | Lower bound for the TPE KDE width. Larger values spread candidates more broadly; smaller values concentrate them closer to observed good trials. | `0.15` |
 | `max_parameter_change_ratio` | Limits candidate values to a ratio around the currently accepted value. `2.0` means the sampling range is `current/2` to `current*2`. `null` or omission disables this limit. | none |
 | `commit_source` | Parameters used for the generation-end commit run. `"best"` uses the best measured trial; `"recommended"` uses the inferred value from the top trials. | `"best"` |
+| `save_rate` | How often to save committed generation checkpoints under `generation-checkpoints/genXXXX/`. `1` saves every generation; `0` disables generation checkpoint retention. | `1` |
 
 ## Settings example
 
@@ -119,6 +120,7 @@ These are sampler settings, not NNUE training parameters. They control how the r
     "tpe_bandwidth": 0.15,
     "max_parameter_change_ratio": 2.0,
     "commit_source": "best",
+    "save_rate": 1,
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false
@@ -249,9 +251,9 @@ The runner root is:
 | `summary-learn.log` | Every trial result |
 | `current-checkpoint/` | Checkpoint accepted at the latest completed generation; the next generation starts from here |
 | `pending-commit-checkpoint/` | Temporary checkpoint after the commit run and before it is moved to `current-checkpoint/`; normally it does not remain |
-| `best-checkpoint/` | Best checkpoint among completed commit runs |
+| `generation-checkpoints/genXXXX/` | Stable per-generation checkpoint saved according to `tuning.save_rate` |
 | `recommended-parameters.json` | Inferred parameters from top trials |
-| `generation-best-parameters.csv` | Wide CSV summary of the best trial parameters for each generation. With the default settings, per-generation checkpoints are not kept, so the `checkpoint` column is usually empty |
+| `generation-best-parameters.csv` | Wide CSV summary of the best trial parameters for each generation. If a generation checkpoint is saved, the `checkpoint` column contains `generation-checkpoints/genXXXX/` |
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
 
@@ -262,7 +264,7 @@ With the usual `commit_source: "best"` setting, the parameter columns in this CS
 With `commit_source: "recommended"`, the CSV still records the best measured trial parameters, while the commit-run result is written separately in the `commit_*` columns.
 In that case, the best trial parameters themselves may not have a saved checkpoint.
 
-`current-checkpoint/` and `best-checkpoint/` are mutable runner directories. They are not fixed per-generation snapshots, so `generation-best-parameters.csv` does not write those mutable paths as historical checkpoints.
+`current-checkpoint/` is a mutable runner directory. It is not a fixed per-generation snapshot, so `generation-best-parameters.csv` does not write it as a historical checkpoint. Use `generation-checkpoints/genXXXX/` for fixed retained checkpoints.
 
 ## How to read `recommended-parameters.json`
 
@@ -313,6 +315,14 @@ The TPE sampler compares the distributions of good and bad trials to generate ca
 
 ## Checkpoint retention
 
+`save_rate` controls how many generation checkpoints are kept.
+
+```json
+"save_rate": 1
+```
+
+`1` saves every committed generation as `generation-checkpoints/gen0001/`, `generation-checkpoints/gen0002/`, and so on. `0` disables generation checkpoint retention and only updates `current-checkpoint/` for resume.
+
 `keep_all_trials` controls how many trial checkpoints are kept.
 
 ```json
@@ -321,7 +331,7 @@ The TPE sampler compares the distributions of good and bad trials to generate ca
 "keep_all_trials": false
 ```
 
-With this setting, lower `quantized_value_loss` is better. By default, trial checkpoints are not saved. The runner records each trial's metrics and parameters in `summary-learn.log`, then runs one generation-end commit run using the parameters selected by `commit_source`. That commit run becomes `current-checkpoint/`.
+With this setting, lower `quantized_value_loss` is better. By default, trial checkpoints are not saved. The runner records each trial's metrics and parameters in `summary-learn.log`, then runs one generation-end commit run using the parameters selected by `commit_source`. That commit run becomes `current-checkpoint/`. If `save_rate` is `1`, the same checkpoint is also saved under `generation-checkpoints/genXXXX/`.
 
 With `commit_source: "best"`, the commit run uses the parameters from the best measured trial in that generation. With `commit_source: "recommended"`, it uses the same inferred parameters written to `recommended-parameters.json` for the latest generation. `recommended` is an unevaluated estimate, so the safer default is `"best"`.
 

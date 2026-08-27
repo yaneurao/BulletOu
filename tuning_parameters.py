@@ -8,7 +8,8 @@ This is a small local sampler for expensive BulletOu trials:
 * each trial runs for a fixed number of superbatches,
 * lr / lr-min and factorizer/count parameters can be sampled together,
 * one generation-end commit run creates the next generation's checkpoint,
-* only the current checkpoint and the observed best checkpoint are kept by default.
+* the current checkpoint is kept for resume, and stable per-generation
+  checkpoints are kept according to tuning.save_rate.
 
 The first generation starts with uniform random trials. Later generations use
 the latest earlier generation that actually ran trials. Commit-only generations
@@ -146,6 +147,7 @@ class StudySettings:
     max_parameter_change_ratio: float | None
     validation_rate: int
     quantized_validation_rate: int
+    save_rate: int
     keep_all_trials: bool
     use_worker: bool
     commit_source: str
@@ -314,6 +316,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "max_parameter_change_ratio",
         "validation_rate",
         "quantized_validation_rate",
+        "save_rate",
         "keep_all_trials",
         "use_worker",
         "commit_source",
@@ -365,6 +368,7 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         ),
         validation_rate=int(tuning_obj.get("validation_rate", 0)),
         quantized_validation_rate=int(tuning_obj.get("quantized_validation_rate", 0)),
+        save_rate=int(tuning_obj.get("save_rate", 1)),
         keep_all_trials=bool(tuning_obj.get("keep_all_trials", False)),
         use_worker=bool(tuning_obj.get("use_worker", True)),
         commit_source=commit_source,
@@ -379,6 +383,8 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError("tuning.max_parameter_change_ratio must be finite and >= 1.0")
     if settings.validation_rate < -1 or settings.quantized_validation_rate < -1:
         raise ValueError("tuning.validation_rate / quantized_validation_rate must be >= -1")
+    if settings.save_rate < 0:
+        raise ValueError("tuning.save_rate must be >= 0")
     if (metric.startswith("test_value_") or metric == tuner.BORDA_COUNT_METRIC) and settings.validation_rate < 0:
         raise ValueError(f"tuning.metric {metric!r} requires tuning.validation_rate >= 0")
     if (metric.startswith("quantized_value_") or metric == tuner.BORDA_COUNT_METRIC) and settings.quantized_validation_rate < 0:
@@ -1041,10 +1047,12 @@ def move_dir_replace(src: Path, dst: Path) -> None:
         shutil.rmtree(old)
 
 
-def is_better_score(score: float, best_score: float | None, lower_is_better: bool) -> bool:
-    if best_score is None:
-        return True
-    return score < best_score if lower_is_better else score > best_score
+def generation_checkpoint_path(runner_root: Path, generation: int) -> Path:
+    return runner_root / "generation-checkpoints" / f"gen{generation:04d}"
+
+
+def should_save_generation_checkpoint(settings: StudySettings, generation: int) -> bool:
+    return settings.save_rate > 0 and generation % settings.save_rate == 0
 
 
 def result_generation(settings: StudySettings, result: TrialResult) -> int:
@@ -1205,9 +1213,9 @@ def write_generation_best_csv_row(
                 )
             for old_row in reader:
                 if str(old_row.get("generation", "")) != generation:
-                    # current-checkpoint and best-checkpoint are mutable runner
-                    # aliases, not historical per-generation snapshots.  Do
-                    # not leave them on old rows where they would point at a
+                    # current-checkpoint and legacy best-checkpoint are mutable
+                    # runner aliases, not historical per-generation snapshots.
+                    # Do not leave them on old rows where they would point at a
                     # newer model after later generations overwrite them.
                     checkpoint = str(old_row.get("checkpoint", ""))
                     if is_mutable_runner_checkpoint(checkpoint):
@@ -1414,7 +1422,6 @@ def main() -> int:
         recommendation_path = runner_root / "recommended-parameters.json"
         current_dir = runner_root / "current-checkpoint"
         pending_commit_dir = runner_root / "pending-commit-checkpoint"
-        best_dir = runner_root / "best-checkpoint"
         generation_best_fields_list = generation_best_fields(specs)
 
         if runner_root.exists() and not args.resume and not args.dry_run:
@@ -1442,7 +1449,7 @@ def main() -> int:
                 next_trial = 1
             completed = [result for result in completed if result.trial < next_trial]
         elif args.resume:
-            current_checkpoint = current_dir if current_dir.exists() else (best_dir if best_dir.exists() else run.base_checkpoint)
+            current_checkpoint = current_dir if current_dir.exists() else run.base_checkpoint
             next_trial = 1 + max((r.trial for r in completed), default=0)
         else:
             current_checkpoint = run.base_checkpoint
@@ -1462,6 +1469,8 @@ def main() -> int:
                 "pending_commit_source": None,
                 "pending_commit_params": None,
                 "recommended_parameters": str(recommendation_path),
+                "save_rate": settings.save_rate,
+                "last_generation_checkpoint": None,
                 "settings_file": str(args.settings_file.resolve()),
             }
             if not args.dry_run:
@@ -1480,16 +1489,6 @@ def main() -> int:
         best = None
         if completed:
             best = best_result(completed, settings)
-        best_commit_score = None
-        state_metric = state.get("metric")
-        state_metric_compatible = state_metric == settings.metric or (
-            state_metric is None and settings.metric != tuner.BORDA_COUNT_METRIC
-        )
-        if state_metric_compatible and state.get("best_commit_selection_metric") is not None:
-            best_commit_score = float(state["best_commit_selection_metric"])
-        elif state_metric_compatible and state.get("best_selection_metric") is not None and best_dir.exists():
-            # Older state files used best_selection_metric for the saved best checkpoint.
-            best_commit_score = float(state["best_selection_metric"])
         tuner.event(
             color,
             "[CONFIG]",
@@ -1504,6 +1503,7 @@ def main() -> int:
                 f"tpe_good_fraction={settings.tpe_good_fraction:g} "
                 f"tpe_bandwidth={settings.tpe_bandwidth:g} "
                 f"max_parameter_change_ratio={settings.max_parameter_change_ratio or '-'} "
+                f"save_rate={settings.save_rate} "
                 f"worker={'on' if settings.use_worker else 'off'}"
             ),
             "cyan",
@@ -1829,9 +1829,11 @@ def main() -> int:
                         "pending_commit_params": None,
                         "best_trial": best.trial if best else None,
                         "best_selection_metric": best.score if best else None,
-                        "best_commit_selection_metric": best_commit_score,
-                        "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
+                        "best_commit_selection_metric": None,
+                        "best_checkpoint": None,
                         "recommended_parameters": str(recommendation_path),
+                        "save_rate": settings.save_rate,
+                        "last_generation_checkpoint": state.get("last_generation_checkpoint"),
                         "settings_file": str(args.settings_file.resolve()),
                     }
                     write_json(state_path, state)
@@ -1898,9 +1900,11 @@ def main() -> int:
                     "generation_best_selection_metric": generation_best.score if generation_best else None,
                     "best_trial": best.trial if best else None,
                     "best_selection_metric": best.score if best else None,
-                    "best_commit_selection_metric": best_commit_score,
-                    "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
+                    "best_commit_selection_metric": None,
+                    "best_checkpoint": None,
                     "recommended_parameters": str(recommendation_path),
+                    "save_rate": settings.save_rate,
+                    "last_generation_checkpoint": state.get("last_generation_checkpoint"),
                     "settings_file": str(args.settings_file.resolve()),
                 }
                 write_json(state_path, state)
@@ -2014,6 +2018,17 @@ def main() -> int:
                 move_dir_replace(pending_commit_dir, current_dir)
                 current_checkpoint = current_dir
                 current_parameters = dict(commit_params)
+                saved_generation_checkpoint: Path | None = None
+                if should_save_generation_checkpoint(settings, generation):
+                    saved_generation_checkpoint = generation_checkpoint_path(runner_root, generation)
+                    tuner.event(
+                        color,
+                        f"[GEN {generation} CHECKPOINT SAVE]",
+                        f"dir={saved_generation_checkpoint}",
+                        "green",
+                    )
+                    tuner.copy_dir_replace(current_dir, saved_generation_checkpoint)
+                stable_checkpoint_text = str(saved_generation_checkpoint) if saved_generation_checkpoint else ""
 
                 tuner.append_csv(
                     summary_path,
@@ -2027,7 +2042,7 @@ def main() -> int:
                         "quantized_value_loss": tuner.format_float(commit_metric.qloss),
                         "parameters": json.dumps(commit_params, ensure_ascii=False, sort_keys=True),
                         "selection_metric": tuner.format_float(commit_score),
-                        "checkpoint": "",
+                        "checkpoint": stable_checkpoint_text,
                     },
                 )
 
@@ -2063,11 +2078,7 @@ def main() -> int:
                     "commit_quantized_value_accuracy": tuner.format_float(commit_metric.qacc),
                     "commit_quantized_value_loss": tuner.format_float(commit_metric.qloss),
                     "commit_selection_metric": tuner.format_float(commit_score),
-                    # current-checkpoint is a mutable runner alias overwritten
-                    # by later generations.  generation-best-parameters.csv is
-                    # historical, so do not write that alias as if it were a
-                    # stable per-generation snapshot.
-                    "checkpoint": "",
+                    "checkpoint": stable_checkpoint_text,
                 }
                 for name in sorted(specs):
                     generation_row[name] = tuner.format_float(best_params_for_row.get(name))
@@ -2076,10 +2087,6 @@ def main() -> int:
                     generation_best_fields_list,
                     generation_row,
                 )
-
-                if is_better_score(commit_score, best_commit_score, settings.lower_is_better):
-                    tuner.copy_dir_replace(current_dir, best_dir)
-                    best_commit_score = commit_score
 
                 next_trial = generation_last_trial + 1
                 state = {
@@ -2099,9 +2106,11 @@ def main() -> int:
                     "pending_commit_params": None,
                     "best_trial": best.trial if best else None,
                     "best_selection_metric": best.score if best else None,
-                    "best_commit_selection_metric": best_commit_score,
-                    "best_checkpoint": str(best_dir) if best_commit_score is not None else None,
+                    "best_commit_selection_metric": None,
+                    "best_checkpoint": None,
                     "recommended_parameters": str(recommendation_path),
+                    "save_rate": settings.save_rate,
+                    "last_generation_checkpoint": stable_checkpoint_text or state.get("last_generation_checkpoint"),
                     "settings_file": str(args.settings_file.resolve()),
                 }
                 write_json(state_path, state)

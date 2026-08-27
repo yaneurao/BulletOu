@@ -11,7 +11,7 @@
 - trial 中はパラメーターを変えません。
 - generation ごとに `population` 本の trial を走らせ、指定した metric が良いものを記録します。
 - generation の最後に、選ばれたパラメーターで commit run を1回だけ実行し、その checkpoint を `current-checkpoint/` に保存します。
-- `best-checkpoint/` には、これまでの commit run の中で一番良かった checkpoint を保存します。これは次 generation の開始地点とは別です。
+- `tuning.save_rate` に応じて、commit済みの世代checkpointを `generation-checkpoints/gen0001/` のような固定pathにも保存します。
 - `recommended-parameters.json` に、上位 trial から推定した推奨パラメーターを書き出します。
 
 短い trial では「たまたま良かった1本」をそのまま採用するとノイズを拾いやすいです。そのため、最終的に使う値は `best_observed` だけでなく、`recommended` も確認してください。
@@ -100,6 +100,7 @@ TPE-style sampler は、同じ generation 内ですでに完了した trial を�
 | `tpe_bandwidth` | TPE の KDE 幅の下限です。大きいほど候補が広めに散り、小さいほど観測された良い候補の近くに寄ります。 | `0.15` |
 | `max_parameter_change_ratio` | 候補値を現在採用中の値から何倍まで動かしてよいか。`2.0` なら `current/2` から `current*2` をサンプリング範囲にします。`null` または省略ならこの制限を使いません。 | なし |
 | `commit_source` | generation の最後に commit run へ使うパラメーター。`"best"` なら実測1位、`"recommended"` なら上位 trial から推定した値を使います。 | `"best"` |
+| `save_rate` | commit済みの世代checkpointを何generationごとに `generation-checkpoints/genXXXX/` へ保存するか。`1` なら毎generation、`0` なら保存しません。 | `1` |
 
 ## 設定例
 
@@ -119,6 +120,7 @@ TPE-style sampler は、同じ generation 内ですでに完了した trial を�
     "tpe_bandwidth": 0.15,
     "max_parameter_change_ratio": 2.0,
     "commit_source": "best",
+    "save_rate": 1,
     "validation_rate": 0,
     "quantized_validation_rate": 0,
     "keep_all_trials": false
@@ -251,9 +253,9 @@ runner root は次の場所です。
 | `summary-learn.log` | 各 trial の結果 |
 | `current-checkpoint/` | 最新 generation で採用された checkpoint。次 generation の開始地点 |
 | `pending-commit-checkpoint/` | commit run 完了後、`current-checkpoint/` へ反映する前の一時 checkpoint。通常は残りません |
-| `best-checkpoint/` | これまでの commit run の中で一番良かった checkpoint |
+| `generation-checkpoints/genXXXX/` | `tuning.save_rate` に応じて保存される、generation ごとの固定checkpoint |
 | `recommended-parameters.json` | 上位 trial から推定した推奨パラメーター |
-| `generation-best-parameters.csv` | generation ごとの best trial パラメーターを横持ちでまとめたCSV。標準設定では世代別 checkpoint は残さないため、`checkpoint` 列は通常空欄 |
+| `generation-best-parameters.csv` | generation ごとの best trial パラメーターを横持ちでまとめたCSV。世代checkpointを保存した場合は、`checkpoint` 列に `generation-checkpoints/genXXXX/` が入ります |
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
 
@@ -264,7 +266,7 @@ runner root は次の場所です。
 `commit_source: "recommended"` を使った場合は、CSVには best trial の値を書き、commit run の結果は `commit_*` 列に分けて書きます。
 この場合、best trial の値そのものは checkpoint として保存されていないことがあります。
 
-`current-checkpoint/` と `best-checkpoint/` は runner が更新する可変のフォルダです。過去 generation 固有の checkpoint ではありません。そのため `generation-best-parameters.csv` には、これらの可変pathを過去 generation の checkpoint として書きません。
+`current-checkpoint/` は runner が更新する可変のフォルダです。過去 generation 固有の checkpoint ではありません。そのため `generation-best-parameters.csv` には、`current-checkpoint/` を過去 generation の checkpoint として書きません。固定で残したい checkpoint は `generation-checkpoints/genXXXX/` を見ます。
 
 ## `recommended-parameters.json` の読み方
 
@@ -315,6 +317,14 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 
 ## checkpoint の保存と削除
 
+`save_rate` は generation ごとの checkpoint をどれだけ残すかを決めます。
+
+```json
+"save_rate": 1
+```
+
+`1` なら毎generationのcommit後に `generation-checkpoints/gen0001/`、`generation-checkpoints/gen0002/` のように保存します。`0` なら世代checkpointを保存せず、resume用の `current-checkpoint/` だけを更新します。
+
 `keep_all_trials` は、trial ごとの checkpoint をどれだけ残すかを決めます。
 
 ```json
@@ -323,7 +333,7 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 "keep_all_trials": false
 ```
 
-この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。現在の標準動作では、trial ごとの checkpoint は保存しません。各 trial の metric とパラメーターだけを `summary-learn.log` に記録し、generation の最後に `commit_source` で選んだパラメーターを使って commit run を1回だけ実行します。その commit run の checkpoint が `current-checkpoint/` になります。
+この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。現在の標準動作では、trial ごとの checkpoint は保存しません。各 trial の metric とパラメーターだけを `summary-learn.log` に記録し、generation の最後に `commit_source` で選んだパラメーターを使って commit run を1回だけ実行します。その commit run の checkpoint が `current-checkpoint/` になります。さらに `save_rate` が `1` なら、同じ内容が `generation-checkpoints/genXXXX/` にも保存されます。
 
 `commit_source: "best"` では、その generation で実測 metric が一番良かった trial のパラメーターを使います。`commit_source: "recommended"` では、最新 generation の上位 trial から `recommended-parameters.json` と同じ式で推定したパラメーターを使います。`recommended` は未評価の推定値なので、標準ではより安全な `"best"` を使います。
 
