@@ -156,6 +156,29 @@ These are sampler settings, not NNUE training parameters. They control how the r
 }
 ```
 
+## Choosing `metric`
+
+`metric` is the criterion used to compare candidate trials. Common values are:
+
+| metric | Meaning | `lower_is_better` |
+| --- | --- | --- |
+| `quantized_value_loss` | Choose the candidate with lower quantized loss | `true` |
+| `quantized_value_accuracy` | Choose the candidate with higher quantized accuracy | `false` |
+| `test_value_loss` | Choose the candidate with lower fp32 validation loss | `true` |
+| `test_value_accuracy` | Choose the candidate with higher fp32 validation accuracy | `false` |
+| `borda_count` | Rank candidates by all four metrics and choose the smallest rank sum | `true` |
+
+`quantized_value_loss` is a useful first choice because it directly checks the quantized network. If qloss disagrees with qacc or with the fp32 metrics too often, `borda_count` is the safer compromise.
+
+`borda_count` adds these four ranks:
+
+1. higher `test_value_accuracy`;
+2. lower `test_value_loss`;
+3. higher `quantized_value_accuracy`;
+4. lower `quantized_value_loss`.
+
+If two candidates have the same rank sum, the runner prefers the one with lower `quantized_value_loss`.
+
 When both `lr` and `lr_min` are tuned, the runner samples `lr_min` with the sampled `lr` as its upper bound, so generated trials satisfy `lr_min <= lr`.
 
 ## Keeping teacher data in RAM

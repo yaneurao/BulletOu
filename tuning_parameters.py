@@ -327,9 +327,10 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         "quantized_value_accuracy",
         "test_value_loss",
         "test_value_accuracy",
+        tuner.BORDA_COUNT_METRIC,
     }:
         raise ValueError(f"{path}: unsupported tuning.metric {metric!r}")
-    lower_is_better = bool(tuning_obj.get("lower_is_better", "loss" in metric))
+    lower_is_better = True if metric == tuner.BORDA_COUNT_METRIC else bool(tuning_obj.get("lower_is_better", "loss" in metric))
     sampler = str(tuning_obj.get("sampler", "tpe"))
     if sampler not in {"tpe", "random"}:
         raise ValueError(f"{path}: unsupported tuning.sampler {sampler!r}; expected 'tpe' or 'random'")
@@ -378,9 +379,9 @@ def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSetting
         raise ValueError("tuning.max_parameter_change_ratio must be finite and >= 1.0")
     if settings.validation_rate < -1 or settings.quantized_validation_rate < -1:
         raise ValueError("tuning.validation_rate / quantized_validation_rate must be >= -1")
-    if metric.startswith("test_value_") and settings.validation_rate < 0:
+    if (metric.startswith("test_value_") or metric == tuner.BORDA_COUNT_METRIC) and settings.validation_rate < 0:
         raise ValueError(f"tuning.metric {metric!r} requires tuning.validation_rate >= 0")
-    if metric.startswith("quantized_value_") and settings.quantized_validation_rate < 0:
+    if (metric.startswith("quantized_value_") or metric == tuner.BORDA_COUNT_METRIC) and settings.quantized_validation_rate < 0:
         raise ValueError(f"tuning.metric {metric!r} requires tuning.quantized_validation_rate >= 0")
 
     run_obj = root.get("run")
@@ -531,8 +532,26 @@ def kde_log_density(x: float, values: list[float], lo: float, hi: float, sigma_r
     return logsumexp([gaussian_log_pdf(x, value, sigma) for value in values]) - math.log(len(values))
 
 
+def result_sort_key(result: TrialResult, settings: StudySettings) -> tuple[float, ...]:
+    if settings.metric == tuner.BORDA_COUNT_METRIC:
+        # Borda's primary value is the rank sum.  Break ties toward the usual
+        # engine-oriented preference: lower quantized loss, higher quantized
+        # accuracy, lower f32 loss, higher f32 accuracy, then earlier trial.
+        return (
+            result.score,
+            result.metric.qloss if result.metric.qloss is not None else math.inf,
+            -(result.metric.qacc if result.metric.qacc is not None else -math.inf),
+            result.metric.test_loss if result.metric.test_loss is not None else math.inf,
+            -(result.metric.test_acc if result.metric.test_acc is not None else -math.inf),
+            float(result.trial),
+        )
+    if settings.lower_is_better:
+        return (result.score, float(result.trial))
+    return (-result.score, float(result.trial))
+
+
 def split_good_bad(completed: list[TrialResult], settings: StudySettings) -> tuple[list[TrialResult], list[TrialResult]]:
-    ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
+    ordered = sorted(completed, key=lambda r: result_sort_key(r, settings))
     good_count = max(1, math.ceil(len(ordered) * settings.tpe_good_fraction))
     good_count = min(good_count, max(1, len(ordered) - 1))
     return ordered[:good_count], ordered[good_count:]
@@ -880,6 +899,123 @@ def metric_score(metric: tuner.Metric, name: str) -> float:
     return metric.score(name)
 
 
+def assign_borda_count_scores(results: list[TrialResult]) -> None:
+    """Assign Borda rank-sum scores to completed trials in one generation.
+
+    Lower is better.  Each component contributes rank 1 for the best trial,
+    rank 2 for the next, and so on.  Ties receive the average rank for the tied
+    range, so an arbitrary row order does not decide equal metrics.
+    """
+    if not results:
+        return
+    scores = {id(result): 0.0 for result in results}
+    for metric_name, lower_is_better in tuner.BORDA_COMPONENTS:
+        ranked_values: list[tuple[TrialResult, float]] = []
+        for result in results:
+            ranked_values.append((result, result.metric.score(metric_name)))
+        ranked_values.sort(key=lambda item: item[1], reverse=not lower_is_better)
+
+        i = 0
+        while i < len(ranked_values):
+            j = i + 1
+            value = ranked_values[i][1]
+            while j < len(ranked_values) and ranked_values[j][1] == value:
+                j += 1
+            average_rank = (i + 1 + j) / 2.0
+            for result, _ in ranked_values[i:j]:
+                scores[id(result)] += average_rank
+            i = j
+
+    for result in results:
+        result.score = scores[id(result)]
+
+
+def refresh_selection_scores(settings: StudySettings, completed: list[TrialResult]) -> None:
+    if settings.metric == tuner.BORDA_COUNT_METRIC:
+        generations = sorted({result_generation(settings, result) for result in completed})
+        for generation in generations:
+            assign_borda_count_scores(generation_results(settings, completed, generation))
+    else:
+        for result in completed:
+            result.score = metric_score(result.metric, settings.metric)
+
+
+def refresh_generation_selection_scores(
+    settings: StudySettings,
+    completed: list[TrialResult],
+    generation: int,
+) -> None:
+    if settings.metric == tuner.BORDA_COUNT_METRIC:
+        assign_borda_count_scores(generation_results(settings, completed, generation))
+    else:
+        for result in generation_results(settings, completed, generation):
+            result.score = metric_score(result.metric, settings.metric)
+
+
+def rewrite_summary_selection_metrics(
+    summary_path: Path,
+    results: list[TrialResult],
+) -> None:
+    if not results or not summary_path.exists():
+        return
+    score_by_trial = {str(result.trial): tuner.format_float(result.score) for result in results}
+    with summary_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or SUMMARY_FIELDS
+        rows = list(reader)
+    changed = False
+    for row in rows:
+        if row.get("status") != "finished":
+            continue
+        trial = row.get("trial", "")
+        if trial not in score_by_trial:
+            continue
+        new_score = score_by_trial[trial]
+        if row.get("selection_metric") != new_score:
+            row["selection_metric"] = new_score
+            changed = True
+    if not changed:
+        return
+    tmp = summary_path.with_name(summary_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    os.replace(tmp, summary_path)
+
+
+def commit_metric_score(
+    commit_metric: tuner.Metric,
+    generation_completed: list[TrialResult],
+    settings: StudySettings,
+) -> float:
+    if settings.metric != tuner.BORDA_COUNT_METRIC:
+        return metric_score(commit_metric, settings.metric)
+    comparison = [
+        TrialResult(
+            trial=result.trial,
+            params=result.params,
+            metric=result.metric,
+            score=result.score,
+            checkpoint=result.checkpoint,
+            output_dir=result.output_dir,
+        )
+        for result in generation_completed
+    ]
+    pseudo = TrialResult(
+        trial=-1,
+        params={},
+        metric=commit_metric,
+        score=math.inf,
+        checkpoint=Path(""),
+        output_dir=Path(""),
+    )
+    comparison.append(pseudo)
+    assign_borda_count_scores(comparison)
+    return pseudo.score
+
+
 def move_dir_replace(src: Path, dst: Path) -> None:
     if not src.exists():
         raise RuntimeError(f"source directory does not exist: {src}")
@@ -954,7 +1090,7 @@ def latest_prior_generation_with_results(
 def best_result(results: list[TrialResult], settings: StudySettings) -> TrialResult | None:
     if not results:
         return None
-    return sorted(results, key=lambda r: r.score, reverse=not settings.lower_is_better)[0]
+    return sorted(results, key=lambda r: result_sort_key(r, settings))[0]
 
 
 def upgrade_summary_csv(path: Path) -> None:
@@ -1146,7 +1282,7 @@ def recommended_params(
 ) -> dict[str, float]:
     if not completed:
         return current_fixed_values(specs)
-    ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
+    ordered = sorted(completed, key=lambda r: result_sort_key(r, settings))
     keep = max(1, math.ceil(len(ordered) * settings.tpe_good_fraction))
     elite = ordered[:keep]
     weights = [float(keep - i) for i in range(keep)]
@@ -1212,7 +1348,7 @@ def write_recommendation(
         }
         write_json(path, obj)
         return obj
-    ordered = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)
+    ordered = sorted(completed, key=lambda r: result_sort_key(r, settings))
     best = ordered[0]
     params = recommended_params(specs, recommendation_trials, settings)
     obj = {
@@ -1301,6 +1437,7 @@ def main() -> int:
             next_trial = 1
             state = {
                 "version": SETTINGS_VERSION,
+                "metric": settings.metric,
                 "next_trial": next_trial,
                 "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
                 "current_parameters": configured_current_values(specs),
@@ -1317,6 +1454,9 @@ def main() -> int:
             }
             if not args.dry_run:
                 write_json(state_path, state)
+        refresh_selection_scores(settings, completed)
+        if settings.metric == tuner.BORDA_COUNT_METRIC and not args.dry_run:
+            rewrite_summary_selection_metrics(summary_path, completed)
         current_parameters_raw = state.get("current_parameters")
         if isinstance(current_parameters_raw, dict):
             current_parameters = {str(k): float(v) for k, v in current_parameters_raw.items()}
@@ -1327,11 +1467,15 @@ def main() -> int:
         rng = random.Random(settings.seed + next_trial * 1_000_003)
         best = None
         if completed:
-            best = sorted(completed, key=lambda r: r.score, reverse=not settings.lower_is_better)[0]
+            best = best_result(completed, settings)
         best_commit_score = None
-        if state.get("best_commit_selection_metric") is not None:
+        state_metric = state.get("metric")
+        state_metric_compatible = state_metric == settings.metric or (
+            state_metric is None and settings.metric != tuner.BORDA_COUNT_METRIC
+        )
+        if state_metric_compatible and state.get("best_commit_selection_metric") is not None:
             best_commit_score = float(state["best_commit_selection_metric"])
-        elif state.get("best_selection_metric") is not None and best_dir.exists():
+        elif state_metric_compatible and state.get("best_selection_metric") is not None and best_dir.exists():
             # Older state files used best_selection_metric for the saved best checkpoint.
             best_commit_score = float(state["best_selection_metric"])
         tuner.event(
@@ -1569,7 +1713,7 @@ def main() -> int:
                         )
                         elapsed = time.perf_counter() - started
                         metric = tuner.metric_from_worker_payload(payload)
-                        score = metric_score(metric, settings.metric)
+                        score = math.inf if settings.metric == tuner.BORDA_COUNT_METRIC else metric_score(metric, settings.metric)
                         checkpoint = Path("")
                     else:
                         code, elapsed = tuner.run_command(
@@ -1597,7 +1741,7 @@ def main() -> int:
                             raise RuntimeError(f"trial {trial} failed; see {log_path}")
                         row = tuner.latest_summary_row(out_dir)
                         metric = tuner.metric_from_summary_row(row)
-                        score = metric_score(metric, settings.metric)
+                        score = math.inf if settings.metric == tuner.BORDA_COUNT_METRIC else metric_score(metric, settings.metric)
                         checkpoint = (
                             tuner.latest_checkpoint_dir(out_dir)
                             if settings.keep_all_trials or args.keep_temp
@@ -1613,14 +1757,11 @@ def main() -> int:
                         output_dir=out_dir,
                     )
                     completed.append(result)
+                    refresh_generation_selection_scores(settings, completed, generation)
+                    score = result.score
 
-                    is_generation_best = is_better_score(
-                        score,
-                        generation_best.score if generation_best is not None else None,
-                        settings.lower_is_better,
-                    )
-                    if is_generation_best:
-                        generation_best = result
+                    generation_best = best_result(generation_results(settings, completed, generation), settings)
+                    is_generation_best = generation_best is not None and generation_best.trial == result.trial
                     if (
                         not settings.use_worker
                         and not settings.keep_all_trials
@@ -1628,8 +1769,7 @@ def main() -> int:
                         and out_dir.exists()
                     ):
                         tuner.remove_dir_quiet(out_dir)
-                    if is_better_score(score, best.score if best is not None else None, settings.lower_is_better):
-                        best = result
+                    best = best_result(completed, settings)
 
                     keep_non_best_checkpoint = (
                         (not settings.use_worker) and (settings.keep_all_trials or args.keep_temp)
@@ -1650,6 +1790,11 @@ def main() -> int:
                             "checkpoint": summary_checkpoint,
                         },
                     )
+                    if settings.metric == tuner.BORDA_COUNT_METRIC:
+                        rewrite_summary_selection_metrics(
+                            summary_path,
+                            generation_results(settings, completed, generation),
+                        )
                     tuner.event(
                         color,
                         f"{display_prefix} END",
@@ -1661,6 +1806,7 @@ def main() -> int:
                     )
                     state = {
                         "version": SETTINGS_VERSION,
+                        "metric": settings.metric,
                         "next_trial": trial + 1,
                         "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
                         "current_parameters": current_parameters,
@@ -1729,6 +1875,7 @@ def main() -> int:
 
                 state = {
                     "version": SETTINGS_VERSION,
+                    "metric": settings.metric,
                     "next_trial": generation_last_trial + 1,
                     "current_checkpoint": str(current_checkpoint) if current_checkpoint else None,
                     "current_parameters": current_parameters,
@@ -1751,7 +1898,7 @@ def main() -> int:
                 pending_has_checkpoint = (pending_commit_dir / "state.bin").exists()
                 if pending_matches and pending_has_checkpoint:
                     commit_metric = tuner.latest_learn_log_metric(pending_commit_dir)
-                    commit_score = metric_score(commit_metric, settings.metric)
+                    commit_score = commit_metric_score(commit_metric, generation_completed, settings)
                     tuner.event(
                         color,
                         f"[GEN {generation} COMMIT RESUME]",
@@ -1799,7 +1946,7 @@ def main() -> int:
                         )
                         elapsed = time.perf_counter() - started
                         commit_metric = tuner.metric_from_worker_payload(payload)
-                        commit_score = metric_score(commit_metric, settings.metric)
+                        commit_score = commit_metric_score(commit_metric, generation_completed, settings)
                         save_args = worker_args_from_train_args(
                             train_args(
                                 run,
@@ -1836,7 +1983,7 @@ def main() -> int:
                             )
                         row = tuner.latest_summary_row(commit_out_dir)
                         commit_metric = tuner.metric_from_summary_row(row)
-                        commit_score = metric_score(commit_metric, settings.metric)
+                        commit_score = commit_metric_score(commit_metric, generation_completed, settings)
                         move_dir_replace(tuner.latest_checkpoint_dir(commit_out_dir), pending_commit_dir)
                         if not args.keep_temp:
                             tuner.remove_dir_quiet(commit_out_dir)
@@ -1921,6 +2068,7 @@ def main() -> int:
                 next_trial = generation_last_trial + 1
                 state = {
                     "version": SETTINGS_VERSION,
+                    "metric": settings.metric,
                     "next_trial": next_trial,
                     "current_checkpoint": str(current_checkpoint),
                     "current_parameters": current_parameters,

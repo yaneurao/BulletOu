@@ -156,6 +156,29 @@ TPE-style sampler は、同じ generation 内ですでに完了した trial を�
 }
 ```
 
+## metric の選び方
+
+`metric` は候補を比較するときの基準です。主に次の値を使います。
+
+| metric | 意味 | `lower_is_better` |
+| --- | --- | --- |
+| `quantized_value_loss` | 量子化後の loss が小さい候補を選ぶ | `true` |
+| `quantized_value_accuracy` | 量子化後の accuracy が高い候補を選ぶ | `false` |
+| `test_value_loss` | fp32 の validation loss が小さい候補を選ぶ | `true` |
+| `test_value_accuracy` | fp32 の validation accuracy が高い候補を選ぶ | `false` |
+| `borda_count` | 上の4指標それぞれで順位を付け、順位合計が小さい候補を選ぶ | `true` |
+
+`quantized_value_loss` は量子化後の評価値誤差を直接見られるので、最初に試す基準として使いやすいです。ただし qloss と qacc、または fp32 側の acc/loss が食い違う場合は、`borda_count` のほうが安全です。
+
+`borda_count` は次の4つの順位を合計します。
+
+1. `test_value_accuracy` が高い順
+2. `test_value_loss` が低い順
+3. `quantized_value_accuracy` が高い順
+4. `quantized_value_loss` が低い順
+
+順位合計が同じ場合は、`quantized_value_loss` が小さい候補を優先します。
+
 `lr` と `lr_min` を両方 tune する場合、runner は `lr_min <= lr` になるように `lr_min` の上限をその trial の `lr` 以下に制限してサンプルします。
 
 ## 教師データをRAMに保持する場合
