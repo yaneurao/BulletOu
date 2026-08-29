@@ -25,6 +25,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,9 @@ SPECIAL_TRAIN_PARAMETERS = {"lr", "lr_min", "lr_min_ratio"}
 KNOWN_SEARCH_PARAMETERS = set(tuner.KNOWN_PARAMETERS) | SPECIAL_TRAIN_PARAMETERS
 
 SUMMARY_FIELDS = [
+    "generation",
+    "generation_trial",
+    "trial_sbs",
     "trial",
     "status",
     "test_value_accuracy",
@@ -191,6 +195,9 @@ class TrialResult:
     score: float
     checkpoint: Path
     output_dir: Path
+    generation: int = 0
+    generation_trial: int = 0
+    trial_sbs: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,6 +208,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-temp", action="store_true")
     parser.add_argument("--no-stream-child-output", action="store_true")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    parser.add_argument(
+        "--reset-generation",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Discard tuner state/results from generation N onward and resume from generation N-1. "
+            "Use this before changing population/trial_sbs for an already-started generation."
+        ),
+    )
+    parser.add_argument(
+        "--reset-only",
+        action="store_true",
+        help="Apply --reset-generation and exit without starting trials.",
+    )
     return parser.parse_args()
 
 
@@ -271,6 +293,342 @@ def first_trial_of_generation(settings: StudySettings, generation: int) -> int:
     for prior in range(1, generation):
         first += settings.population_for_generation(prior)
     return first
+
+
+def generation_plans(state: dict[str, Any]) -> dict[str, dict[str, int]]:
+    raw = state.get("generation_plans")
+    if not isinstance(raw, dict):
+        raw = {}
+        state["generation_plans"] = raw
+    out: dict[str, dict[str, int]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            generation = int(key)
+            out[str(generation)] = {
+                "first_trial": int(value["first_trial"]),
+                "population": int(value["population"]),
+                "trial_sbs": int(value["trial_sbs"]),
+                "tpe_startup_trials": int(value.get("tpe_startup_trials", 0)),
+            }
+        except Exception:
+            continue
+    state["generation_plans"] = out
+    return out
+
+
+def import_generation_plans_from_generation_best(
+    state: dict[str, Any],
+    generation_best_path: Path,
+    settings: StudySettings,
+) -> None:
+    """Recover immutable generation plans from the human summary file.
+
+    Older runner-state.json files did not store per-generation schedules.  Once
+    population/trial_sbs are edited, recomputing old generations from the new
+    settings is wrong, so use generation-best-parameters.csv as the stable
+    record for already-committed generations.
+    """
+    plans = generation_plans(state)
+    if not generation_best_path.exists() or generation_best_path.stat().st_size == 0:
+        return
+    rows: list[tuple[int, dict[str, str]]] = []
+    with generation_best_path.open("r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                rows.append((int(row.get("generation", "")), row))
+            except Exception:
+                continue
+    if not rows:
+        return
+    rows.sort(key=lambda item: item[0])
+    next_first_trial = 1
+    row_by_generation = {generation: row for generation, row in rows}
+    for generation in range(1, max(row_by_generation) + 1):
+        key = str(generation)
+        if key in plans:
+            plan = plans[key]
+            next_first_trial = max(
+                next_first_trial,
+                int(plan["first_trial"]) + max(0, int(plan["population"])),
+            )
+            continue
+        row = row_by_generation.get(generation)
+        if row is None:
+            population = settings.population_for_generation(generation)
+            trial_sbs = settings.trial_sbs_for_generation(generation)
+            tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
+        else:
+            try:
+                population = int(row.get("population", ""))
+            except Exception:
+                population = settings.population_for_generation(generation)
+            try:
+                trial_sbs = int(row.get("trial_sbs", ""))
+            except Exception:
+                trial_sbs = settings.trial_sbs_for_generation(generation)
+            tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
+        plans[key] = {
+            "first_trial": next_first_trial,
+            "population": population,
+            "trial_sbs": trial_sbs,
+            "tpe_startup_trials": tpe_startup_trials,
+        }
+        next_first_trial += max(0, population)
+
+
+def get_or_create_generation_plan(
+    state: dict[str, Any],
+    settings: StudySettings,
+    generation: int,
+    next_trial: int,
+) -> dict[str, int]:
+    plans = generation_plans(state)
+    key = str(generation)
+    if key not in plans:
+        population = settings.population_for_generation(generation)
+        plans[key] = {
+            "first_trial": max(1, next_trial),
+            "population": population,
+            "trial_sbs": settings.trial_sbs_for_generation(generation),
+            "tpe_startup_trials": settings.tpe_startup_trials_for_generation(generation),
+        }
+    return plans[key]
+
+
+def trial_metadata_from_plans(
+    state: dict[str, Any],
+    trial: int,
+) -> tuple[int, int, int] | None:
+    for key, plan in generation_plans(state).items():
+        try:
+            generation = int(key)
+            first_trial = int(plan["first_trial"])
+            population = int(plan["population"])
+            if population <= 0:
+                continue
+            last_trial = first_trial + population - 1
+            if first_trial <= trial <= last_trial:
+                return generation, trial - first_trial + 1, int(plan["trial_sbs"])
+        except Exception:
+            continue
+    return None
+
+
+def assign_result_metadata(
+    settings: StudySettings,
+    state: dict[str, Any],
+    completed: list[TrialResult],
+) -> None:
+    for result in completed:
+        if result.generation > 0:
+            continue
+        mapped = trial_metadata_from_plans(state, result.trial)
+        if mapped is None:
+            generation, generation_trial = generation_for_trial(settings, result.trial)
+            trial_sbs = settings.trial_sbs_for_generation(generation)
+        else:
+            generation, generation_trial, trial_sbs = mapped
+        result.generation = generation
+        result.generation_trial = generation_trial
+        result.trial_sbs = trial_sbs
+
+
+def next_trial_after_generation(
+    state: dict[str, Any],
+    settings: StudySettings,
+    generation: int,
+) -> int:
+    if generation <= 0:
+        return 1
+    plans = generation_plans(state)
+    max_next = 1
+    for g in range(1, generation + 1):
+        plan = plans.get(str(g))
+        if plan is None:
+            # Last-resort fallback for very old runs with no generation summary.
+            first_trial = first_trial_of_generation(settings, g)
+            population = settings.population_for_generation(g)
+        else:
+            first_trial = int(plan["first_trial"])
+            population = int(plan["population"])
+        max_next = max(max_next, first_trial + max(0, population))
+    return max_next
+
+
+def summary_row_generation(
+    state: dict[str, Any],
+    row: dict[str, str],
+) -> int | None:
+    raw_generation = row.get("generation")
+    if raw_generation:
+        try:
+            return int(raw_generation)
+        except Exception:
+            pass
+    trial_cell = str(row.get("trial", ""))
+    match = re.fullmatch(r"gen(\d+)-commit", trial_cell)
+    if match:
+        return int(match.group(1))
+    try:
+        trial = int(trial_cell)
+    except Exception:
+        return None
+    mapped = trial_metadata_from_plans(state, trial)
+    return mapped[0] if mapped else None
+
+
+def trim_summary_from_generation(
+    summary_path: Path,
+    state: dict[str, Any],
+    reset_generation: int,
+    first_reset_trial: int,
+) -> None:
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
+        return
+    with summary_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or SUMMARY_FIELDS
+        rows = list(reader)
+    kept: list[dict[str, str]] = []
+    for row in rows:
+        generation = summary_row_generation(state, row)
+        if generation is not None:
+            if generation < reset_generation:
+                kept.append(row)
+            continue
+        try:
+            trial = int(row.get("trial", ""))
+        except Exception:
+            kept.append(row)
+            continue
+        if trial < first_reset_trial:
+            kept.append(row)
+    tmp = summary_path.with_name(summary_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in kept:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    os.replace(tmp, summary_path)
+
+
+def trim_generation_best_from_generation(generation_best_path: Path, reset_generation: int) -> None:
+    if not generation_best_path.exists() or generation_best_path.stat().st_size == 0:
+        return
+    with generation_best_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        rows = list(reader)
+    kept: list[dict[str, str]] = []
+    for row in rows:
+        try:
+            generation = int(row.get("generation", ""))
+        except Exception:
+            kept.append(row)
+            continue
+        if generation < reset_generation:
+            kept.append(row)
+    tmp = generation_best_path.with_name(generation_best_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in kept:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    os.replace(tmp, generation_best_path)
+
+
+def reset_generation_state(
+    *,
+    state: dict[str, Any],
+    settings: StudySettings,
+    run: RunSettings,
+    specs: dict[str, SearchParameter],
+    runner_root: Path,
+    summary_path: Path,
+    generation_best_path: Path,
+    state_path: Path,
+    pending_commit_dir: Path,
+    reset_generation: int,
+    dry_run: bool,
+    color: bool,
+) -> tuple[Path | None, int, dict[str, Any]]:
+    if reset_generation < 1:
+        raise ValueError("--reset-generation must be >= 1")
+    base_generation = reset_generation - 1
+    first_reset_trial = next_trial_after_generation(state, settings, base_generation)
+    base_checkpoint: Path | None
+    if base_generation == 0:
+        base_checkpoint = run.base_checkpoint
+    else:
+        base_checkpoint = generation_checkpoint_path(runner_root, base_generation)
+        if not (base_checkpoint / "state.bin").exists():
+            raw = state.get("last_generation_checkpoint")
+            fallback = Path(raw) if raw else None
+            if fallback is not None and (fallback / "state.bin").exists():
+                base_checkpoint = fallback
+            else:
+                raise RuntimeError(
+                    f"cannot reset to generation {base_generation}: "
+                    f"{base_checkpoint} has no state.bin"
+                )
+    if base_checkpoint is not None:
+        tuner.validate_checkpoint_dir(base_checkpoint)
+
+    tuner.event(
+        color,
+        "[RESET]",
+        (
+            f"generation={reset_generation} -> resume_from_generation={base_generation} "
+            f"checkpoint={base_checkpoint or 'scratch'} next_trial={first_reset_trial}"
+        ),
+        "yellow",
+    )
+
+    if not dry_run:
+        trim_summary_from_generation(summary_path, state, reset_generation, first_reset_trial)
+        trim_generation_best_from_generation(generation_best_path, reset_generation)
+        tuner.remove_dir_quiet(pending_commit_dir)
+
+    plans = generation_plans(state)
+    state["generation_plans"] = {
+        key: value for key, value in plans.items() if int(key) < reset_generation
+    }
+    current_parameters = latest_commit_params(summary_path) or configured_current_values(specs)
+    state.update(
+        {
+            "version": SETTINGS_VERSION,
+            "metric": settings.metric,
+            "next_trial": first_reset_trial,
+            "current_checkpoint": str(base_checkpoint) if base_checkpoint else None,
+            "current_parameters": current_parameters,
+            "pending_commit_generation": None,
+            "pending_commit_source": None,
+            "pending_commit_params": None,
+            "generation_best_trial": None,
+            "generation_best_selection_metric": None,
+            "best_trial": None,
+            "best_selection_metric": None,
+            "best_commit_selection_metric": None,
+            "best_checkpoint": None,
+            "save_rate": settings.save_rate,
+            "last_generation_checkpoint": str(base_checkpoint) if base_generation > 0 and base_checkpoint else None,
+        }
+    )
+    if base_generation > 0:
+        state["current_generation"] = base_generation
+        state["current_generation_trial"] = None
+        state["current_generation_selection_metric"] = None
+        state["current_generation_commit_source"] = "reset"
+    else:
+        state.pop("current_generation", None)
+        state.pop("current_generation_trial", None)
+        state.pop("current_generation_selection_metric", None)
+        state.pop("current_generation_commit_source", None)
+    if not dry_run:
+        write_json(state_path, state)
+    return base_checkpoint, first_reset_trial, state
 
 
 def load_settings(path: Path) -> tuple[dict[str, Any], StudySettings, RunSettings, dict[str, SearchParameter]]:
@@ -1006,6 +1364,9 @@ def commit_metric_score(
             score=result.score,
             checkpoint=result.checkpoint,
             output_dir=result.output_dir,
+            generation=result.generation,
+            generation_trial=result.generation_trial,
+            trial_sbs=result.trial_sbs,
         )
         for result in generation_completed
     ]
@@ -1056,6 +1417,8 @@ def should_save_generation_checkpoint(settings: StudySettings, generation: int) 
 
 
 def result_generation(settings: StudySettings, result: TrialResult) -> int:
+    if result.generation > 0:
+        return result.generation
     return generation_for_trial(settings, result.trial)[0]
 
 
@@ -1149,6 +1512,9 @@ def load_completed(summary_path: Path) -> list[TrialResult]:
                         score=float(selection_metric),
                         checkpoint=Path(row["checkpoint"]),
                         output_dir=Path(row.get("output_dir") or row.get("checkpoint") or ""),
+                        generation=int(row.get("generation") or 0),
+                        generation_trial=int(row.get("generation_trial") or 0),
+                        trial_sbs=int(row.get("trial_sbs") or 0),
                     )
                 )
             except Exception:
@@ -1426,6 +1792,10 @@ def main() -> int:
 
         if runner_root.exists() and not args.resume and not args.dry_run:
             raise RuntimeError(f"{runner_root} already exists; use --resume or choose a new run.tag_prefix")
+        if args.reset_generation is not None and not args.resume:
+            raise RuntimeError("--reset-generation requires --resume")
+        if args.reset_only and args.reset_generation is None:
+            raise RuntimeError("--reset-only requires --reset-generation")
         if not args.dry_run:
             runner_root.mkdir(parents=True, exist_ok=True)
             trials_root.mkdir(parents=True, exist_ok=True)
@@ -1472,9 +1842,35 @@ def main() -> int:
                 "save_rate": settings.save_rate,
                 "last_generation_checkpoint": None,
                 "settings_file": str(args.settings_file.resolve()),
+                "generation_plans": {},
             }
             if not args.dry_run:
                 write_json(state_path, state)
+        import_generation_plans_from_generation_best(state, generation_best_path, settings)
+        if args.reset_generation is not None:
+            current_checkpoint, next_trial, state = reset_generation_state(
+                state=state,
+                settings=settings,
+                run=run,
+                specs=specs,
+                runner_root=runner_root,
+                summary_path=summary_path,
+                generation_best_path=generation_best_path,
+                state_path=state_path,
+                pending_commit_dir=pending_commit_dir,
+                reset_generation=args.reset_generation,
+                dry_run=args.dry_run,
+                color=color,
+            )
+            completed = load_completed(summary_path) if args.resume else []
+            if args.reset_only:
+                tuner.event(color, "[RESET DONE]", "state/logs were rewound; no training was started", "green")
+                return 0
+        if args.resume:
+            completed = [result for result in completed if result.trial < next_trial]
+        assign_result_metadata(settings, state, completed)
+        if not args.dry_run:
+            write_json(state_path, state)
         refresh_selection_scores(settings, completed)
         if settings.metric == tuner.BORDA_COUNT_METRIC and not args.dry_run:
             rewrite_summary_selection_metrics(summary_path, completed)
@@ -1554,7 +1950,10 @@ def main() -> int:
         worker: tuner.WorkerClient | None = None
         try:
             if settings.use_worker:
-                open_trial_sbs = settings.trial_sbs_for_generation(start_generation)
+                start_plan = get_or_create_generation_plan(state, settings, start_generation, next_trial)
+                if not args.dry_run:
+                    write_json(state_path, state)
+                open_trial_sbs = int(start_plan["trial_sbs"])
                 if args.dry_run:
                     open_dir = runner_root / "worker-session"
                     open_params = dict(current_parameters)
@@ -1583,11 +1982,14 @@ def main() -> int:
                     )
 
             for generation in range(start_generation, settings.generations + 1):
-                generation_first_trial = first_trial_of_generation(settings, generation)
-                population = settings.population_for_generation(generation)
+                plan = get_or_create_generation_plan(state, settings, generation, next_trial)
+                generation_first_trial = int(plan["first_trial"])
+                population = int(plan["population"])
                 generation_last_trial = generation_first_trial + population - 1
-                trial_sbs = settings.trial_sbs_for_generation(generation)
-                tpe_startup_trials = settings.tpe_startup_trials_for_generation(generation)
+                trial_sbs = int(plan["trial_sbs"])
+                tpe_startup_trials = int(plan["tpe_startup_trials"])
+                if not args.dry_run:
+                    write_json(state_path, state)
                 prior_sampler_generation = latest_prior_generation_with_results(settings, completed, generation)
                 prior_sampler_trials = (
                     generation_results(settings, completed, prior_sampler_generation)
@@ -1739,6 +2141,9 @@ def main() -> int:
                                 summary_path,
                                 SUMMARY_FIELDS,
                                 {
+                                    "generation": generation,
+                                    "generation_trial": generation_trial,
+                                    "trial_sbs": trial_sbs,
                                     "trial": trial,
                                     "status": "failed",
                                     "test_value_accuracy": "",
@@ -1767,6 +2172,9 @@ def main() -> int:
                         score=score,
                         checkpoint=checkpoint,
                         output_dir=out_dir,
+                        generation=generation,
+                        generation_trial=generation_trial,
+                        trial_sbs=trial_sbs,
                     )
                     completed.append(result)
                     refresh_generation_selection_scores(settings, completed, generation)
@@ -1791,6 +2199,9 @@ def main() -> int:
                         summary_path,
                         SUMMARY_FIELDS,
                         {
+                            "generation": generation,
+                            "generation_trial": generation_trial,
+                            "trial_sbs": trial_sbs,
                             "trial": trial,
                             "status": "finished",
                             "test_value_accuracy": tuner.format_float(metric.test_acc),
@@ -1835,6 +2246,7 @@ def main() -> int:
                         "save_rate": settings.save_rate,
                         "last_generation_checkpoint": state.get("last_generation_checkpoint"),
                         "settings_file": str(args.settings_file.resolve()),
+                        "generation_plans": state.get("generation_plans", {}),
                     }
                     write_json(state_path, state)
                     rec = write_recommendation(recommendation_path, specs, completed, settings)
@@ -1906,6 +2318,7 @@ def main() -> int:
                     "save_rate": settings.save_rate,
                     "last_generation_checkpoint": state.get("last_generation_checkpoint"),
                     "settings_file": str(args.settings_file.resolve()),
+                    "generation_plans": state.get("generation_plans", {}),
                 }
                 write_json(state_path, state)
 
@@ -2034,6 +2447,9 @@ def main() -> int:
                     summary_path,
                     SUMMARY_FIELDS,
                     {
+                        "generation": generation,
+                        "generation_trial": "",
+                        "trial_sbs": trial_sbs,
                         "trial": f"gen{generation}-commit",
                         "status": f"commit_{commit_source}",
                         "test_value_accuracy": tuner.format_float(commit_metric.test_acc),
@@ -2112,6 +2528,7 @@ def main() -> int:
                     "save_rate": settings.save_rate,
                     "last_generation_checkpoint": stable_checkpoint_text or state.get("last_generation_checkpoint"),
                     "settings_file": str(args.settings_file.resolve()),
+                    "generation_plans": state.get("generation_plans", {}),
                 }
                 write_json(state_path, state)
                 rec = write_recommendation(recommendation_path, specs, completed, settings)
@@ -2123,7 +2540,10 @@ def main() -> int:
                     "green",
                 )
                 if settings.use_worker and worker is not None and generation < settings.generations:
-                    next_trial_sbs = settings.trial_sbs_for_generation(generation + 1)
+                    next_plan = get_or_create_generation_plan(state, settings, generation + 1, next_trial)
+                    if not args.dry_run:
+                        write_json(state_path, state)
+                    next_trial_sbs = int(next_plan["trial_sbs"])
                     open_worker_session(
                         worker=worker,
                         run=run,

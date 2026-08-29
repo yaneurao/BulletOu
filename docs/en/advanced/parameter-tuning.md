@@ -335,6 +335,33 @@ With this setting, lower `quantized_value_loss` is better. By default, trial che
 
 With `commit_source: "best"`, the commit run uses the parameters from the best measured trial in that generation. With `commit_source: "recommended"`, it uses the same inferred parameters written to `recommended-parameters.json` for the latest generation. `recommended` is an unevaluated estimate, so the safer default is `"best"`.
 
+## Changing population or trial_sbs mid-run
+
+`population` and `trial_sbs` define the generation boundary. If you change them in the middle of a generation, already-finished trials and new trials would have different meanings and should not be compared directly.
+
+To change these settings safely, reset the generation you want to restart:
+
+```powershell
+python .\tuning_parameters.py `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
+  --resume `
+  --reset-generation 17
+```
+
+This discards trial results from generation 17 onward and restarts generation 17 from the generation 16 checkpoint. Training continues immediately.
+
+If you only want to rewind the state and logs without starting training, add `--reset-only`:
+
+```powershell
+python .\tuning_parameters.py `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
+  --resume `
+  --reset-generation 17 `
+  --reset-only
+```
+
+The runner records each generation's `population`, `trial_sbs`, and trial-number range in `runner-state.json`. Finished generations are therefore not reinterpreted when you edit the settings file. New settings apply to generations that have not started yet, or to a generation explicitly rewound with `--reset-generation`.
+
 Even when a non-best trial checkpoint is deleted, `summary-learn.log` and `logs/trialXXXX.stdout.log` remain, so you can still inspect the metric values and stdout later.
 
 To keep every trial checkpoint, use one of these:

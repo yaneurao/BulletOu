@@ -345,3 +345,30 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 - 実行時に `--keep-temp`
 
 通常は storage 消費を抑えるため、`keep_all_trials: false` のままにしておくのが安全です。
+
+## 途中から population や trial_sbs を変える
+
+`population` や `trial_sbs` は generation の区切りを決める設定です。すでに開始した generation の途中でこれを変更すると、完了済み trial と新しい trial の長さが混ざり、比較が意味を持たなくなります。
+
+途中で設定を変えたい場合は、変更したい generation を開始前の状態へ戻してから再開します。
+
+```powershell
+python .\tuning_parameters.py `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
+  --resume `
+  --reset-generation 17
+```
+
+この例では、generation 17 以降の trial 結果を捨て、generation 16 の checkpoint から generation 17 を開始し直します。そのまま学習も開始します。
+
+状態だけ戻して、学習はまだ始めたくない場合は `--reset-only` を付けます。
+
+```powershell
+python .\tuning_parameters.py `
+  --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
+  --resume `
+  --reset-generation 17 `
+  --reset-only
+```
+
+runner は generation ごとの `population`、`trial_sbs`、trial番号範囲を `runner-state.json` に保存します。そのため、設定ファイルを変更しても完了済み generation の意味は変わりません。新しい設定は、まだ開始していない generation、または `--reset-generation` で戻した generation から反映されます。
