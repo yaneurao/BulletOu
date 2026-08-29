@@ -514,6 +514,84 @@ def trim_summary_from_generation(
     os.replace(tmp, summary_path)
 
 
+def repair_summary_generation_columns(
+    summary_path: Path,
+    state: dict[str, Any],
+) -> None:
+    """Fill generation metadata in existing summary rows.
+
+    Some older summary files predate the explicit generation columns.  A bad
+    migration can also leave the trial cell empty after the new leading columns
+    were inserted.  For append-only trial rows, the row order still gives the
+    trial id, so repair those rows before later resume/reset logic reads them.
+    """
+    if not summary_path.exists() or summary_path.stat().st_size == 0:
+        return
+    with summary_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or SUMMARY_FIELDS
+        rows = list(reader)
+    changed = False
+    next_sequential_trial = 1
+    next_commit_generation = 1
+    for row in rows:
+        status = row.get("status", "")
+        trial_cell = str(row.get("trial", "")).strip()
+        if status.startswith("commit_") and not row.get("generation") and not trial_cell:
+            row["generation"] = str(next_commit_generation)
+            row["trial"] = f"gen{next_commit_generation}-commit"
+            trial_cell = row["trial"]
+            changed = True
+        if status in {"finished", "failed"}:
+            if trial_cell:
+                try:
+                    next_sequential_trial = max(next_sequential_trial, int(trial_cell) + 1)
+                except Exception:
+                    pass
+            else:
+                row["trial"] = str(next_sequential_trial)
+                trial_cell = row["trial"]
+                next_sequential_trial += 1
+                changed = True
+
+        generation = summary_row_generation(state, row)
+        if generation is None:
+            continue
+        if status.startswith("commit_"):
+            next_commit_generation = max(next_commit_generation, generation + 1)
+        plan = generation_plans(state).get(str(generation))
+        generation_trial = ""
+        trial_sbs = ""
+        if plan is not None:
+            trial_sbs = str(int(plan["trial_sbs"]))
+            try:
+                trial = int(trial_cell)
+                first_trial = int(plan["first_trial"])
+                population = int(plan["population"])
+                if population > 0 and first_trial <= trial <= first_trial + population - 1:
+                    generation_trial = str(trial - first_trial + 1)
+            except Exception:
+                generation_trial = ""
+        updates = {
+            "generation": str(generation),
+            "generation_trial": generation_trial,
+            "trial_sbs": trial_sbs,
+        }
+        for key, value in updates.items():
+            if row.get(key, "") != value:
+                row[key] = value
+                changed = True
+    if not changed:
+        return
+    tmp = summary_path.with_name(summary_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+    os.replace(tmp, summary_path)
+
+
 def trim_generation_best_from_generation(generation_best_path: Path, reset_generation: int) -> None:
     if not generation_best_path.exists() or generation_best_path.stat().st_size == 0:
         return
@@ -1847,6 +1925,8 @@ def main() -> int:
             if not args.dry_run:
                 write_json(state_path, state)
         import_generation_plans_from_generation_best(state, generation_best_path, settings)
+        if not args.dry_run:
+            repair_summary_generation_columns(summary_path, state)
         if args.reset_generation is not None:
             current_checkpoint, next_trial, state = reset_generation_state(
                 state=state,
