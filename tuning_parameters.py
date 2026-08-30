@@ -386,7 +386,21 @@ def get_or_create_generation_plan(
 ) -> dict[str, int]:
     plans = generation_plans(state)
     key = str(generation)
-    if key not in plans:
+    existing = plans.get(key)
+    current_generation_raw = state.get("current_generation")
+    current_generation = int(current_generation_raw) if current_generation_raw is not None else None
+    if existing is not None and current_generation is not None:
+        first_trial = int(existing["first_trial"])
+        generation_started = next_trial > first_trial
+        generation_is_future = generation > current_generation
+        if generation_is_future and not generation_started:
+            # Worker reopen can pre-create the next generation's plan before a
+            # human edits the settings file.  Keep completed/started
+            # generations immutable, but let an unstarted future generation
+            # pick up the edited population/trial_sbs safely.
+            existing = None
+            plans.pop(key, None)
+    if existing is None:
         population = settings.population_for_generation(generation)
         plans[key] = {
             "first_trial": max(1, next_trial),
