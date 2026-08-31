@@ -2985,6 +2985,23 @@ fn colored_seconds(label: &str, seconds: f64) -> String {
     paint(format!("{label}={seconds:.1}s"), ConsoleColor::BoldCyan)
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_progress_update_detail(progress: CudaCppScheduleProgress) -> String {
+    let batches_per_update = progress.batches_per_update.max(1);
+    let updates_per_superbatch = progress.batches_per_superbatch / batches_per_update;
+    let completed_updates = progress.batch_in_superbatch / batches_per_update;
+    if progress.batch_in_superbatch == progress.batches_per_superbatch {
+        format!("bpu={} updates/sb={}", format_count(batches_per_update), format_count(updates_per_superbatch))
+    } else {
+        format!(
+            "bpu={} updates={}/{}",
+            format_count(batches_per_update),
+            format_count(completed_updates),
+            format_count(updates_per_superbatch)
+        )
+    }
+}
+
 fn colored_metric(label: &str, value: f32, precision: usize) -> String {
     paint(format!("{label}={value:.precision$}"), ConsoleColor::Magenta)
 }
@@ -3197,7 +3214,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
                 )
             };
             eprintln!(
-                "  {}  {}  {}  {}  {}  {}  {}  {}",
+                "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
                 paint_log_tag("[train]", ConsoleColor::BoldCyan),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
@@ -3205,6 +3222,7 @@ fn print_cuda_cpp_checkpoint_with_timing(
                     ConsoleColor::BoldYellow
                 ),
                 paint(batch_detail, ConsoleColor::Yellow),
+                paint(cuda_cpp_progress_update_detail(progress), ConsoleColor::BoldYellow),
                 paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
                 colored_seconds("wall", stats.interval_wall_elapsed_sec),
                 colored_seconds("train", stats.interval_train_elapsed_sec),
@@ -3256,7 +3274,7 @@ fn print_cuda_cpp_superbatch_progress(
             let sb_total_positions = progress.batches_per_superbatch.saturating_mul(batch_size);
             let batch_word = if progress.batches_per_superbatch == 1 { "batch" } else { "batches" };
             eprintln!(
-                "  {}  {}  {}  {}  {}  {}  {}  {}",
+                "  {}  {}  {}  {}  {}  {}  {}  {}  {}",
                 paint_log_tag("[train]", ConsoleColor::BoldCyan),
                 paint(format!("epoch {}", progress.epoch), ConsoleColor::BoldCyan),
                 paint(
@@ -3273,6 +3291,7 @@ fn print_cuda_cpp_superbatch_progress(
                     ),
                     ConsoleColor::Yellow
                 ),
+                paint(cuda_cpp_progress_update_detail(progress), ConsoleColor::BoldYellow),
                 paint(format!("total={} pos", format_count(positions)), ConsoleColor::Cyan),
                 colored_seconds("wall", stats.interval_wall_elapsed_sec),
                 colored_seconds("train", stats.interval_train_elapsed_sec),
@@ -10146,10 +10165,17 @@ impl WorkerSfnnSession {
         let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
         let device = args.cuda_cpp_device;
         let name = bulletou_cuda_cpp::device_name(device).map_err(|e| e.to_string())?;
+        let total_updates = schedule.total_steps / schedule.batches_per_update.max(1);
+        let updates_per_superbatch = schedule.batches_per_superbatch / schedule.batches_per_update.max(1);
         eprintln!(
-            "  worker session open: device={device}:{name}, arch={}, trial_steps={}, batch_size={}",
+            "  worker session open: device={device}:{name}, arch={}, superbatches={}, batches/sb={}, bpu={}, trial_steps={}, trial_updates={}, updates/sb={}, batch_size={}",
             args.arch().cli_name(),
-            schedule.total_steps,
+            format_count(schedule.superbatches_per_epoch),
+            format_count(schedule.batches_per_superbatch),
+            format_count(schedule.batches_per_update),
+            format_count(schedule.total_steps),
+            format_count(total_updates),
+            format_count(updates_per_superbatch),
             format_count(batch_size)
         );
         let initial_state = build_sfnn_initial_state_for_cuda_cpp(&args, feature_kind)?;
@@ -13037,13 +13063,15 @@ fn run_cuda_cpp_kppt_direct_steps(args: &Args) -> Result<(), String> {
         print_startup_kv(
             "schedule",
             format!(
-                "{}: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                "{}: max_epochs={}, superbatches={}, save_rate={}, save_epoch_end={}, batches_per_superbatch={}, batches_per_update={}, updates_per_superbatch={}, lr={}",
                 paint("production", ConsoleColor::BoldGreen),
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
                 effective_save_rate(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
+                schedule.batches_per_update,
+                schedule.batches_per_superbatch / schedule.batches_per_update.max(1),
                 args.lr_schedule.cli_name()
             ),
         );
@@ -13753,7 +13781,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         print_startup_kv(
             "schedule",
             format!(
-                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, save_epoch_end={}, batches_per_superbatch={}, batches_per_update={}, updates_per_superbatch={}, lr={}",
                 paint("production", ConsoleColor::BoldGreen),
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
@@ -13761,6 +13789,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 validation_rate_label(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
+                schedule.batches_per_update,
+                schedule.batches_per_superbatch / schedule.batches_per_update.max(1),
                 args.lr_schedule.cli_name()
             ),
         );
@@ -16719,7 +16749,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "schedule",
             format!(
-                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, quantized_validation_rate={}, quantized_validation_mode={}, save_epoch_end={}, batches_per_superbatch={}, lr={}",
+                "{}: max_epochs={}, superbatches={}, save_rate={}, validation_rate={}, quantized_validation_rate={}, quantized_validation_mode={}, save_epoch_end={}, batches_per_superbatch={}, batches_per_update={}, updates_per_superbatch={}, lr={}",
                 paint("production", ConsoleColor::BoldGreen),
                 args.max_epochs.unwrap_or(1).max(1),
                 args.superbatches.unwrap_or(1),
@@ -16729,6 +16759,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 quantized_validation_mode_label(args),
                 effective_save_epoch_end(args),
                 schedule.batches_per_superbatch,
+                schedule.batches_per_update,
+                schedule.batches_per_superbatch / schedule.batches_per_update.max(1),
                 args.lr_schedule.cli_name()
             ),
         );
@@ -23744,6 +23776,7 @@ struct CudaCppRunSchedule {
     production: bool,
     total_steps: usize,
     batches_per_superbatch: usize,
+    batches_per_update: usize,
     superbatches_per_epoch: usize,
     prior_positions: usize,
     lr_position_offset: usize,
@@ -23790,6 +23823,7 @@ impl CudaCppRunSchedule {
                 superbatches_per_epoch: self.superbatches_per_epoch,
                 batch_in_superbatch: offset % batches_per_superbatch + 1,
                 batches_per_superbatch,
+                batches_per_update: self.batches_per_update.max(1),
             });
         }
         None
@@ -23804,6 +23838,7 @@ struct CudaCppScheduleProgress {
     superbatches_per_epoch: usize,
     batch_in_superbatch: usize,
     batches_per_superbatch: usize,
+    batches_per_update: usize,
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -24053,6 +24088,7 @@ fn append_cuda_cpp_progress_log(
         superbatches_per_epoch: schedule.superbatches_per_epoch,
         batch_in_superbatch: 0,
         batches_per_superbatch: schedule.batches_per_superbatch,
+        batches_per_update: schedule.batches_per_update,
     });
     let optimizer_step = optimizer_step.map(|step| step.to_string()).unwrap_or_else(|| "-".to_string());
     writeln!(
@@ -24072,6 +24108,7 @@ fn append_cuda_cpp_progress_log(
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let batch_size = effective_batch_size(args);
+    let batches_per_update = args.batches_per_update.max(1);
     let default_lr_step_positions = effective_lr_step_positions(args, 1);
     if let Some(train_steps) = args.cuda_cpp_train_steps {
         let lr = args.lr;
@@ -24079,6 +24116,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             production: false,
             total_steps: train_steps,
             batches_per_superbatch: train_steps,
+            batches_per_update,
             superbatches_per_epoch: 1,
             prior_positions: 0,
             lr_position_offset: 0,
@@ -24269,6 +24307,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         production: true,
         total_steps,
         batches_per_superbatch,
+        batches_per_update,
         superbatches_per_epoch: superbatches,
         prior_positions,
         lr_position_offset,
@@ -27817,6 +27856,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 1,
                 batches_per_superbatch: 4,
+                batches_per_update: 1,
             })
         );
         assert_eq!(
@@ -27827,6 +27867,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 4,
                 batches_per_superbatch: 4,
+                batches_per_update: 1,
             })
         );
         assert_eq!(
@@ -27837,6 +27878,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 1,
                 batches_per_superbatch: 4,
+                batches_per_update: 1,
             })
         );
         assert_eq!(
@@ -27847,6 +27889,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 1,
                 batches_per_superbatch: 4,
+                batches_per_update: 1,
             })
         );
         assert_eq!(
@@ -27857,6 +27900,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 4,
                 batches_per_superbatch: 4,
+                batches_per_update: 1,
             })
         );
         assert_eq!(schedule.progress_for_step(25), None);
@@ -32416,6 +32460,7 @@ mod tests {
                 superbatches_per_epoch: 3,
                 batch_in_superbatch: 2,
                 batches_per_superbatch: 2,
+                batches_per_update: 1,
             },
             2,
             5,

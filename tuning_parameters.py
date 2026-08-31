@@ -411,6 +411,29 @@ def get_or_create_generation_plan(
     return plans[key]
 
 
+def generation_plan_mismatch_text(settings: StudySettings, generation: int, plan: dict[str, int]) -> str | None:
+    expected_population = settings.population_for_generation(generation)
+    expected_trial_sbs = settings.trial_sbs_for_generation(generation)
+    expected_startup = settings.tpe_startup_trials_for_generation(generation)
+    actual_population = int(plan["population"])
+    actual_trial_sbs = int(plan["trial_sbs"])
+    actual_startup = int(plan["tpe_startup_trials"])
+    mismatches: list[str] = []
+    if actual_population != expected_population:
+        mismatches.append(f"population stored={actual_population} settings={expected_population}")
+    if actual_trial_sbs != expected_trial_sbs:
+        mismatches.append(f"trial_sbs stored={actual_trial_sbs} settings={expected_trial_sbs}")
+    if actual_startup != expected_startup:
+        mismatches.append(f"tpe_startup_trials stored={actual_startup} settings={expected_startup}")
+    if not mismatches:
+        return None
+    return (
+        "; ".join(mismatches)
+        + f"; this generation will keep the stored plan. "
+        + f"Use --reset-generation {generation} --reset-only before --resume to apply edited settings."
+    )
+
+
 def trial_metadata_from_plans(
     state: dict[str, Any],
     trial: int,
@@ -1721,6 +1744,24 @@ def configured_teacher_memory_cache_sbs(path: Path) -> int:
         return 0
 
 
+def configured_bulletou_settings_summary(path: Path) -> str:
+    try:
+        obj = tuner.load_json_object(path)
+    except Exception as exc:
+        return f"bulletou_settings={path} (unreadable: {exc})"
+    parts = [f"bulletou_settings={path}"]
+    for key in (
+        "positions_per_superbatch",
+        "batches_per_update",
+        "validation_rate",
+        "quantized_validation_rate",
+        "teacher_memory_cache_sbs",
+    ):
+        if key in obj:
+            parts.append(f"{key}={obj[key]}")
+    return " ".join(parts)
+
+
 def open_worker_session(
     *,
     worker: tuner.WorkerClient,
@@ -1998,6 +2039,7 @@ def main() -> int:
             ),
             "cyan",
         )
+        tuner.event(color, "[BULLETOU SETTINGS]", configured_bulletou_settings_summary(run.bulletou_settings_file), "cyan")
         cache_sbs = configured_teacher_memory_cache_sbs(run.bulletou_settings_file)
         if cache_sbs > 0 and settings.use_worker:
             tuner.event(
@@ -2045,6 +2087,9 @@ def main() -> int:
         try:
             if settings.use_worker:
                 start_plan = get_or_create_generation_plan(state, settings, start_generation, next_trial)
+                start_plan_mismatch = generation_plan_mismatch_text(settings, start_generation, start_plan)
+                if start_plan_mismatch is not None:
+                    tuner.event(color, f"[GEN {start_generation} PLAN WARN]", start_plan_mismatch, "yellow")
                 if not args.dry_run:
                     write_json(state_path, state)
                 open_trial_sbs = int(start_plan["trial_sbs"])
@@ -2082,6 +2127,7 @@ def main() -> int:
                 generation_last_trial = generation_first_trial + population - 1
                 trial_sbs = int(plan["trial_sbs"])
                 tpe_startup_trials = int(plan["tpe_startup_trials"])
+                plan_mismatch = generation_plan_mismatch_text(settings, generation, plan)
                 if not args.dry_run:
                     write_json(state_path, state)
                 prior_sampler_generation = latest_prior_generation_with_results(settings, completed, generation)
@@ -2124,6 +2170,8 @@ def main() -> int:
                     ),
                     "magenta",
                 )
+                if plan_mismatch is not None:
+                    tuner.event(color, f"[GEN {generation} PLAN WARN]", plan_mismatch, "yellow")
 
                 generation_best = best_result(generation_results(settings, completed, generation), settings)
                 if generation_best is not None:
