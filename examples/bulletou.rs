@@ -3617,6 +3617,10 @@ impl SfnnFactorizerSpec {
         self.king_axis || self.hand_axis || self.progress_axis || self.any_pair()
     }
 
+    fn any(self) -> bool {
+        self.shared || self.any_axis()
+    }
+
     fn label(self) -> String {
         if !self.shared && !self.king_axis && !self.hand_axis && !self.any_pair() {
             return "none".to_string();
@@ -10309,6 +10313,34 @@ impl WorkerSfnnSession {
         if rebase_axis_factorizer {
             let old_factorizer = effective_sfnn_factorizer_spec(&old_args);
             let new_factorizer = effective_sfnn_factorizer_spec(args);
+            if old_factorizer.any() || new_factorizer.any() {
+                let (ratios, stats) = cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
+                    self.shape,
+                    old_factorizer,
+                    self.residual_count_gates.as_deref(),
+                    new_factorizer,
+                    new_count_settings.residual_count_gates.as_deref(),
+                )?;
+                if stats.changed_stacks != 0 {
+                    self.runner
+                        .rebase_residual_count_gate_terms(
+                            &self.ctx,
+                            ratios.as_slice(),
+                            cuda_cpp_sfnn_factorizer_active(&old_args),
+                            cuda_cpp_sfnn_factorizer_active(args),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    eprintln!(
+                        "  SFNN factorizer rebase = residual count gate terms: changed_stacks={}/{}, ratio=[{:.6},{:.6}], clamped={}, zeroed={}",
+                        stats.changed_stacks,
+                        self.shape.num_stacks,
+                        stats.min_ratio,
+                        stats.max_ratio,
+                        stats.clamped_stacks,
+                        stats.zeroed_stacks
+                    );
+                }
+            }
             if old_factorizer.any_axis() || new_factorizer.any_axis() {
                 let (ratios, stats) = cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
                     self.shape,
@@ -15000,6 +15032,58 @@ impl SfnnBucketCounts {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_progress_bucket_count_summary(
+    counts: &SfnnBucketCounts,
+    layerstack: LayerStackMode,
+) -> Result<Option<String>, String> {
+    let bucket_kind = layerstack.bucket_kind();
+    let progress_bucket_count = bucket_kind.progress_bucket_count();
+    if progress_bucket_count <= 1 {
+        return Ok(None);
+    }
+    let hand_bucket_count = bucket_kind.hand_bucket_count();
+    let king_bucket_count = bucket_kind.king_bucket_count();
+    let base_bucket_count = hand_bucket_count
+        .checked_mul(king_bucket_count)
+        .ok_or_else(|| "SFNN progress bucket summary base bucket count overflow".to_string())?;
+    let expected_stacks = base_bucket_count
+        .checked_mul(progress_bucket_count)
+        .ok_or_else(|| "SFNN progress bucket summary stack count overflow".to_string())?;
+    if counts.counts.len() != expected_stacks {
+        return Err(format!(
+            "SFNN progress bucket summary stack count mismatch: count file has {}, layerstack {} expects {}",
+            counts.counts.len(),
+            layerstack.cli_name(),
+            expected_stacks
+        ));
+    }
+
+    let total_positions = counts.positions.max(1) as f64;
+    let parts = (0..progress_bucket_count)
+        .map(|progress| {
+            let mut sum = 0u64;
+            let mut nonzero = 0usize;
+            for base in 0..base_bucket_count {
+                let count = counts.counts[base * progress_bucket_count + progress];
+                sum = sum.saturating_add(u64::from(count));
+                if count != 0 {
+                    nonzero += 1;
+                }
+            }
+            format!(
+                "p{progress}:{} ({:.2}%, nz {}/{})",
+                format_count_u64(sum),
+                100.0 * sum as f64 / total_positions,
+                format_count(nonzero),
+                format_count(base_bucket_count)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Some(parts))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn read_le_u32(reader: &mut impl std::io::Read, path: &Path, label: &str) -> Result<u32, String> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes).map_err(|err| format!("failed to read {} {label}: {err}", path.display()))?;
@@ -15651,6 +15735,9 @@ fn finish_bucket_count_report(
         format_count(bucket_count_percentile(&nonzero_counts, 0.99) as usize),
         format_count(report.max() as usize)
     );
+    if let Some(summary) = sfnn_progress_bucket_count_summary(&report, layerstack)? {
+        println!("  progress_buckets  = {summary}");
+    }
     let count_thresholds = [
         ("1B", 1_000_000_000u32),
         ("100M", 100_000_000u32),
@@ -16946,6 +17033,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 format_count(counts.max() as usize)
             ),
         );
+        if let Some(summary) = sfnn_progress_bucket_count_summary(counts, layerstack)? {
+            print_startup_kv_colored("progress buckets", summary, ConsoleColor::BoldYellow);
+        }
     }
     if let Some((effective_k, k_label, lambdas)) = sfnn_residual_count_decay.as_ref() {
         print_startup_kv_colored(
@@ -19620,6 +19710,16 @@ struct SfnnAxisFactorizerRebaseStats {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[derive(Debug, Clone, Copy)]
+struct SfnnResidualCountGateRebaseStats {
+    changed_stacks: usize,
+    clamped_stacks: usize,
+    zeroed_stacks: usize,
+    min_ratio: f32,
+    max_ratio: f32,
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 const SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER: f32 = 1.0e-6;
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -19722,6 +19822,86 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
         max_ratio = 1.0;
     }
     Ok((ratios, SfnnAxisFactorizerRebaseStats { changed_axes, clamped_axes, zeroed_axes, min_ratio, max_ratio }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    old_factorizer: SfnnFactorizerSpec,
+    old_gates: Option<&[f32]>,
+    new_factorizer: SfnnFactorizerSpec,
+    new_gates: Option<&[f32]>,
+) -> Result<(Vec<f32>, SfnnResidualCountGateRebaseStats), String> {
+    let stacks = shape.num_stacks;
+    if let Some(values) = old_gates {
+        if values.len() != stacks {
+            return Err(format!(
+                "SFNN residual count gate rebase old gate length mismatch: got {}, expected {stacks}",
+                values.len()
+            ));
+        }
+    }
+    if let Some(values) = new_gates {
+        if values.len() != stacks {
+            return Err(format!(
+                "SFNN residual count gate rebase new gate length mismatch: got {}, expected {stacks}",
+                values.len()
+            ));
+        }
+    }
+
+    let mut ratios = vec![1.0f32; stacks];
+    let mut changed_stacks = 0usize;
+    let mut clamped_stacks = 0usize;
+    let mut zeroed_stacks = 0usize;
+    let mut min_ratio = f32::INFINITY;
+    let mut max_ratio = f32::NEG_INFINITY;
+    let old_uses_gate = old_factorizer.any();
+    let new_uses_gate = new_factorizer.any();
+    for stack in 0..stacks {
+        let old_effective = if old_uses_gate {
+            old_gates.and_then(|values| values.get(stack)).copied().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let new_effective = if new_uses_gate {
+            new_gates.and_then(|values| values.get(stack)).copied().unwrap_or(1.0)
+        } else {
+            1.0
+        };
+        let old_is_zero = old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
+        let new_is_zero = new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
+        let mut ratio = if old_is_zero && new_is_zero {
+            1.0
+        } else if old_is_zero || new_is_zero {
+            zeroed_stacks += 1;
+            0.0
+        } else {
+            old_effective / new_effective
+        };
+        if !(ratio.is_finite() && ratio >= 0.0) {
+            ratio = 1.0;
+            clamped_stacks += 1;
+        }
+        if ratio > SFNN_AXIS_REBASE_MAX_RATIO {
+            ratio = SFNN_AXIS_REBASE_MAX_RATIO;
+            clamped_stacks += 1;
+        }
+        if (ratio - 1.0).abs() > 1.0e-6 {
+            changed_stacks += 1;
+        }
+        min_ratio = min_ratio.min(ratio);
+        max_ratio = max_ratio.max(ratio);
+        ratios[stack] = ratio;
+    }
+    if stacks == 0 {
+        min_ratio = 1.0;
+        max_ratio = 1.0;
+    }
+    Ok((
+        ratios,
+        SfnnResidualCountGateRebaseStats { changed_stacks, clamped_stacks, zeroed_stacks, min_ratio, max_ratio },
+    ))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -29071,6 +29251,104 @@ mod tests {
 
         assert_eq!(shape.factorizer_axis_count(), 746);
         assert_eq!(cuda_cpp_sfnn_factorizer_axis_ids(shape, stack, factorizer), vec![2, 4, 11, 19, 434, 614, 725, 745]);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_residual_count_gate_rebase_preserves_effective_multiplier() {
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 3,
+            num_stacks: 4,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
+            factorizer_progress_axis: false,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
+        };
+        let factorizer = SfnnFactorizerSpec { shared: true, ..SfnnFactorizerSpec::NONE };
+        let old_gates = [0.5, 1.0, 0.0, 0.25];
+        let new_gates = [1.0, 0.25, 0.5, 0.0];
+
+        let (ratios, stats) = cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
+            shape,
+            factorizer,
+            Some(&old_gates),
+            factorizer,
+            Some(&new_gates),
+        )
+        .unwrap();
+
+        assert_eq!(ratios, vec![0.5, 4.0, 0.0, 0.0]);
+        assert_eq!(stats.changed_stacks, 4);
+        assert_eq!(stats.zeroed_stacks, 2);
+        assert_eq!(stats.clamped_stacks, 0);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn cuda_cpp_sfnn_residual_count_gate_rebase_handles_newly_enabled_gate() {
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 4,
+            ft_size: 4,
+            l1_hidden: 2,
+            l1_skip: true,
+            l2_size: 3,
+            num_stacks: 2,
+            l1_group_count: 1,
+            l1_common_size: 0,
+            l1_shard_size: 0,
+            factorizer_king_axis_dim: 0,
+            factorizer_hand_axis_dim: 0,
+            factorizer_progress_axis: false,
+            factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false,
+            factorizer_hand_progress_pair: false,
+        };
+        let no_factorizer = SfnnFactorizerSpec::NONE;
+        let factorizer = SfnnFactorizerSpec { shared: true, ..SfnnFactorizerSpec::NONE };
+        let new_gates = [0.5, 0.25];
+
+        let (ratios, stats) =
+            cuda_cpp_sfnn_residual_count_gate_rebase_ratios(shape, no_factorizer, None, factorizer, Some(&new_gates))
+                .unwrap();
+
+        assert_eq!(ratios, vec![2.0, 4.0]);
+        assert_eq!(stats.changed_stacks, 2);
+        assert_eq!(stats.zeroed_stacks, 0);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn sfnn_progress_bucket_count_summary_reports_dead_progress_buckets() {
+        let layerstack = LayerStackMode::Custom {
+            hand: ShogiSfnnHandBucketKind::None,
+            king: ShogiSfnnKingBucketKind::KingRank9,
+            progress: ShogiSfnnProgressBucketKind::Progress4,
+        };
+        let mut bucket_counts = Vec::new();
+        for _ in 0..9 {
+            bucket_counts.extend([1, 2, 0, 1]);
+        }
+        let counts = SfnnBucketCounts {
+            arch: "SFNN_halfka2_1024_8_64_k3k3_progress4".to_string(),
+            positions: bucket_counts.iter().map(|&count| u64::from(count)).sum(),
+            counts: bucket_counts,
+        };
+
+        let summary = sfnn_progress_bucket_count_summary(&counts, layerstack).unwrap().unwrap();
+
+        assert!(summary.contains("p0:9 (25.00%, nz 9/9)"), "{summary}");
+        assert!(summary.contains("p1:18 (50.00%, nz 9/9)"), "{summary}");
+        assert!(summary.contains("p2:0 (0.00%, nz 0/9)"), "{summary}");
+        assert!(summary.contains("p3:9 (25.00%, nz 9/9)"), "{summary}");
     }
 
     #[test]

@@ -530,9 +530,8 @@ fn scale_axis_rows_f32_device(
     if row_len == 0 {
         return Err(CudaCppError::message("axis row scaling row_len must be greater than zero"));
     }
-    let expected = row_count
-        .checked_mul(row_len)
-        .ok_or_else(|| CudaCppError::message("axis row scaling length overflow"))?;
+    let expected =
+        row_count.checked_mul(row_len).ok_or_else(|| CudaCppError::message("axis row scaling length overflow"))?;
     if values.len() != expected {
         return Err(CudaCppError::message(format!(
             "axis row scaling value length mismatch: values={}, expected {expected} ({row_count} x {row_len})",
@@ -6575,14 +6574,123 @@ impl SfnnTrainStepRunner {
             self.shape.l2_size,
             kind,
         )?;
-        Self::scale_optional_axis_optimizer_rows(
-            ctx,
-            self.optimizer_states.l3axb.as_ref(),
-            row_scales,
-            axes,
-            1,
-            kind,
-        )
+        Self::scale_optional_axis_optimizer_rows(ctx, self.optimizer_states.l3axb.as_ref(), row_scales, axes, 1, kind)
+    }
+
+    fn scale_residual_stack_weight_rows(
+        &self,
+        ctx: &Context,
+        row_scales: &F32Buffer,
+        gate_l1: bool,
+        gate_l2: bool,
+        gate_l3: bool,
+    ) -> Result<()> {
+        let stacks = self.shape.num_stacks;
+        if stacks == 0 {
+            return Ok(());
+        }
+        if !self.shape.has_compact_l1() && gate_l1 {
+            Self::scale_optional_axis_rows(
+                ctx,
+                Some(&self.weights.l1w),
+                row_scales,
+                stacks,
+                self.shape.l1w_len()? / stacks,
+            )?;
+        }
+        if gate_l1 {
+            Self::scale_optional_axis_rows(ctx, Some(&self.weights.l1b), row_scales, stacks, self.shape.l1_out())?;
+        }
+        if gate_l2 {
+            Self::scale_optional_axis_rows(
+                ctx,
+                Some(&self.weights.l2w),
+                row_scales,
+                stacks,
+                checked_product("sfnn l2 residual gate rebase row", &[self.shape.l2_size, self.shape.l2_in()])?,
+            )?;
+            Self::scale_optional_axis_rows(ctx, Some(&self.weights.l2b), row_scales, stacks, self.shape.l2_size)?;
+        }
+        if gate_l3 {
+            Self::scale_optional_axis_rows(ctx, Some(&self.weights.l3w), row_scales, stacks, self.shape.l2_size)?;
+            Self::scale_optional_axis_rows(ctx, Some(&self.weights.l3b), row_scales, stacks, 1)?;
+        }
+        Ok(())
+    }
+
+    fn scale_residual_stack_optimizer_rows(
+        &self,
+        ctx: &Context,
+        row_scales: &F32Buffer,
+        kind: SfnnAxisRebaseStateKind,
+        gate_l1: bool,
+        gate_l2: bool,
+        gate_l3: bool,
+    ) -> Result<()> {
+        let stacks = self.shape.num_stacks;
+        if stacks == 0 {
+            return Ok(());
+        }
+        if !self.shape.has_compact_l1() && gate_l1 {
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l1w),
+                row_scales,
+                stacks,
+                self.shape.l1w_len()? / stacks,
+                kind,
+            )?;
+        }
+        if gate_l1 {
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l1b),
+                row_scales,
+                stacks,
+                self.shape.l1_out(),
+                kind,
+            )?;
+        }
+        if gate_l2 {
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l2w),
+                row_scales,
+                stacks,
+                checked_product(
+                    "sfnn l2 residual gate optimizer rebase row",
+                    &[self.shape.l2_size, self.shape.l2_in()],
+                )?,
+                kind,
+            )?;
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l2b),
+                row_scales,
+                stacks,
+                self.shape.l2_size,
+                kind,
+            )?;
+        }
+        if gate_l3 {
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l3w),
+                row_scales,
+                stacks,
+                self.shape.l2_size,
+                kind,
+            )?;
+            Self::scale_optional_axis_optimizer_rows(
+                ctx,
+                Some(&self.optimizer_states.l3b),
+                row_scales,
+                stacks,
+                1,
+                kind,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn rebase_axis_factorizer_terms(&mut self, ctx: &Context, weight_ratios: &[f32]) -> Result<()> {
@@ -6599,10 +6707,8 @@ impl SfnnTrainStepRunner {
             }
         }
 
-        let momentum_ratios = weight_ratios
-            .iter()
-            .map(|&ratio| if ratio > 0.0 { 1.0 / ratio } else { 0.0 })
-            .collect::<Vec<_>>();
+        let momentum_ratios =
+            weight_ratios.iter().map(|&ratio| if ratio > 0.0 { 1.0 / ratio } else { 0.0 }).collect::<Vec<_>>();
         let velocity_ratios = momentum_ratios.iter().map(|&ratio| ratio * ratio).collect::<Vec<_>>();
 
         self.factorizer_axis_confidences.upload(ctx, weight_ratios)?;
@@ -6625,6 +6731,71 @@ impl SfnnTrainStepRunner {
             ctx,
             &self.factorizer_axis_confidences,
             SfnnAxisRebaseStateKind::Velocity,
+        )
+    }
+
+    pub fn rebase_residual_count_gate_terms(
+        &mut self,
+        ctx: &Context,
+        weight_ratios: &[f32],
+        old_factorizer: SfnnFactorizerActive,
+        new_factorizer: SfnnFactorizerActive,
+    ) -> Result<()> {
+        let stacks = self.shape.num_stacks;
+        expect_len("SFNN residual count gate rebase ratios", stacks, weight_ratios.len())?;
+        if stacks == 0 || weight_ratios.iter().all(|&ratio| ratio == 1.0) {
+            return Ok(());
+        }
+        for &ratio in weight_ratios {
+            if !(ratio.is_finite() && ratio >= 0.0) {
+                return Err(CudaCppError::message(
+                    "SFNN residual count gate rebase ratios must be finite and non-negative",
+                ));
+            }
+        }
+
+        let gate_l1 = self.layer_has_active_factorizer_for(SfnnUpdateLayer::L1, old_factorizer)
+            || self.layer_has_active_factorizer_for(SfnnUpdateLayer::L1, new_factorizer);
+        let gate_l2 = self.layer_has_active_factorizer_for(SfnnUpdateLayer::L2, old_factorizer)
+            || self.layer_has_active_factorizer_for(SfnnUpdateLayer::L2, new_factorizer);
+        let gate_l3 = self.layer_has_active_factorizer_for(SfnnUpdateLayer::L3, old_factorizer)
+            || self.layer_has_active_factorizer_for(SfnnUpdateLayer::L3, new_factorizer);
+        if !gate_l1 && !gate_l2 && !gate_l3 {
+            return Ok(());
+        }
+
+        let row_scales = F32Buffer::from_host(ctx, weight_ratios)?;
+        self.scale_residual_stack_weight_rows(ctx, &row_scales, gate_l1, gate_l2, gate_l3)?;
+        self.scale_residual_stack_optimizer_rows(
+            ctx,
+            &row_scales,
+            SfnnAxisRebaseStateKind::SlowParams,
+            gate_l1,
+            gate_l2,
+            gate_l3,
+        )?;
+
+        let momentum_ratios =
+            weight_ratios.iter().map(|&ratio| if ratio > 0.0 { 1.0 / ratio } else { 0.0 }).collect::<Vec<_>>();
+        let row_scales = F32Buffer::from_host(ctx, momentum_ratios.as_slice())?;
+        self.scale_residual_stack_optimizer_rows(
+            ctx,
+            &row_scales,
+            SfnnAxisRebaseStateKind::Momentum,
+            gate_l1,
+            gate_l2,
+            gate_l3,
+        )?;
+
+        let velocity_ratios = momentum_ratios.iter().map(|&ratio| ratio * ratio).collect::<Vec<_>>();
+        let row_scales = F32Buffer::from_host(ctx, velocity_ratios.as_slice())?;
+        self.scale_residual_stack_optimizer_rows(
+            ctx,
+            &row_scales,
+            SfnnAxisRebaseStateKind::Velocity,
+            gate_l1,
+            gate_l2,
+            gate_l3,
         )
     }
 
@@ -7464,22 +7635,26 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
-    fn layer_has_active_factorizer(&self, layer: SfnnUpdateLayer) -> bool {
+    fn layer_has_active_factorizer_for(&self, layer: SfnnUpdateLayer, factorizer: SfnnFactorizerActive) -> bool {
         match layer {
             SfnnUpdateLayer::L0 => false,
             SfnnUpdateLayer::L1 => {
-                (self.factorizer.shared && self.weights.l1fw.is_some())
-                    || (self.factorizer.any_axis() && self.weights.l1axw.is_some())
+                (factorizer.shared && self.weights.l1fw.is_some())
+                    || (factorizer.any_axis() && self.weights.l1axw.is_some())
             }
             SfnnUpdateLayer::L2 => {
-                (self.factorizer.shared && self.weights.l2fw.is_some())
-                    || (self.factorizer.any_axis() && self.weights.l2axw.is_some())
+                (factorizer.shared && self.weights.l2fw.is_some())
+                    || (factorizer.any_axis() && self.weights.l2axw.is_some())
             }
             SfnnUpdateLayer::L3 => {
-                (self.factorizer.shared && self.weights.l3fw.is_some())
-                    || (self.factorizer.any_axis() && self.weights.l3axw.is_some())
+                (factorizer.shared && self.weights.l3fw.is_some())
+                    || (factorizer.any_axis() && self.weights.l3axw.is_some())
             }
         }
+    }
+
+    fn layer_has_active_factorizer(&self, layer: SfnnUpdateLayer) -> bool {
+        self.layer_has_active_factorizer_for(layer, self.factorizer)
     }
 
     fn params_with_residual_decay(
