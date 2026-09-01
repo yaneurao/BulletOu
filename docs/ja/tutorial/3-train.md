@@ -147,6 +147,8 @@ axis / pair factorizer の行も count に応じて弱めたい場合は、必�
 
 `--sfnn-progress-bin` を指定しない場合は、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。`count.bin` と `progress.bin` は厳密な一致チェックをしません。実験のために仮の組み合わせで使うこともできます。
 
+完結した `.pack` 棋譜から「対局の先頭を0、最後を255」として進行度だけを学習する方法は、[応用編: 対局棋譜から進行度分類器を作る](../advanced/progress-training.md) を参照してください。
+
 `count.bin` の作り方、式、読み込み buffer の調整は [応用編: SFNN factorizer](../advanced/sfnn-factorizer.md) を参照してください。
 
 ## 3.7 population search で決まった値を使って通常学習する

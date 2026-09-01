@@ -21,7 +21,8 @@
 //! 4. Batch:   batch_size に分割してコールバックへ
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek};
+use std::io::{self, BufRead, BufReader, Read, Seek};
+use std::path::Path;
 use std::sync::mpsc;
 
 use crate::shogi::packed_sfen::PackedSfenValue;
@@ -756,6 +757,56 @@ fn expand_game(game: RawGameData) -> Vec<PackedSfenValue> {
     result
 }
 
+/// Reads a YaneuraOu `.pack` file one complete game at a time.
+///
+/// Unlike [`ShogiPackLoader`], this reader preserves game boundaries.  It is
+/// intended for consumers such as the progress trainer that need the first and
+/// last training position of each game.  Each returned vector contains the
+/// positions immediately before the moves stored in that game; therefore the
+/// first item is the game start and the last item is the last evaluable
+/// position before the terminal move/marker.
+pub struct ShogiPackGameReader {
+    cursor: PackCursor,
+    file_len: u64,
+}
+
+impl ShogiPackGameReader {
+    /// Opens one `.pack` file for sequential game-level reading.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let file_len = file.metadata()?.len();
+        // A larger buffer materially reduces small-read overhead while keeping
+        // the reader's memory footprint negligible compared with training.
+        let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        Ok(Self { cursor: PackCursor::new(reader), file_len })
+    }
+
+    /// Returns the next complete game, or `None` at a clean end of file.
+    pub fn next_game(&mut self) -> io::Result<Option<Vec<PackedSfenValue>>> {
+        if self.cursor.eof() {
+            return Ok(None);
+        }
+        let offset = self.cursor.bytes_consumed();
+        let Some((_header_offset, game)) = read_one_game(&mut self.cursor) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed or truncated .pack game at byte offset {offset}"),
+            ));
+        };
+        Ok(Some(expand_game(game)))
+    }
+
+    /// Number of source bytes consumed so far.
+    pub fn bytes_consumed(&self) -> u64 {
+        self.cursor.bytes_consumed()
+    }
+
+    /// Total source file size in bytes.
+    pub const fn file_len(&self) -> u64 {
+        self.file_len
+    }
+}
+
 // =============================================================================
 // ShogiPackLoader
 // =============================================================================
@@ -1139,6 +1190,52 @@ where
 mod tests {
     use super::*;
     use crate::shogi::types::Square;
+
+    fn temporary_pack_path(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("bulletou-{label}-{}-{unique}.pack", std::process::id()))
+    }
+
+    #[test]
+    fn game_reader_preserves_empty_game_boundaries_and_clean_eof() {
+        use std::io::Write as _;
+
+        let path = temporary_pack_path("game-reader");
+        let mut file = File::create(&path).expect("create temporary pack");
+        // start_flag=1 (hirate), end marker=0, reason=0.  Repeat twice.
+        file.write_all(&[1, 0, 0, 0, 1, 0, 0, 0]).expect("write temporary pack");
+        drop(file);
+
+        let mut reader = ShogiPackGameReader::open(&path).expect("open temporary pack");
+        assert!(reader.next_game().expect("read first game").expect("first game exists").is_empty());
+        assert!(reader.next_game().expect("read second game").expect("second game exists").is_empty());
+        assert!(reader.next_game().expect("read EOF").is_none());
+        assert_eq!(reader.bytes_consumed(), reader.file_len());
+
+        std::fs::remove_file(path).expect("remove temporary pack");
+    }
+
+    #[test]
+    fn game_reader_rejects_truncated_game() {
+        use std::io::Write as _;
+
+        let path = temporary_pack_path("game-reader-truncated");
+        let mut file = File::create(&path).expect("create temporary pack");
+        file.write_all(&[1, 42]).expect("write truncated pack");
+        drop(file);
+
+        let mut reader = ShogiPackGameReader::open(&path).expect("open temporary pack");
+        let error = match reader.next_game() {
+            Ok(_) => panic!("truncated game must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::remove_file(path).expect("remove temporary pack");
+    }
 
     #[test]
     fn test_hirate_pack_roundtrip() {

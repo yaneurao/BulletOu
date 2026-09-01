@@ -14,6 +14,7 @@
 | [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、sigmoid loss、量子化後の出力 scale |
 | [追加学習](additional-training.md) | 完了済み checkpoint からさらに学習する方法 |
 | [LayerStack](layerstack.md) | SFNN の hand / king / progress bucket |
+| [対局棋譜から進行度分類器を作る](progress-training.md) | `.pack` の対局内位置から `progress.bin` を学習する |
 | [SFNN factorizer](sfnn-factorizer.md) | shared / axis / pair factorizer と alpha |
 | [量子化 `nn.bin` の確認](quantized-nn-bin.md) | `quantized-test` と `calibrate-nn-bin` |
 | [`bulletou_lib` をコードから使う](bullet-lib.md) | 独自 example や外部 crate からの利用 |

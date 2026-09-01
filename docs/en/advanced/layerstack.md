@@ -407,7 +407,9 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`.
 
-BulletOu trains the progress calculation parameters together with the SFNN weights. During training, progress is handled as a soft bucket: the output is linearly interpolated between two neighboring progress buckets, so the loss can send gradients into the progress parameters.
+Use `progress-train` to learn a classifier whose target is `0` at the start of a complete `.pack` game and `255` at its last evaluable position. This separates progress semantics from evaluation-network loss. The clearest workflow is to train the classifier first, then keep it fixed during SFNN training with `--sfnn-freeze-progress`. See [Training a progress classifier from complete games](progress-training.md) for the command and target formula.
+
+If progress is not frozen during SFNN training, BulletOu treats adjacent progress buckets as a linear soft bucket and lets evaluation loss update the progress parameters. Use a frozen `progress-train` classifier when progress must mean relative location inside a game.
 
 When exporting, BulletOu rounds the learned progress parameters to q16 integers and writes them into the Progress section of `nn.bin`. YaneuraOu then reads that section and uses hard progress buckets during search.
 
@@ -429,7 +431,7 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 For example, `progress8` splits `0..255` into roughly 32-point ranges. `progress16` uses roughly 16-point ranges.
 
-When `progressN` is used, the exported `nn.bin` includes a Progress section. This section stores the learned progress parameters.
+When `progressN` is used, the exported `nn.bin` includes a Progress section. If `--sfnn-progress-bin` is supplied, that classifier is stored in the section.
 
 | Section | Contents |
 |---|---|

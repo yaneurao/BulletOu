@@ -163,6 +163,8 @@ For count-aware fine-tuning, usually pass the same `progress.bin` during trainin
 
 If `--sfnn-progress-bin` is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch. `count.bin` and `progress.bin` are not strictly paired, so you can intentionally mix provisional files during experiments.
 
+To train only the progress classifier from complete `.pack` games, with the first position mapped to 0 and the last to 255, see [Advanced: Training a progress classifier](../advanced/progress-training.md).
+
 When you build `count.bin` from a very large teacher folder, `bucket-count` reads fixed-size `.psv` / `.bin` files in large chunks while counting. If read speed fluctuates on a drive such as `D:`, see the Advanced guide for `--buffer-mb` and `--read-buffers`.
 
 ## 3.7 Use population search-tuned values for normal training

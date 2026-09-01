@@ -50,6 +50,9 @@ Usage:
 
 #![cfg_attr(not(feature = "cuda-cpp-backend"), allow(dead_code, unused_imports))]
 
+#[path = "bulletou/progress_train.rs"]
+mod progress_train;
+
 #[cfg(feature = "cuda-cpp-backend")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -98,6 +101,7 @@ use bulletou_lib::{
     },
 };
 use clap::{ArgAction, Parser, ValueEnum};
+use progress_train::{ProgressTrainArgs, run_progress_train};
 #[cfg(feature = "cuda-cpp-backend")]
 use rayon::prelude::*;
 
@@ -4282,7 +4286,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(about = "BulletOu unified trainer")]
 #[command(args_override_self = true)]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  export-progress-bin        Extract SFNN progress parameters from state.bin or nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin or nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Read BulletOu training options from a JSON file. Keys use snake_case
@@ -11756,6 +11760,18 @@ fn main() {
         #[cfg(not(feature = "cuda-cpp-backend"))]
         {
             eprintln!("error: average-sfnn-state requires building with --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("progress-train")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou progress-train");
+        }
+        let args = ProgressTrainArgs::parse_from(raw_args);
+        if let Err(e) = run_progress_train(&args) {
+            eprintln!("error: progress-train failed: {e}");
             std::process::exit(2);
         }
         return;
