@@ -375,11 +375,10 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-progress-bin C:\path\to\same-progress\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\same-progress\progress.bin
 ```
 
-`--sfnn-progress-bin` を指定しない場合、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。count-aware な追加学習では、count を作ったときと同じ `progress.bin` を指定し、`--sfnn-freeze-progress` で固定するのが基本です。
+通常学習では進行度分類器は常に固定です。再開時に `--sfnn-progress-bin` を省略すると `state.bin` 内の分類器を使います。新規学習には、専用の [`progress-train`](progress-training.md) で作った `progress.bin` を指定してください。省略すると未学習の初期値が固定されたままになります。count-aware な追加学習では、count を作ったときと同じ分類器を使うのが基本です。
 
 `--sfnn-bucket-counts` を指定し、SFNN factorizer が有効な場合、residual count gate はデフォルトで有効です。これは `W_effective = gate * W_residual + factorizer成分` という形で、forward から bucket 固有 residual を弱めます。
 

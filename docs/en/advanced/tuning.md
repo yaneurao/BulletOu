@@ -389,11 +389,10 @@ Then pass it during training:
 --sfnn-factorizer pair `
 --sfnn-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-progress-bin C:\path\to\same-progress\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\same-progress\progress.bin
 ```
 
-If `--sfnn-progress-bin` is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch. For count-aware fine-tuning, usually pass the same `progress.bin` that was used to create the count file and freeze progress.
+Normal training always keeps the progress classifier fixed. When resuming without `--sfnn-progress-bin`, BulletOu uses the classifier from `state.bin`. For a fresh run, supply a `progress.bin` trained with the dedicated [`progress-train`](progress-training.md) command; otherwise the untrained initial classifier stays fixed. For count-aware fine-tuning, use the classifier that produced the count file.
 
 When `--sfnn-bucket-counts` is set and an SFNN factorizer is active, the residual count gate is enabled by default. It changes the forward formula to `W_effective = gate * W_residual + factorizer terms`.
 

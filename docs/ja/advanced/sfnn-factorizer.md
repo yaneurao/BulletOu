@@ -294,17 +294,16 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
 
 `progressN` 付きの学習で count.bin を使う場合は、count.bin を作ったときの progress 判定と、学習中の progress 判定を揃える必要があります。count.bin 作成後に progress parameter も動かし続けると、count.bin が表している bucket 分布と学習中の bucket 分布がずれていきます。
 
-そのため、count.bin を作った checkpoint から count-aware な追加学習をする場合は、次のように progress を固定します。
+count-aware な追加学習では、count.bin を作ったときと同じ分類器を次のように読み込みます。
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
---sfnn-progress-bin C:\path\to\checkpoint\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\checkpoint\progress.bin
 ```
 
-`--sfnn-progress-bin` を指定すると、学習開始時にその progress parameter を読み込みます。指定しない場合は、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。
+`--sfnn-progress-bin` を指定すると、学習開始時にその進行度分類器を読み込みます。再開時に省略すると `state.bin` 内の分類器を使います。新規学習には、専用の [`progress-train`](progress-training.md) で作った `progress.bin` を指定してください。省略すると未学習の初期値が固定されたままになります。
 
-`--sfnn-freeze-progress` を指定すると、progress parameter は更新されません。学習時の bucket も `nn.bin` に書き出される q16 Progress section と同じ hard bucket 判定になります。validation 用の局面データも、progress parameter が変わらない限り GPU cache を再利用します。
+通常学習では進行度分類器を常に固定し、`nn.bin` に書き出す q16 Progress section と同じ判定で一つの bucket を選びます。評価関数の loss は分類器を更新しません。validation 用の局面データも GPU cache を再利用します。
 
 `count.bin` と `progress.bin` は厳密な一致チェックをしません。仮の count と仮の progress 分類器を意図的に組み合わせたい実験があるためです。通常運用では、count を作ったときと同じ `progress.bin` を学習にも指定してください。
 

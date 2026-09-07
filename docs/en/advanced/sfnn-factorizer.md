@@ -294,17 +294,16 @@ For architectures containing `progressN`, `--progress-bin` or `--nn-bin` is requ
 
 When you use count.bin with a `progressN` architecture, keep the progress bucket assignment aligned with the parameters used to create the count file. If the progress parameters keep changing after count.bin is built, the bucket distribution represented by count.bin drifts away from the buckets used during training.
 
-For count-aware fine-tuning from the checkpoint that produced count.bin, freeze progress:
+For count-aware fine-tuning, load the classifier used to produce count.bin:
 
 ```powershell
 --sfnn-bucket-counts D:\...\count.bin `
---sfnn-progress-bin C:\path\to\checkpoint\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\checkpoint\progress.bin
 ```
 
-With `--sfnn-progress-bin`, BulletOu loads the given progress parameters at training start. If it is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch.
+With `--sfnn-progress-bin`, BulletOu loads the classifier at training start. When resuming without it, the classifier from `state.bin` is used. For a fresh run, supply a `progress.bin` trained with the dedicated [`progress-train`](progress-training.md) command; otherwise the untrained initial classifier stays fixed.
 
-With `--sfnn-freeze-progress`, BulletOu does not update the progress parameters. Training also uses the same hard q16 Progress bucket rule that is exported to `nn.bin`. Validation batches can keep their GPU cache as long as the progress parameters do not change.
+Normal training always keeps the classifier fixed and uses the same hard q16 Progress bucket rule exported to `nn.bin`. Evaluation loss never updates the classifier, and validation batches can reuse their GPU cache.
 
 `count.bin` and `progress.bin` are not strictly paired. This is intentional: experiments sometimes need a provisional count file and a provisional progress classifier. For ordinary use, pass the same `progress.bin` that was used to build the count file.
 

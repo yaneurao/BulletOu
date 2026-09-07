@@ -1612,21 +1612,21 @@ fn shogi_sfnn_progress_sum_q16_from_board_explicit(board: &ShogiBoard, params: &
     let wk_base = board.white_king_sq.inverse().index() * FE_OLD_END;
     let mut sum_q16 = i64::from(params.bias_q16);
 
-    for &pt in &BOARD_PIECE_TYPES {
-        for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
-                let piece = Piece::new(color, pt);
-
-                let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
-                if bp_b != BonaPiece::ZERO {
-                    sum_q16 += i64::from(weights[bk_base + bp_b.value() as usize]);
-                }
-
-                let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
-                if bp_w != BonaPiece::ZERO {
-                    sum_q16 += i64::from(weights[wk_base + bp_w.value() as usize]);
-                }
-            }
+    // ShogiBoard::pieces scans all 81 squares. Visit the board once instead
+    // of once for each of 13 piece types x 2 colors. Integer addition keeps
+    // the q16 sum exact regardless of this enumeration order.
+    for (sq_index, &piece) in board.board.iter().enumerate() {
+        if piece.is_none() || piece.piece_type == PieceType::King {
+            continue;
+        }
+        let sq = Square::from_index(sq_index);
+        let bp_b = BonaPiece::from_piece_square(piece, sq, Color::Black);
+        if bp_b != BonaPiece::ZERO {
+            sum_q16 += i64::from(weights[bk_base + bp_b.value() as usize]);
+        }
+        let bp_w = BonaPiece::from_piece_square(piece, sq, Color::White);
+        if bp_w != BonaPiece::ZERO {
+            sum_q16 += i64::from(weights[wk_base + bp_w.value() as usize]);
         }
     }
 
@@ -2473,6 +2473,40 @@ mod tests {
         let startpos_like = psv_with_kings(Color::Black, Square::new(4, 8), Square::new(4, 0));
         assert_eq!(ShogiKingRankBucket::<81>.bucket(&startpos_like), 80);
         assert_eq!(ShogiKingRankBucket::<9>.bucket(&startpos_like), 8);
+    }
+
+    #[test]
+    fn progress_single_board_scan_matches_kp_abs_index_sum() {
+        let mut params = ShogiSfnnProgressQ16Params::zero();
+        params.bias_q16 = -56789;
+        for (i, weight) in params.weights_q16.iter_mut().enumerate() {
+            *weight = ((i * 137 % 2003) as i32 - 1001) * 1234;
+        }
+        let mut indices = Vec::new();
+        for variant in 0..128 {
+            let mut board = ShogiBoard::default();
+            board.black_king_sq = Square::from_index(variant % 81);
+            board.white_king_sq = Square::from_index((variant + 40) % 81);
+            // Cover every promotion, both colors, empty squares and hands.
+            for (i, piece) in board.board.iter_mut().enumerate() {
+                if (i + variant) % 4 != 0 {
+                    *piece = Piece::new(
+                        if (i + variant) % 2 == 0 { Color::Black } else { Color::White },
+                        BOARD_PIECE_TYPES[(i + variant) % BOARD_PIECE_TYPES.len()],
+                    );
+                }
+            }
+            board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+            board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+            for (i, &pt) in HAND_PIECE_TYPES.iter().enumerate() {
+                board.black_hand.add(pt, ((i + variant) % 3) as u8);
+                board.white_hand.add(pt, ((2 * i + variant) % 3) as u8);
+            }
+            ShogiProgressKPAbs::collect_active_indices_from_board(&board, &mut indices);
+            let reference =
+                indices.iter().fold(i64::from(params.bias_q16), |sum, &idx| sum + i64::from(params.weights_q16[idx]));
+            assert_eq!(shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &params), reference);
+        }
     }
 
     #[test]

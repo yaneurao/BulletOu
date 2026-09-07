@@ -78,9 +78,9 @@ bucket = min(progress_0_255 * bucket_count / 256,
 SFNN の学習でも同じ分類器を読み込み、固定します。
 
 ```powershell
---sfnn-progress-bin C:\path\to\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\progress.bin
 ```
 
-これにより、count を集計したときと SFNN を学習するときで progress bucket の判定が一致します。
+通常の SFNN 学習では、この分類器は常に固定です。評価値の loss では更新しないので、count を集計したときと SFNN を学習するときの progress bucket 判定が一致し、validation の cache も再利用できます。分類器を学習し直したいときは、`progress-train` を別途実行してください。
 
+HalfKA2 / KA2 の学習では、CPU のデータ準備スレッドが盤面の decode と同時に進行度 bucket を計算します。GPU に渡す前に bucket が確定するため、進行度用の特徴番号を局面ごとに保存したり、学習側で再計算したりする必要はありません。通常学習と worker の両方で自動的に使われ、追加オプションや追加の VRAM は不要です。

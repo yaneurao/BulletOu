@@ -137,15 +137,16 @@ axis / pair factorizer の行も count に応じて弱めたい場合は、必�
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`count.bin` を使って追加学習する場合は、count を作ったときの progress 判定と学習中の progress 判定を揃えるため、通常は同じ `progress.bin` を指定し、progress を固定します。
+`count.bin` を使って追加学習する場合は、count を作ったときと学習中の progress 判定を揃えるため、通常は同じ `progress.bin` を指定します。
 
 ```powershell
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-progress-bin D:\path\to\checkpoint\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin D:\path\to\checkpoint\progress.bin
 ```
 
-`--sfnn-progress-bin` を指定しない場合は、resume 元の `state.bin` に入っている progress parameter を使います。新規学習では scratch 初期化されます。`count.bin` と `progress.bin` は厳密な一致チェックをしません。実験のために仮の組み合わせで使うこともできます。
+通常の学習では、進行度分類器のパラメーターは常に固定です。進行度分類器を学習させるときだけ、専用の [`progress-train` コマンド](../advanced/progress-training.md) を使います。
+
+`--sfnn-progress-bin` を省略して再開する場合は、`state.bin` 内の分類器をそのまま使います。新規学習では、作成済みの `progress.bin` を指定してください。省略すると未学習の初期値が固定されたままになります。`count.bin` と `progress.bin` は厳密な一致チェックをしないため、実験で仮の組み合わせを使うこともできます。
 
 完結した `.pack` 棋譜から「対局の先頭を0、最後を255」として進行度だけを学習する方法は、[応用編: 対局棋譜から進行度分類器を作る](../advanced/progress-training.md) を参照してください。
 

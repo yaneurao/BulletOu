@@ -156,8 +156,8 @@ pub struct SfnnTeacherBatchConfig<'a> {
     pub win_rate_model: bool,
     pub wrm_target: WinRateModelTargetParams,
     /// If set for a progressN SFNN architecture, materialise the final hard
-    /// progress bucket directly and skip the trainable-progress feature buffer.
-    /// This is intended for `--sfnn-freeze-progress`.
+    /// progress bucket directly and skip the progress feature buffer. Otherwise
+    /// the consumer computes fixed buckets from the emitted active indices.
     pub hard_progress_params: Option<ShogiSfnnProgressQ16Params>,
     pub score_drop_abs: Option<u16>,
     pub teacher_shuffle_buffer_batches: usize,
@@ -2954,10 +2954,9 @@ fn prepare_sfnn_fast_batch_from_board_features(
                         }
                         progress_indices.clear();
                     }
-                    // Existing hard-bucket field is retained for consumers that do
-                    // not use trainable progress.  With no process-global progress
-                    // parameters installed this maps to the neutral progress
-                    // bucket; trainable progress code uses `progress` above.
+                    // Keep the generic bucket field for consumers using the
+                    // process-global classifier. The SFNN trainer uses the
+                    // emitted indices and its own fixed classifier instead.
                     buckets_chunk[i] = layerstack_bucket.bucket_from_board(&board) as i32;
                 }
             } else {
@@ -2986,7 +2985,9 @@ fn prepare_sfnn_fast_batch_from_board_features(
         let _ = chunk_index;
     };
 
-    if !progress_enabled
+    // A fixed classifier needs no per-position progress feature array. This
+    // includes progress architectures: they must use the parallel path too.
+    if !collect_progress_features
         && let Some(pool) = pool
         && threads > 1
         && batch_size > 1
@@ -3184,6 +3185,100 @@ mod tests {
             bytes.extend_from_slice(psv.as_bytes());
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn fixed_progress_parallel_preparation_matches_feature_index_reference() {
+        use crate::game::outputs::{
+            ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind, ShogiSfnnProgressBucketKind,
+            shogi_sfnn_progress_0_to_255_from_sum_q16,
+        };
+
+        fn fill_in_pool(board: &ShogiBoard, stm: &mut [i32], nstm: &mut [i32]) -> (usize, usize) {
+            assert!(rayon::current_thread_index().is_some(), "fixed progress must prepare in the Rayon pool");
+            fill_halfka2_feature_indices_from_board(board, stm, nstm)
+        }
+
+        let path = tmp_teacher_path("fixed_progress_parallel", "pack");
+        write_tiny_pack(&path);
+        let loader = ShogiPackLoader::new(path.to_str().unwrap(), 1, |_| true).with_buffer_records(4);
+        let mut data = Vec::new();
+        loader.map_chunks(0, |batch| {
+            data.extend_from_slice(batch);
+            true
+        });
+        assert_eq!(data.len(), 4);
+        let data = data.repeat(5); // uneven chunks with three preparation threads
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+        let mut params = ShogiSfnnProgressQ16Params::zero();
+        for (i, weight) in params.weights_q16.iter_mut().enumerate() {
+            *weight = ((i * 97 % 1001) as i32 - 500) * 64;
+        }
+        let input = ShogiHalfKa2;
+        for progress_kind in [
+            ShogiSfnnProgressBucketKind::Progress4,
+            ShogiSfnnProgressBucketKind::Progress8,
+            ShogiSfnnProgressBucketKind::Progress16,
+        ] {
+            for hand_kind in [ShogiSfnnHandBucketKind::None, ShogiSfnnHandBucketKind::Hand256] {
+                let mut config = sfnn_config();
+                config.layerstack_bucket =
+                    ShogiSfnnLayerStackBucketKind::new(hand_kind, ShogiSfnnKingBucketKind::KingRank9, progress_kind);
+                let reference = prepare_sfnn_fast_batch_from_board_features(
+                    "halfka2",
+                    &data,
+                    &config,
+                    None,
+                    fill_halfka2_feature_indices_from_board,
+                    input.num_inputs(),
+                    input.max_active(),
+                );
+                let progress = reference.progress.as_ref().unwrap();
+                for bias in [-5 * 65536, 0, 5 * 65536] {
+                    params.bias_q16 = bias;
+                    config.hard_progress_params = Some(params.clone());
+                    config.threads = 3;
+                    let parallel = prepare_sfnn_fast_batch_from_board_features(
+                        "halfka2",
+                        &data,
+                        &config,
+                        Some(&pool),
+                        fill_in_pool,
+                        input.num_inputs(),
+                        input.max_active(),
+                    );
+                    config.threads = 1;
+                    let serial = prepare_sfnn_fast_batch_from_board_features(
+                        "halfka2",
+                        &data,
+                        &config,
+                        None,
+                        fill_halfka2_feature_indices_from_board,
+                        input.num_inputs(),
+                        input.max_active(),
+                    );
+                    assert!(parallel.progress.is_none());
+                    parallel.validate().unwrap();
+                    assert_eq!(parallel.stm, reference.stm);
+                    assert_eq!(parallel.nstm, reference.nstm);
+                    assert_eq!(parallel.targets, reference.targets);
+                    assert_eq!(parallel.weights, reference.weights);
+                    assert_eq!(parallel.buckets, serial.buckets);
+                    let count = config.layerstack_bucket.progress_bucket_count();
+                    for (i, indices) in progress.active_indices.chunks_exact(progress.max_active).enumerate() {
+                        let sum = indices
+                            .iter()
+                            .filter(|&&idx| idx >= 0)
+                            .fold(i64::from(bias), |sum, &idx| sum + i64::from(params.weights_q16[idx as usize]));
+                        let value = shogi_sfnn_progress_0_to_255_from_sum_q16(sum);
+                        let expected = progress.base_buckets[i] as usize * count
+                            + shogi_sfnn_progress_bucket_from_value(value, count);
+                        assert_eq!(parallel.buckets[i] as usize, expected);
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

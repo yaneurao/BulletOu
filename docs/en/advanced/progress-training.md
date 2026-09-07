@@ -76,9 +76,9 @@ Create the architecture-specific count file with the trained classifier:
 Load and freeze the same classifier during SFNN training:
 
 ```powershell
---sfnn-progress-bin C:\path\to\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin C:\path\to\progress.bin
 ```
 
-This keeps progress-bucket assignment aligned between count collection and SFNN training.
+Normal SFNN training always keeps this classifier fixed. Evaluation loss never updates it, so progress-bucket assignment stays aligned with count collection and validation caches can be reused. To retrain the classifier, run `progress-train` separately.
 
+For HalfKA2 / KA2 training, the CPU preparation threads calculate the progress bucket from the already decoded board. Each batch reaches the GPU with its buckets finalized, without storing per-position progress feature indices or recomputing buckets in the training consumer. Both normal training and worker mode use this automatically; no extra option or VRAM is needed.

@@ -407,11 +407,11 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`.
 
-Use `progress-train` to learn a classifier whose target is `0` at the start of a complete `.pack` game and `255` at its last evaluable position. This separates progress semantics from evaluation-network loss. The clearest workflow is to train the classifier first, then keep it fixed during SFNN training with `--sfnn-freeze-progress`. See [Training a progress classifier from complete games](progress-training.md) for the command and target formula.
+Use the dedicated `progress-train` command to learn a classifier whose target is `0` at the start of a complete `.pack` game and `255` at its last evaluable position. Pass the resulting `progress.bin` through `--sfnn-progress-bin`; SFNN training always keeps this classifier fixed. See [Training a progress classifier from complete games](progress-training.md) for the command and target formula.
 
-If progress is not frozen during SFNN training, BulletOu treats adjacent progress buckets as a linear soft bucket and lets evaluation loss update the progress parameters. Use a frozen `progress-train` classifier when progress must mean relative location inside a game.
+Evaluation-network loss never updates the classifier. Training and validation select one progress bucket using its q16 parameters. Because the classifier stays fixed, validation can cache bucket assignments.
 
-When exporting, BulletOu rounds the learned progress parameters to q16 integers and writes them into the Progress section of `nn.bin`. YaneuraOu then reads that section and uses hard progress buckets during search.
+When exporting, BulletOu rounds the active progress parameters to q16 integers and writes them into the Progress section of `nn.bin`. YaneuraOu then reads that section and uses hard progress buckets during search.
 
 | Token | Progress buckets |
 |---|---:|
@@ -540,7 +540,7 @@ Combine hand, king, and progress:
   "arch": "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
   "teacher": "teachers",
   "tag": "sfnn-hand256-k3k3-progress16",
-  "sfnn_freeze_progress": true
+  "sfnn_progress_bin": "C:/path/to/progress.bin"
 }
 ```
 

@@ -101,7 +101,6 @@ python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
   "wrm_in_offset": 0,
   "wrm_target_offset": 0,
   "sfnn_dirty_bucket_update": true,
-  "sfnn_freeze_progress": true,
   "teacher_memory_cache_sbs": 4,
   "sfnn_saturation_penalty": 1e-7
 }
@@ -119,7 +118,7 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `sfnn_*_count_confidence` | population search の `parameters` から候補ごとに作る |
 | `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡す。探索中の採用値は `runner-state.json` に保存する |
 
-`progress` 付き arch で進行度パラメーターを固定したい場合は、`bulletou-settings.json` に `sfnn_freeze_progress: true` を入れます。進行度を固定すると validation cache を使いやすくなり、qvalid も軽くなります。
+`progress` 付き arch の通常学習・worker 学習では、進行度分類器は常に固定です。新規学習では、`bulletou-settings.json` の `sfnn_progress_bin` に作成済みの分類器を指定してください。再開時に省略すると `state.bin` 内の分類器を使います。分類器を学習させるのは専用の [`progress-train`](progress-training.md) だけであり、通常学習では validation / qvalid の cache を再利用できます。
 
 `teacher_memory_cache_sbs` は、worker process の RAM に教師データを保持するための設定です。値は「何 superbatch 分を RAM に保持するか」です。たとえば `4` なら、trial で使う 4 sb 分の `.psv` / `.bin` 教師レコードを RAM に読み込み、同じ worker process 内の候補評価で再利用します。
 

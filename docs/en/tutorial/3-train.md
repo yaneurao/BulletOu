@@ -143,25 +143,16 @@ If you only have an existing `state.bin` or `nn.bin`, extract `progress.bin` fir
   --output D:\path\to\checkpoint\progress.bin
 ```
 
-For a `progressN` architecture, BulletOu updates the progress parameters by default. That training path uses neighboring progress buckets during training, so it is much slower than an ordinary hard-bucket path.
-
-Once you no longer want to move the progress parameters, resume with:
-
-```powershell
---sfnn-freeze-progress
-```
-
-This freezes the progress parameters and trains with the same hard bucket assignment that is exported to `nn.bin`. It also makes validation caching cheaper. Do not pass this option at the start if you still want BulletOu to learn the progress parameters.
+Normal evaluation-network training always keeps the progress classifier fixed and uses the hard bucket assignment exported to `nn.bin`. Validation caches can be reused. Train the classifier separately with [`progress-train`](../advanced/progress-training.md); evaluation loss never updates it.
 
 For count-aware fine-tuning, usually pass the same `progress.bin` during training:
 
 ```powershell
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
---sfnn-progress-bin D:\path\to\checkpoint\progress.bin `
---sfnn-freeze-progress
+--sfnn-progress-bin D:\path\to\checkpoint\progress.bin
 ```
 
-If `--sfnn-progress-bin` is omitted, BulletOu uses the progress parameters already present in the resumed `state.bin`; a fresh run initializes them from scratch. `count.bin` and `progress.bin` are not strictly paired, so you can intentionally mix provisional files during experiments.
+If `--sfnn-progress-bin` is omitted when resuming, BulletOu keeps the classifier from `state.bin`. For a fresh run, supply a trained `progress.bin`: otherwise the untrained initial classifier stays fixed. `count.bin` and `progress.bin` are not strictly paired, so you can intentionally mix provisional files during experiments.
 
 To train only the progress classifier from complete `.pack` games, with the first position mapped to 0 and the last to 255, see [Advanced: Training a progress classifier](../advanced/progress-training.md).
 

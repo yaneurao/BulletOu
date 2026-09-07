@@ -101,7 +101,6 @@ python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
   "wrm_in_offset": 0,
   "wrm_target_offset": 0,
   "sfnn_dirty_bucket_update": true,
-  "sfnn_freeze_progress": true,
   "teacher_memory_cache_sbs": 4,
   "sfnn_saturation_penalty": 1e-7
 }
@@ -119,7 +118,7 @@ During population search, the runner owns these candidate-specific values, so do
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
 | `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min`. Accepted values during search are stored in `runner-state.json` |
 
-For progress-based architectures, put `sfnn_freeze_progress: true` in `bulletou-settings.json` when you want to keep the progress parameters fixed. Freezing progress makes validation caching easier and keeps qvalid lighter.
+Normal and worker training always keep the progress classifier fixed. For a fresh progress-based run, set `sfnn_progress_bin` in `bulletou-settings.json` to a trained classifier. When resuming without it, the classifier from `state.bin` is used. Only the dedicated [`progress-train`](progress-training.md) command trains the classifier; normal training can reuse validation and qvalid caches.
 
 `teacher_memory_cache_sbs` keeps teacher records in the worker process RAM. The value means how many superbatches to keep in RAM. For example, `4` loads four superbatches of `.psv` / `.bin` teacher records and reuses them for candidate evaluation inside the same worker process.
 

@@ -430,11 +430,11 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3の分け方として progress bucket が使われます。必要な進行度情報は、BulletOu が `nn.bin` の一部として出力します。
 
-対局の開始を `0`、最後に評価可能な局面を `255` とする分類器は、`.pack` の対局境界を教師として `progress-train` で学習できます。評価関数の loss から進行度を決める必要がないため、progress 分類器を先に作り、SFNN 学習では `--sfnn-freeze-progress` で固定する使い方が明確です。コマンドと教師値の式は [対局棋譜から進行度分類器を作る](progress-training.md) を参照してください。
+対局の開始を `0`、最後に評価可能な局面を `255` とする分類器は、`.pack` の対局境界を教師として専用の `progress-train` で学習します。作成した `progress.bin` を SFNN の `--sfnn-progress-bin` に指定すると、通常学習ではその分類器を固定して使います。コマンドと教師値の式は [対局棋譜から進行度分類器を作る](progress-training.md) を参照してください。
 
-SFNN 本体の学習で progress を固定しない場合は、隣り合う progress bucket を線形補間する soft bucket として扱い、評価関数の loss から progress パラメーターにも勾配が流れます。対局内の相対位置を進行度の意味にしたい場合は、`progress-train` で作った分類器を固定してください。
+SFNN 本体では、評価関数の loss で進行度分類器を更新しません。学習・検証ともに、分類器の q16 パラメーターから一つの progress bucket を決めます。分類器が変わらないので、検証局面の bucket 判定も cache に保持できます。
 
-保存時には、学習された progress パラメーターを q16 整数に丸めて `nn.bin` の Progress section に書き出します。やねうら王側は、その Progress section を読んで hard bucket として使います。
+保存時には、使用中の progress パラメーターを q16 整数に丸めて `nn.bin` の Progress section に書き出します。やねうら王側は、その Progress section を読んで hard bucket として使います。
 
 | 指定 | progress buckets |
 |---|---:|
@@ -563,7 +563,7 @@ hand / king / progress を全部組み合わせる例:
   "arch": "SFNN_halfka2_1024_7_64_hand256_k3k3_progress16",
   "teacher": "teachers",
   "tag": "sfnn-hand256-k3k3-progress16",
-  "sfnn_freeze_progress": true
+  "sfnn_progress_bin": "C:/path/to/progress.bin"
 }
 ```
 
