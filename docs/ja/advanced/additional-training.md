@@ -47,7 +47,7 @@
 - 出力ディレクトリ (`checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-round1/`) を見つける
 - 最大番号の `0018/state.bin`、つまり前回最後の保存状態を読む
 - 続きの `0019/` から保存する
-- `summary-learn.log` にも追記する
+- `summary-learn.csv` にも追記する
 
 **累積 epoch 数** は前回 3 + 今回 3 = 6 epoch 相当の学習に。
 
@@ -126,7 +126,7 @@
 2回目は `bulletou-settings.json` の `teacher`、`max_epochs`、`superbatches`、`lr`、`lr_min` を変更し、同じ `tag` のまま `--resume` を付けて実行します。
 
 教師変更時の挙動:
-- bulletou が `summary-learn.log` の最終行を見て **`teacher` 列が変わっている** ことを検出
+- bulletou が `summary-learn.csv` の最終行を見て **`teacher` 列が変わっている** ことを検出
 - 警告メッセージを出して、新しい教師の先頭から読み直す
 - `dataloader_pos.txt` をリセット
 - 表示上の sb 番号は続きに見えるように調整される

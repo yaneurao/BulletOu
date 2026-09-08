@@ -44,7 +44,7 @@ On the second launch:
 - Detects the output dir `checkpoints/NNUE_KP-NNUE_kp_256x2_32_32-round1/`.
 - Loads the latest `0018/state.bin` (weights + Ranger optimizer state).
 - New saves start at `0019/`.
-- `summary-learn.log` keeps growing — cumulative across runs.
+- `summary-learn.csv` keeps growing — cumulative across runs.
 
 Total effective epochs trained: 3 + 3 = 6.
 
@@ -118,7 +118,7 @@ A common workflow: train on a large weaker corpus, then continue on a smaller st
 For the second launch, edit `teacher`, `max_epochs`, `superbatches`, `lr`, and `lr_min` in `bulletou-settings.json`, keep the same `tag`, and rerun with `--resume`.
 
 Teacher-change handling:
-- bulletou reads the last `teacher` column in `summary-learn.log` and notices the path differs.
+- bulletou reads the last `teacher` column in `summary-learn.csv` and notices the path differs.
 - Prints a warning and re-opens the dataloader at the new teacher's head.
 - Resets `dataloader_pos.txt`.
 - Adjusts the displayed sb counter (`cb_ctx.sb_offset`) so the log row stays monotonic.

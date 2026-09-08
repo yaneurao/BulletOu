@@ -19288,6 +19288,7 @@ fn append_cuda_cpp_direct_summary_log_row(
 fn ensure_cuda_cpp_summary_log_header(output_dir: &std::path::Path) -> Result<(), String> {
     use std::io::Write as _;
 
+    migrate_summary_log_filename(output_dir).map_err(|err| err.to_string())?;
     std::fs::create_dir_all(output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
     if !output_dir.join(EPOCH_LAST_SUMMARY_NAME).exists() {
         warn_epoch_summary_error(output_dir, initialize_epoch_last_summary(output_dir));
@@ -25254,6 +25255,10 @@ fn prepare_resume_config_or_exit(args: &Args) {
         }
     }
 
+    if let Err(err) = migrate_summary_log_filename(&output_dir) {
+        eprintln!("error: {err}");
+        std::process::exit(2);
+    }
     let will_resume = resume_enabled(args, &output_dir);
     if will_resume {
         if let Some(anchor) = latest_checkpoint_epoch_superbatch(&output_dir) {
@@ -25280,7 +25285,7 @@ fn prepare_resume_config_or_exit(args: &Args) {
 }
 
 /// CSV header for per-save `0NNN/learn.log`. The top-level
-/// `<output>/summary-learn.log` uses [`SUMMARY_LEARN_LOG_HEADER`] because
+/// `<output>/summary-learn.csv` uses [`SUMMARY_LEARN_LOG_HEADER`] because
 /// it drops `curr_batch`. Column meanings (13 total):
 ///
 /// - `eval`: mirror of the output-dir name (`<eval-type>[-<arch>]`)
@@ -25309,13 +25314,13 @@ fn prepare_resume_config_or_exit(args: &Args) {
 ///   to three decimal places (`1.000`, `0.500`, ...).
 /// - `positions`: cumulative number of teacher positions consumed so far
 ///   for this component, including positions from prior runs detected
-///   in the existing top-level `summary-learn.log` (resume-aware).
+///   in the existing top-level `summary-learn.csv` (resume-aware).
 /// - `teacher`: the user's `--teacher` CLI value verbatim, RFC-4180
 ///   escaped (quoted if it contains a comma / quote / newline) so a
 ///   directory or comma-separated list is preserved as one CSV field.
 const LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,lr_start,lr_end,lambda,positions,teacher";
 
-/// Schema for the top-level `<output>/summary-learn.log`. Same as
+/// Schema for the top-level `<output>/summary-learn.csv`. Same as
 /// [`LEARN_LOG_HEADER`] but **without** the `curr_batch` column, because
 /// the summary file holds only one row per superbatch (the closing
 /// row), where `curr_batch` is always the last batch index of that sb
@@ -25345,9 +25350,37 @@ const SUMMARY_LEARN_LOG_HEADER: &str = "eval,epoch,superbatch,test_value_accurac
 /// Filename of the top-level summary log inside `<output>/`. Per-save
 /// dirs (`<output>/<NNNN>/`) keep the original per-batch `learn.log`;
 /// the summary lives next to them so they don't shadow each other.
-const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.log";
+const SUMMARY_LEARN_LOG_NAME: &str = "summary-learn.csv";
 
-/// Transposed, completed-epoch metrics next to summary-learn.log.
+/// One-time rename before reading resume history or creating a new summary.
+/// Never overwrite or merge two potentially different training histories.
+fn migrate_summary_log_filename(output_dir: &Path) -> std::io::Result<()> {
+    let source = output_dir.join("summary-learn.log");
+    if !source.try_exists()? {
+        return Ok(());
+    }
+    let destination = output_dir.join(SUMMARY_LEARN_LOG_NAME);
+    if destination.try_exists()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "both {} and {} exist; keep the intended summary and move the other file before restarting; neither file was changed",
+                source.display(),
+                destination.display()
+            ),
+        ));
+    }
+    std::fs::rename(&source, &destination).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!("failed to rename {} to {}: {err}", source.display(), destination.display()),
+        )
+    })?;
+    eprintln!("  [summary] renamed {} -> {}", source.display(), destination.display());
+    Ok(())
+}
+
+/// Transposed, completed-epoch metrics next to summary-learn.csv.
 const EPOCH_LAST_SUMMARY_NAME: &str = "summary-epoch-last.csv";
 const EPOCH_LAST_METRICS: [(&str, &str); 8] = [
     ("acc", "test_value_accuracy"),
@@ -25628,7 +25661,7 @@ impl LogContext {
 
     /// Cumulative teacher positions consumed up to `(superbatch, curr_batch)`
     /// within the current epoch, plus the `position_offset` carried over
-    /// from prior runs (read from the existing top-level `summary-learn.log`).
+    /// from prior runs (read from the existing top-level `summary-learn.csv`).
     fn positions_at(&self, superbatch: usize, curr_batch: usize, position_offset: usize) -> usize {
         position_offset + (superbatch.saturating_sub(1) * self.batches_per_superbatch + curr_batch) * self.batch_size
     }
@@ -25823,14 +25856,14 @@ fn enrich_bullet_log_to_csv(
     out
 }
 
-/// Read the existing top-level `<output>/summary-learn.log` and return the maximum
+/// Read the existing top-level `<output>/summary-learn.csv` and return the maximum
 /// `positions` value seen per component. Used at the start of a run to
 /// pick up the cumulative offset across resumes.
 ///
 /// Returns an empty map if the file doesn't exist yet (= first run).
 ///
 /// Reads the **summary** log [`SUMMARY_LEARN_LOG_NAME`] (`<output>/
-/// summary-learn.log`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (15
+/// summary-learn.csv`). Schema is [`SUMMARY_LEARN_LOG_HEADER`] (15
 /// columns, NO `curr_batch`):
 ///
 ///   eval, epoch, superbatch, test_value_accuracy, test_value_loss,
@@ -26038,7 +26071,7 @@ fn read_latest_saved_teacher(output_dir: &std::path::Path) -> Option<String> {
 
 /// Append the body of the latest save dir's `learn.log` (already enriched
 /// 13-column CSV from cuda-cpp checkpoint writing / `assemble_numbered_dirs`) onto
-/// the top-level `<output>/summary-learn.log`, writing the CSV header on first
+/// the top-level `<output>/summary-learn.csv`, writing the CSV header on first
 /// file creation. The result is a single pure CSV  - no section headers,
 /// no separators  - that pandas / Excel can load directly.
 ///
@@ -33430,6 +33463,54 @@ mod tests {
     }
 
     #[test]
+    fn summary_filename_migration_preserves_history_and_conflicts() {
+        let tmp = epoch_summary_test_dir("csv-name");
+        let source = tmp.join("summary-learn.log");
+        let destination = tmp.join(SUMMARY_LEARN_LOG_NAME);
+        migrate_summary_log_filename(&tmp).unwrap();
+        assert!(!destination.exists());
+        let original = format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\r\nNNUE,5,324,0.64,0.12,0.63,0.13,0.001,0.0001,1,64762675200,\"teacher,a.psv\",test.hcpe,4,0005\r\n"
+        );
+        std::fs::write(&source, &original).unwrap();
+        migrate_summary_log_filename(&tmp).unwrap();
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_bytes());
+        assert_eq!(read_prior_positions(&destination)["nnue"], 64762675200);
+        migrate_summary_log_filename(&tmp).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_bytes());
+        std::fs::write(&source, "different history").unwrap();
+        assert_eq!(migrate_summary_log_filename(&tmp).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "different history");
+        assert_eq!(std::fs::read(&destination).unwrap(), original.as_bytes());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn summary_filename_migration_precedes_backfill_and_resume_trim() {
+        let tmp = epoch_summary_test_dir("csv-resume");
+        let original = format!(
+            "{SUMMARY_LEARN_LOG_HEADER}\n\
+             NNUE,1,1,0.64,0.12,0.63,0.13,0.001,0.001,1,64,teacher.psv,test.hcpe,4,-\n\
+             NNUE,1,2,0.65,0.11,0.64,0.12,0.0001,0.0001,1,128,teacher.psv,test.hcpe,4,0001\n\
+             NNUE,2,1,0.66,0.10,0.65,0.11,0.001,0.001,1,192,teacher.psv,test.hcpe,4,-\n"
+        );
+        std::fs::write(tmp.join("summary-learn.log"), &original).unwrap();
+        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=2\n").unwrap();
+        ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
+        assert!(!tmp.join("summary-learn.log").exists());
+        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 1);
+        assert_eq!(truncate_summary_log_after_checkpoint(&tmp, (1, 2)).unwrap(), 1);
+        assert_eq!(read_prior_positions(&tmp.join(SUMMARY_LEARN_LOG_NAME))["nnue"], 128);
+        assert_eq!(worker_last_summary_row(&tmp).unwrap().unwrap()["row"]["superbatch"], "2");
+        update_summary_log_quantized_metrics(&tmp, 1, 2, TestMetrics { accuracy: 0.645, loss: 0.115 }).unwrap();
+        assert!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap().contains("qloss,0.11500000\n"));
+        assert!(!tmp.join("summary-learn.log").exists());
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
     fn epoch_summary_startup_header_and_backfill_completed_only() {
         let tmp = epoch_summary_test_dir("backfill");
         initialize_epoch_last_summary(&tmp).unwrap();
@@ -34196,7 +34277,7 @@ mod tests {
     }
 
     /// Verify that `read_latest_epoch_in_top_level_log` reads the maximum epoch
-    /// column (index 1) from summary-learn.log.
+    /// column (index 1) from summary-learn.csv.
     #[test]
     fn read_latest_epoch_picks_max() {
         let tmp = std::env::temp_dir().join(format!(
@@ -34205,7 +34286,7 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let log = tmp.join("summary-learn.log");
+        let log = tmp.join("summary-learn.csv");
 
         // Missing file -> None.
         assert_eq!(read_latest_epoch_in_top_level_log(&log), None);
@@ -34232,7 +34313,7 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        let log = tmp.join("summary-learn.log");
+        let log = tmp.join("summary-learn.csv");
 
         assert_eq!(read_latest_nnue_test_metrics_in_top_level_log(&log), None);
         std::fs::write(

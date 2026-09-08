@@ -248,7 +248,7 @@ The runner root is:
 
 | path | Meaning |
 | --- | --- |
-| `summary-learn.log` | Every trial result |
+| `summary-learn.csv` | Every trial result |
 | `current-checkpoint/` | Checkpoint accepted at the latest completed generation; the next generation starts from here |
 | `pending-commit-checkpoint/` | Temporary checkpoint after the commit run and before it is moved to `current-checkpoint/`; normally it does not remain |
 | `generation-checkpoints/genXXXX/` | Stable per-generation checkpoint saved according to `tuning.save_rate` |
@@ -256,6 +256,8 @@ The runner root is:
 | `generation-best-parameters.csv` | Wide CSV summary of the best trial parameters for each generation. If a generation checkpoint is saved, the `checkpoint` column contains `generation-checkpoints/genXXXX/` |
 | `runner-state.json` | Resume state |
 | `logs/` | stdout for each trial |
+
+At startup, the runner renames `summary-learn.log` to `summary-learn.csv` without changing its contents, before reading trial history. If both files exist, it reports an error without overwriting either file. The extension does not change column order, search behavior, or resume behavior.
 
 `generation-best-parameters.csv` is updated once after each generation-end commit run.
 If the same generation is resumed, the row for that generation is replaced instead of duplicated.
@@ -331,7 +333,7 @@ The TPE sampler compares the distributions of good and bad trials to generate ca
 "keep_all_trials": false
 ```
 
-With this setting, lower `quantized_value_loss` is better. By default, trial checkpoints are not saved. The runner records each trial's metrics and parameters in `summary-learn.log`, then runs one generation-end commit run using the parameters selected by `commit_source`. That commit run becomes `current-checkpoint/`. If `save_rate` is `1`, the same checkpoint is also saved under `generation-checkpoints/genXXXX/`.
+With this setting, lower `quantized_value_loss` is better. By default, trial checkpoints are not saved. The runner records each trial's metrics and parameters in `summary-learn.csv`, then runs one generation-end commit run using the parameters selected by `commit_source`. That commit run becomes `current-checkpoint/`. If `save_rate` is `1`, the same checkpoint is also saved under `generation-checkpoints/genXXXX/`.
 
 With `commit_source: "best"`, the commit run uses the parameters from the best measured trial in that generation. With `commit_source: "recommended"`, it uses the same inferred parameters written to `recommended-parameters.json` for the latest generation. `recommended` is an unevaluated estimate, so the safer default is `"best"`.
 
@@ -362,7 +364,7 @@ python .\tuning_parameters.py `
 
 The runner records each generation's `population`, `trial_sbs`, and trial-number range in `runner-state.json`. Finished generations are therefore not reinterpreted when you edit the settings file. New settings apply to generations that have not started yet, or to a generation explicitly rewound with `--reset-generation`.
 
-Even when a non-best trial checkpoint is deleted, `summary-learn.log` and `logs/trialXXXX.stdout.log` remain, so you can still inspect the metric values and stdout later.
+Even when a non-best trial checkpoint is deleted, `summary-learn.csv` and `logs/trialXXXX.stdout.log` remain, so you can still inspect the metric values and stdout later.
 
 To keep every trial checkpoint, use one of these:
 

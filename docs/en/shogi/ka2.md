@@ -107,13 +107,13 @@ Run any of these with:
 ./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
-Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.log`) is identical to [HalfKP](halfkp.md) — only `--arch` (and the input dim) differs.
+Everything else (training schedule flags, save layout, resume from `state.bin`, top-level `summary-learn.csv`) is identical to [HalfKP](halfkp.md) — only `--arch` (and the input dim) differs.
 
 ### Save layout
 
 ```
 checkpoints/my-ka2/
-├── summary-learn.log
+├── summary-learn.csv
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
 │   ├── state.bin                      ← resume data (weights + Ranger optimizer state)

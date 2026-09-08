@@ -57,7 +57,7 @@ Without `--superbatches` or `--max-epochs`, training runs through the teacher da
 
 ```
 checkpoints/my-halfkp/
-├── summary-learn.log                  ← top-level cumulative log across runs/resumes
+├── summary-learn.csv                  ← top-level cumulative log across runs/resumes
 ├── 0001/
 │   ├── nn.bin                         ← YaneuraOu / Stockfish (nnue-pytorch) compatible NNUE binary
 │   ├── state.bin                      ← resume data (weights + Ranger optimizer state)

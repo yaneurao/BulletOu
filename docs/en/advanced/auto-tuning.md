@@ -291,7 +291,7 @@ In this mode, the runner fills `superbatches` from `trial_sbs` and `max_epochs` 
 
 With `enabled: false`, the runner does not create population search candidates, worker caches, or snapshots. It launches `bulletou.exe` once and only converts `parameters.current` into CLI arguments. stdout is written to `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log`.
 
-The ordinary training output is written under `output_folder/tuning-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.log` into `output_folder/tuning-<tag_prefix>/summary-learn.log` and `accepted-summary-learn.log`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
+The ordinary training output is written under `output_folder/tuning-<tag_prefix>/bulletou-run/`. The runner imports that `summary-learn.csv` into `output_folder/tuning-<tag_prefix>/summary-learn.csv` and `accepted-summary-learn.csv`. Saved checkpoints are copied to `accepted-checkpoints/sbXXXXXXXX/`, and the latest checkpoint is copied to `current/`.
 
 After that, you can set `enabled` back to `true` and run with `--resume`. population search resumes from the updated `current/`. The runner also writes the ordinary-training progress into `runner-state.json`, so `accepted_sbs`, `generation`, and public checkpoint numbering do not roll back.
 
@@ -319,14 +319,16 @@ The runner root is `output_folder/tuning-<tag_prefix>`.
 | --- | --- |
 | `current/` | Latest accepted checkpoint. `--resume` continues from here |
 | `accepted-checkpoints/sbXXXXXXXX/` | Public checkpoints saved every `save_rate` accepted generations |
-| `summary-learn.log` | Results for all candidates |
-| `accepted-summary-learn.log` | Results for accepted survivors only |
+| `summary-learn.csv` | Results for all candidates |
+| `accepted-summary-learn.csv` | Results for accepted survivors only |
 | `parameters-history.jsonl` | Accepted parameter history |
 | `runner-state.json` | Resume state |
 | `logs/` | Per-candidate stdout logs |
 | `temp/` | Temporary candidate checkpoints, unless `temp_folder` is set |
 
-population search writes metric columns in `summary-learn.log` and `accepted-summary-learn.log` in the same order as normal BulletOu summaries: `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss`.
+population search writes metric columns in `summary-learn.csv` and `accepted-summary-learn.csv` in the same order as normal BulletOu summaries: `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss`.
+
+At startup, the runner renames `summary-learn.log` / `accepted-summary-learn.log` to their `.csv` counterparts without changing the contents. If both extensions exist for either summary, it reports an error without overwriting either history.
 
 The runner copies the current `tuning-settings.json` and `bulletou-settings.json` into `current/` and `accepted-checkpoints/sbXXXXXXXX/`. This makes it possible to inspect the exact settings used for a checkpoint later.
 

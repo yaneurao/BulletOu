@@ -69,7 +69,7 @@ When training finishes, the saved checkpoints are laid out as zero-padded number
 
 ```
 checkpoints/my-kppt/
-├── summary-learn.log                  ← top-level cumulative log across all runs/resumes
+├── summary-learn.csv                  ← top-level cumulative log across all runs/resumes
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
@@ -102,7 +102,7 @@ KPPT/kpp,1,1,32,-,-,-,-,0.001000,0.000999,1.000000,524288,teachers/
 
 The `eval` column uses the **`<target>/<component>`** format, which distinguishes the kk / kkp / kpp components for KPPT-family rows. KPPT-family rows have no NNUE/SFNN architecture suffix (unlike NNUE rows, which embed it as `NNUE_HALFKP-NNUE_halfkp_256x2_32_32`).
 
-Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.log` have different granularities but the same column meanings. `summary-learn.log` keeps only sb-boundary rows and omits `curr_batch`. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md).
+Per-save snapshot `0NNN/learn.log` and the top-level `<output>/summary-learn.csv` have different granularities but the same column meanings. `summary-learn.csv` keeps only sb-boundary rows and omits `curr_batch`. The top-level accumulates rows across resumes; `positions` is cumulative across resumes (the start of a resumed run picks up from the previous run's max positions per component). The columns are described in detail in [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md).
 
 Point a YaneuraOu KPPT engine at the latest numbered directory (`000N/`). The engine ignores `state.bin`.
 

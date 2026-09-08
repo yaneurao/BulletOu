@@ -75,7 +75,7 @@
 
 `validation_rate` / `--validation-rate` は accuracy / loss を測る頻度です。
 
-`summary-learn.log` 自体は1sbごとに1行書かれますが、検証しないsbの
+`summary-learn.csv` 自体は1sbごとに1行書かれますが、検証しないsbの
 `test_value_accuracy` / `test_value_loss` は `-` になります。
 
 たとえば、保存は epoch 末だけでよく、検証は毎 sb 見たい場合は次のようにします。
@@ -108,7 +108,7 @@
 }
 ```
 
-量子化後検証をしないsbでは、`summary-learn.log` の
+量子化後検証をしないsbでは、`summary-learn.csv` の
 `quantized_value_accuracy` / `quantized_value_loss` は `-` になります。
 
 量子化後検証は少し重いので、最初は `--test-teacher` と `--validation-rate` だけで十分です。詳しくは [応用編: 量子化後の `nn.bin` を検証する](../advanced/quantized-nn-bin.md) を参照してください。
@@ -135,11 +135,11 @@ bpu,1,4
 
 `lr` はそのepochのsb 1開始時のlr、`lr-min` は最終sb終了時に実際に使ったlrです。後者は設定上の下限値とは限りません。`sb` は最終sb番号（そのepochのsb数）、`bpu` は最終sbで使った `batches_per_update` です。epoch途中でbpuを変えた場合も、終了時の値を記録します。
 
-再開時にこのCSVがなければ、`summary-learn.log` と保存されている学習設定から完了済みepochを集計します。学習途中のepochは含めず、再開で巻き戻された結果も取り除きます。最新epochの完了を確認できる記録がない場合、そのepochは含めません。
+再開時にこのCSVがなければ、`summary-learn.csv` と保存されている学習設定から完了済みepochを集計します。学習途中のepochは含めず、再開で巻き戻された結果も取り除きます。最新epochの完了を確認できる記録がない場合、そのepochは含めません。
 
 4つの検証指標は最終sbの値であり、epoch内の最大accuracyや平均値ではありません。そのsbで検証していない項目は空欄です。sb 1の記録がないepochの `lr` や、bpuの記録がない過去epochの `bpu` も空欄にし、現在の設定からは推定しません。
 
-`batches_per_update` は `summary-learn.log` のcheckpoint列の直前にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
+`batches_per_update` は `summary-learn.csv` のcheckpoint列の直前にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
 
 ---
 

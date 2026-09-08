@@ -7,7 +7,7 @@ After training, check two things.
 | Item | Use |
 | --- | --- |
 | `000N/nn.bin` | Evaluation file loaded by the engine |
-| `summary-learn.log` | Accuracy / loss history |
+| `summary-learn.csv` | Accuracy / loss history |
 
 ## 6.1 Output files
 
@@ -15,7 +15,7 @@ NNUE / SFNN output looks like this:
 
 ```text
 checkpoints/NNUE_HALFKP-NNUE_halfkp_256x2_32_32-first-halfkp/
-  summary-learn.log
+  summary-learn.csv
   0001/
     nn.bin
     state.bin
@@ -40,7 +40,10 @@ KPP_synthesized.bin
 
 ## 6.2 Log
 
-`summary-learn.log` contains one row per superbatch.
+`summary-learn.csv` is a CSV file, usable with VSCode CSV extensions and spreadsheet software.
+If the training folder contains `summary-learn.log`, training startup renames it to `summary-learn.csv` without changing its contents. If both files exist, startup reports an error instead of overwriting either one. Check which history to keep and move the other file elsewhere. Do not manually rename a file while a training process is writing to it.
+
+`summary-learn.csv` contains one row per superbatch.
 If that sb did not run ordinary validation, `test_value_accuracy` / `test_value_loss` are `-`.
 If that sb did not run quantized validation, `quantized_value_accuracy` / `quantized_value_loss` are `-`.
 

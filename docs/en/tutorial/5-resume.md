@@ -59,7 +59,7 @@ checkpoints/.../
 | `0074/learn.log` | yes | Metadata used to treat the checkpoint as fully saved |
 | `resume-config.txt` | yes | Training-control signature used by auto-resume |
 | `0074/nn.bin` | no | Quantized network for the engine. Resume does not use it |
-| `summary-learn.log` | no | Cumulative validation log. Useful to keep, but not required for resume |
+| `summary-learn.csv` | no | Cumulative validation log. Useful to keep, but not required for resume |
 | old `0001/` ... `0073/` | no | Safe to delete if you only need to resume from `0074` |
 
 For example, if you only need to resume from `0074` and no longer need old `nn.bin` files, you can delete `0001` through `0073`.

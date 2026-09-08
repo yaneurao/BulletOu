@@ -250,7 +250,7 @@ runner root は次の場所です。
 
 | path | 意味 |
 | --- | --- |
-| `summary-learn.log` | 各 trial の結果 |
+| `summary-learn.csv` | 各 trial の結果 |
 | `current-checkpoint/` | 最新 generation で採用された checkpoint。次 generation の開始地点 |
 | `pending-commit-checkpoint/` | commit run 完了後、`current-checkpoint/` へ反映する前の一時 checkpoint。通常は残りません |
 | `generation-checkpoints/genXXXX/` | `tuning.save_rate` に応じて保存される、generation ごとの固定checkpoint |
@@ -258,6 +258,8 @@ runner root は次の場所です。
 | `generation-best-parameters.csv` | generation ごとの best trial パラメーターを横持ちでまとめたCSV。世代checkpointを保存した場合は、`checkpoint` 列に `generation-checkpoints/genXXXX/` が入ります |
 | `runner-state.json` | resume 用 |
 | `logs/` | trial ごとの stdout |
+
+runnerの起動時に `summary-learn.log` があれば、内容を変えずに `summary-learn.csv` へ改名してから履歴を読み込みます。両方存在する場合は上書きせずエラーにします。CSVの列順や探索・再開の動作は拡張子によって変わりません。
 
 `generation-best-parameters.csv` は、generation の commit run が終わるたびに1行更新されます。
 同じ generation を resume した場合は、その generation の行を置き換えるので、同じ generation の行が二重に増えません。
@@ -333,11 +335,11 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 "keep_all_trials": false
 ```
 
-この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。現在の標準動作では、trial ごとの checkpoint は保存しません。各 trial の metric とパラメーターだけを `summary-learn.log` に記録し、generation の最後に `commit_source` で選んだパラメーターを使って commit run を1回だけ実行します。その commit run の checkpoint が `current-checkpoint/` になります。さらに `save_rate` が `1` なら、同じ内容が `generation-checkpoints/genXXXX/` にも保存されます。
+この設定では、`quantized_value_loss` が小さい trial を良い trial とみなします。現在の標準動作では、trial ごとの checkpoint は保存しません。各 trial の metric とパラメーターだけを `summary-learn.csv` に記録し、generation の最後に `commit_source` で選んだパラメーターを使って commit run を1回だけ実行します。その commit run の checkpoint が `current-checkpoint/` になります。さらに `save_rate` が `1` なら、同じ内容が `generation-checkpoints/genXXXX/` にも保存されます。
 
 `commit_source: "best"` では、その generation で実測 metric が一番良かった trial のパラメーターを使います。`commit_source: "recommended"` では、最新 generation の上位 trial から `recommended-parameters.json` と同じ式で推定したパラメーターを使います。`recommended` は未評価の推定値なので、標準ではより安全な `"best"` を使います。
 
-削除しても、`summary-learn.log` と `logs/trialXXXX.stdout.log` は残るので、各 trial の指標と実行ログはあとから確認できます。
+削除しても、`summary-learn.csv` と `logs/trialXXXX.stdout.log` は残るので、各 trial の指標と実行ログはあとから確認できます。
 
 すべての trial checkpoint を残したい場合は、次のどちらかを使います。
 

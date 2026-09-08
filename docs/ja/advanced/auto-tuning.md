@@ -294,7 +294,7 @@ python .\tuning_parameters.py --settings-file .\tuning-settings.json
 
 `enabled: false` では population search の候補生成、worker cache、snapshot保持は使いません。runner は `bulletou.exe` を1回起動し、`parameters.current` をCLI引数に変換して渡すだけです。stdoutログは `output_folder/tuning-<tag_prefix>/logs/bulletou-settings-run.stdout.log` に書かれます。
 
-普通学習の出力本体は `output_folder/tuning-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.log` を読み、`output_folder/tuning-<tag_prefix>/summary-learn.log` と `accepted-summary-learn.log` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
+普通学習の出力本体は `output_folder/tuning-<tag_prefix>/bulletou-run/` に作られます。runner はその `summary-learn.csv` を読み、`output_folder/tuning-<tag_prefix>/summary-learn.csv` と `accepted-summary-learn.csv` にも同じ指標を反映します。保存された checkpoint は `accepted-checkpoints/sbXXXXXXXX/` に同期され、最新 checkpoint は `current/` にコピーされます。
 
 そのあと `enabled` を `true` に戻して `--resume` すると、population search は更新済みの `current/` から続行します。`enabled=false` で進めたぶんの `accepted_sbs` と `generation` も `runner-state.json` に保存されるので、公開 checkpoint の番号も巻き戻りません。
 
@@ -322,14 +322,16 @@ runner root は `output_folder/tuning-<tag_prefix>` です。
 | --- | --- |
 | `current/` | 最新の採用 checkpoint。`--resume` はここから続ける |
 | `accepted-checkpoints/sbXXXXXXXX/` | `save_rate` 回採用するごとに保存される公開 checkpoint |
-| `summary-learn.log` | すべての候補の結果 |
-| `accepted-summary-learn.log` | 採用された候補だけの結果 |
+| `summary-learn.csv` | すべての候補の結果 |
+| `accepted-summary-learn.csv` | 採用された候補だけの結果 |
 | `parameters-history.jsonl` | 採用されたパラメーターの履歴 |
 | `runner-state.json` | resume 用の状態 |
 | `logs/` | 候補ごとの stdout log |
 | `temp/` | `temp_folder` 未指定時の一時 checkpoint |
 
-population search の `summary-learn.log` と `accepted-summary-learn.log` は、通常の BulletOu の `summary-learn.log` と同じく `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` の順で指標を書きます。
+population search の `summary-learn.csv` と `accepted-summary-learn.csv` は、通常の BulletOu の `summary-learn.csv` と同じく `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` の順で指標を書きます。
+
+runnerの起動時に `summary-learn.log` / `accepted-summary-learn.log` があれば、それぞれ内容を保ったまま `.csv` に改名します。同名の `.log` と `.csv` が両方存在する場合は、上書きせずエラーにします。
 
 runner は `current/` と `accepted-checkpoints/sbXXXXXXXX/` に、その時点の `tuning-settings.json` と `bulletou-settings.json` をコピーします。あとから「この checkpoint はどの条件で作ったのか」を確認できます。
 

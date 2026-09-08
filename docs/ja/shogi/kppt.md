@@ -69,7 +69,7 @@ KPP_KKPT は KPPT の factorise 版で、KPP ファイルから手番チャン�
 
 ```
 checkpoints/my-kppt/
-├── summary-learn.log                  ← トップレベルの通算ログ (全 run / resume を連結)
+├── summary-learn.csv                  ← トップレベルの通算ログ (全 run / resume を連結)
 ├── 0001/
 │   ├── KK_synthesized.bin
 │   ├── KKP_synthesized.bin
@@ -102,7 +102,7 @@ KPPT/kpp,1,1,32,-,-,-,-,0.001000,0.000999,1.000000,524288,teachers/
 
 `eval` 列は **`<target>/<component>`** 形式で、KPPT 系では `kk` / `kkp` / `kpp` を区別する。KPPT 系の行には NNUE/SFNN architecture 接尾辞は付かない (NNUE 系では `NNUE_HALFKP-NNUE_halfkp_256x2_32_32` のように arch も結合される)。
 
-各 save の `0NNN/learn.log` snapshot とトップレベル `<output>/summary-learn.log` は列数が違うが、列の意味は同じ。`summary-learn.log` は `curr_batch` を除いた sb 境界行だけを保持する。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md) を参照。
+各 save の `0NNN/learn.log` snapshot とトップレベル `<output>/summary-learn.csv` は列数が違うが、列の意味は同じ。`summary-learn.csv` は `curr_batch` を除いた sb 境界行だけを保持する。`positions` は resume またぎで累積される (新規 run 開始時、既存トップレベル log からその component の最大 positions を読み取って続きから書く)。各列の意味は [`spec/04-checkpoint-layout.md`](../../spec/04-checkpoint-layout.md) を参照。
 
 最新の `000N/` (= 最大番号) をやねうら王の KPPT エンジンの eval ディレクトリに設定すれば対局可能 (`state.bin` は engine からは無視される)。
 

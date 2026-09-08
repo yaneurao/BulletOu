@@ -6,7 +6,7 @@
 
 ```
 <output>/
-├── summary-learn.log                  ← トップレベル累積ログ (= 全 run の sb 境界行だけを連結)
+├── summary-learn.csv                  ← トップレベル累積ログ (= 全 run の sb 境界行だけを連結)
 ├── 0001/                              ← 1 個目の save
 │   ├── (eval-type specific files)
 │   ├── state.bin                      ← resume 用 (重み + Ranger optimizer state)
@@ -25,7 +25,7 @@
 
 resume 時は **既存番号の続きから連番**。例えば前回 `0005/` まで存在する dir に対して再実行すると、新規 save は `0006/`, `0007/`, ... となる。
 
-トップレベル log の名前が `summary-learn.log` なのは per-save 配下の `learn.log` (= per-batch 行を含む詳細版) と区別するため。`summary-learn.log` には各 sb の最終行 (= sb 境界の代表行) のみ抽出されて連結される。
+トップレベル log の名前が `summary-learn.csv` なのは per-save 配下の `learn.log` (= per-batch 行を含む詳細版) と区別するため。`summary-learn.csv` には各 sb の最終行 (= sb 境界の代表行) のみ抽出されて連結される。
 
 `learn.log` (各 save 配下) は **その save 時点までの loss 履歴 snapshot**。同一 run 内では cumulative。run を跨ぐ (resume する) と loss snapshot はその run 単位で start し直す。
 
@@ -145,13 +145,13 @@ backend-specific loader. Current BulletOu writes `cuda-cpp`; `bullet` and
 
 ### 起動時の自動分岐 (3 ケース)
 
-`bulletou` 起動時、auto-resume は前回 run の状態を読んで以下のいずれかに分岐する。bullet 内部の `start_superbatch` と HCPE dataloader の byte offset がケースごとに変わる。LR scheduler は positions-based なので、いずれも `cb_prior_position` (= `summary-learn.log` の最大 positions) を carry-over するだけで連続性を保つ。
+`bulletou` 起動時、auto-resume は前回 run の状態を読んで以下のいずれかに分岐する。bullet 内部の `start_superbatch` と HCPE dataloader の byte offset がケースごとに変わる。LR scheduler は positions-based なので、いずれも `cb_prior_position` (= `summary-learn.csv` の最大 positions) を carry-over するだけで連続性を保つ。
 
 | ケース | 検出条件 | bullet `start_sb` | dataloader offset | log 表示 |
 |---|---|---|---|---|
 | **mid-epoch resume** | 教師同じ & 前回 last_sb < `--superbatches` | `last_sb + 1` | `dataloader_pos.txt` から | sb 列 = `last_sb+1..N` で再開、次 epoch 以降 sb=1..N |
 | **clean continuation** | 教師同じ & 前回 last_sb >= `--superbatches` (= 完走後の追加学習) | `1` | `dataloader_pos.txt` から | sb 列 = 1..N (= 新 epoch の自然なカウント) |
-| **teacher-changed** | 教師パス変更 (= `summary-learn.log` 最終行と現 `--teacher` 不一致) | `1` | `0` | sb 列 = 1..N |
+| **teacher-changed** | 教師パス変更 (= `summary-learn.csv` 最終行と現 `--teacher` 不一致) | `1` | `0` | sb 列 = 1..N |
 | **fresh first run** | numbered dir 無し | `1` | `0` | sb 列 = 1..N |
 
 `--superbatches N` を明示した run では、epoch は教師1周ではなく LR/validation cycle である。そのため clean continuation でも教師位置は `dataloader_pos.txt` から継続し、epoch 境界で教師先頭へは戻さない。教師EOFに到達した場合だけ、同じ epoch のまま教師先頭へ cyclic に戻る。
@@ -178,7 +178,7 @@ sb 列は intrinsic に **per-epoch カウンタ** (= 各 epoch で 1..`--superb
 
 (歴史的経緯: `--max-epochs` 導入前の v0.x では sb は invocation を跨ぐ累積カウンタで、cross-run の `sb_offset` 補正が必要だった。v1.0 で sb は per-epoch 化され、`sb_offset` 補正は削除された。)
 
-## `learn.log` / `summary-learn.log` フォーマット
+## `learn.log` / `summary-learn.csv` フォーマット
 
 2 種類の CSV ログがあり、列数が違う。両方ともヘッダ行つき、区切り文字はカンマ、行ごとの末尾改行あり。pandas / Excel でそのまま load 可能。
 
@@ -191,17 +191,19 @@ SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,1,1,610,0.576647,0.181778,0.575000,0.18
 
 cuda-cpp の保存時には、その時点の学習進捗と検証結果を記録する。検証を実施していない指標は `-`。`--validation-rate` と `--quantized-validation-rate` で通常検証・量子化後検証の間隔を指定できる。詳しくは [validation](../ja/tutorial/4-validation.md) を参照。
 
-### top-level `<output>/summary-learn.log` (= 14 列、sb 境界のみ)
+### top-level `<output>/summary-learn.csv` (= 15 列、sb 境界のみ)
 
 ```
-eval,epoch,superbatch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,checkpoint
-SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,1,1,-,-,-,-,0.001000,0.001000,1.000000,39976960,teachers/,test.hcpe,-
-SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,1,2,0.583300,0.174947,0.582000,0.17510000,0.000934,0.000934,1.000000,79953920,teachers/,test.hcpe,0001
+eval,epoch,superbatch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,lr_start,lr_end,lambda,positions,teacher,test_teacher,batches_per_update,checkpoint
+SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,1,1,-,-,-,-,0.001000,0.001000,1.000000,39976960,teachers/,test.hcpe,1,-
+SFNN_HALFKA2-SFNN_halfka2_1024_8_64_k3k3,1,2,0.583300,0.174947,0.582000,0.17510000,0.000934,0.000934,1.000000,79953920,teachers/,test.hcpe,1,0001
 ```
 
 `test_teacher` is summary-only: it records the filename (basename) of the `--test-teacher` file that produced `test_value_accuracy` / `test_value_loss`; `-` means validation was not configured.
 
-`summary-learn.log` is created with its header at run startup and then gets
+起動時に `summary-learn.log` があれば、履歴を読む前に `summary-learn.csv` へ改名する。両方存在する場合は上書きや結合をせずエラーにする。`batches_per_update` は各sbの実際の値で、過去の行に記録がなければ `-` とする。
+
+`summary-learn.csv` is created with its header at run startup and then gets
 one row per completed superbatch. If ordinary validation did not run at that
 sb, `test_value_accuracy` / `test_value_loss` are `-`. If quantized
 validation did not run, `quantized_value_accuracy` /
@@ -240,7 +242,7 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 | `lr_start` | その行が表す区間の開始時点の学習率。summary 行ではその superbatch の開始 LR |
 | `lr_end` | その行が表す区間の最後の batch で使った学習率。summary 行ではその superbatch の終端側 LR |
 | `lambda` | その時点の `--lambda` (1 run 内では定数)。**小数点以下 6 桁固定** で出力 (`1.000000`、`0.500000` など) |
-| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.log` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × 実効superbatch内batch数 × batch_size` を書く。常に単調増加 |
+| `positions` | この component で消費した累計教師局面数。**resume / epoch 跨ぎで累積される** (run 開始時に既存 `summary-learn.csv` の最大値を読み取って続きから書く)。full save の sb 境界行では、bullet の raw log が 32 batch 刻みで途中までしか出ていなくても、正確な `superbatch × 実効superbatch内batch数 × batch_size` を書く。常に単調増加 |
 | `teacher` | CLI の `--teacher` 値そのまま (RFC 4180 escape: 値内にカンマ/ダブルクォート/改行があるときは `"..."` で囲む) |
 | `test_teacher` | CLI の `--test-teacher` のファイル名部分。未指定なら `-` |
 | `checkpoint` | この行に対応する numbered checkpoint dir 名。保存していないsbなら `-` |
@@ -250,7 +252,7 @@ per-save 版から `curr_batch` 列を除いたもの (= 各 sb の最終行 = s
 - 1 run 内で各 component が消費する局面数: `positions = cb_prior_position + (local_superbatch − 1) × 実効superbatch内batch数 × batch_size + curr_batch × batch_size`
 - `cb_prior_position` は run 開始時 + 各 epoch 境界で `read_prior_positions()` から再ロードされる (= component 別の最大 `positions`)
 - 各 save dir の `0NNN/learn.log` は「**その save 時点までの累積**」(bullet が log.txt を逐次更新するため)。最新番号 dir の `learn.log` を読めばその run の全貌が分かる
-- トップレベル `<output>/summary-learn.log` は run 開始時にヘッダを作り、cuda-cpp direct 学習では sb 完了ごとに 1 行ずつ追記する。ファイル内のヘッダは常に 1 行のみ
+- トップレベル `<output>/summary-learn.csv` は run 開始時にヘッダを作り、cuda-cpp direct 学習では sb 完了ごとに 1 行ずつ追記する。ファイル内のヘッダは常に 1 行のみ
 - resume を跨いでも `epoch` / `superbatch` / `positions` 全部が連続表示される (= `epoch_offset` + 自然な per-epoch sb + `cb_prior_position` のおかげ)。Pandas で `positions` を sort key にすれば確実に時系列順
 
 ## ファイル名規約 (一時)

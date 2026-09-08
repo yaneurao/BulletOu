@@ -84,13 +84,13 @@ K-P は HalfKP と並んで NNUE 系評価関数の最初期に追加された (
 ./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.csv` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` だけが違う。
 
 ### 保存レイアウト
 
 ```
 checkpoints/my-kp/
-├── summary-learn.log
+├── summary-learn.csv
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Ranger optimizer state

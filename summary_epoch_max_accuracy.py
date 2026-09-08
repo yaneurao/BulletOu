@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Extract per-epoch maximum accuracy from summary-learn.log.
+"""Extract per-epoch maximum accuracy from summary-learn.csv.
 
 Default behavior:
     python summary_epoch_max_accuracy.py
 
-reads ./summary-learn.log and prints one tab-separated row containing the
+reads ./summary-learn.csv and prints one tab-separated row containing the
 maximum test_value_accuracy for each epoch, sorted by epoch.
 """
 
@@ -19,13 +19,13 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Print per-epoch maximum accuracy from BulletOu summary-learn.log as TSV."
+        description="Print per-epoch maximum accuracy from BulletOu summary-learn.csv as TSV."
     )
     parser.add_argument(
         "log",
         nargs="?",
         default=None,
-        help="summary-learn.log path. Defaults to summary-learn.log in the current working directory",
+        help="summary-learn.csv path. Defaults to summary-learn.csv in the current working directory",
     )
     parser.add_argument(
         "--column",
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
 
 def resolve_log_path(log: str | None) -> Path:
     if log is None:
-        return Path.cwd() / "summary-learn.log"
+        return Path.cwd() / "summary-learn.csv"
 
     path = Path(log)
     if path.is_absolute():

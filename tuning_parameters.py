@@ -1915,7 +1915,7 @@ def main() -> int:
         runner_root = run.output_folder / f"tuning-{run.tag_prefix}"
         trials_root = (run.temp_folder / f"tuning-{run.tag_prefix}" if run.temp_folder else runner_root / "trials")
         log_dir = runner_root / "logs"
-        summary_path = runner_root / "summary-learn.log"
+        summary_path = runner_root / tuner.SUMMARY_CSV_NAME
         generation_best_path = runner_root / "generation-best-parameters.csv"
         state_path = runner_root / "runner-state.json"
         recommendation_path = runner_root / "recommended-parameters.json"
@@ -1930,6 +1930,7 @@ def main() -> int:
         if args.reset_only and args.reset_generation is None:
             raise RuntimeError("--reset-only requires --reset-generation")
         if not args.dry_run:
+            tuner.migrate_summary_logs(runner_root)
             runner_root.mkdir(parents=True, exist_ok=True)
             trials_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)

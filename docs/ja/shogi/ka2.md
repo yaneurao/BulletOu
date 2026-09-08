@@ -107,13 +107,13 @@ SFNN-1536 architecture を KA2 入力で:
 ./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
-スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.log` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` (および入力次元) だけが違う。
+スケジュール系フラグ、save layout、`state.bin` からの resume、トップレベル `summary-learn.csv` — その他はすべて [HalfKP](halfkp.md) と同一。`--arch` (および入力次元) だけが違う。
 
 ### 保存レイアウト
 
 ```
 checkpoints/my-ka2/
-├── summary-learn.log
+├── summary-learn.csv
 ├── 0001/
 │   ├── nn.bin                         ← やねうら王 / Stockfish (nnue-pytorch) 互換 NNUE バイナリ
 │   ├── state.bin                      ← resume 用の重み + Ranger optimizer state

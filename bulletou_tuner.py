@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from bulletou_csv import ACCEPTED_SUMMARY_CSV_NAME, SUMMARY_CSV_NAME, migrate_summary_logs
+
 
 TUNING_SETTINGS_VERSION = 1
 STATE_VERSION = 1
@@ -642,7 +644,7 @@ def metric_status_text(metric: Metric, *, prefix: str = "") -> str:
 
 
 def latest_summary_row(output_dir: Path) -> dict[str, str]:
-    path = output_dir / "summary-learn.log"
+    path = output_dir / SUMMARY_CSV_NAME
     if not path.exists():
         raise RuntimeError(f"{path} was not written")
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -736,7 +738,7 @@ def import_ordinary_run_summaries(
     base_accepted_sbs: int,
     color: bool,
 ) -> tuple[int, int, int]:
-    source_summary = ordinary_output / "summary-learn.log"
+    source_summary = ordinary_output / SUMMARY_CSV_NAME
     rows = read_csv_rows(source_summary)
     if not rows:
         event(color, "[LOG IMPORT]", f"no summary rows found: {source_summary}", "yellow")
@@ -825,7 +827,7 @@ def sync_ordinary_accepted_checkpoints(
     bulletou_settings_file: Path,
     color: bool,
 ) -> int:
-    rows = read_csv_rows(ordinary_output / "summary-learn.log")
+    rows = read_csv_rows(ordinary_output / SUMMARY_CSV_NAME)
     if not rows:
         return 0
 
@@ -1588,9 +1590,10 @@ def run_once_from_settings(
         accepted_root = runner_root / "accepted-checkpoints"
         current_dir = runner_root / "current"
         state_path = runner_root / "runner-state.json"
-        summary_path = runner_root / "summary-learn.log"
-        accepted_summary_path = runner_root / "accepted-summary-learn.log"
+        summary_path = runner_root / SUMMARY_CSV_NAME
+        accepted_summary_path = runner_root / ACCEPTED_SUMMARY_CSV_NAME
         if not args.dry_run:
+            migrate_summary_logs(runner_root)
             runner_root.mkdir(parents=True, exist_ok=True)
             log_dir.mkdir(parents=True, exist_ok=True)
             accepted_root.mkdir(parents=True, exist_ok=True)
@@ -1753,11 +1756,12 @@ def main() -> int:
     accepted_root = runner_root / "accepted-checkpoints"
     current_dir = runner_root / "current"
     state_path = runner_root / "runner-state.json"
-    summary_path = runner_root / "summary-learn.log"
-    accepted_summary_path = runner_root / "accepted-summary-learn.log"
+    summary_path = runner_root / SUMMARY_CSV_NAME
+    accepted_summary_path = runner_root / ACCEPTED_SUMMARY_CSV_NAME
     history_path = runner_root / "parameters-history.jsonl"
 
     if not args.dry_run:
+        migrate_summary_logs(runner_root)
         runner_root.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
         accepted_root.mkdir(parents=True, exist_ok=True)

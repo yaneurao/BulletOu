@@ -12,7 +12,7 @@ current cuda-cpp follow-up queue.
 | BO-CUDA-001 | done | cuda-oxide resume from root `state.bin` | `--nnue-teacher-train` can restore weights + Ranger optimizer state from root-format `state.bin`, not only `state.boung`; smoke verifies the same next-step result as `state.boung` resume |
 | BO-CUDA-002 | done | promote direct cuda-oxide loop into end-user BulletOu CLI | `examples/bulletou.rs` exposes an opt-in cuda-oxide NNUE HalfKP training path that writes the normal numbered checkpoint layout |
 | BO-CUDA-003 | done | production schedule integration | cuda-oxide path honors `--superbatches`, epoch boundaries, LR schedule, `--save-rate`, positions carry-over, and plateau control in the same user-facing sense as the Bullet backend |
-| BO-CUDA-004 | done | validation metrics integration | cuda-oxide checkpoints write production-compatible `learn.log` / `summary-learn.log` columns including `test_value_accuracy`, `test_value_loss`, and `train_value_loss` |
+| BO-CUDA-004 | done | validation metrics integration | cuda-oxide checkpoints write production-compatible `learn.log` / `summary-learn.csv` columns including `test_value_accuracy`, `test_value_loss`, and `train_value_loss` |
 | BO-CUDA-005 | done | dataloader resume generalisation | HCPE3, shogipack, multi-teacher specs, and teacher changes have explicit resume behavior and smoke coverage |
 | BO-CUDA-006 | done | async input/readback rings | input upload and loss readback are pipelined without changing fp32 baseline results |
 | BO-CUDA-007 | done | speed benchmark | same teacher / seed / schedule benchmark compares Bullet backend vs cuda-oxide positions/sec |
@@ -73,7 +73,7 @@ current cuda-cpp follow-up queue.
 - The wrapper launches `cargo run -p bulletou-cuda-train --features cuda,root-loader -- --nnue-teacher-train ...` in the nested `cuda-oxide` workspace and forwards teacher/output/batch/loader/loss/save/checkpoint settings.
 - Unsupported production semantics (`--superbatches`, `--max-epochs`, LR schedule, validation metrics, SFNN/KPPT families, and `--no-resume`) fail fast and remain assigned to later tickets.
 - Validation: `cargo test --example bulletou cuda_oxide_backend` passed.
-- Validation: WSL CUDA smoke through `examples/bulletou --backend cuda-oxide` consumed one real HCPE batch and wrote `0001/nn.bin`, `state.boung`, `state.bin`, `dataloader_pos.txt`, `learn.log`, `summary-learn.log`, and `tag.txt`.
+- Validation: WSL CUDA smoke through `examples/bulletou --backend cuda-oxide` consumed one real HCPE batch and wrote `0001/nn.bin`, `state.boung`, `state.bin`, `dataloader_pos.txt`, `learn.log`, `summary-learn.csv`, and `tag.txt`.
 
 ### BO-CUDA-003
 
@@ -82,14 +82,14 @@ current cuda-cpp follow-up queue.
 - `--save-rate` is interpreted as superbatch units when BulletOu passes `--batches-per-superbatch`; direct smoke mode keeps the old batch-unit behavior via `batches_per_superbatch=1`.
 - Added BulletOu-side plateau orchestration for cuda-oxide: one fixed-LR child run per superbatch, validation-metric monitoring, rejected checkpoint removal, summary-log row trimming, and same-superbatch retry at the lowered LR.
 - Validation: WSL CUDA smoke with `--superbatches 2 --positions-per-superbatch 2 --save-rate 2 --lr-schedule cos` ran two real HCPE batches, reported `lr_start=0.01`, `lr_last=0.0055`, and wrote one checkpoint.
-- Validation: WSL CUDA plateau reject smoke forced a no-improvement second superbatch, removed rejected `0002`, retried the same HCPE byte offset at `lr_min=0.005`, trimmed `summary-learn.log` back to the accepted row, and wrote `0001/plateau_epoch_done.txt`.
+- Validation: WSL CUDA plateau reject smoke forced a no-improvement second superbatch, removed rejected `0002`, retried the same HCPE byte offset at `lr_min=0.005`, trimmed `summary-learn.csv` back to the accepted row, and wrote `0001/plateau_epoch_done.txt`.
 
 ### BO-CUDA-004
 
 - Added cuda-oxide `--test-teacher`, `--test-positions`, `--test-batch-size`, and `--test-seed`.
 - Checkpoint-time validation reads trained weights back, runs CPU fast HalfKP NNUE forward on sampled HCPE positions, and computes `test_value_accuracy` / `test_value_loss` with the same helper used by the Bullet backend.
 - cuda-oxide `learn.log` now uses the production per-save CSV schema: `eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher`.
-- cuda-oxide `summary-learn.log` now uses the production top-level CSV schema without `curr_batch`.
+- cuda-oxide `summary-learn.csv` now uses the production top-level CSV schema without `curr_batch`.
 - Validation: WSL CUDA smoke with 8 sampled test positions wrote `test_value_accuracy=0.625000`, `test_value_loss=0.051297`, and `train_value_loss=0.020710541`.
 
 ### BO-CUDA-005
@@ -118,7 +118,7 @@ current cuda-cpp follow-up queue.
   - `cargo check -p bulletou-cuda-train`
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`
   - WSL: `cargo test -p bulletou-cuda-train --features cuda,root-loader dataloader_pos -- --nocapture`
-  - WSL CUDA async final-output smoke on `shuffled-001.hcpe` with `--train-steps 2 --batch-size 2` wrote `0001/{nn.bin,state.boung,state.bin,teacher.txt,dataloader_pos.txt,learn.log,trained-forward.nnuef}`, `summary-learn.log`, and `dataloader_pos.txt = 152,0`.
+  - WSL CUDA async final-output smoke on `shuffled-001.hcpe` with `--train-steps 2 --batch-size 2` wrote `0001/{nn.bin,state.boung,state.bin,teacher.txt,dataloader_pos.txt,learn.log,trained-forward.nnuef}`, `summary-learn.csv`, and `dataloader_pos.txt = 152,0`.
   - WSL CUDA async-vs-sync baseline smoke on the same teacher produced identical losses: step1 `weighted_sum=0.4999314 mean=0.2499657`, step2 `weighted_sum=0.013783315 mean=0.0068916576`.
 
 ### BO-CUDA-007
@@ -139,13 +139,13 @@ current cuda-cpp follow-up queue.
 - Added a host-side SFNN loss/Ranger train-step runner for cuda-oxide.
 - Added `bulletou-cuda-train --sfnn-teacher-train` for the fixed HalfKA2 / `SFNN_halfka2_1024_7_64_k3k3` path.
 - The SFNN teacher path streams real `ShogiHalfKa2` + `ShogiLayerStackBucket9::KingRank9` batches from `bulletou_lib`, supports deterministic initial weights or `--weights-bin`, and feeds batches directly to the SFNN forward/loss/backward/Ranger kernels.
-- `--output` writes numbered bridge checkpoints with YaneuraOu-compatible `nn.bin`, root-format `state.bin` under the usual `nnue/*` component records, `teacher.txt`, `dataloader_pos.txt`, `learn.log`, and `summary-learn.log`.
+- `--output` writes numbered bridge checkpoints with YaneuraOu-compatible `nn.bin`, root-format `state.bin` under the usual `nnue/*` component records, `teacher.txt`, `dataloader_pos.txt`, `learn.log`, and `summary-learn.csv`.
 - Validation:
   - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - `cargo test -p bulletou_lib teacher_batch -- --nocapture`.
   - WSL: `cargo test -p bulletou-cuda-train --features cuda,root-loader dataloader_pos -- --nocapture`.
-  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 1 --batch-size 1 --output /tmp/bo008-sfnn-output-smoke` streamed one real HCPE batch, printed `step1_loss weighted_sum=0.25801346 mean=0.25801346`, and wrote `0001/nn.bin` (129 MiB), `0001/state.bin` (2.1 GiB), `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.log`.
+  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 1 --batch-size 1 --output /tmp/bo008-sfnn-output-smoke` streamed one real HCPE batch, printed `step1_loss weighted_sum=0.25801346 mean=0.25801346`, and wrote `0001/nn.bin` (129 MiB), `0001/state.bin` (2.1 GiB), `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.csv`.
   - The smoke `nn.bin` advertised `ModelType=SFNNWithoutPsqt;Features=HalfKA2(Friend)[131949->1024x2],Network=SFNN-1024{LayerStack=9}`, and `state.bin` contained `nnue/weights/l0w` plus `nnue/step_ranger/l3w` records.
 
 ### BO-CUDA-009
@@ -157,7 +157,7 @@ current cuda-cpp follow-up queue.
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check --example bulletou`.
   - `cargo check -p bulletou_lib --example bulletou`.
-  - WSL CUDA smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` on `shuffled-001.hcpe` streamed one real HCPE batch, launched the nested child with `--sfnn-teacher-train --save-rate 0`, wrote `0001/nn.bin`, `0001/state.bin`, `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.log`, and reported `step1_loss weighted_sum=0.25801346 mean=0.25801346`.
+  - WSL CUDA smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3` on `shuffled-001.hcpe` streamed one real HCPE batch, launched the nested child with `--sfnn-teacher-train --save-rate 0`, wrote `0001/nn.bin`, `0001/state.bin`, `teacher.txt`, `dataloader_pos.txt = 38,0`, `learn.log`, and top-level `summary-learn.csv`, and reported `step1_loss weighted_sum=0.25801346 mean=0.25801346`.
 
 ### BO-CUDA-010
 
@@ -169,19 +169,19 @@ current cuda-cpp follow-up queue.
   - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - `cargo check --example bulletou`.
-  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --test-teacher shuffled-001.hcpe --test-positions 8 --test-batch-size 4 --train-steps 1 --batch-size 1` wrote `test_value_accuracy=0.375000`, `test_value_loss=0.111235`, and `train_value_loss=0.258013457` to both `0001/learn.log` and top-level `summary-learn.log`.
+  - WSL CUDA smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --test-teacher shuffled-001.hcpe --test-positions 8 --test-batch-size 4 --train-steps 1 --batch-size 1` wrote `test_value_accuracy=0.375000`, `test_value_loss=0.111235`, and `train_value_loss=0.258013457` to both `0001/learn.log` and top-level `summary-learn.csv`.
 
 ### BO-CUDA-011
 
 - Removed the SFNN child trainer's final-checkpoint-only restriction. `--sfnn-teacher-train` now uses the same `--save-rate * --batches-per-superbatch` interval rule as the NNUE bridge path.
-- Periodic SFNN checkpoint writes include `nn.bin`, root `state.bin`, `teacher.txt`, `dataloader_pos.txt`, checkpoint-local `learn.log`, and top-level `summary-learn.log`; validation metrics are computed per saved checkpoint when `--test-teacher` is present.
+- Periodic SFNN checkpoint writes include `nn.bin`, root `state.bin`, `teacher.txt`, `dataloader_pos.txt`, checkpoint-local `learn.log`, and top-level `summary-learn.csv`; validation metrics are computed per saved checkpoint when `--test-teacher` is present.
 - The BulletOu wrapper now forwards SFNN `--save-rate` unchanged and accepts bounded non-plateau production schedule mode (`--superbatches N --max-epochs N`). Plateau scheduling is enabled by BO-CUDA-013.
 - Validation:
   - `cargo test --example bulletou cuda_oxide_backend -- --nocapture`.
   - `cargo check -p bulletou-cuda-train` from the nested `cuda-oxide` workspace.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - `cargo check --example bulletou`.
-  - WSL CUDA periodic smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 2 --batches-per-superbatch 1 --batch-size 1 --save-rate 1 --test-positions 4` wrote both `0001` and `0002`, with `dataloader_pos.txt = 38,0` then `76,0`; `summary-learn.log` had two SFNN rows with train losses `0.258013457` and `0.241245091`.
+  - WSL CUDA periodic smoke on `shuffled-001.hcpe`: `--sfnn-teacher-train --train-steps 2 --batches-per-superbatch 1 --batch-size 1 --save-rate 1 --test-positions 4` wrote both `0001` and `0002`, with `dataloader_pos.txt = 38,0` then `76,0`; `summary-learn.csv` had two SFNN rows with train losses `0.258013457` and `0.241245091`.
   - WSL CUDA wrapper smoke through `examples/bulletou --backend cuda-oxide --eval-type SFNN_HALFKA2 --arch SFNN_halfka2_1024_7_64_k3k3 --superbatches 1 --max-epochs 1 --positions-per-superbatch 1 --batch-size 1 --save-rate 1` launched the nested child in production schedule mode with `--superbatches-per-epoch 1` and wrote checkpoint `0001`.
 
 ### BO-CUDA-012
@@ -269,7 +269,7 @@ current cuda-cpp follow-up queue.
   - WSL: `cargo check -p bulletou-cuda-train --features cuda,root-loader`.
   - Export smoke: `shuffled-001.hcpe` -> `target/tatara-parity/teacher-128.psv` and `yamaoka-floodgate.hcpe` -> `target/tatara-parity/yamaoka-128.psv`, both `128 * 40 = 5120` bytes.
   - WSL CUDA NNUE smoke on the exported PSV teacher/test slice loaded `32` PSV validation positions and completed one training batch (`step1_loss mean=0.09178529`).
-  - WSL CUDA NNUE checkpoint smoke with `--save-rate 1` wrote `summary-learn.log` from the PSV validation slice with `test_value_accuracy=0.468750` and `test_value_loss=0.118148`.
+  - WSL CUDA NNUE checkpoint smoke with `--save-rate 1` wrote `summary-learn.csv` from the PSV validation slice with `test_value_accuracy=0.468750` and `test_value_loss=0.118148`.
 
 ### BO-CUDA-018
 
@@ -418,7 +418,7 @@ current cuda-cpp follow-up queue.
 - Same-PSV BulletOu cuda-oxide run:
   - speed smoke: `262144` positions in `0.234s`, `1120522 pos/s`;
   - checkpoint-time validation: `accuracy=50.6470% (4149/8192; pred>=0 0 pred<0 8192 zero 0)`, `loss=0.070590`;
-  - `summary-learn.log`: `test_value_accuracy=0.506470`, `test_value_loss=0.070590`, `train_value_loss=0.100704312`.
+  - `summary-learn.csv`: `test_value_accuracy=0.506470`, `test_value_loss=0.070590`, `train_value_loss=0.100704312`.
 - YaneuraOu quantized cross-check on the same BulletOu checkpoint:
   - `./YaneuraOu-by-gcc EvalDir <bulletou-metrics/0001> , test eval_accuracy <test-8192.psv> , quit`;
   - result: `accuracy=50.6470% (4149/8192)`, `drawn=0`, `skipped=0`.
@@ -442,7 +442,7 @@ current cuda-cpp follow-up queue.
   - on this longer clean run, BulletOu is roughly `53%` of tatara's mean per-superbatch training throughput (`592156 / 1116150.3`), so standard NNUE cuda-oxide training still trails tatara materially after the async loader and loss-kernel fixes.
 - Same-PSV BulletOu checkpoint/validation run:
   - checkpoint-time validation: `accuracy=65.0635% (5330/8192; pred>=0 4139 pred<0 4053 zero 0)`, `loss=0.055417`;
-  - `summary-learn.log`: `test_value_accuracy=0.650635`, `test_value_loss=0.055417`, `train_value_loss=0.061433263`;
+  - `summary-learn.csv`: `test_value_accuracy=0.650635`, `test_value_loss=0.055417`, `train_value_loss=0.061433263`;
   - metrics-run throughput (`82659` pos/s) is intentionally not used for speed comparison because it includes checkpoint serialization and validation overhead.
 
 ### BO-CUDA-027
@@ -751,16 +751,16 @@ current cuda-cpp follow-up queue.
   - unprofiled 100-step release smoke after vectorized update reported `throughput=897088 pos/s` for `--cuda-cpp-train-steps 100 --batch-size 4096 --buffer-mb 128 --threads 8 --output target\cuda-cpp-vec4-100`.
   - after moving L0 bias backward off atomics, `cargo run -p bulletou-cuda-cpp --bin bulletou-cuda-cpp-smoke` passed, `cargo test -p bulletou-cuda-cpp --lib persistent_device_api_smoke -- --ignored --nocapture` passed, and the unprofiled 100-step release smoke reported `throughput=910234 pos/s`.
   - Added direct-mode numbered checkpoint/log emission alongside the temporary `cuda-cpp-direct` folder:
-    `--backend cuda-cpp --eval-type NNUE_HALFKP --cuda-cpp-train-steps 1 --batch-size 64 --output target\cuda-cpp-numbered-halfkp-smoke` wrote `0001/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}`, top-level `summary-learn.log`, and `tag.txt`; `learn.log` / `summary-learn.log` used the production CSV schemas and `dataloader_pos.txt` was `2432,0`.
+    `--backend cuda-cpp --eval-type NNUE_HALFKP --cuda-cpp-train-steps 1 --batch-size 64 --output target\cuda-cpp-numbered-halfkp-smoke` wrote `0001/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}`, top-level `summary-learn.csv`, and `tag.txt`; `learn.log` / `summary-learn.csv` used the production CSV schemas and `dataloader_pos.txt` was `2432,0`.
 - Added direct-mode auto-resume from numbered checkpoints:
   - `--backend cuda-cpp` now participates in the normal `resume-config.txt` compatibility check, accepts `--resume` / `--no-resume`, and auto-loads the latest numbered `state.bin` when the output directory is compatible;
   - the direct path resumes both weights and Ranger optimizer state, restores the completed optimizer-step counter, and passes the latest `dataloader_pos.txt` into the shared teacher batch loader;
   - if `--resume` is forced while the teacher spec differs from the latest checkpoint, weights/optimizer state still resume but the dataloader starts from the new teacher's beginning, matching the normal BulletOu resume rule;
   - fixed-record PSV teacher batches now map `TeacherDataloaderPos.byte_offset` back to a batch index for both HalfKP and SFNN, while rejecting nonzero plies, record-misaligned offsets, and batch-misaligned offsets;
-  - direct `learn.log` / `summary-learn.log` rows now keep `positions` cumulative across resumed direct runs.
+  - direct `learn.log` / `summary-learn.csv` rows now keep `positions` cumulative across resumed direct runs.
 - Added HalfKP final validation for the Windows-native direct path:
   - root `bulletou` now accepts `--test-teacher` for `--backend cuda-cpp --eval-type NNUE_HALFKP`;
-  - validation folds factorized L0 virtual rows into normal HalfKP rows, runs the existing CPU fast NNUE validator, and writes `test_value_accuracy` / `test_value_loss` into numbered `learn.log` and `summary-learn.log`;
+  - validation folds factorized L0 virtual rows into normal HalfKP rows, runs the existing CPU fast NNUE validator, and writes `test_value_accuracy` / `test_value_loss` into numbered `learn.log` and `summary-learn.csv`;
   - benchmark and smoke validation use only `C:\shogi\teacher\test\yamaoka-floodgate.psv` as the held-out set.
 - Validation for direct auto-resume:
   - `cargo check --features cuda-cpp-backend --example bulletou` passed;
@@ -844,7 +844,7 @@ current cuda-cpp follow-up queue.
   - the final C++ direct validation reads the trained weights back, folds optional `l1fw/l1fb` into the stacked L1 weights/biases for the CPU fast SFNN forward, evaluates the cached yamaoka positions, and prints `test_value_accuracy` / `test_value_loss`;
   - root `--backend cuda-oxide` now forwards `--test-sample` to the child trainer so the same CLI spelling works across both experimental backends.
 - Added the same direct-mode numbered checkpoint/log emission to SFNN C++ direct:
-  - after training, the backend still writes the temporary `<output>/cuda-cpp-direct/{nn.bin,weights.bin}` compatibility folder, and now also writes the production-shaped `<output>/<NNNN>/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}` plus top-level `summary-learn.log`;
+  - after training, the backend still writes the temporary `<output>/cuda-cpp-direct/{nn.bin,weights.bin}` compatibility folder, and now also writes the production-shaped `<output>/<NNNN>/{nn.bin,state.bin,teacher.txt,dataloader_pos.txt,learn.log}` plus top-level `summary-learn.csv`;
   - direct `learn.log` is a one-row production CSV for the completed direct run, with final validation metrics populated when `--test-teacher` is present.
 - Added SFNN direct auto-resume through the same numbered-checkpoint path as HalfKP:
   - compatible `--backend cuda-cpp --eval-type SFNN_HALFKA2` runs now load the latest numbered `state.bin` automatically, restore optional factorized-L1 weights and Ranger state, and continue the optimizer-step counter;
@@ -944,7 +944,7 @@ current cuda-cpp follow-up queue.
   - the warmup does not update trainable weights or optimizer state, and it avoids reading sparse feature indices, so it is safe before the first real teacher batch upload.
 - Adopted direct-mode benchmark timing cleanup:
   - explicit `--cuda-cpp-train-steps` direct mode now defers its final numbered checkpoint and final validation until after `cuda-cpp direct train = ok` has measured elapsed training time;
-  - numbered checkpoints, `summary-learn.log`, validation metrics, and the compatibility `cuda-cpp-direct/{nn.bin,weights.bin}` folder are still written.
+  - numbered checkpoints, `summary-learn.csv`, validation metrics, and the compatibility `cuda-cpp-direct/{nn.bin,weights.bin}` folder are still written.
 - Adopted HalfKP CPU/GPU teacher-prepare overlap:
   - `HalfkpTeacherBatchConfig` now has `queue_depth`;
   - when `queue_depth > 1` and `profile_prepare=false`, a producer thread materializes `FastBatchHost` batches into a bounded queue while the caller consumes the previous batch on the GPU;

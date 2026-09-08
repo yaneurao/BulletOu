@@ -75,7 +75,7 @@ When validation is enabled, BulletOu prints lines like:
 
 `validation_rate` / `--validation-rate` controls accuracy / loss measurement.
 
-`summary-learn.log` still gets one row per sb. For sb where ordinary
+`summary-learn.csv` still gets one row per sb. For sb where ordinary
 validation is not run, `test_value_accuracy` / `test_value_loss` are `-`.
 
 For example, to save only at epoch end but validate every sb:
@@ -108,7 +108,7 @@ To also watch accuracy / loss after quantizing like `nn.bin`, use `--quantized-v
 }
 ```
 
-For sb where quantized validation is not run, `summary-learn.log` writes
+For sb where quantized validation is not run, `summary-learn.csv` writes
 `quantized_value_accuracy` / `quantized_value_loss` as `-`.
 
 Quantized validation is heavier, so start with only `--test-teacher` and `--validation-rate`. For details, see [Advanced: Validate a quantized `nn.bin`](../advanced/quantized-nn-bin.md).
@@ -135,11 +135,11 @@ A new run creates the file at startup with just the header line `metric`. Each c
 
 `lr` is the LR at the start of sb 1; `lr-min` is the LR actually used at the end of the final sb, not necessarily the configured lower bound. `sb` is the final sb number (the number of sb in that epoch). `bpu` is the `batches_per_update` used in the final sb, including when this setting changed during the epoch.
 
-If this CSV is missing when resuming, it is reconstructed from `summary-learn.log` and the recorded training settings. Incomplete epochs and results rolled back on resume are excluded. If the latest epoch cannot be confirmed complete, it is omitted.
+If this CSV is missing when resuming, it is reconstructed from `summary-learn.csv` and the recorded training settings. Incomplete epochs and results rolled back on resume are excluded. If the latest epoch cannot be confirmed complete, it is omitted.
 
 The four validation metrics come from the final sb, not the best or average metrics of that epoch. Unmeasured metrics are blank. `lr` is also blank if sb 1 is missing, and historical `bpu` values without a record are blank. Neither is inferred from the current settings.
 
-`batches_per_update` is also recorded immediately before `checkpoint` in `summary-learn.log`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
+`batches_per_update` is also recorded immediately before `checkpoint` in `summary-learn.csv`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
 
 ---
 
