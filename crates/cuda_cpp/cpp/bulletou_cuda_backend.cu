@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cfloat>
 #include <climits>
 #include <cstddef>
 #include <cstdint>
@@ -326,6 +327,14 @@ __global__ void scale_axis_rows_f32_kernel(size_t len, size_t row_len, const flo
     values[idx] *= row_scales[idx / row_len];
 }
 
+__device__ __forceinline__ float clip_updated_weight(float weight, float min_weight, float max_weight) {
+    // Disabled means no clamp, including no fminf/fmaxf conversion of NaN/Inf.
+    if (min_weight == -FLT_MAX && max_weight == FLT_MAX) {
+        return weight;
+    }
+    return fminf(fmaxf(weight, min_weight), max_weight);
+}
+
 __device__ __forceinline__ void radam_update_one(
     float grad,
     float learning_rate,
@@ -350,7 +359,7 @@ __device__ __forceinline__ void radam_update_one(
         update /= sqrtf(v) + epsilon;
     }
     w -= rate * update;
-    w = fminf(fmaxf(w, min_weight), max_weight);
+    w = clip_updated_weight(w, min_weight, max_weight);
 
     *weight = w;
     *momentum = m;
@@ -480,18 +489,21 @@ __global__ void radam_update_reset_gradients_vec4_kernel(
     reinterpret_cast<float4*>(velocity)[idx] = velocity4;
 }
 
-__global__ void ranger_lookahead_kernel(float* weights, float* slow_params, size_t len, float alpha) {
+__global__ void ranger_lookahead_kernel(
+    float* weights, float* slow_params, size_t len, float alpha, float min_weight, float max_weight) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
 
-    float next = alpha * weights[idx] + (1.0f - alpha) * slow_params[idx];
+    float next = clip_updated_weight(
+        alpha * weights[idx] + (1.0f - alpha) * slow_params[idx], min_weight, max_weight);
     weights[idx] = next;
     slow_params[idx] = next;
 }
 
-__global__ void ranger_lookahead_vec4_kernel(float* weights, float* slow_params, size_t len4, float alpha) {
+__global__ void ranger_lookahead_vec4_kernel(
+    float* weights, float* slow_params, size_t len4, float alpha, float min_weight, float max_weight) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= len4) {
         return;
@@ -499,10 +511,10 @@ __global__ void ranger_lookahead_vec4_kernel(float* weights, float* slow_params,
 
     float4 weight4 = reinterpret_cast<const float4*>(weights)[idx];
     const float4 slow4 = reinterpret_cast<const float4*>(slow_params)[idx];
-    weight4.x = alpha * weight4.x + (1.0f - alpha) * slow4.x;
-    weight4.y = alpha * weight4.y + (1.0f - alpha) * slow4.y;
-    weight4.z = alpha * weight4.z + (1.0f - alpha) * slow4.z;
-    weight4.w = alpha * weight4.w + (1.0f - alpha) * slow4.w;
+    weight4.x = clip_updated_weight(alpha * weight4.x + (1.0f - alpha) * slow4.x, min_weight, max_weight);
+    weight4.y = clip_updated_weight(alpha * weight4.y + (1.0f - alpha) * slow4.y, min_weight, max_weight);
+    weight4.z = clip_updated_weight(alpha * weight4.z + (1.0f - alpha) * slow4.z, min_weight, max_weight);
+    weight4.w = clip_updated_weight(alpha * weight4.w + (1.0f - alpha) * slow4.w, min_weight, max_weight);
     reinterpret_cast<float4*>(weights)[idx] = weight4;
     reinterpret_cast<float4*>(slow_params)[idx] = weight4;
 }
@@ -715,7 +727,9 @@ __global__ void ranger_lookahead_stacked_dirty_kernel(
     size_t len,
     float* weights,
     float* slow_params,
-    float alpha) {
+    float alpha,
+    float min_weight,
+    float max_weight) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride;
     if (tid >= total) {
@@ -733,7 +747,8 @@ __global__ void ranger_lookahead_stacked_dirty_kernel(
         return;
     }
 
-    float next = alpha * weights[idx] + (1.0f - alpha) * slow_params[idx];
+    float next = clip_updated_weight(
+        alpha * weights[idx] + (1.0f - alpha) * slow_params[idx], min_weight, max_weight);
     weights[idx] = next;
     slow_params[idx] = next;
 }
@@ -745,7 +760,9 @@ __global__ void ranger_lookahead_stacked_dirty_vec4_kernel(
     size_t len4,
     float* weights,
     float* slow_params,
-    float alpha) {
+    float alpha,
+    float min_weight,
+    float max_weight) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride4;
     if (tid >= total) {
@@ -765,10 +782,10 @@ __global__ void ranger_lookahead_stacked_dirty_vec4_kernel(
 
     float4 weight4 = reinterpret_cast<const float4*>(weights)[idx];
     const float4 slow4 = reinterpret_cast<const float4*>(slow_params)[idx];
-    weight4.x = alpha * weight4.x + (1.0f - alpha) * slow4.x;
-    weight4.y = alpha * weight4.y + (1.0f - alpha) * slow4.y;
-    weight4.z = alpha * weight4.z + (1.0f - alpha) * slow4.z;
-    weight4.w = alpha * weight4.w + (1.0f - alpha) * slow4.w;
+    weight4.x = clip_updated_weight(alpha * weight4.x + (1.0f - alpha) * slow4.x, min_weight, max_weight);
+    weight4.y = clip_updated_weight(alpha * weight4.y + (1.0f - alpha) * slow4.y, min_weight, max_weight);
+    weight4.z = clip_updated_weight(alpha * weight4.z + (1.0f - alpha) * slow4.z, min_weight, max_weight);
+    weight4.w = clip_updated_weight(alpha * weight4.w + (1.0f - alpha) * slow4.w, min_weight, max_weight);
     reinterpret_cast<float4*>(weights)[idx] = weight4;
     reinterpret_cast<float4*>(slow_params)[idx] = weight4;
 }
@@ -7840,12 +7857,13 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     if (do_lookahead != 0) {
         if (use_vec4) {
             ranger_lookahead_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                weights->ptr, slow_params->ptr, len / 4, lookahead_alpha);
+                weights->ptr, slow_params->ptr, len / 4, lookahead_alpha, min_weight, max_weight);
             if (check_kernel_launch("ranger_lookahead_vec4_kernel launch") != 0) {
                 return -1;
             }
         } else {
-            ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(weights->ptr, slow_params->ptr, len, lookahead_alpha);
+            ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                weights->ptr, slow_params->ptr, len, lookahead_alpha, min_weight, max_weight);
             if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
                 return -1;
             }
@@ -7986,7 +8004,9 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
                 effective_len,
                 weights->ptr,
                 slow_params->ptr,
-                lookahead_alpha);
+                lookahead_alpha,
+                min_weight,
+                max_weight);
             if (check_kernel_launch("ranger_lookahead_stacked_dirty_vec4_kernel launch") != 0) {
                 return -1;
             }
@@ -7998,7 +8018,9 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
                 len,
                 weights->ptr,
                 slow_params->ptr,
-                lookahead_alpha);
+                lookahead_alpha,
+                min_weight,
+                max_weight);
             if (check_kernel_launch("ranger_lookahead_stacked_dirty_kernel launch") != 0) {
                 return -1;
             }
@@ -10642,7 +10664,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_host(
         }
 
         if (do_lookahead != 0) {
-            ranger_lookahead_kernel<<<blocks, threads>>>(dw.ptr, dslow.ptr, len, lookahead_alpha);
+            ranger_lookahead_kernel<<<blocks, threads>>>(
+                dw.ptr, dslow.ptr, len, lookahead_alpha, min_weight, max_weight);
             if (sync_after_kernel("ranger_lookahead_kernel launch", "ranger_lookahead_kernel sync") != 0) {
                 return -1;
             }

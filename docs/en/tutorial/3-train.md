@@ -188,6 +188,8 @@ Next: [4. Enable validation](4-validation.md)
 
 HalfKA2 / HalfKP FT (first-layer) weight sharing is enabled by default. Disable it with `"no_ft_factorize": true` in JSON or `--no-ft-factorize` on the CLI. This is separate from `"sfnn_factorizer": "none"`, which disables L1 sharing. L2/L3 do not use sharing. Resume with the same FT setting as the saved checkpoint. See [FT versus L1 sharing and examples](../advanced/sfnn-factorizer.md).
 
+Weight clipping is disabled by default. Use `--optimizer-weight-clip N` (JSON: `"optimizer_weight_clip": N`) to set a limit. See [what this controls and its limitations](../advanced/tuning.md#weight-clipping-during-training).
+
 For tuning and comparison experiments, see the [Advanced guide](../advanced/).
 
 Previous: [2. Prepare training data](2-data.md)

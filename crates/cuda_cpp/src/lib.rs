@@ -8343,6 +8343,7 @@ pub struct RAdamUpdateParams {
     pub beta2: f32,
     pub n_sma_threshold: f32,
     pub epsilon: f32,
+    /// Use f32::MIN and f32::MAX together to disable weight clipping.
     pub min_weight: f32,
     pub max_weight: f32,
 }
@@ -8358,8 +8359,8 @@ impl Default for RAdamUpdateParams {
             beta2: 0.999,
             n_sma_threshold: 5.0,
             epsilon: 0.00000001,
-            min_weight: -1.98,
-            max_weight: 1.98,
+            min_weight: f32::MIN,
+            max_weight: f32::MAX,
         }
     }
 }
@@ -9511,6 +9512,124 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ranger_default_disables_weight_clipping() {
+        let params = RangerUpdateParams::default();
+        params.validate().unwrap();
+        assert_eq!((params.radam.min_weight, params.radam.max_weight), (f32::MIN, f32::MAX));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn ranger_optional_weight_clip_covers_lookahead_and_dirty_updates() {
+        let ctx = Context::new(0).unwrap();
+        // Stride 3 exercises scalar kernels; stride 4 exercises vector kernels.
+        for stride in [3, 4] {
+            let len = stride * 2;
+            let weights: Vec<f32> = (0..len).map(|i| if i % 2 == 0 { -3.0 } else { 3.0 }).collect();
+            let gradients: Vec<f32> = weights.iter().map(|w| -w.signum() * 0.5).collect();
+            let slow: Vec<f32> = weights.iter().map(|w| w.signum() * 8.0).collect();
+            for step in [1, 6] {
+                for clip in [None, Some(0.5_f32), Some(1.98_f32)] {
+                    let limit = clip.unwrap_or(f32::MAX);
+                    let params = RangerUpdateParams {
+                        radam: RAdamUpdateParams {
+                            step,
+                            learning_rate: 0.01,
+                            min_weight: -limit,
+                            max_weight: limit,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut expected_w = weights.clone();
+                    let mut expected_g = gradients.clone();
+                    let mut expected_m = vec![0.0; len];
+                    let mut expected_v = vec![0.0; len];
+                    let mut expected_slow = slow.clone();
+                    ranger_update_host(
+                        0,
+                        params,
+                        RangerStateMut {
+                            gradients: &mut expected_g,
+                            weights: &mut expected_w,
+                            momentum: &mut expected_m,
+                            velocity: &mut expected_v,
+                            slow_params: &mut expected_slow,
+                        },
+                    )
+                    .unwrap();
+                    for w in &expected_w {
+                        if let Some(clip) = clip {
+                            assert_eq!(w.abs(), clip, "step={step}, clip={clip}");
+                        } else {
+                            assert!(w.abs() > 3.0, "disabled clipping must preserve updates beyond 1.98");
+                        }
+                    }
+                    if step == 6 {
+                        assert_eq!(expected_slow, expected_w);
+                    }
+                    for dirty in [false, true] {
+                        let w = F32Buffer::from_host(&ctx, &weights).unwrap();
+                        let g = F32Buffer::from_host(&ctx, &gradients).unwrap();
+                        let m = F32Buffer::from_host(&ctx, &vec![0.0; len]).unwrap();
+                        let v = F32Buffer::from_host(&ctx, &vec![0.0; len]).unwrap();
+                        let s = F32Buffer::from_host(&ctx, &slow).unwrap();
+                        if dirty {
+                            let buckets = I32Buffer::from_host(&ctx, &[1]).unwrap();
+                            ranger_update_stacked_dirty_device(
+                                &ctx,
+                                params,
+                                RangerStackedDirtyDeviceStateMut {
+                                    weights: &w,
+                                    gradients: &g,
+                                    momentum: &m,
+                                    velocity: &v,
+                                    slow_params: &s,
+                                    dirty_buckets: &buckets,
+                                    dirty_count: 1,
+                                    stride,
+                                },
+                            )
+                            .unwrap();
+                        } else {
+                            ranger_update_device(
+                                &ctx,
+                                params,
+                                RangerDeviceStateMut {
+                                    weights: &w,
+                                    gradients: &g,
+                                    momentum: &m,
+                                    velocity: &v,
+                                    slow_params: &s,
+                                },
+                            )
+                            .unwrap();
+                        }
+                        let actual_w = w.download(&ctx).unwrap();
+                        let actual_s = s.download(&ctx).unwrap();
+                        for i in 0..len {
+                            let (expected, expected_s) = if dirty && i < stride {
+                                (weights[i], slow[i])
+                            } else {
+                                (expected_w[i], expected_slow[i])
+                            };
+                            assert!((actual_w[i] - expected).abs() < 1e-6);
+                            assert!((actual_s[i] - expected_s).abs() < 1e-6);
+                        }
+                        // Clipping weights must not discard the computed moments.
+                        let actual_m = m.download(&ctx).unwrap();
+                        let actual_v = v.download(&ctx).unwrap();
+                        for i in (if dirty { stride } else { 0 })..len {
+                            assert!((actual_m[i] - expected_m[i]).abs() < 1e-6);
+                            assert!((actual_v[i] - expected_v[i]).abs() < 1e-6);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn radam_step_scale_matches_reference_points() {

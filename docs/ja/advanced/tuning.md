@@ -102,7 +102,24 @@
 | `--sfnn-saturation-threshold` | 飽和ペナルティをかけ始めるi8量子化値 | 127.0 |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
+| `--optimizer-weight-clip` | 更新後の各重み・biasを `[-N, +N]` に制限する。`0` は制限なし | 0.0（無効） |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizerの詳細パラメータ | 省略 |
+
+### 学習中の重み制限
+
+重み制限はデフォルトで無効です。有効にする場合は、たとえば `--optimizer-weight-clip 1.98` を指定すると、optimizerで更新した各重み・biasを `-1.98` から `+1.98` に収めます。`--optimizer-weight-clip 0` または省略で無効です。値は有限の非負数を指定してください。
+
+`bulletou-settings.json` では、次の項目を追加します。
+
+```json
+"optimizer_weight_clip": 1.98
+```
+
+対象はFT・L1・L2・L3などの更新対象の重みとbiasで、L1のfactorizer成分も含みます。RangerのLookahead更新後もこの範囲に収めます。固定した層やdirty-bucket更新で更新しないbucketは変更しません。factorizerを足し合わせた後の値への制限ではありません。
+
+これは**勾配そのものの制限ではなく、更新後の重みを切り詰める処理**です。無効にすると上限・下限で更新が止まることはなくなりますが、必ず精度が上がるわけではありません。活性化関数のCReLU、`nn.bin`への量子化時の丸め・整数範囲への飽和処理、`--sfnn-saturation-penalty` は別の処理で、この設定では変わりません。
+
+通常学習・worker経由の学習ともに適用され、起動ログに `optimizer weight clip = off` または指定範囲が出ます。再開時も今回指定した値を使うため、制限したい場合は再開コマンドや設定ファイルにも明示してください。制限の設定を変えて同じ保存先から再開する場合は `--resume` を付けます。新しい実行ファイルを起動するまでは、実行中の学習の動作は変わりません。
 
 ## 3. 学習率schedule
 

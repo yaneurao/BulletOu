@@ -102,7 +102,24 @@ Fuller option table:
 | `--sfnn-saturation-threshold` | Quantized i8 value where the saturation penalty starts | 127.0 |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
+| `--optimizer-weight-clip` | Limit each updated weight and bias to `[-N, +N]`; `0` disables clipping | 0.0 (off) |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients | omitted |
+
+### Weight clipping during training
+
+Weight clipping is disabled by default. For example, `--optimizer-weight-clip 1.98` keeps each updated weight and bias between `-1.98` and `+1.98`. Omit the option or pass `--optimizer-weight-clip 0` to disable it. The value must be finite and non-negative.
+
+In `bulletou-settings.json`, add:
+
+```json
+"optimizer_weight_clip": 1.98
+```
+
+This applies to updated weights and biases in FT, L1, L2, L3, and the L1 factorizer components, including after Ranger's Lookahead update. Frozen layers and untouched buckets in dirty-bucket updates remain unchanged. It does not constrain the sum of factorizer components.
+
+This clips **weights after updating them, not the gradients themselves**. Disabling it lets updates move past the limits, but does not guarantee better accuracy. CReLU activation limits, rounding and integer saturation during `nn.bin` export, and `--sfnn-saturation-penalty` are separate operations and remain unchanged.
+
+The setting applies to both standalone and worker training. Startup logs show `optimizer weight clip = off` or the selected range. Resume uses the value supplied for that run, so specify the limit again in the command or settings file if clipping is wanted. Use `--resume` when changing the clipping setting while continuing from the same output directory. An already-running process is unaffected until you launch the new executable.
 
 ## 3. Learning-rate schedules
 

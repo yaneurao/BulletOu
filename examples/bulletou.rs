@@ -4685,6 +4685,11 @@ struct Args {
     #[arg(long, default_value = "0.0")]
     optimizer_weight_decay: f32,
 
+    /// Clip each updated weight and bias to [-N, +N]. 0 disables clipping.
+    /// This does not change activation or nn.bin quantization limits.
+    #[arg(long, default_value_t = 0.0)]
+    optimizer_weight_clip: f32,
+
     /// Optimizer epsilon override for the selected optimizer. If omitted,
     /// the optimizer's own default is used.
     #[arg(long)]
@@ -5080,6 +5085,9 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if !self.optimizer_weight_clip.is_finite() || self.optimizer_weight_clip < 0.0 {
+            return Err("--optimizer-weight-clip must be finite and non-negative (0 disables clipping)".to_string());
+        }
         if self.count_teacher || self.analyze_score_winrate || self.cuda_cpp_smoke {
             return Ok(());
         }
@@ -5643,6 +5651,14 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     } else {
         resolve_sigmoid_scale(args)?;
     }
+    if args.optimizer_weight_clip == 0.0 {
+        eprintln!("  optimizer weight clip        = off");
+    } else {
+        eprintln!(
+            "  optimizer weight clip        = [-{0}, +{0}] (weights and biases after each update)",
+            args.optimizer_weight_clip
+        );
+    }
     Ok(())
 }
 
@@ -5727,11 +5743,12 @@ fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
     )
 }
 
-const BULLETOU_DEFAULT_RANGER_CLIP: f32 = 1.98;
 #[cfg(feature = "cuda-cpp-backend")]
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
 
-fn ranger_params(args: &Args, clip: f32) -> optimiser::RangerParams {
+fn ranger_params(args: &Args) -> optimiser::RangerParams {
+    // The CUDA backend recognizes the full finite range as clipping disabled.
+    let clip = if args.optimizer_weight_clip == 0.0 { f32::MAX } else { args.optimizer_weight_clip };
     let mut params = optimiser::RangerParams {
         decay: args.optimizer_weight_decay,
         min_weight: -clip,
@@ -10730,7 +10747,7 @@ impl WorkerSfnnSession {
             let is_optimizer_step = seen_steps % batches_per_update == 0;
             let optimizer_step = self.optimizer_steps + optimizer_updates + usize::from(is_optimizer_step);
             let fast = teacher_batch.batch;
-            let ranger = ranger_params(&trial_args, BULLETOU_DEFAULT_RANGER_CLIP);
+            let ranger = ranger_params(&trial_args);
             let step_index = if is_optimizer_step {
                 seen_steps.saturating_sub(batches_per_update)
             } else {
@@ -13254,7 +13271,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
+            let ranger = ranger_params(args);
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
@@ -14043,7 +14060,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         chunk_last_pos = teacher_batch.dataloader_pos;
                         let optimizer_step = snapshot_completed_steps + chunk_seen_steps;
                         let fast = teacher_batch.batch;
-                        let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
+                        let ranger = ranger_params(args);
                         let params = RangerUpdateParams {
                             radam: RAdamUpdateParams {
                                 step: optimizer_step as u64,
@@ -14329,7 +14346,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
+            let ranger = ranger_params(args);
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
@@ -17386,7 +17403,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     chunk_last_pos = teacher_batch.dataloader_pos;
                     let optimizer_step = snapshot_optimizer_steps + chunk_seen_steps;
                     let fast = teacher_batch.batch;
-                    let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
+                    let ranger = ranger_params(args);
                     let params = RangerUpdateParams {
                         radam: RAdamUpdateParams {
                             step: optimizer_step as u64,
@@ -17737,7 +17754,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let is_checkpoint_step = checkpoint_chunk.is_some_and(|chunk| chunk.cumulative_steps == seen_steps);
         let fast = teacher_batch.batch;
         let params = {
-            let ranger = ranger_params(args, BULLETOU_DEFAULT_RANGER_CLIP);
+            let ranger = ranger_params(args);
             let step_index = if is_optimizer_step {
                 seen_steps.saturating_sub(batches_per_update)
             } else {
@@ -24400,6 +24417,7 @@ fn resume_signature(args: &Args) -> String {
         format!("wrm_target_offset={:.9}", effective_wrm_target_params(args).offset),
         format!("wrm_target_scaling={:.9}", effective_wrm_target_params(args).scaling),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
+        format!("optimizer_weight_clip={:.9}", args.optimizer_weight_clip),
         format!(
             "optimizer_epsilon={}",
             args.optimizer_epsilon.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
@@ -24516,6 +24534,15 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     fn line_value(out: &[String], prefix: &str, fallback: &str) -> String {
         out.iter().find_map(|line| line.strip_prefix(prefix)).unwrap_or(fallback).to_string()
     }
+
+    // Checkpoints without this field were trained with the hard-coded 1.98 limit.
+    // Do not mislabel that setting as the new default (disabled).
+    ensure_line_after(
+        &mut out,
+        "optimizer_weight_clip=",
+        "optimizer_weight_decay=",
+        &format!("optimizer_weight_clip={:.9}", 1.98_f32),
+    );
 
     let has_teacher_shuffle_buffer_batches = out.iter().any(|line| line.starts_with("teacher_shuffle_buffer_batches="));
     let has_teacher_shuffle_seed = out.iter().any(|line| line.starts_with("teacher_shuffle_seed="));
@@ -32054,6 +32081,50 @@ mod tests {
     }
 
     #[test]
+    fn optimizer_weight_clip_defaults_off_and_validates_ranges() {
+        let mut args =
+            Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--teacher", "/dev/null"])
+                .unwrap();
+        assert_eq!(args.optimizer_weight_clip, 0.0);
+        assert!(args.validate_arch_flags().is_ok());
+        let params = ranger_params(&args);
+        assert_eq!((params.min_weight, params.max_weight), (f32::MIN, f32::MAX));
+        let off_signature = resume_signature(&args);
+        for limit in [0.5, 1.98, 3.0] {
+            args.optimizer_weight_clip = limit;
+            assert!(args.validate_arch_flags().is_ok());
+            let params = ranger_params(&args);
+            assert_eq!((params.min_weight, params.max_weight), (-limit, limit));
+            assert!(!resume_signature_matches(&off_signature, &args));
+        }
+        args.optimizer_weight_clip = 1.98;
+        let old_signature = resume_signature_without_line(&resume_signature(&args), "optimizer_weight_clip=");
+        assert!(resume_signature_matches(&old_signature, &args));
+        args.optimizer_weight_clip = 0.0;
+        assert!(!resume_signature_matches(&old_signature, &args));
+        for invalid in [-0.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            args.optimizer_weight_clip = invalid;
+            assert!(args.validate_arch_flags().unwrap_err().contains("--optimizer-weight-clip"));
+        }
+    }
+
+    #[test]
+    fn optimizer_weight_clip_json_matches_cli() {
+        let mut json_args: Vec<std::ffi::OsString> = ["bulletou", "--teacher", "/dev/null"].map(Into::into).to_vec();
+        let path = std::path::Path::new("bulletou-settings.json");
+        bulletou_settings_json_value_to_args(path, "optimizer_weight_clip", &serde_json::json!(0.5), &mut json_args)
+            .unwrap();
+        let json = Args::try_parse_from(json_args).unwrap();
+        let cli =
+            Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0.5"]).unwrap();
+        assert_eq!(json.optimizer_weight_clip, 0.5);
+        assert_eq!(json.optimizer_weight_clip, cli.optimizer_weight_clip);
+        let disabled =
+            Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0"]).unwrap();
+        assert_eq!(ranger_params(&disabled).max_weight, f32::MAX);
+    }
+
+    #[test]
     fn optimizer_flags_feed_params_and_resume_signature() {
         use clap::Parser as _;
 
@@ -32071,20 +32142,24 @@ mod tests {
             "0.85",
             "--optimizer-beta2",
             "0.995",
+            "--optimizer-weight-clip",
+            "0.5",
         ])
         .unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
 
-        let ranger = ranger_params(&args, BULLETOU_DEFAULT_RANGER_CLIP);
+        let ranger = ranger_params(&args);
         assert_eq!(ranger.decay, 0.0);
         assert_eq!(ranger.epsilon, 0.0000001);
         assert_eq!(ranger.beta1, 0.85);
         assert_eq!(ranger.beta2, 0.995);
+        assert_eq!((ranger.min_weight, ranger.max_weight), (-0.5, 0.5));
 
         let sig = resume_signature(&args);
         assert!(sig.contains("optimizer=ranger"));
         assert!(sig.contains("optimizer_weight_decay=0.000000000"));
+        assert!(sig.contains("optimizer_weight_clip=0.500000000"));
         assert!(sig.contains("optimizer_epsilon=0.000000100"));
         assert!(sig.contains("optimizer_beta1=0.850000024"));
         assert!(sig.contains("optimizer_beta2=0.995000005"));
@@ -32297,7 +32372,7 @@ mod tests {
             Args::try_parse_from(["bulletou", "--arch", "NNUE_halfkp_256x2_32_32", "--teacher", "/dev/null"]).unwrap();
 
         assert_eq!(args.optimizer, OptimizerKind::Ranger);
-        let ranger = ranger_params(&args, BULLETOU_DEFAULT_RANGER_CLIP);
+        let ranger = ranger_params(&args);
         assert_eq!(ranger.beta1, 0.99);
         assert_eq!(ranger.beta2, 0.999);
     }
