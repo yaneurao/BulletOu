@@ -3453,7 +3453,8 @@ const DEFAULT_SAVE_RATE: usize = 20;
 const DEFAULT_SIGMOID_SCALE: f32 = 600.0;
 const DEFAULT_FV_SCALE: f32 = 24.0;
 const DEFAULT_NNUE_RAW_OUTPUT_SCALE: f32 = 127.0 * 64.0;
-const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 0.5;
+const DEFAULT_SFNN_INIT_HALF_WIDTH: f32 = 0.01;
+const DEFAULT_SFNN_INIT_L2_L3_SCALE: f32 = 1.0;
 const DEFAULT_SFNN_RESIDUAL_COUNT_DECAY: f32 = 1.0e-7;
 const DEFAULT_SFNN_COUNT_CONFIDENCE: f32 = 0.0;
 const DEFAULT_SFNN_RESIDUAL_COUNT_GATE_CONFIDENCE: f32 = 1.0;
@@ -4818,10 +4819,9 @@ struct Args {
     #[arg(long)]
     no_ft_factorize: bool,
 
-    /// Scale multiplier for nnue-pytorch-compatible initialisation used by
-    /// SFNN / LayerStack networks. The actual bound is
-    /// `scale * sqrt(1 / fan_in)`. Values below 1.0 make the initial
-    /// activations smaller and help diagnose early CReLU saturation.
+    /// Initial-weight multiplier for SFNN / LayerStack networks. FT uses
+    /// `scale * sqrt(1 / fan_in)`; bucket-specific L1/L2/L3 use `scale * 0.01`.
+    /// L1 shared weights keep the fixed [-0.01, 0.01] range. Default 1.0.
     #[arg(long, default_value = "1.0")]
     nnue_pytorch_init_scale: f32,
 
@@ -4832,9 +4832,8 @@ struct Args {
     sfnn_init_bias: SfnnInitBiasMode,
 
     /// Extra multiplier applied only to SFNN L2/L3 scratch weights. The
-    /// effective bound is
-    /// `--nnue-pytorch-init-scale * this * sqrt(1 / fan_in)`. Default 0.5
-    /// keeps L2/L3 initial outputs smaller than the plain fan-in rule.
+    /// effective half-width is `0.01 * --nnue-pytorch-init-scale * this`.
+    /// Default 1.0 gives tatara's [-0.01, 0.01] range without other overrides.
     #[arg(long = "sfnn-init-l2-l3-scale", default_value_t = DEFAULT_SFNN_INIT_L2_L3_SCALE)]
     sfnn_init_l2_l3_scale: f32,
 
@@ -16901,12 +16900,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     } else {
-        print_startup_kv_colored("initial weights", "deterministic nnue-pytorch-style scratch", ConsoleColor::Yellow);
+        print_startup_kv_colored("initial weights", "deterministic tatara-style scratch", ConsoleColor::Yellow);
         print_startup_kv(
             "SFNN init",
             format!(
-                "bias={}, l2_scale={:.3}, l3_scale={:.3}, L1 shared=uniform[-0.01,0.01] when enabled",
+                "bias={}, dense=uniform[-0.01,0.01] x scale, bucket weights=independent, init_scale={:.3}, l2_scale={:.3}, l3_scale={:.3}, L1 shared=uniform[-0.01,0.01] when enabled",
                 paint(args.sfnn_init_bias.cli_name(), ConsoleColor::BoldYellow),
+                args.nnue_pytorch_init_scale,
                 effective_sfnn_init_l2_scale(args),
                 effective_sfnn_init_l3_scale(args)
             ),
@@ -20702,28 +20702,20 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l0_bound = init_scale * (1.0 / base_input_size.max(1) as f32).sqrt();
     let l0b = cuda_cpp_sfnn_hidden_bias_init(ft_size, 0x5f11_e002, l0_bound, args.sfnn_init_bias);
 
-    let l1_fan_in = if common_shard_l1 { shape.l1_common_shard_input() } else { ft_size };
-    let l1_bound = init_scale * (1.0 / l1_fan_in.max(1) as f32).sqrt();
-    let l2_bound = init_scale * l2_init_scale * (1.0 / l2_in.max(1) as f32).sqrt();
-    let l3_bound = init_scale * l3_init_scale * (1.0 / l2_size.max(1) as f32).sqrt();
-    let l1w = if common_shard_l1 {
-        cuda_cpp_tatara_stacked_row_major_bucket0_init(
-            shape.l1_common_shard_input(),
-            l1_out,
-            num_stacks,
-            0x5f11_e003,
-            l1_bound,
-        )
-    } else {
-        cuda_cpp_tatara_stacked_row_major_bucket0_init(ft_size, l1_out, num_stacks, 0x5f11_e003, l1_bound)
-    };
+    let l1_bound = init_scale * DEFAULT_SFNN_INIT_HALF_WIDTH;
+    let l2_bound = l1_bound * l2_init_scale;
+    let l3_bound = l1_bound * l3_init_scale;
+    let l1w = cuda_cpp_tatara_uniform_abs_init(cuda_cpp_sfnn_l1w_len_for_shape(shape)?, 0x5f11_e003, l1_bound);
     let l1b = cuda_cpp_sfnn_stacked_hidden_bias_init(l1_out, num_stacks, 0x5f11_e004, l1_bound, args.sfnn_init_bias);
-    let l2w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_in, l2_size, num_stacks, 0x5f11_e005, l2_bound);
+    let l2w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size * l2_in, 0x5f11_e005, l2_bound);
     let l2b = cuda_cpp_sfnn_stacked_hidden_bias_init(l2_size, num_stacks, 0x5f11_e006, l2_bound, args.sfnn_init_bias);
-    let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
+    let l3w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
     let (l1fw, l1fb) = if effective_sfnn_factorized_l1(args) {
-        (Some(cuda_cpp_tatara_uniform_abs_init(ft_size * l1_out, 0x5f11_e009, 0.01)), Some(vec![0.0; l1_out]))
+        (
+            Some(cuda_cpp_tatara_uniform_abs_init(ft_size * l1_out, 0x5f11_e009, DEFAULT_SFNN_INIT_HALF_WIDTH)),
+            Some(vec![0.0; l1_out]),
+        )
     } else {
         (None, None)
     };
@@ -22216,27 +22208,6 @@ fn cuda_cpp_optional_step_pair_present(
         (true, false) => Err(format!("cuda-cpp {label} state has nnue/step_ranger/{weight_id} without {bias_id}")),
         (false, true) => Err(format!("cuda-cpp {label} state has nnue/step_ranger/{bias_id} without {weight_id}")),
     }
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_tatara_stacked_row_major_bucket0_init(
-    input_dim: usize,
-    output_dim: usize,
-    num_stacks: usize,
-    seed: u64,
-    half_width: f32,
-) -> Vec<f32> {
-    let bucket0 = cuda_cpp_tatara_uniform_abs_init(input_dim * output_dim, seed, half_width);
-    let mut weights = vec![0.0; num_stacks * output_dim * input_dim];
-    for stack in 0..num_stacks {
-        let stack_base = stack * output_dim * input_dim;
-        for out_col in 0..output_dim {
-            let src_base = out_col * input_dim;
-            let dst_base = stack_base + out_col * input_dim;
-            weights[dst_base..dst_base + input_dim].copy_from_slice(&bucket0[src_base..src_base + input_dim]);
-        }
-    }
-    weights
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -29996,7 +29967,20 @@ mod tests {
         assert!(weights.l3axb.is_none());
 
         let stack_stride = l1_out * weights.shape.ft_size;
-        assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
+        assert_ne!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
+        for (values, stride, seed) in [
+            (&weights.l1w, stack_stride, 0x5f11_e003),
+            (&weights.l2w, weights.shape.l2_in() * weights.shape.l2_size, 0x5f11_e005),
+            (&weights.l3w, weights.shape.l2_size, 0x5f11_e007),
+        ] {
+            assert!(values.iter().all(|v| v.abs() <= 0.01));
+            assert!(values.iter().any(|&v| v > 0.009));
+            assert!(values.iter().any(|&v| v < -0.009));
+            assert_eq!(values.as_slice(), cuda_cpp_tatara_uniform_abs_init(values.len(), seed, 0.01));
+            for stack in 1..weights.shape.num_stacks {
+                assert_ne!(&values[..stride], &values[stack * stride..(stack + 1) * stride]);
+            }
+        }
         assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
     }
 
@@ -30283,11 +30267,13 @@ mod tests {
         .unwrap();
 
         let weights = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Halfka2).unwrap();
-        let l2_bound = (0.25_f32) * (1.0_f32 / weights.shape.l2_in().max(1) as f32).sqrt();
-        let l3_bound = (0.75_f32) * (1.0_f32 / weights.shape.l2_size.max(1) as f32).sqrt();
+        let l2_bound = 0.25_f32 * 0.01;
+        let l3_bound = 0.75_f32 * 0.01;
         let eps = 1.0e-7_f32;
         assert!(weights.l2w.iter().all(|&v| v.abs() <= l2_bound + eps));
         assert!(weights.l3w.iter().all(|&v| v.abs() <= l3_bound + eps));
+        assert_eq!(weights.l2w, cuda_cpp_tatara_uniform_abs_init(weights.l2w.len(), 0x5f11_e005, l2_bound));
+        assert_eq!(weights.l3w, cuda_cpp_tatara_uniform_abs_init(weights.l3w.len(), 0x5f11_e007, l3_bound));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

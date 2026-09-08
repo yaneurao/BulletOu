@@ -110,7 +110,29 @@ W_effective[hand, king, progress]
 checkpointから再開するときは保存されたL1共通重みを引き継ぎ、再初期化しません。
 
 FTを有効、L1を `shared`（alpha=1）、count補正なしにすれば、tataraのLayerStackと同じ共有構成です。
-ただし、bucket個別重みの初期化やloss・optimizerなどは別の設定なので、学習全体が等価になるという意味ではありません。
+ただし、loss・optimizer・architectureなどは別の設定なので、学習全体が等価になるという意味ではありません。
+
+### 新規学習時の重みとbias
+
+SFNNのデフォルト初期化は、tataraのLayerStackと同じ分布・範囲を使います。
+
+| 対象 | 初期値 |
+|---|---|
+| FTの個別重み | `[-sqrt(1 / 入力特徴数), +sqrt(1 / 入力特徴数)]` の一様乱数 |
+| FTの共通重み | 0 |
+| L1のbucket個別重み・L1共通重み・L2・L3の重み | `[-0.01, +0.01]` の一様乱数 |
+| 全層のbias | 0 |
+
+L1・L2・L3のbucket個別重みは、それぞれ別の乱数を使います。1つのbucketの初期値を全bucketへ複製しません。
+乱数seedは固定なので、同じ設定での新規学習は再現可能です。tataraと乱数列そのものが同一という意味ではありません。
+
+初期値の範囲を変更したい場合は、次の倍率を使えます。すべてデフォルトは `1.0` です。
+
+- `--nnue-pytorch-init-scale`：FT個別重みとL1・L2・L3個別重みの初期範囲をこの倍にします。L1共通重みには掛かりません。
+- `--sfnn-init-l2-l3-scale`：L2・L3だけに追加で掛ける倍率です。半値幅は `0.01 × nnue-pytorch-init-scale × この値` です。
+- `--sfnn-init-l2-scale` / `--sfnn-init-l3-scale`：指定した層では `sfnn-init-l2-l3-scale` の代わりに使います。
+
+これらは新規学習だけに使います。`state.bin` からの再開では保存した重みを使い、初期化し直しません。
 
 ## 4. `axis`
 

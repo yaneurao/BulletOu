@@ -110,7 +110,29 @@ For fresh training, L1 shared weights use uniform `[-0.01, +0.01]` initializatio
 Resuming preserves saved L1 shared weights instead of reinitializing them.
 
 With FT sharing enabled, L1 `shared` at alpha=1, and no count corrections, the sharing structure matches tatara's LayerStack.
-This does not imply equivalent training overall: per-bucket initialization, loss, and optimizer settings can differ.
+This does not imply equivalent training overall: loss, optimizer, and architecture settings can differ.
+
+### Weights and biases for fresh training
+
+SFNN defaults use the same initialization distributions and ranges as tatara's LayerStack.
+
+| Parameter group | Initial values |
+|---|---|
+| Individual FT weights | Uniform `[-sqrt(1 / input_features), +sqrt(1 / input_features)]` |
+| Shared FT weights | Zero |
+| Per-bucket L1 weights, shared L1 weights, L2/L3 weights | Uniform `[-0.01, +0.01]` |
+| All biases | Zero |
+
+Per-bucket L1/L2/L3 weights use different random samples for each bucket, not copies of one bucket's weights.
+Fixed seeds make fresh runs reproducible with the same settings. The actual random sequences are not claimed to match tatara.
+
+Optional range multipliers all default to `1.0`:
+
+- `--nnue-pytorch-init-scale`: scales the initial ranges of individual FT and per-bucket L1/L2/L3 weights, not shared L1 weights.
+- `--sfnn-init-l2-l3-scale`: an additional L2/L3 multiplier. The half-width is `0.01 × nnue-pytorch-init-scale × this value`.
+- `--sfnn-init-l2-scale` / `--sfnn-init-l3-scale`: replaces `sfnn-init-l2-l3-scale` for the specified layer.
+
+These settings apply to fresh training only. Resuming from `state.bin` preserves saved weights without reinitializing them.
 
 ## 4. `axis`
 
