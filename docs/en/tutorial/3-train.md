@@ -186,6 +186,8 @@ For `recommended-parameters.json` and the recommendation formula, see [Advanced:
 
 Next: [4. Enable validation](4-validation.md)
 
+HalfKA2 / HalfKP FT (first-layer) weight sharing is enabled by default. Disable it with `"no_ft_factorize": true` in JSON or `--no-ft-factorize` on the CLI. This is separate from `sfnn_factorizer: "none"`, which disables later-layer sharing. Resume with the same FT setting as the saved checkpoint. See [FT versus later-layer sharing and examples](../advanced/sfnn-factorizer.md).
+
 For tuning and comparison experiments, see the [Advanced guide](../advanced/).
 
 Previous: [2. Prepare training data](2-data.md)

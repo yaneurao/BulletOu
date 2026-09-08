@@ -6,6 +6,44 @@ This page explains `--sfnn-factorizer` for SFNN LayerStack architectures.
 
 You do not need this page for a first training run. Read it when you want to compare architectures with many buckets, such as `hand1024`, `k29k29`, or `progress8`.
 
+## Configure FT sharing separately from later-layer sharing
+
+`SFNN_halfka2` architectures also share weights in the feature transformer (FT), the first layer that turns input features into neuron activations.
+For king position `k` and piece feature `p` (piece type, ownership, square, etc.), each FT neuron's weight is:
+
+```text
+effective_FT_weight[k, p] = individual_weight[k, p] + shared_weight[p]
+```
+
+The shared weight receives gradients from the same piece feature across king positions. Individual weights remain trainable, so king-specific differences can still be learned.
+Shared weights start at zero and are added to the individual weights when exporting `nn.bin`.
+
+FT factorization is enabled by default. `--no-ft-factorize` disables allocation, addition, and updates of the shared FT weights.
+This switch also applies to `NNUE_halfkp` architectures. Inputs without an FT factorizer do not gain shared rows.
+
+`--sfnn-factorizer` controls **sharing in the later L1/L2/L3 layers**, independently of the FT.
+
+| HalfKA2 options | FT sharing | Later-layer sharing |
+|---|---|---|
+| Neither option specified | On | `shared` |
+| `--sfnn-factorizer none` | On | None |
+| `--no-ft-factorize` | Off | `shared` |
+| `--no-ft-factorize --sfnn-factorizer none` | Off | None |
+
+To compare fresh training with all this sharing disabled, add these fields to `bulletou-settings.json`:
+
+```json
+"no_ft_factorize": true,
+"sfnn_factorizer": "none"
+```
+
+To enable FT factorization, omit `no_ft_factorize` or set it to `false`. Startup prints `FT factorizer = on/off`.
+`sfnn_factorizer_alpha` does not scale the shared FT weights.
+
+Loading `state.bin` through `--resume` or `--initial-state` requires the same FT setting as the saved checkpoint.
+Changing ON/OFF changes weight and optimizer-state array sizes and produces an explicit error; there is no automatic conversion.
+A worker session also cannot change its FT ON/OFF setting between trials.
+
 ## 1. What the factorizer does
 
 LayerStack switches the later network by position bucket. For example:

@@ -4817,6 +4817,13 @@ struct Args {
     #[arg(long)]
     arch: Option<TrainArch>,
 
+    /// Disable FT piece-feature factorization for HalfKA2 / HalfKP training.
+    /// Default: enabled for those inputs. Independent of --sfnn-factorizer,
+    /// which controls later LayerStack layers. Checkpoints must use the same
+    /// FT factorization setting when resuming or loading --initial-state.
+    #[arg(long)]
+    no_ft_factorize: bool,
+
     /// Scale multiplier for nnue-pytorch-compatible initialisation used by
     /// SFNN / LayerStack networks. The actual bound is
     /// `scale * sqrt(1 / fan_in)`. Values below 1.0 make the initial
@@ -10172,6 +10179,7 @@ impl WorkerSfnnSession {
         let progress_params = cuda_cpp_sfnn_progress_params_for_state(progress_state.as_ref())?;
         let initial_weights = &initial_state.weights;
         let shape = initial_weights.shape;
+        print_ft_factorizer_status(feature_kind.base_input_size(), shape.input_size);
         let ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
         let upload_ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
         let factorizer_active = cuda_cpp_sfnn_factorizer_active(&args);
@@ -10293,6 +10301,9 @@ impl WorkerSfnnSession {
     }
 
     fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
+        if self.feature_kind.input_size_for_args(args) != self.shape.input_size {
+            return Err("worker FT factorizer setting differs from the opened session; --no-ft-factorize cannot change within a session".to_string());
+        }
         let old_args = self.args.clone();
         let new_count_settings = Self::compute_count_settings(args, self.shape)?;
         if rebase_axis_factorizer {
@@ -10622,6 +10633,9 @@ impl WorkerSfnnSession {
         }
         if trial_args.arch() != self.args.arch() {
             return Err("worker trial arch differs from the opened session".to_string());
+        }
+        if trial_feature.input_size_for_args(&trial_args) != self.shape.input_size {
+            return Err("worker trial --no-ft-factorize differs from the opened session".to_string());
         }
         if trial_args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3) != self.layerstack {
             return Err("worker trial layerstack differs from the opened session".to_string());
@@ -12463,6 +12477,10 @@ impl CudaCppNnueFeatureKind {
         }
     }
 
+    fn input_size_for_args(self, args: &Args) -> usize {
+        if args.no_ft_factorize { self.base_input_size() } else { self.training_input_size() }
+    }
+
     fn virtual_rows(self) -> usize {
         match self {
             Self::Halfkp => bulletou_lib::game::inputs::HALFKP_PIECE_INPUTS,
@@ -12481,8 +12499,9 @@ impl CudaCppNnueFeatureKind {
         }
     }
 
-    fn scratch_init_label(self) -> &'static str {
+    fn scratch_init_label(self, no_ft_factorize: bool) -> &'static str {
         match self {
+            Self::Halfkp if no_ft_factorize => "tatara-simple scratch (FT factorizer off)",
             Self::Halfkp => "tatara-simple factorized scratch",
             Self::Kp => "deterministic NNUE_KP scratch",
             Self::Ka2 => "deterministic NNUE_KA2 scratch",
@@ -12495,6 +12514,63 @@ impl CudaCppNnueFeatureKind {
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_nnue_l0w_len_for_shape(shape: bulletou_lib::value::NnueForwardShape) -> Result<usize, String> {
     shape.input_size.checked_mul(shape.l1).ok_or_else(|| "NNUE l0w length overflow".to_string())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn validate_ft_factorizer_checkpoint(
+    records: &BTreeMap<String, Vec<f32>>,
+    base_inputs: usize,
+    virtual_rows: usize,
+    ft_size: usize,
+    no_ft_factorize: bool,
+) -> Result<(), String> {
+    if virtual_rows == 0 {
+        return Ok(());
+    }
+    let Some(weights) = records.get("l0w") else {
+        return Err("checkpoint is missing FT weights (l0w)".to_string());
+    };
+    let base_len = base_inputs.checked_mul(ft_size).ok_or("FT weight length overflow")?;
+    let factorized_len = base_inputs
+        .checked_add(virtual_rows)
+        .and_then(|n| n.checked_mul(ft_size))
+        .ok_or("factorized FT weight length overflow")?;
+    let stored_enabled = if weights.len() == factorized_len {
+        true
+    } else if weights.len() == base_len {
+        false
+    } else {
+        return Err(format!(
+            "checkpoint FT weight length {} does not match this architecture: expected {base_len} (FT factorizer off) or {factorized_len} (on)",
+            weights.len()
+        ));
+    };
+    if stored_enabled == no_ft_factorize {
+        return Err(format!(
+            "checkpoint FT factorizer is {}, but requested {}; {}. Changing FT factorization when resuming/loading --initial-state is not supported; weights and optimizer state are not converted",
+            if stored_enabled { "on" } else { "off" },
+            if no_ft_factorize { "off" } else { "on" },
+            if stored_enabled {
+                "omit --no-ft-factorize to use this checkpoint"
+            } else {
+                "pass --no-ft-factorize to use this checkpoint"
+            },
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn print_ft_factorizer_status(base_inputs: usize, input_size: usize) {
+    let virtual_rows = input_size.saturating_sub(base_inputs);
+    print_startup_kv(
+        "FT factorizer",
+        if virtual_rows == 0 {
+            "off (no shared piece rows)".to_string()
+        } else {
+            format!("on ({} shared piece rows; independent of --sfnn-factorizer)", format_count(virtual_rows))
+        },
+    );
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -12590,6 +12666,10 @@ impl CudaCppSfnnFeatureKind {
 
     fn training_input_size(self) -> usize {
         self.base_input_size() + self.virtual_rows()
+    }
+
+    fn input_size_for_args(self, args: &Args) -> usize {
+        if args.no_ft_factorize { self.base_input_size() } else { self.training_input_size() }
     }
 
     fn max_active(self) -> usize {
@@ -13778,7 +13858,11 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             ),
         );
     } else {
-        print_startup_kv_colored("initial weights", feature_kind.scratch_init_label(), ConsoleColor::Yellow);
+        print_startup_kv_colored(
+            "initial weights",
+            feature_kind.scratch_init_label(args.no_ft_factorize),
+            ConsoleColor::Yellow,
+        );
     }
     if initial_state.completed_steps > 0 {
         print_startup_kv_colored(
@@ -13790,7 +13874,8 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let input_size = initial_weights.shape.input_size;
     let max_active = feature_kind.max_active();
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
-    if feature_kind.virtual_rows() > 0 {
+    print_ft_factorizer_status(feature_kind.base_input_size(), input_size);
+    if input_size > feature_kind.base_input_size() {
         print_startup_kv(
             "arch",
             format!(
@@ -16892,7 +16977,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::BoldYellow,
         );
     }
-    if feature_kind.virtual_rows() > 0 {
+    print_ft_factorizer_status(feature_kind.base_input_size(), initial_weights.shape.input_size);
+    if initial_weights.shape.input_size > feature_kind.base_input_size() {
         print_startup_kv(
             "arch",
             format!(
@@ -20600,7 +20686,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let num_stacks = layerstack.num_stacks();
     let base_input_size = feature_kind.base_input_size();
-    let input_size = feature_kind.training_input_size();
+    let input_size = feature_kind.input_size_for_args(args);
     let init_scale = args.nnue_pytorch_init_scale;
     let l2_init_scale = effective_sfnn_init_l2_scale(args);
     let l3_init_scale = effective_sfnn_init_l3_scale(args);
@@ -20729,7 +20815,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     let shape = bulletou_cuda_cpp::SfnnForwardShape {
-        input_size: feature_kind.training_input_size(),
+        input_size: feature_kind.input_size_for_args(args),
         ft_size,
         l1_hidden,
         l1_skip: args.arch().sfnn_l1_skip(),
@@ -20745,6 +20831,13 @@ fn load_cuda_cpp_sfnn_initial_state(
         factorizer_king_progress_pair: effective_sfnn_factorizer_spec(args).king_progress_pair,
         factorizer_hand_progress_pair: effective_sfnn_factorizer_spec(args).hand_progress_pair,
     };
+    validate_ft_factorizer_checkpoint(
+        &weights_records,
+        feature_kind.base_input_size(),
+        feature_kind.virtual_rows(),
+        ft_size,
+        args.no_ft_factorize,
+    )?;
     let (mut weights, progress_axis_appended) =
         load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, &weights_records).map_err(|err| {
             format!(
@@ -21837,9 +21930,9 @@ fn load_cuda_cpp_sfnn_weights_from_records(
 ) -> Result<(CudaCppSfnnInitialWeights, bool), String> {
     let base_input_size = feature_kind.base_input_size();
     let factorized_input_size = feature_kind.training_input_size();
-    if shape.input_size != factorized_input_size {
+    if shape.input_size != factorized_input_size && shape.input_size != base_input_size {
         return Err(format!(
-            "internal SFNN {} shape uses input_size={}, expected training input size {}",
+            "internal SFNN {} shape uses input_size={}, expected training input size {} or base input size {base_input_size}",
             feature_kind.source_label(),
             shape.input_size,
             factorized_input_size
@@ -21849,7 +21942,7 @@ fn load_cuda_cpp_sfnn_weights_from_records(
     let mut l0w = load_cuda_cpp_weight_record(records, "l0w")?;
     let expected_factorized_l0w = shape.input_size * shape.ft_size;
     let expected_base_l0w = base_input_size * shape.ft_size;
-    if feature_kind.virtual_rows() > 0 && l0w.len() == expected_base_l0w {
+    if shape.input_size != base_input_size && feature_kind.virtual_rows() > 0 && l0w.len() == expected_base_l0w {
         l0w.resize(expected_factorized_l0w, 0.0);
     } else if l0w.len() != expected_factorized_l0w {
         return Err(format!(
@@ -22470,8 +22563,8 @@ fn build_nnue_initial_weights_for_cuda_cpp(
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
     let base_input_size = feature_kind.base_input_size();
-    let virtual_rows = feature_kind.virtual_rows();
-    let input_size = feature_kind.training_input_size();
+    let input_size = feature_kind.input_size_for_args(args);
+    let virtual_rows = input_size - base_input_size;
     let l1_input_dim = 2 * l1_size;
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
     let l0w_len = cuda_cpp_nnue_l0w_len_for_shape(shape)?;
@@ -22548,8 +22641,15 @@ fn load_cuda_cpp_nnue_initial_state(
     let weights_records = sections.remove("weights").unwrap_or_default();
 
     let (l1_size, l2_size, l3_size) = args.arch().dims();
-    let input_size = feature_kind.training_input_size();
+    let input_size = feature_kind.input_size_for_args(args);
     let shape = FastNnueForwardShape { input_size, l1: l1_size, l2: l2_size, l3: l3_size };
+    validate_ft_factorizer_checkpoint(
+        &weights_records,
+        feature_kind.base_input_size(),
+        feature_kind.virtual_rows(),
+        l1_size,
+        args.no_ft_factorize,
+    )?;
     let weights = load_cuda_cpp_nnue_owned_weights(feature_kind, shape, &weights_records).map_err(|err| {
         format!(
             "failed to load cuda-cpp {} weights from {} for arch {}: {err}",
@@ -24406,6 +24506,7 @@ fn resume_signature(args: &Args) -> String {
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
+        format!("no_ft_factorize={}", args.no_ft_factorize),
         format!("sfnn_init_bias={}", args.sfnn_init_bias.cli_name()),
         format!("sfnn_init_l2_l3_scale={:.9}", args.sfnn_init_l2_l3_scale),
         format!("sfnn_init_l2_scale={:.9}", effective_sfnn_init_l2_scale(args)),
@@ -24566,7 +24667,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "wrm_in_scaling=", "wrm_in_offset=", "wrm_in_scaling=340.000000000");
     ensure_line_after(&mut out, "wrm_target_offset=", "wrm_in_scaling=", "wrm_target_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_target_scaling=", "wrm_target_offset=", "wrm_target_scaling=380.000000000");
-    ensure_line_after(&mut out, "sfnn_init_bias=", "nnue_pytorch_init_scale=", "sfnn_init_bias=zero");
+    ensure_line_after(&mut out, "no_ft_factorize=", "nnue_pytorch_init_scale=", "no_ft_factorize=false");
+    ensure_line_after(&mut out, "sfnn_init_bias=", "no_ft_factorize=", "sfnn_init_bias=zero");
     ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_bias=", "sfnn_init_l2_l3_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l2_scale=", "sfnn_init_l2_l3_scale=", "sfnn_init_l2_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l3_scale=", "sfnn_init_l2_scale=", "sfnn_init_l3_scale=0.500000000");
@@ -28563,6 +28665,7 @@ mod tests {
               "backend": "cuda-cpp",
               "cuda_cpp_train_steps": 1,
               "arch": "SFNN_halfka2_1024_7_64_k3k3",
+              "no_ft_factorize": true,
               "lr": 0.001,
               "lr_min": 0.0001,
               "sfnn_dirty_bucket_update": true
@@ -28588,6 +28691,7 @@ mod tests {
         assert!((args.lr - 0.002).abs() < 1.0e-9);
         assert!((args.lr_min - 0.0001).abs() < 1.0e-9);
         assert!(args.sfnn_dirty_bucket_update);
+        assert!(args.no_ft_factorize);
 
         let _ = std::fs::remove_file(path);
     }
@@ -29953,6 +30057,155 @@ mod tests {
         let stack_stride = l1_out * weights.shape.ft_size;
         assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
         assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
+    }
+
+    #[test]
+    fn no_ft_factorize_is_independent_of_stack_sharing_and_recorded_for_resume() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "none",
+        ])
+        .unwrap();
+        assert!(!args.no_ft_factorize);
+        assert!(!effective_sfnn_factorizer_spec(&args).any());
+        let on_signature = resume_signature(&args);
+        let missing_flag = resume_signature_without_line(&on_signature, "no_ft_factorize=");
+        assert!(resume_signature_matches(&missing_flag, &args));
+        args.no_ft_factorize = true;
+        assert!(resume_signature(&args).contains("no_ft_factorize=true"));
+        assert!(!resume_signature_matches(&on_signature, &args));
+        assert!(!resume_signature_matches(&missing_flag, &args));
+        assert!(!effective_sfnn_factorizer_spec(&args).any());
+        args.sfnn_factorizer = Some(SfnnFactorizerSpec::SHARED);
+        assert!(effective_sfnn_factorized_l1(&args));
+        assert!(effective_sfnn_factorized_l2_l3(&args));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn no_ft_factorize_halfka2_preserves_initial_effective_weights_and_export() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "none",
+        ])
+        .unwrap();
+        let kind = CudaCppSfnnFeatureKind::Halfka2;
+        let on = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        args.no_ft_factorize = true;
+        let off = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        assert_eq!(off.shape.input_size, kind.base_input_size());
+        assert_eq!(on.shape.input_size, off.shape.input_size + kind.virtual_rows());
+        assert_eq!(off.l0w, on.l0w[..off.l0w.len()]);
+        assert_eq!(off.l1w, on.l1w);
+        assert_eq!(off.l2w, on.l2w);
+        assert_eq!(off.l3w, on.l3w);
+        let folded = fold_sfnn_halfka2_piece_factorized_l0w(
+            &on.l0w,
+            kind.base_input_size(),
+            kind.virtual_rows(),
+            on.shape.ft_size,
+        )
+        .unwrap();
+        assert_eq!(off.l0w, folded);
+
+        // The export and CPU quantized-validation paths must accept base-only FT weights.
+        let off_shape = off.shape;
+        let on_shape = on.shape;
+        let off = sfnn_initial_weights_into_readback(off);
+        let on = sfnn_initial_weights_into_readback(on);
+        let off_quant = quantized_sfnn_weights_from_cuda_cpp_readback(&args, kind, off_shape, &off, None).unwrap();
+        let on_quant = quantized_sfnn_weights_from_cuda_cpp_readback(&args, kind, on_shape, &on, None).unwrap();
+        assert_eq!(off_quant.l0w, on_quant.l0w);
+        assert_eq!(off_quant.l0b, on_quant.l0b);
+        assert_eq!(off_quant.l1w, on_quant.l1w);
+        assert_eq!(off_quant.l2w, on_quant.l2w);
+        assert_eq!(off_quant.l3w, on_quant.l3w);
+
+        let path = std::env::temp_dir().join(format!("bulletou-no-ft-factorize-{}.bin", std::process::id()));
+        for (weights, disabled) in [(&on, false), (&off, true)] {
+            let records = vec![
+                ("nnue/weights/l0w", weights.l0w.as_slice()),
+                ("nnue/weights/l0b", weights.l0b.as_slice()),
+                ("nnue/weights/l1w", weights.l1w.as_slice()),
+                ("nnue/weights/l1b", weights.l1b.as_slice()),
+                ("nnue/weights/l2w", weights.l2w.as_slice()),
+                ("nnue/weights/l2b", weights.l2b.as_slice()),
+                ("nnue/weights/l3w", weights.l3w.as_slice()),
+                ("nnue/weights/l3b", weights.l3b.as_slice()),
+            ];
+            write_cuda_cpp_state_records_atomic(&path, records).unwrap();
+            args.no_ft_factorize = disabled;
+            let loaded = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap();
+            assert_eq!(loaded.weights.l0w, weights.l0w);
+            assert_eq!(loaded.weights.shape.input_size, kind.input_size_for_args(&args));
+            args.no_ft_factorize = !disabled;
+            let err = match load_cuda_cpp_sfnn_initial_state(&path, &args, kind) {
+                Err(err) => err,
+                Ok(_) => panic!("FT mode mismatch must not silently transform a checkpoint"),
+            };
+            assert!(err.contains("checkpoint FT factorizer"), "{err}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn no_ft_factorize_halfkp_preserves_initial_effective_weights() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "NNUE_halfkp_32x2_32_32",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+        ])
+        .unwrap();
+        let kind = CudaCppNnueFeatureKind::Halfkp;
+        let on = build_nnue_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        args.no_ft_factorize = true;
+        let off = build_nnue_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        assert_eq!(off.shape.input_size, kind.base_input_size());
+        assert_eq!(off.l0w, on.l0w[kind.virtual_rows() * off.shape.l1..]);
+        assert_eq!(off.l1w, on.l1w);
+        assert_eq!(
+            off.l0w,
+            fold_halfkp_piece_factorized_l0w(&on.l0w, kind.base_input_size(), kind.virtual_rows(), on.shape.l1,)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn no_ft_factorize_checkpoint_mode_must_match() {
+        let mut records = BTreeMap::new();
+        for (len, enabled) in [(12, false), (16, true)] {
+            records.insert("l0w".to_string(), vec![0.0; len]);
+            validate_ft_factorizer_checkpoint(&records, 6, 2, 2, !enabled).unwrap();
+            let err = validate_ft_factorizer_checkpoint(&records, 6, 2, 2, enabled).unwrap_err();
+            assert!(err.contains("checkpoint FT factorizer"), "{err}");
+            assert!(err.contains("--no-ft-factorize"), "{err}");
+        }
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

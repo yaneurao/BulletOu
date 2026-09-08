@@ -6,6 +6,44 @@
 
 まず学習を1回動かしたいだけなら、このページを読む必要はありません。`hand1024`、`k29k29`、`progress8` のように bucket 数が多い architecture を比較したいときに読んでください。
 
+## FTの共有と、後段の共有を分けて設定する
+
+`SFNN_halfka2` 系は、FT（入力特徴を最初のニューロン列へ変換する層）でも重みを共有します。
+玉位置を `k`、駒の種類・所属・位置などの特徴を `p` とすると、各FTニューロンに使う重みは次の形です。
+
+```text
+FTの実効重み[k, p] = 個別重み[k, p] + 共通重み[p]
+```
+
+同じ駒特徴の共通重みには、異なる玉位置の局面から勾配が集まります。
+個別重みは残るため、玉位置ごとの差も学習できます。共通重みは0で初期化し、`nn.bin` の書き出し時に個別重みへ足し込みます。
+
+FT factorizerはデフォルトで有効です。`--no-ft-factorize` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
+この切り替えは `NNUE_halfkp` 系にも使えます。FT factorizerを持たない入力では、共有項は追加されません。
+
+`--sfnn-factorizer` が設定するのは**後段のL1/L2/L3の共有**です。FTとは独立しています。
+
+| HalfKA2での指定 | FTの共有 | 後段の共有 |
+|---|---|---|
+| 指定なし | 有効 | `shared` |
+| `--sfnn-factorizer none` | 有効 | なし |
+| `--no-ft-factorize` | 無効 | `shared` |
+| `--no-ft-factorize --sfnn-factorizer none` | 無効 | なし |
+
+共有をすべて外して新規学習を比較するなら、`bulletou-settings.json` に次の2項目を指定します。
+
+```json
+"no_ft_factorize": true,
+"sfnn_factorizer": "none"
+```
+
+FTを有効にするには `no_ft_factorize` を省略するか `false` にします。起動時の `FT factorizer = on/off` でも確認できます。
+`sfnn_factorizer_alpha` はFTの共通重みには掛かりません。
+
+`--resume` または `--initial-state` で `state.bin` を読み込むときは、保存元と同じFT設定が必要です。
+ON/OFFを変えると重みとoptimizer stateの配列サイズが異なるため、明示的なエラーになります。自動変換は行いません。
+workerでもセッション内のON/OFF変更はできません。
+
 ## 1. factorizer は何をするものか
 
 LayerStack は、局面ごとに使う後段 network を切り替える仕組みです。たとえば次の architecture は、手駒、玉位置、進行度を組み合わせます。
