@@ -125,13 +125,21 @@ acc,0.620000,0.630000
 loss,0.130000,0.120000
 qacc,0.619000,0.629000
 qloss,0.131000,0.121000
+lr,0.000875,0.000500
+lr-min,0.000030,0.000020
+sb,324,324
+bpu,1,4
 ```
 
-新規学習では、開始時にヘッダ行 `metric` だけのファイルを作ります。epochが完了すると、右にそのepochの列が追加されます。行は `acc`、`loss`、`qacc`、`qloss` の順です。accuracyは百分率ではなく0～1の値です。
+新規学習では、開始時にヘッダ行 `metric` だけのファイルを作ります。epochが完了すると、右にそのepochの列が追加されます。行は `acc`、`loss`、`qacc`、`qloss`、`lr`、`lr-min`、`sb`、`bpu` の順です。accuracyは百分率ではなく0～1の値です。
+
+`lr` はそのepochのsb 1開始時のlr、`lr-min` は最終sb終了時に実際に使ったlrです。後者は設定上の下限値とは限りません。`sb` は最終sb番号（そのepochのsb数）、`bpu` は最終sbで使った `batches_per_update` です。epoch途中でbpuを変えた場合も、終了時の値を記録します。
 
 再開時にこのCSVがなければ、`summary-learn.log` と保存されている学習設定から完了済みepochを集計します。学習途中のepochは含めず、再開で巻き戻された結果も取り除きます。最新epochの完了を確認できる記録がない場合、そのepochは含めません。
 
-各列は最終sbの値であり、epoch内の最大accuracyや平均値ではありません。そのsbで検証していない項目は空欄です。集計のための追加推論は行わず、`summary-learn.log` 自体も変更しません。
+4つの検証指標は最終sbの値であり、epoch内の最大accuracyや平均値ではありません。そのsbで検証していない項目は空欄です。sb 1の記録がないepochの `lr` や、bpuの記録がない過去epochの `bpu` も空欄にし、現在の設定からは推定しません。
+
+`batches_per_update` は `summary-learn.log` のcheckpoint列の直前にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
 
 ---
 

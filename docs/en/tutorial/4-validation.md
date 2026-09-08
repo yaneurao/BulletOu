@@ -125,13 +125,21 @@ acc,0.620000,0.630000
 loss,0.130000,0.120000
 qacc,0.619000,0.629000
 qloss,0.131000,0.121000
+lr,0.000875,0.000500
+lr-min,0.000030,0.000020
+sb,324,324
+bpu,1,4
 ```
 
-A new run creates the file at startup with just the header line `metric`. Each completed epoch adds a column on the right. The four rows are `acc`, `loss`, `qacc`, and `qloss`; accuracies are ratios from 0 to 1, not percentages.
+A new run creates the file at startup with just the header line `metric`. Each completed epoch adds a column on the right. Rows are ordered as `acc`, `loss`, `qacc`, `qloss`, `lr`, `lr-min`, `sb`, and `bpu`. Accuracies are ratios from 0 to 1, not percentages.
+
+`lr` is the LR at the start of sb 1; `lr-min` is the LR actually used at the end of the final sb, not necessarily the configured lower bound. `sb` is the final sb number (the number of sb in that epoch). `bpu` is the `batches_per_update` used in the final sb, including when this setting changed during the epoch.
 
 If this CSV is missing when resuming, it is reconstructed from `summary-learn.log` and the recorded training settings. Incomplete epochs and results rolled back on resume are excluded. If the latest epoch cannot be confirmed complete, it is omitted.
 
-Values come from the final sb, not the best or average metrics of that epoch. Unmeasured metrics are blank. Exporting this table performs no additional inference and does not modify `summary-learn.log`.
+The four validation metrics come from the final sb, not the best or average metrics of that epoch. Unmeasured metrics are blank. `lr` is also blank if sb 1 is missing, and historical `bpu` values without a record are blank. Neither is inferred from the current settings.
+
+`batches_per_update` is also recorded immediately before `checkpoint` in `summary-learn.log`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
 
 ---
 
