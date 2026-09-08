@@ -44,6 +44,8 @@ KPP_synthesized.bin
 検証を行っていないsbでは、`test_value_accuracy` / `test_value_loss` は `-` になります。
 量子化後検証を行っていないsbでは、`quantized_value_accuracy` / `quantized_value_loss` は `-` になります。
 
+4つの指標列は **acc → loss → qacc → qloss** の順に並びます。保存フォルダ内の `learn.log` も同じ順序です。`train_value_loss` 列は出力しません。
+
 よく見る列は次の通りです。
 
 | 列 | 意味 |
@@ -52,7 +54,8 @@ KPP_synthesized.bin
 | `superbatch` | epoch 内の何 sb 目か |
 | `test_value_accuracy` | 検証局面での符号一致率 |
 | `test_value_loss` | 検証局面での loss |
-| `train_value_loss` | 予約列。現在の cuda-cpp 学習では `-` |
+| `quantized_value_accuracy` | 量子化後の検証局面での符号一致率（qacc） |
+| `quantized_value_loss` | 量子化後の検証局面でのloss（qloss） |
 | `positions` | 累積で処理した局面数 |
 
 詳しい読み方やプロットは [応用編](../advanced/) を参照してください。

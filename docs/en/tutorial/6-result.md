@@ -44,6 +44,8 @@ KPP_synthesized.bin
 If that sb did not run ordinary validation, `test_value_accuracy` / `test_value_loss` are `-`.
 If that sb did not run quantized validation, `quantized_value_accuracy` / `quantized_value_loss` are `-`.
 
+The four metric columns are adjacent, in **acc → loss → qacc → qloss** order. Checkpoint-local `learn.log` uses the same order. There is no `train_value_loss` column.
+
 The main columns are:
 
 | Column | Meaning |
@@ -52,7 +54,8 @@ The main columns are:
 | `superbatch` | Current sb inside the epoch |
 | `test_value_accuracy` | Validation sign accuracy |
 | `test_value_loss` | Validation loss |
-| `train_value_loss` | Reserved column. Current cuda-cpp training writes `-` |
+| `quantized_value_accuracy` | Post-quantization validation sign accuracy (qacc) |
+| `quantized_value_loss` | Post-quantization validation loss (qloss) |
 | `positions` | Total processed positions |
 
 For deeper log analysis and plotting, see the [Advanced guide](../advanced/).
