@@ -90,13 +90,13 @@ checkpoints/my-kppt/
 `learn.log` is a CSV with a header row, using the same schema as other targets:
 
 ```
-eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher
-KPPT/kk,1,1,32,-,-,0.234,0.001000,0.000999,1.000000,524288,teachers/
-KPPT/kk,1,1,64,-,-,0.232,0.000999,0.000998,1.000000,1048576,teachers/
+eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,lr_start,lr_end,lambda,positions,teacher
+KPPT/kk,1,1,32,-,-,-,-,0.001000,0.000999,1.000000,524288,teachers/
+KPPT/kk,1,1,64,-,-,-,-,0.000999,0.000998,1.000000,1048576,teachers/
 ...
-KPPT/kkp,1,1,32,-,-,0.156,0.001000,0.000999,1.000000,524288,teachers/
+KPPT/kkp,1,1,32,-,-,-,-,0.001000,0.000999,1.000000,524288,teachers/
 ...
-KPPT/kpp,1,1,32,-,-,0.245,0.001000,0.000999,1.000000,524288,teachers/
+KPPT/kpp,1,1,32,-,-,-,-,0.001000,0.000999,1.000000,524288,teachers/
 ...
 ```
 
