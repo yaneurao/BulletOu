@@ -21,9 +21,11 @@ FTの実効重み[k, p] = 個別重み[k, p] + 共通重み[p]
 FT factorizerはデフォルトで有効です。`--no-ft-factorize` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
 この切り替えは `NNUE_halfkp` 系にも使えます。FT factorizerを持たない入力では、共有項は追加されません。
 
-`--sfnn-factorizer` が設定するのは**後段のL1/L2/L3の共有**です。FTとは独立しています。
+`--sfnn-factorizer` が設定するのは**L1の共有だけ**です。FTとは独立しています。
+L2・L3はbucketごとの個別重み・biasだけを持ち、shared・axis・pairのいずれも適用しません。
+compact L1のarchitectureでは、このL1共有も無効です。
 
-| HalfKA2での指定 | FTの共有 | 後段の共有 |
+| dense L1のHalfKA2での指定 | FTの共有 | L1の共有 |
 |---|---|---|
 | 指定なし | 有効 | `shared` |
 | `--sfnn-factorizer none` | 有効 | なし |
@@ -43,6 +45,10 @@ FTを有効にするには `no_ft_factorize` を省略するか `false` にし�
 `--resume` または `--initial-state` で `state.bin` を読み込むときは、保存元と同じFT設定が必要です。
 ON/OFFを変えると重みとoptimizer stateの配列サイズが異なるため、明示的なエラーになります。自動変換は行いません。
 workerでもセッション内のON/OFF変更はできません。
+
+L2・L3のfactorizerを含む `state.bin` は、学習用に読み込むと明示エラーになります。
+保存時のalpha・count補正を無視して共有項を捨てると出力が変わるため、自動変換は行いません。
+L2・L3のfactorizerを含まないcheckpointから再開するか、新規学習してください。保存済みのファイルは変更しません。
 
 ## 1. factorizer は何をするものか
 
@@ -66,7 +72,7 @@ factorizer は、この問題を緩和するために、stack 間で共通成分
 W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_effective` が実際に forward で使われる重みです。ここでの `W` は、SFNN の L1/L2/L3 の stack ごとの weight や bias の1要素だと思ってください。
+`W_effective` が実際にforwardで使われる重みです。この式の `W` は、L1のweightまたはbiasの1要素です。L2・L3にはこの足し算はありません。
 
 ## 2. bucket 軸と stack 番号
 
@@ -98,6 +104,13 @@ W_effective[hand, king, progress]
 ```
 
 全 stack に同じ成分が足されるので、最も粗い共有です。BulletOu のデフォルトは `--sfnn-factorizer shared` です。
+
+新規学習時のL1共通重みは、tataraと同じく `[-0.01, +0.01]` の一様乱数、共通biasは0で初期化します。
+この共通重みの初期範囲には `--nnue-pytorch-init-scale` は掛けません。FT共通重みの初期値は0のままです。
+checkpointから再開するときは保存されたL1共通重みを引き継ぎ、再初期化しません。
+
+FTを有効、L1を `shared`（alpha=1）、count補正なしにすれば、tataraのLayerStackと同じ共有構成です。
+ただし、bucket個別重みの初期化やloss・optimizerなどは別の設定なので、学習全体が等価になるという意味ではありません。
 
 ## 4. `axis`
 
@@ -413,7 +426,8 @@ gate_stack = count_stack / (count_stack + K)
 | `9K` | bucket 固有 residual を 90% 使う |
 | 十分大きい count | `gate_stack` は 1 に近づく |
 
-compact L1 storage の SFNN では、L1 は compact weight として持つため、この gate は L2/L3 の bucket 固有 residual にかかります。dense L1 factorizer を使う構成では L1 にも同じ考え方でかかります。
+このgateとresidual decayの対象は、factorizerが有効なdense L1だけです。L2・L3およびcompact L1には適用しません。
+`residual_params_per_bucket` もL1のweightとbiasだけを数えます。たとえばFT=1024、L1出力=8なら `1024 × 8 + 8 = 8,200` です。
 
 ### residual count decay
 
@@ -482,7 +496,7 @@ BulletOu は、それぞれの axis 行・pair 行を使う LayerStack bucket �
 confidence = count_term / (count_term + term_params * option_value)
 ```
 
-`term_params` は、1つの axis 行または pair 行が L1/L2/L3 に持つパラメーター数です。option value が `0` なら係数は `1` になり、その factorizer 行は弱まりません。option を有効にしていて count が `0` の行は、係数が `0` になります。
+`term_params` は、1つのaxis行またはpair行がL1に持つweightとbiasの数です。L2・L3は数えません。option valueが `0` なら係数は `1` になり、そのfactorizer行は弱まりません。optionを有効にしていてcountが `0` の行は、係数が `0` になります。
 
 例えば `--sfnn-axis-count-confidence 2.0` と `--sfnn-king-axis-count-confidence 4.0` を両方指定した場合、king-axis 行だけ `4.0` を使い、hand-axis 行と progress-axis 行は `2.0` を使います。pair 側も同じ考え方です。
 

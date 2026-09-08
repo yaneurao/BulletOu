@@ -4033,6 +4033,9 @@ fn effective_sfnn_factorizer_spec(args: &Args) -> SfnnFactorizerSpec {
     if !args.resolved_eval_type().is_some_and(EvalType::uses_layerstack) {
         return SfnnFactorizerSpec::NONE;
     }
+    if args.train_arch().and_then(TrainArch::nnue_arch).is_some_and(|arch| arch.has_compact_sfnn_l1()) {
+        return SfnnFactorizerSpec::NONE;
+    }
     let Some(layerstack) = args.effective_layerstack() else {
         return SfnnFactorizerSpec::NONE;
     };
@@ -4051,21 +4054,12 @@ fn effective_sfnn_factorized_l1(args: &Args) -> bool {
     effective_sfnn_factorizer_spec(args).shared && !arch.has_compact_sfnn_l1()
 }
 
-fn effective_sfnn_factorized_l2_l3(args: &Args) -> bool {
-    effective_sfnn_factorizer_spec(args).shared
-}
-
 fn effective_sfnn_axis_factorized_l1(args: &Args) -> bool {
     let Some(arch) = args.train_arch().and_then(TrainArch::nnue_arch) else {
         return false;
     };
     let spec = effective_sfnn_factorizer_spec(args);
     spec.any_axis() && !arch.has_compact_sfnn_l1()
-}
-
-fn effective_sfnn_axis_factorized_l2_l3(args: &Args) -> bool {
-    let spec = effective_sfnn_factorizer_spec(args);
-    spec.any_axis()
 }
 
 fn effective_sfnn_factorizer_alpha(args: &Args) -> SfnnFactorizerAlphaSpec {
@@ -4819,7 +4813,7 @@ struct Args {
 
     /// Disable FT piece-feature factorization for HalfKA2 / HalfKP training.
     /// Default: enabled for those inputs. Independent of --sfnn-factorizer,
-    /// which controls later LayerStack layers. Checkpoints must use the same
+    /// which controls LayerStack L1 sharing. Checkpoints must use the same
     /// FT factorization setting when resuming or loading --initial-state.
     #[arg(long)]
     no_ft_factorize: bool,
@@ -4854,10 +4848,9 @@ struct Args {
     #[arg(long = "sfnn-init-l3-scale")]
     sfnn_init_l3_scale: Option<f32>,
 
-    /// Compatibility alias for `--sfnn-factorizer shared`. The shared terms
-    /// are zero-initialised and added to every bucket during training, then
-    /// folded into each bucket when saving `nn.bin`. L1 is used for dense L1
-    /// architectures; L2/L3 are used for all SFNN LayerStack architectures.
+    /// Select `--sfnn-factorizer shared`. Dense L1 shared weights start from
+    /// uniform [-0.01, 0.01], with zero bias, and are folded into each bucket
+    /// when saving nn.bin. L2/L3 have no factorizer. Compact L1 has no sharing.
     #[arg(
         long = "sfnn-factorized",
         alias = "sfnn-factorized-l1",
@@ -4865,7 +4858,7 @@ struct Args {
     )]
     sfnn_factorized: bool,
 
-    /// Select SFNN stack factorizer terms. Accepted values:
+    /// Select SFNN dense-L1 factorizer terms (never L2/L3). Accepted values:
     /// `none`, `shared`, `axis`, or comma-separated per-family forms such as
     /// `king=axis,hand=shared` / `king=axis,hand=axis`.
     /// `axis` is shorthand for enabling every bucket axis available in the
@@ -15876,19 +15869,7 @@ fn sfnn_residual_params_per_bucket(shape: bulletou_cuda_cpp::SfnnForwardShape) -
     } else {
         (cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks, shape.l1_out())
     };
-    let l2w = shape
-        .l2_size
-        .checked_mul(shape.l2_in())
-        .ok_or_else(|| "SFNN residual parameter count overflow at L2 weight".to_string())?;
-    let l2b = shape.l2_size;
-    let l3w = shape.l2_size;
-    let l3b = 1usize;
-    l1w.checked_add(l1b)
-        .and_then(|v| v.checked_add(l2w))
-        .and_then(|v| v.checked_add(l2b))
-        .and_then(|v| v.checked_add(l3w))
-        .and_then(|v| v.checked_add(l3b))
-        .ok_or_else(|| "SFNN residual parameter count overflow".to_string())
+    l1w.checked_add(l1b).ok_or_else(|| "SFNN residual parameter count overflow".to_string())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -15905,17 +15886,6 @@ fn sfnn_factorizer_axis_term_params(shape: bulletou_cuda_cpp::SfnnForwardShape) 
             .and_then(|v| v.checked_add(shape.l1_out()))
             .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L1".to_string())?;
     }
-    params = params
-        .checked_add(
-            shape
-                .l2_size
-                .checked_mul(shape.l2_in())
-                .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L2 weight".to_string())?,
-        )
-        .and_then(|v| v.checked_add(shape.l2_size))
-        .and_then(|v| v.checked_add(shape.l2_size))
-        .and_then(|v| v.checked_add(1))
-        .ok_or_else(|| "SFNN factorizer axis parameter count overflow".to_string())?;
     Ok(params)
 }
 
@@ -16935,7 +16905,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "SFNN init",
             format!(
-                "bias={}, l2_scale={:.3}, l3_scale={:.3}",
+                "bias={}, l2_scale={:.3}, l3_scale={:.3}, L1 shared=uniform[-0.01,0.01] when enabled",
                 paint(args.sfnn_init_bias.cli_name(), ConsoleColor::BoldYellow),
                 effective_sfnn_init_l2_scale(args),
                 effective_sfnn_init_l3_scale(args)
@@ -17007,7 +16977,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         initial_weights.l1fw.is_some() || initial_weights.l2fw.is_some() || initial_weights.l3fw.is_some();
     let stored_axis_factorizers =
         initial_weights.l1axw.is_some() || initial_weights.l2axw.is_some() || initial_weights.l3axw.is_some();
-    print_startup_kv_colored("SFNN factorizer", format!("{} (active)", factorizer_spec.label()), ConsoleColor::Magenta);
+    print_startup_kv_colored(
+        "SFNN factorizer",
+        format!("{} (L1 only; L2/L3 independent)", factorizer_spec.label()),
+        ConsoleColor::Magenta,
+    );
     if !effective_sfnn_factorizer_alpha(args).is_default() {
         print_startup_kv_colored(
             "factorizer alpha",
@@ -19406,6 +19380,7 @@ fn cuda_cpp_sfnn_active_factorizer_pair<'a>(
     match (weights, biases) {
         (Some(w), Some(b)) if enabled => Ok((Some(w), Some(b))),
         (Some(_), Some(_)) => Ok((None, None)),
+        (None, None) if matches!(name, "l2f" | "l3f" | "l2ax" | "l3ax") => Ok((None, None)),
         (None, None) if enabled => Err(format!("cuda-cpp SFNN factorizer `{name}` is active but tensors are missing")),
         (None, None) => Ok((None, None)),
         (Some(_), None) | (None, Some(_)) => Err(format!("cuda-cpp SFNN weights have partial {name} state")),
@@ -20748,15 +20723,11 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l3w = cuda_cpp_tatara_stacked_row_major_bucket0_init(l2_size, 1, num_stacks, 0x5f11_e007, l3_bound);
     let l3b = vec![0.0; num_stacks];
     let (l1fw, l1fb) = if effective_sfnn_factorized_l1(args) {
-        (Some(vec![0.0; ft_size * l1_out]), Some(vec![0.0; l1_out]))
+        (Some(cuda_cpp_tatara_uniform_abs_init(ft_size * l1_out, 0x5f11_e009, 0.01)), Some(vec![0.0; l1_out]))
     } else {
         (None, None)
     };
-    let (l2fw, l2fb, l3fw, l3fb) = if effective_sfnn_factorized_l2_l3(args) {
-        (Some(vec![0.0; l2_size * l2_in]), Some(vec![0.0; l2_size]), Some(vec![0.0; l2_size]), Some(vec![0.0; 1]))
-    } else {
-        (None, None, None, None)
-    };
+    let (l2fw, l2fb, l3fw, l3fb) = (None, None, None, None);
 
     let axis_count = shape.factorizer_axis_count();
     let (l1axw, l1axb) = if effective_sfnn_axis_factorized_l1(args) {
@@ -20764,16 +20735,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     } else {
         (None, None)
     };
-    let (l2axw, l2axb, l3axw, l3axb) = if effective_sfnn_axis_factorized_l2_l3(args) {
-        (
-            Some(vec![0.0; axis_count * l2_size * l2_in]),
-            Some(vec![0.0; axis_count * l2_size]),
-            Some(vec![0.0; axis_count * l2_size]),
-            Some(vec![0.0; axis_count]),
-        )
-    } else {
-        (None, None, None, None)
-    };
+    let (l2axw, l2axb, l3axw, l3axb) = (None, None, None, None);
 
     let weights = CudaCppSfnnInitialWeights {
         shape,
@@ -20803,6 +20765,20 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn validate_sfnn_l1_only_factorizer_checkpoint(records: &BTreeMap<String, Vec<f32>>) -> Result<(), String> {
+    for name in ["l2fw", "l2fb", "l2axw", "l2axb", "l3fw", "l3fb", "l3axw", "l3axb"] {
+        if records.contains_key(name) {
+            return Err(format!(
+                "checkpoint contains {name}: L2/L3 factorizers are no longer supported for training. \
+                 The checkpoint has NOT been converted or modified. Exact folding needs the saved alpha/count \
+                 settings; use a checkpoint without L2/L3 factorizers or start a new training run"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_sfnn_initial_state(
     path: &Path,
     args: &Args,
@@ -20811,6 +20787,8 @@ fn load_cuda_cpp_sfnn_initial_state(
     let mut initial_sections =
         load_cuda_cpp_component_state_sections(path, "nnue", &["weights", "train", "step_ranger"], true)?;
     let weights_records = initial_sections.remove("weights").unwrap_or_default();
+
+    validate_sfnn_l1_only_factorizer_checkpoint(&weights_records)?;
 
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
@@ -20849,21 +20827,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         })?;
     let mut progress = load_cuda_cpp_sfnn_progress_train_state_from_path(path, layerstack, &weights_records)?;
     let wants_l1f = effective_sfnn_factorized_l1(args);
-    let wants_l2_l3f = effective_sfnn_factorized_l2_l3(args);
     let wants_l1ax = effective_sfnn_axis_factorized_l1(args);
-    let wants_l2_l3ax = effective_sfnn_axis_factorized_l2_l3(args);
-    if weights.l2fw.is_some() != weights.l3fw.is_some() {
-        return Err(format!(
-            "loaded SFNN state {} has only one of factorized L2/L3 shared terms; expected both or neither",
-            path.display()
-        ));
-    }
-    if weights.l2axw.is_some() != weights.l3axw.is_some() {
-        return Err(format!(
-            "loaded SFNN state {} has only one of axis-factorized L2/L3 terms; expected both or neither",
-            path.display()
-        ));
-    }
     let mut created_factorizers = CudaCppSfnnCreatedFactorizers::default();
     if wants_l1f && weights.l1fw.is_none() && !weights.shape.has_compact_l1() {
         eprintln!(
@@ -20874,17 +20838,6 @@ fn load_cuda_cpp_sfnn_initial_state(
         weights.l1fb = Some(vec![0.0; weights.shape.l1_out()]);
         created_factorizers.shared_l1 = true;
     }
-    if wants_l2_l3f && weights.l2fw.is_none() {
-        eprintln!(
-            "  WARN: loaded SFNN state {} has no L2/L3 shared stack factorizer tensors; adding zero-initialized l2f/l3f terms for compatibility",
-            path.display()
-        );
-        weights.l2fw = Some(vec![0.0; weights.shape.l2_size * weights.shape.l2_in()]);
-        weights.l2fb = Some(vec![0.0; weights.shape.l2_size]);
-        weights.l3fw = Some(vec![0.0; weights.shape.l2_size]);
-        weights.l3fb = Some(vec![0.0; 1]);
-        created_factorizers.shared_l2_l3 = true;
-    }
     let axis_count = weights.shape.factorizer_axis_count();
     if wants_l1ax && weights.l1axw.is_none() && !weights.shape.has_compact_l1() {
         eprintln!(
@@ -20894,17 +20847,6 @@ fn load_cuda_cpp_sfnn_initial_state(
         weights.l1axw = Some(vec![0.0; axis_count * weights.shape.ft_size * weights.shape.l1_out()]);
         weights.l1axb = Some(vec![0.0; axis_count * weights.shape.l1_out()]);
         created_factorizers.axis_l1 = true;
-    }
-    if wants_l2_l3ax && weights.l2axw.is_none() {
-        eprintln!(
-            "  WARN: loaded SFNN state {} has no L2/L3 axis factorizer tensors; adding zero-initialized l2ax/l3ax terms",
-            path.display()
-        );
-        weights.l2axw = Some(vec![0.0; axis_count * weights.shape.l2_size * weights.shape.l2_in()]);
-        weights.l2axb = Some(vec![0.0; axis_count * weights.shape.l2_size]);
-        weights.l3axw = Some(vec![0.0; axis_count * weights.shape.l2_size]);
-        weights.l3axb = Some(vec![0.0; axis_count]);
-        created_factorizers.axis_l2_l3 = true;
     }
     if progress_axis_appended {
         eprintln!(
@@ -24513,7 +24455,7 @@ fn resume_signature(args: &Args) -> String {
         format!("sfnn_init_l3_scale={:.9}", effective_sfnn_init_l3_scale(args)),
         format!("sfnn_factorized_stack={}", effective_sfnn_factorized_stack(args)),
         format!("sfnn_factorized_l1={}", effective_sfnn_factorized_l1(args)),
-        format!("sfnn_factorized_l2_l3={}", effective_sfnn_factorized_l2_l3(args)),
+        "sfnn_factorized_l2_l3=false".to_string(),
         format!("sfnn_factorizer={}", effective_sfnn_factorizer_spec(args).config_string()),
         format!("sfnn_factorizer_alpha={}", effective_sfnn_factorizer_alpha(args).config_string()),
         format!("sfnn_factorizer_residual_decay={:.9}", args.sfnn_factorizer_residual_decay),
@@ -28491,7 +28433,6 @@ mod tests {
         .unwrap();
 
         assert!(effective_sfnn_factorized_l1(&args));
-        assert!(effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -28519,7 +28460,6 @@ mod tests {
         .unwrap();
 
         assert!(!effective_sfnn_factorized_l1(&args));
-        assert!(!effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -28552,9 +28492,7 @@ mod tests {
         assert!(spec.king_axis);
         assert!(!spec.hand_axis);
         assert!(effective_sfnn_factorized_l1(&args));
-        assert!(effective_sfnn_factorized_l2_l3(&args));
         assert!(effective_sfnn_axis_factorized_l1(&args));
-        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -28592,7 +28530,6 @@ mod tests {
         assert!(spec.hand_axis);
         assert_eq!(spec.label(), "shared+king-axis+hand-axis");
         assert!(effective_sfnn_axis_factorized_l1(&args));
-        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
     }
 
     #[test]
@@ -28821,7 +28758,6 @@ mod tests {
         assert!(!spec.hand_axis);
         assert_eq!(spec.label(), "shared+king-axis");
         assert!(effective_sfnn_axis_factorized_l1(&args));
-        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
     }
 
     #[test]
@@ -28861,7 +28797,6 @@ mod tests {
         assert!(spec.hand_progress_pair);
         assert_eq!(spec.label(), "shared+king-axis+hand-axis+progress-axis+king-hand+king-progress+hand-progress");
         assert!(effective_sfnn_axis_factorized_l1(&args));
-        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
     }
 
     #[test]
@@ -28930,7 +28865,6 @@ mod tests {
         assert!(spec.king_axis);
         assert!(spec.hand_axis);
         assert!(effective_sfnn_axis_factorized_l1(&args));
-        assert!(effective_sfnn_axis_factorized_l2_l3(&args));
 
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
@@ -29178,7 +29112,6 @@ mod tests {
         .unwrap();
 
         assert!(!effective_sfnn_factorized_l1(&args));
-        assert!(effective_sfnn_factorized_l2_l3(&args));
         let result = args.validate_backend_flags();
         if cfg!(feature = "cuda-cpp-backend") {
             assert!(result.is_ok());
@@ -30047,16 +29980,82 @@ mod tests {
         assert_eq!(weights.shape.input_size, base_input_size + virtual_rows);
         assert!(weights.l0w[..base_input_size * weights.shape.ft_size].iter().any(|&v| v != 0.0));
         assert!(weights.l0w[base_input_size * weights.shape.ft_size..].iter().all(|&v| v == 0.0));
-        assert!(weights.l1fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        let shared = weights.l1fw.as_deref().unwrap();
+        assert!(shared.iter().all(|&v| (-0.01..=0.01).contains(&v)));
+        assert!(shared.iter().any(|&v| v > 0.0));
+        assert!(shared.iter().any(|&v| v < 0.0));
+        assert_eq!(shared, cuda_cpp_tatara_uniform_abs_init(shared.len(), 0x5f11_e009, 0.01));
         assert!(weights.l1fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
-        assert!(weights.l2fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
-        assert!(weights.l2fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
-        assert!(weights.l3fw.as_deref().unwrap().iter().all(|&v| v == 0.0));
-        assert!(weights.l3fb.as_deref().unwrap().iter().all(|&v| v == 0.0));
+        assert!(weights.l2fw.is_none());
+        assert!(weights.l2fb.is_none());
+        assert!(weights.l3fw.is_none());
+        assert!(weights.l3fb.is_none());
+        assert!(weights.l2axw.is_none());
+        assert!(weights.l2axb.is_none());
+        assert!(weights.l3axw.is_none());
+        assert!(weights.l3axb.is_none());
 
         let stack_stride = l1_out * weights.shape.ft_size;
         assert_eq!(&weights.l1w[..stack_stride], &weights.l1w[stack_stride..2 * stack_stride]);
         assert_eq!(&weights.l1b[..l1_out], &weights.l1b[l1_out..2 * l1_out]);
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn sfnn_l1_only_factorizers_and_count_parameter_counts() {
+        for mode in ["none", "shared", "axis", "pair"] {
+            let args = Args::try_parse_from([
+                "bulletou",
+                "--arch",
+                "SFNN_ka2_128_8_16_hand16_k3k3_progress4",
+                "--teacher",
+                "/dev/null",
+                "--sfnn-factorizer",
+                mode,
+            ])
+            .unwrap();
+            let weights = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+            assert_eq!(weights.l1fw.is_some(), mode != "none");
+            assert_eq!(weights.l1axw.is_some(), matches!(mode, "axis" | "pair"));
+            for term in [
+                &weights.l2fw,
+                &weights.l2fb,
+                &weights.l2axw,
+                &weights.l2axb,
+                &weights.l3fw,
+                &weights.l3fb,
+                &weights.l3axw,
+                &weights.l3axb,
+            ] {
+                assert!(term.is_none(), "{mode}");
+            }
+            let mut shape = weights.shape;
+            let expected = shape.ft_size * shape.l1_out() + shape.l1_out();
+            assert_eq!(sfnn_residual_params_per_bucket(shape).unwrap(), expected);
+            assert_eq!(sfnn_factorizer_axis_term_params(shape).unwrap(), expected);
+            shape.l2_size *= 4;
+            assert_eq!(sfnn_residual_params_per_bucket(shape).unwrap(), expected);
+            assert_eq!(sfnn_factorizer_axis_term_params(shape).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn sfnn_l2_l3_checkpoint_tensors_are_rejected_without_silent_dropping() {
+        let mut records = BTreeMap::from([("l1fw".to_string(), vec![0.01])]);
+        assert!(validate_sfnn_l1_only_factorizer_checkpoint(&records).is_ok());
+        for name in ["l2fw", "l2fb", "l2axw", "l2axb", "l3fw", "l3fb", "l3axw", "l3axb"] {
+            records.insert(name.to_string(), vec![0.5]);
+            let error = validate_sfnn_l1_only_factorizer_checkpoint(&records).unwrap_err();
+            assert!(error.contains(name));
+            assert!(error.contains("NOT been converted"));
+            assert_eq!(records.remove(name).unwrap(), vec![0.5]);
+        }
+        for name in ["l2f", "l3f", "l2ax", "l3ax"] {
+            assert_eq!(cuda_cpp_sfnn_active_factorizer_pair(true, name, None, None).unwrap(), (None, None));
+            assert!(cuda_cpp_sfnn_active_factorizer_pair(true, name, Some(&[0.1]), None).is_err());
+        }
+        assert!(cuda_cpp_sfnn_active_factorizer_pair(true, "l1f", None, None).is_err());
     }
 
     #[test]
@@ -30087,7 +30086,6 @@ mod tests {
         assert!(!effective_sfnn_factorizer_spec(&args).any());
         args.sfnn_factorizer = Some(SfnnFactorizerSpec::SHARED);
         assert!(effective_sfnn_factorized_l1(&args));
-        assert!(effective_sfnn_factorized_l2_l3(&args));
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -30396,7 +30394,6 @@ mod tests {
         ])
         .unwrap();
         assert!(!effective_sfnn_factorized_l1(&args));
-        assert!(effective_sfnn_factorized_l2_l3(&args));
         assert!(args.validate_arch_flags().is_ok());
     }
 

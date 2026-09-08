@@ -21,9 +21,11 @@ Shared weights start at zero and are added to the individual weights when export
 FT factorization is enabled by default. `--no-ft-factorize` disables allocation, addition, and updates of the shared FT weights.
 This switch also applies to `NNUE_halfkp` architectures. Inputs without an FT factorizer do not gain shared rows.
 
-`--sfnn-factorizer` controls **sharing in the later L1/L2/L3 layers**, independently of the FT.
+`--sfnn-factorizer` controls **L1 sharing only**, independently of the FT.
+L2 and L3 contain only per-bucket weights and biases: no shared, axis, or pair terms.
+Compact-L1 architectures do not use this L1 sharing either.
 
-| HalfKA2 options | FT sharing | Later-layer sharing |
+| HalfKA2 with dense L1: options | FT sharing | L1 sharing |
 |---|---|---|
 | Neither option specified | On | `shared` |
 | `--sfnn-factorizer none` | On | None |
@@ -43,6 +45,10 @@ To enable FT factorization, omit `no_ft_factorize` or set it to `false`. Startup
 Loading `state.bin` through `--resume` or `--initial-state` requires the same FT setting as the saved checkpoint.
 Changing ON/OFF changes weight and optimizer-state array sizes and produces an explicit error; there is no automatic conversion.
 A worker session also cannot change its FT ON/OFF setting between trials.
+
+Training rejects `state.bin` files containing L2/L3 factorizer tensors with an explicit error.
+Dropping these tensors without applying their saved alpha/count settings would change the output, so no automatic conversion is performed.
+Resume from a checkpoint without L2/L3 factorizers or start a fresh run. Existing files are not modified.
 
 ## 1. What the factorizer does
 
@@ -66,7 +72,7 @@ The factorizer mitigates this by letting stacks share common components. Roughly
 W_effective = W_base + W_shared + W_axis + W_pair
 ```
 
-`W_effective` is the weight used by forward propagation. Here, `W` means one element of an SFNN L1/L2/L3 stack weight or bias tensor.
+`W_effective` is the weight used by forward propagation. Here, `W` means one L1 weight or bias element. L2 and L3 do not use this sum.
 
 ## 2. Bucket axes and stack index
 
@@ -98,6 +104,13 @@ W_effective[hand, king, progress]
 ```
 
 This is the coarsest sharing. BulletOu defaults to `--sfnn-factorizer shared`.
+
+For fresh training, L1 shared weights use uniform `[-0.01, +0.01]` initialization and shared biases start at zero, matching tatara.
+`--nnue-pytorch-init-scale` does not scale this shared-weight range. Shared FT weights still start at zero.
+Resuming preserves saved L1 shared weights instead of reinitializing them.
+
+With FT sharing enabled, L1 `shared` at alpha=1, and no count corrections, the sharing structure matches tatara's LayerStack.
+This does not imply equivalent training overall: per-bucket initialization, loss, and optimizer settings can differ.
 
 ## 4. `axis`
 
@@ -413,7 +426,8 @@ Disable it explicitly when you want to load the count file only for statistics o
 | `9K` | Use 90% of the bucket-specific residual |
 | Very large count | `gate_stack` approaches 1 |
 
-For compact-L1 SFNN storage, L1 is held as compact weights, so this gate applies to L2/L3 bucket-specific residuals. For dense L1 factorizer layouts, the same idea also applies to L1.
+This gate and residual decay apply only to dense L1 with an active factorizer, not to L2, L3, or compact L1.
+`residual_params_per_bucket` counts only L1 weights and biases. For FT=1024 and L1 output=8, it is `1024 × 8 + 8 = 8,200`.
 
 ### Count-aware residual decay
 
@@ -490,7 +504,7 @@ For each axis or pair row, BulletOu sums the counts of all LayerStack buckets th
 confidence = count_term / (count_term + term_params * option_value)
 ```
 
-`term_params` is the number of parameters held by one axis or pair row across L1/L2/L3. If the option value is `0`, the multiplier is `1` and the factorizer row is not damped. If a row has count `0` and the option is enabled, its multiplier is `0`.
+`term_params` counts the L1 weights and biases in one axis or pair row; L2/L3 are excluded. If the option value is `0`, the multiplier is `1` and the row is not damped. If a row has count `0` and the option is enabled, its multiplier is `0`.
 
 For example, if `--sfnn-axis-count-confidence 2.0` and `--sfnn-king-axis-count-confidence 4.0` are both specified, king-axis rows use `4.0`; hand-axis and progress-axis rows use `2.0`. The same rule applies to pair rows.
 

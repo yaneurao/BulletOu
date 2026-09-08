@@ -180,6 +180,6 @@ python .\tuning_parameters.py `
 
 次へ: [4. validation を有効にする](4-validation.md)
 
-HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"no_ft_factorize": true`、CLIなら `--no-ft-factorize` を指定します。後段の共有を無効にする `sfnn_factorizer: "none"` とは別の設定です。再開時は保存元と同じFT設定にしてください。[FTと後段の共有の違い・設定例](../advanced/sfnn-factorizer.md)
+HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"no_ft_factorize": true`、CLIなら `--no-ft-factorize` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。再開時は保存元と同じFT設定にしてください。[FTとL1の共有の違い・設定例](../advanced/sfnn-factorizer.md)
 
 詳しい調整や比較実験: [応用編](../advanced/)

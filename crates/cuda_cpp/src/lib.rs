@@ -1962,34 +1962,22 @@ fn sfnn_forward_device_with_factorizer_impl(
     };
     let (l2fw, l2fb, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
         (Some(l2fw), Some(l2fb)) if factorizer.shared => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
     let (l2axw, l2axb, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
         (Some(l2axw), Some(l2axb)) if factorizer.any_axis() => (l2axw.as_ptr(), l2axb.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
     };
     let (l3fw, l3fb, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
         (Some(l3fw), Some(l3fb)) if factorizer.shared => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
-        }
         (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         (Some(_), Some(_)) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
     };
     let (l3axw, l3axb, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
         (Some(l3axw), Some(l3axb)) if factorizer.any_axis() => (l3axw.as_ptr(), l3axb.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
@@ -2167,33 +2155,21 @@ pub fn sfnn_build_quantized_proxy_device(
     };
     let (l2fw, l2fb, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
         (Some(l2fw), Some(l2fb)) if factorizer.shared => (l2fw.as_ptr(), l2fb.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
     let (l2axw, l2axb, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
         (Some(l2axw), Some(l2axb)) if factorizer.any_axis() => (l2axw.as_ptr(), l2axb.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
     };
     let (l3fw, l3fb, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
         (Some(l3fw), Some(l3fb)) if factorizer.shared => (l3fw.as_ptr(), l3fb.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
     };
     let (l3axw, l3axb, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
         (Some(l3axw), Some(l3axb)) if factorizer.any_axis() => (l3axw.as_ptr(), l3axb.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
@@ -3504,33 +3480,21 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     };
     let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
         (Some(l2fw), Some(_)) if factorizer.shared => (l2fw.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
     let (l2axw, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
         (Some(l2axw), Some(_)) if factorizer.any_axis() => (l2axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
     };
     let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
         (Some(l3fw), Some(_)) if factorizer.shared => (l3fw.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
     };
     let (l3axw, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
         (Some(l3axw), Some(_)) if factorizer.any_axis() => (l3axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
@@ -3708,33 +3672,21 @@ fn sfnn_backward_device_impl(
     };
     let (l2fw, has_l2f) = match (&weights.l2fw, &weights.l2fb) {
         (Some(l2fw), Some(_)) if factorizer.shared => (l2fw.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L2 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L2 state is partial")),
     };
     let (l2axw, has_l2ax) = match (&weights.l2axw, &weights.l2axb) {
         (Some(l2axw), Some(_)) if factorizer.any_axis() => (l2axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L2 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L2 state is partial")),
     };
     let (l3fw, has_l3f) = match (&weights.l3fw, &weights.l3fb) {
         (Some(l3fw), Some(_)) if factorizer.shared => (l3fw.as_ptr(), 1),
-        (None, None) if factorizer.shared => {
-            return Err(CudaCppError::message("SFNN shared factorizer is active but L3 shared tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L3 state is partial")),
     };
     let (l3axw, has_l3ax) = match (&weights.l3axw, &weights.l3axb) {
         (Some(l3axw), Some(_)) if factorizer.any_axis() => (l3axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() => {
-            return Err(CudaCppError::message("SFNN axis factorizer is active but L3 axis tensors are missing"));
-        }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN axis-factorized L3 state is partial")),
     };
@@ -7464,8 +7416,16 @@ impl SfnnTrainStepRunner {
                 self.weights.l2fw.as_ref().filter(|_| self.factorizer.shared),
                 self.weights.l2axw.as_ref().filter(|_| self.factorizer.any_axis()),
                 &self.backward_workspace.l2w_gradients,
-                if self.factorizer.shared { Some(&self.backward_workspace.l2fw_gradients) } else { None },
-                if self.factorizer.any_axis() { Some(&self.backward_workspace.l2axw_gradients) } else { None },
+                self.weights
+                    .l2fw
+                    .as_ref()
+                    .filter(|_| self.factorizer.shared)
+                    .map(|_| &self.backward_workspace.l2fw_gradients),
+                self.weights
+                    .l2axw
+                    .as_ref()
+                    .filter(|_| self.factorizer.any_axis())
+                    .map(|_| &self.backward_workspace.l2axw_gradients),
                 self.shape.l2_in(),
                 self.shape.l2_size,
                 self.shape.num_stacks,
@@ -7491,8 +7451,16 @@ impl SfnnTrainStepRunner {
                 self.weights.l3fw.as_ref().filter(|_| self.factorizer.shared),
                 self.weights.l3axw.as_ref().filter(|_| self.factorizer.any_axis()),
                 &self.backward_workspace.l3w_gradients,
-                if self.factorizer.shared { Some(&self.backward_workspace.l3fw_gradients) } else { None },
-                if self.factorizer.any_axis() { Some(&self.backward_workspace.l3axw_gradients) } else { None },
+                self.weights
+                    .l3fw
+                    .as_ref()
+                    .filter(|_| self.factorizer.shared)
+                    .map(|_| &self.backward_workspace.l3fw_gradients),
+                self.weights
+                    .l3axw
+                    .as_ref()
+                    .filter(|_| self.factorizer.any_axis())
+                    .map(|_| &self.backward_workspace.l3axw_gradients),
                 self.shape.l2_size,
                 1,
                 self.shape.num_stacks,
@@ -10162,6 +10130,104 @@ mod tests {
         assert_close_slice("sfnn l3b_grad", &actual.l3b_gradients, &expected.l3b_gradients, 1.0e-6);
         assert_close_slice("sfnn l3fw_grad", &actual.l3fw_gradients, &expected.l3fw_gradients, 1.0e-6);
         assert_close_slice("sfnn l3fb_grad", &actual.l3fb_gradients, &expected.l3fb_gradients, 1.0e-6);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_l1_only_factorizer_training_and_quantization() {
+        let ctx = Context::new(0).unwrap();
+        let upload_ctx = Context::new(0).unwrap();
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        for with_axis in [false, true] {
+            let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
+            weights.l2fw = None;
+            weights.l2fb = None;
+            weights.l3fw = None;
+            weights.l3fb = None;
+            weights.shape.factorizer_progress_axis = with_axis;
+            let shape = weights.shape;
+            let axis_weights = vec![0.003; shape.factorizer_axis_count() * shape.ft_size * shape.l1_out()];
+            let axis_biases = vec![0.002; shape.factorizer_axis_count() * shape.l1_out()];
+            if with_axis {
+                weights.l1axw = Some(&axis_weights);
+                weights.l1axb = Some(&axis_biases);
+            }
+            let mut runner = SfnnTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active).unwrap();
+            assert!(runner.layer_has_active_factorizer(SfnnUpdateLayer::L1));
+            assert!(!runner.layer_has_active_factorizer(SfnnUpdateLayer::L2));
+            assert!(!runner.layer_has_active_factorizer(SfnnUpdateLayer::L3));
+            let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+            let workspace = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 2)).unwrap();
+            runner.forward_current_weights(&ctx, &device_batch, &workspace).unwrap();
+            let output = workspace.download_output(&ctx).unwrap();
+            if !with_axis {
+                assert_close_slice("L1-only forward", &output, &tiny_sfnn_forward_cpu(batch, weights), 1e-6);
+            }
+            runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.25])).unwrap();
+            let proxy_shape = SfnnForwardShape { factorizer_progress_axis: false, ..shape };
+            let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, proxy_shape).unwrap();
+            sfnn_build_quantized_proxy_device(
+                &ctx,
+                shape.input_size,
+                0,
+                &runner.weights,
+                &proxy,
+                runner.factorizer,
+                runner.factorizer_alpha,
+                Some(&runner.residual_count_gates_by_stack),
+                None,
+            )
+            .unwrap();
+            let expected_l3w: Vec<_> = weights.l3w.iter().map(|&w| (w * 64.0).round() / 64.0).collect();
+            assert_close_slice(
+                "L3 quantization is not count-gated",
+                &proxy.l3w.download(&ctx).unwrap(),
+                &expected_l3w,
+                1e-6,
+            );
+            runner
+                .step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                    &ctx,
+                    &upload_ctx,
+                    RangerUpdateParams {
+                        radam: RAdamUpdateParams { step: 1, learning_rate: 0.01, ..Default::default() },
+                        lookahead_alpha: 0.5,
+                        lookahead_period: 6,
+                    },
+                    ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                    1.0,
+                    SfnnTrainStepHostBatch {
+                        stm_indices: batch.stm_indices,
+                        nstm_indices: batch.nstm_indices,
+                        buckets: batch.buckets,
+                        targets: &[0.25, 0.75],
+                        entry_weights: &[1.0, 1.0],
+                        batch_size: 2,
+                        max_active: 3,
+                    },
+                    true,
+                    true,
+                    SfnnLayerLrMultipliers {
+                        saturation_penalty: 1e-7,
+                        saturation_threshold: 1.0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let trained = runner.read_weights(&ctx).unwrap();
+            assert!(trained.l1fw.as_ref().unwrap().iter().all(|w| w.is_finite()));
+            assert!(trained.l2w.iter().all(|w| w.is_finite()));
+            assert!(trained.l3w.iter().all(|w| w.is_finite()));
+            assert_ne!(trained.l1fw.as_deref().unwrap(), weights.l1fw.unwrap());
+            assert!(trained.l2fw.is_none() && trained.l2axw.is_none());
+            assert!(trained.l3fw.is_none() && trained.l3axw.is_none());
+        }
     }
 
     #[test]
