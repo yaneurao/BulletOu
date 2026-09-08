@@ -115,6 +115,26 @@ Quantized validation is heavier, so start with only `--test-teacher` and `--vali
 
 ---
 
+## 4.7 Compare epoch results in CSV
+
+BulletOu automatically writes `summary-epoch-last.csv` in the training directory. No extra option or script is needed. Each column contains the final sb of a completed epoch:
+
+```csv
+metric,epoch 1,epoch 2
+acc,0.620000,0.630000
+loss,0.130000,0.120000
+qacc,0.619000,0.629000
+qloss,0.131000,0.121000
+```
+
+A new run creates the file at startup with just the header line `metric`. Each completed epoch adds a column on the right. The four rows are `acc`, `loss`, `qacc`, and `qloss`; accuracies are ratios from 0 to 1, not percentages.
+
+If this CSV is missing when resuming, it is reconstructed from `summary-learn.log` and the recorded training settings. Incomplete epochs and results rolled back on resume are excluded. If the latest epoch cannot be confirmed complete, it is omitted.
+
+Values come from the final sb, not the best or average metrics of that epoch. Unmeasured metrics are blank. Exporting this table performs no additional inference and does not modify `summary-learn.log`.
+
+---
+
 Next: [5. Stop and resume](5-resume.md)
 
 Metric details: [Spec: Validation Metrics](../../spec/06-validation-metrics.md)

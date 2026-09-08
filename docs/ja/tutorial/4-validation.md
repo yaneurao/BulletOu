@@ -115,6 +115,26 @@
 
 ---
 
+## 4.7 epochごとの結果をCSVで見る
+
+学習フォルダの `summary-epoch-last.csv` に、各epochの最終sbの結果が自動で集計されます。追加のオプションやスクリプト実行は不要です。
+
+```csv
+metric,epoch 1,epoch 2
+acc,0.620000,0.630000
+loss,0.130000,0.120000
+qacc,0.619000,0.629000
+qloss,0.131000,0.121000
+```
+
+新規学習では、開始時にヘッダ行 `metric` だけのファイルを作ります。epochが完了すると、右にそのepochの列が追加されます。行は `acc`、`loss`、`qacc`、`qloss` の順です。accuracyは百分率ではなく0～1の値です。
+
+再開時にこのCSVがなければ、`summary-learn.log` と保存されている学習設定から完了済みepochを集計します。学習途中のepochは含めず、再開で巻き戻された結果も取り除きます。最新epochの完了を確認できる記録がない場合、そのepochは含めません。
+
+各列は最終sbの値であり、epoch内の最大accuracyや平均値ではありません。そのsbで検証していない項目は空欄です。集計のための追加推論は行わず、`summary-learn.log` 自体も変更しません。
+
+---
+
 次へ: [5. 中断・再開](5-resume.md)
 
 詳しい検証指標: [仕様: Validation Metrics](../../spec/06-validation-metrics.md)
