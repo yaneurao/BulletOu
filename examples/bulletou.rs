@@ -3769,6 +3769,8 @@ impl std::str::FromStr for SfnnFactorizerSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SfnnFactorizerAlphaSpec {
+    // Supplied only by --ft-factorizer-alpha, not by the L1 alpha parser.
+    ft: f32,
     shared: f32,
     king_axis: f32,
     hand_axis: f32,
@@ -3781,6 +3783,7 @@ struct SfnnFactorizerAlphaSpec {
 impl SfnnFactorizerAlphaSpec {
     const MAX: f32 = 100.0;
     const ONE: Self = Self {
+        ft: 1.0,
         shared: 1.0,
         king_axis: 1.0,
         hand_axis: 1.0,
@@ -3857,6 +3860,7 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
         if !raw.contains('=') && !raw.contains(',') {
             let value = Self::parse_value(raw, raw)?;
             return Ok(Self {
+                ft: 1.0,
                 shared: value,
                 king_axis: value,
                 hand_axis: value,
@@ -4063,8 +4067,15 @@ fn effective_sfnn_axis_factorized_l1(args: &Args) -> bool {
     spec.any_axis() && !arch.has_compact_sfnn_l1()
 }
 
+fn parse_ft_factorizer_alpha(raw: &str) -> Result<f32, String> {
+    SfnnFactorizerAlphaSpec::parse_value(raw, "ft-factorizer-alpha")
+}
+
 fn effective_sfnn_factorizer_alpha(args: &Args) -> SfnnFactorizerAlphaSpec {
-    args.sfnn_factorizer_alpha.unwrap_or(SfnnFactorizerAlphaSpec::ONE)
+    SfnnFactorizerAlphaSpec {
+        ft: args.ft_factorizer_alpha,
+        ..args.sfnn_factorizer_alpha.unwrap_or(SfnnFactorizerAlphaSpec::ONE)
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4090,6 +4101,7 @@ fn cuda_cpp_sfnn_factorizer_active(args: &Args) -> bulletou_cuda_cpp::SfnnFactor
 fn cuda_cpp_sfnn_factorizer_alpha(args: &Args) -> bulletou_cuda_cpp::SfnnFactorizerAlpha {
     let alpha = effective_sfnn_factorizer_alpha(args);
     bulletou_cuda_cpp::SfnnFactorizerAlpha {
+        ft: alpha.ft,
         shared: alpha.shared,
         king_axis: alpha.king_axis,
         hand_axis: alpha.hand_axis,
@@ -4824,6 +4836,11 @@ struct Args {
     #[arg(long)]
     no_ft_factorize: bool,
 
+    /// Multiplier of FT shared piece weights (SFNN HalfKA2), default 1.
+    /// Forward, gradients and export use the same coefficient. Range 0..=100.
+    #[arg(long, default_value = "1.0", value_parser = parse_ft_factorizer_alpha)]
+    ft_factorizer_alpha: f32,
+
     /// Initial-weight multiplier for SFNN / LayerStack networks. FT uses
     /// `scale * sqrt(1 / fan_in)`; bucket-specific L1/L2/L3 use `scale * 0.01`.
     /// L1 shared weights keep the fixed [-0.01, 0.01] range. Default 1.0.
@@ -5085,6 +5102,11 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.ft_factorizer_alpha != 1.0
+            && (self.no_ft_factorize || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
+        {
+            return Err("--ft-factorizer-alpha requires SFNN_halfka2 with FT factorization enabled".to_string());
+        }
         if !self.optimizer_weight_clip.is_finite() || self.optimizer_weight_clip < 0.0 {
             return Err("--optimizer-weight-clip must be finite and non-negative (0 disables clipping)".to_string());
         }
@@ -8919,8 +8941,13 @@ fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
     let l0w_for_proxy: &[f32] = if shape.input_size == base_input_size {
         &weights.l0w
     } else if virtual_rows > 0 {
-        folded_l0w =
-            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+        folded_l0w = fold_sfnn_halfka2_piece_factorized_l0w(
+            &weights.l0w,
+            base_input_size,
+            virtual_rows,
+            shape.ft_size,
+            args.ft_factorizer_alpha,
+        )?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -9140,8 +9167,13 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
     let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
         &weights.l0w
     } else if virtual_rows > 0 {
-        folded_l0w =
-            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+        folded_l0w = fold_sfnn_halfka2_piece_factorized_l0w(
+            &weights.l0w,
+            base_input_size,
+            virtual_rows,
+            shape.ft_size,
+            args.ft_factorizer_alpha,
+        )?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -10157,7 +10189,7 @@ impl WorkerSfnnSession {
         let progress_params = cuda_cpp_sfnn_progress_params_for_state(progress_state.as_ref())?;
         let initial_weights = &initial_state.weights;
         let shape = initial_weights.shape;
-        print_ft_factorizer_status(feature_kind.base_input_size(), shape.input_size);
+        print_ft_factorizer_status(feature_kind.base_input_size(), shape.input_size, args.ft_factorizer_alpha);
         let ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
         let upload_ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
         let factorizer_active = cuda_cpp_sfnn_factorizer_active(&args);
@@ -10287,6 +10319,21 @@ impl WorkerSfnnSession {
         if rebase_axis_factorizer {
             let old_factorizer = effective_sfnn_factorizer_spec(&old_args);
             let new_factorizer = effective_sfnn_factorizer_spec(args);
+            let old_alpha = effective_sfnn_factorizer_alpha(&old_args);
+            let new_alpha = effective_sfnn_factorizer_alpha(args);
+            // Rebase shared terms with the OLD residual gates before rebasing
+            // residuals to their new gates below.
+            let old_shared = if old_factorizer.shared { old_alpha.shared } else { 0.0 };
+            let new_shared = if new_factorizer.shared { new_alpha.shared } else { 0.0 };
+            self.runner
+                .rebase_shared_factorizer_terms(&self.ctx, old_alpha.ft, new_alpha.ft, old_shared, new_shared)
+                .map_err(|e| e.to_string())?;
+            if old_alpha.ft != new_alpha.ft || old_shared != new_shared {
+                eprintln!(
+                    "  SFNN shared rebase = FT {:.6} -> {:.6}, L1 shared {:.6} -> {:.6}",
+                    old_alpha.ft, new_alpha.ft, old_shared, new_shared
+                );
+            }
             if old_factorizer.any() || new_factorizer.any() {
                 let (ratios, stats) = cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
                     self.shape,
@@ -10464,6 +10511,10 @@ impl WorkerSfnnSession {
                 self.progress_state.as_ref(),
                 completed_steps,
                 optimizer_steps,
+                [
+                    self.runner.factorizer_alpha.ft,
+                    if self.runner.factorizer.shared { self.runner.factorizer_alpha.shared } else { 0.0 },
+                ],
             )?;
             std::fs::write(
                 tmp_dir.join("dataloader_pos.txt"),
@@ -11131,6 +11182,16 @@ impl WorkerSfnnSession {
         epoch: usize,
         superbatch: usize,
     ) -> Result<std::path::PathBuf, String> {
+        let live_coefficients = [
+            self.runner.factorizer_alpha.ft,
+            if self.runner.factorizer.shared { self.runner.factorizer_alpha.shared } else { 0.0 },
+        ];
+        if shared_coefficients_for_args(&save_args) != live_coefficients {
+            return Err(
+                "worker save coefficients must match the live state; change FT/L1 shared alpha on trial, not on save"
+                    .to_string(),
+            );
+        }
         let progress_params = self.current_progress_params()?;
         let test_metrics = run_cuda_cpp_sfnn_resident_validation_cached(
             &save_args,
@@ -11190,6 +11251,7 @@ impl WorkerSfnnSession {
                     self.progress_state.as_ref(),
                     self.completed_steps,
                     self.optimizer_steps,
+                    shared_coefficients_for_args(&save_args),
                 )?;
                 write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, &save_args, log)?;
                 Ok(())
@@ -12539,14 +12601,17 @@ fn validate_ft_factorizer_checkpoint(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn print_ft_factorizer_status(base_inputs: usize, input_size: usize) {
+fn print_ft_factorizer_status(base_inputs: usize, input_size: usize, alpha: f32) {
     let virtual_rows = input_size.saturating_sub(base_inputs);
     print_startup_kv(
         "FT factorizer",
         if virtual_rows == 0 {
             "off (no shared piece rows)".to_string()
         } else {
-            format!("on ({} shared piece rows; independent of --sfnn-factorizer)", format_count(virtual_rows))
+            format!(
+                "on ({} shared piece rows; alpha={alpha:.6}; independent of --sfnn-factorizer)",
+                format_count(virtual_rows)
+            )
         },
     );
 }
@@ -13852,7 +13917,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     let input_size = initial_weights.shape.input_size;
     let max_active = feature_kind.max_active();
     print_startup_kv_colored("batch size", format_count(batch_size), ConsoleColor::BoldYellow);
-    print_ft_factorizer_status(feature_kind.base_input_size(), input_size);
+    print_ft_factorizer_status(feature_kind.base_input_size(), input_size, args.ft_factorizer_alpha);
     if input_size > feature_kind.base_input_size() {
         print_startup_kv(
             "arch",
@@ -16933,7 +16998,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::BoldYellow,
         );
     }
-    print_ft_factorizer_status(feature_kind.base_input_size(), initial_weights.shape.input_size);
+    print_ft_factorizer_status(
+        feature_kind.base_input_size(),
+        initial_weights.shape.input_size,
+        args.ft_factorizer_alpha,
+    );
     if initial_weights.shape.input_size > feature_kind.base_input_size() {
         print_startup_kv(
             "arch",
@@ -19006,6 +19075,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             progress_state,
             completed_steps,
             optimizer_steps,
+            shared_coefficients_for_args(args),
         )?;
         write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, args, log)?;
         Ok(())
@@ -20757,6 +20827,184 @@ fn validate_sfnn_l1_only_factorizer_checkpoint(records: &BTreeMap<String, Vec<f3
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+type SharedRebaseState<'a> = (&'a mut [f32], &'a mut [f32], &'a mut [f32]);
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn shared_rebase_state(state: &mut CudaCppRangerGroupState) -> SharedRebaseState<'_> {
+    (&mut state.momentum, &mut state.velocity, &mut state.slow_params)
+}
+
+/// In-place host counterpart of the CUDA shared rebase, used before upload.
+#[cfg(feature = "cuda-cpp-backend")]
+fn rebase_shared_host(
+    base: &mut [f32],
+    common: &mut [f32],
+    base_state: Option<SharedRebaseState<'_>>,
+    common_state: Option<SharedRebaseState<'_>>,
+    input_dim: usize,
+    output_dim: usize,
+    gates: Option<&[f32]>,
+    old: f32,
+    new: f32,
+) -> Result<(), String> {
+    let ratio = bulletou_cuda_cpp::shared_rebase_ratio(old, new).map_err(|e| e.to_string())?;
+    if old == new {
+        return Ok(());
+    }
+    let width = common.len();
+    if width == 0 || base.len() % width != 0 || (input_dim != 0 && input_dim.checked_mul(output_dim) != Some(width)) {
+        return Err("shared rebase: invalid base/shared shapes".to_string());
+    }
+    for (state, n) in [(&base_state, base.len()), (&common_state, width)] {
+        if let Some((m, v, slow)) = state {
+            if m.len() != n || v.len() != n || slow.len() != n {
+                return Err("shared rebase: invalid optimizer shapes".to_string());
+            }
+        }
+    }
+    if base_state.is_some() != common_state.is_some() {
+        return Err("shared rebase: both optimizer states must be present or absent".to_string());
+    }
+    if old > 0.0 && new == 0.0 {
+        if gates.is_some_and(|g| g.len() != base.len() / width || g.iter().any(|x| !x.is_finite() || *x <= 0.0)) {
+            return Err(
+                "cannot rebase L1 shared to zero with a zero residual gate; keep shared alpha positive".to_string()
+            );
+        }
+        let common_index = |i: usize| {
+            let cell = i % width;
+            if input_dim == 0 { cell } else { (cell % input_dim) * output_dim + cell / input_dim }
+        };
+        for (i, value) in base.iter_mut().enumerate() {
+            let gate = gates.map_or(1.0, |g| g[i / width]);
+            *value += old * common[common_index(i)] / gate;
+        }
+        if let Some((m, v, slow)) = base_state {
+            let common_slow = common_state
+                .as_ref()
+                .map(|(_, _, s)| &**s)
+                .ok_or_else(|| "shared rebase: common optimizer state missing".to_string())?;
+            for (i, value) in slow.iter_mut().enumerate() {
+                let gate = gates.map_or(1.0, |g| g[i / width]);
+                *value += old * common_slow[common_index(i)] / gate;
+            }
+            m.fill(0.0);
+            v.fill(0.0);
+        }
+    }
+    if ratio == 0.0 {
+        common.fill(0.0);
+    } else {
+        common.iter_mut().for_each(|x| *x *= ratio);
+    }
+    if let Some((m, v, slow)) = common_state {
+        if ratio == 0.0 {
+            m.fill(0.0);
+            v.fill(0.0);
+            slow.fill(0.0);
+        } else {
+            slow.iter_mut().for_each(|x| *x *= ratio);
+            m.iter_mut().for_each(|x| *x /= ratio);
+            v.iter_mut().for_each(|x| *x /= ratio * ratio);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn rebase_loaded_sfnn_shared(
+    weights: &mut CudaCppSfnnInitialWeights,
+    optimizer: &mut Option<CudaCppSfnnOptimizerState>,
+    args: &Args,
+    old: [f32; 2],
+    new: [f32; 2],
+) -> Result<(), String> {
+    for i in 0..2 {
+        bulletou_cuda_cpp::shared_rebase_ratio(old[i], new[i]).map_err(|e| e.to_string())?;
+    }
+    let gates = if old[1] > 0.0 && new[1] == 0.0 && weights.l1fw.is_some() {
+        WorkerSfnnSession::compute_count_settings(args, weights.shape)?.residual_count_gates
+    } else {
+        None
+    };
+    // Check the non-invertible case before changing either FT or L1.
+    if gates.as_ref().is_some_and(|g| g.iter().any(|x| *x <= 0.0)) {
+        return Err("cannot rebase L1 shared to zero with a zero residual gate; keep shared alpha positive".to_string());
+    }
+    if old[0] != new[0] {
+        let split = ShogiHalfKa2.num_inputs() * weights.shape.ft_size;
+        if weights.shape.input_size != ShogiHalfKa2.num_inputs() + bulletou_lib::game::inputs::PIECE_INPUTS {
+            return Err("FT alpha rebase requires SFNN HalfKA2 with shared piece rows".to_string());
+        }
+        let (base, common) = weights.l0w.split_at_mut(split);
+        let (bs, cs) = if let Some(opt) = optimizer.as_mut() {
+            let (bm, cm) = opt.l0w.momentum.split_at_mut(split);
+            let (bv, cv) = opt.l0w.velocity.split_at_mut(split);
+            let (bw, cw) = opt.l0w.slow_params.split_at_mut(split);
+            (Some((bm, bv, bw)), Some((cm, cv, cw)))
+        } else {
+            (None, None)
+        };
+        rebase_shared_host(base, common, bs, cs, 0, 0, None, old[0], new[0])?;
+    }
+    if old[1] != new[1] {
+        let shape = weights.shape;
+        for (is_bias, base, common) in
+            [(false, &mut weights.l1w, &mut weights.l1fw), (true, &mut weights.l1b, &mut weights.l1fb)]
+        {
+            if let Some(common) = common.as_mut() {
+                let (bs, cs) = if let Some(opt) = optimizer.as_mut() {
+                    let (base_opt, common_opt) =
+                        if is_bias { (&mut opt.l1b, &mut opt.l1fb) } else { (&mut opt.l1w, &mut opt.l1fw) };
+                    (
+                        Some(shared_rebase_state(base_opt)),
+                        Some(shared_rebase_state(
+                            common_opt
+                                .as_mut()
+                                .ok_or_else(|| "shared optimizer state missing for rebase".to_string())?,
+                        )),
+                    )
+                } else {
+                    (None, None)
+                };
+                rebase_shared_host(
+                    base,
+                    common,
+                    bs,
+                    cs,
+                    if is_bias { 0 } else { shape.ft_size },
+                    shape.l1_out(),
+                    gates.as_deref(),
+                    old[1],
+                    new[1],
+                )?;
+            }
+        }
+    }
+    if old != new {
+        eprintln!(
+            "  initial shared rebase = FT {:.6} -> {:.6}, L1 shared {:.6} -> {:.6}",
+            old[0], new[0], old[1], new[1]
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_sfnn_shared_coefficients(train: &BTreeMap<String, Vec<f32>>) -> Result<Option<[f32; 2]>, String> {
+    let Some(values) = train.get("shared_coefficients") else {
+        return Ok(None);
+    };
+    if values.len() != 2 {
+        return Err("invalid nnue/train/shared_coefficients record (expected FT, L1 shared)".to_string());
+    }
+    for &value in values {
+        bulletou_cuda_cpp::shared_rebase_ratio(value, value).map_err(|e| e.to_string())?;
+    }
+    Ok(Some([values[0], values[1]]))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_sfnn_initial_state(
     path: &Path,
     args: &Args,
@@ -20845,16 +21093,49 @@ fn load_cuda_cpp_sfnn_initial_state(
         ));
     }
     let keep_optimizer_state_on_factorizer_change = args.sfnn_keep_optimizer_state_on_factorizer_change;
-    let mut pre_migration_optimizer_states = if keep_optimizer_state_on_factorizer_change {
-        load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
-    } else {
+    // New factorizer coordinates reset the optimizer during migration; do not
+    // load an incomplete shared optimizer state just to discard it afterwards.
+    let mut pre_migration_optimizer_states = if created_factorizers.any() || progress_axis_appended {
         None
+    } else {
+        load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
     };
+    let train = initial_sections.remove("train").unwrap_or_default();
+    let new_shared_coefficients = shared_coefficients_for_args(args);
+    let old_shared_coefficients = match load_sfnn_shared_coefficients(&train)? {
+        Some(values) => values,
+        None => {
+            if weights.l1fw.is_some() && !created_factorizers.shared_l1 {
+                eprintln!(
+                    "  WARN: {} does not record L1 shared alpha; retaining its shared tensors without L1 alpha rebase. Use the same L1 alpha as when this state was saved.",
+                    path.display()
+                );
+            }
+            [1.0, new_shared_coefficients[1]]
+        }
+    };
+    rebase_loaded_sfnn_shared(
+        &mut weights,
+        &mut pre_migration_optimizer_states,
+        args,
+        old_shared_coefficients,
+        new_shared_coefficients,
+    )?;
     let extracted_new_factorizers = extract_cuda_cpp_sfnn_new_factorizers_from_base(
         &mut weights,
         effective_sfnn_factorizer_spec(args),
         created_factorizers,
     )?;
+    if created_factorizers.shared_l1 {
+        // Extraction builds a unit-coefficient shared term.
+        rebase_loaded_sfnn_shared(
+            &mut weights,
+            &mut pre_migration_optimizer_states,
+            args,
+            [new_shared_coefficients[0], 1.0],
+            new_shared_coefficients,
+        )?;
+    }
     let folded_inactive_factorizers =
         fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut weights, effective_sfnn_factorizer_spec(args))?;
     if extracted_new_factorizers {
@@ -20867,7 +21148,6 @@ fn load_cuda_cpp_sfnn_initial_state(
             "  initial factorizer migration = folded checkpoint factorizer tensors disabled by the current --sfnn-factorizer into base weights"
         );
     }
-    let train = initial_sections.remove("train").unwrap_or_default();
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_steps(&step_ranger, &weights)?;
@@ -22820,7 +23100,14 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         progress_state,
         completed_steps,
         optimizer_steps,
+        [factorizer_alpha.ft, if factorizer.shared { factorizer_alpha.shared } else { 0.0 }],
     )
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn shared_coefficients_for_args(args: &Args) -> [f32; 2] {
+    let a = effective_sfnn_factorizer_alpha(args);
+    [a.ft, if effective_sfnn_factorizer_spec(args).shared { a.shared } else { 0.0 }]
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -22831,11 +23118,13 @@ fn write_cuda_cpp_sfnn_weights_bin(
     progress_state: Option<&CudaCppSfnnProgressTrainState>,
     completed_steps: usize,
     optimizer_steps: usize,
+    shared_coefficients: [f32; 2],
 ) -> Result<(), String> {
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
+        ("nnue/train/shared_coefficients", shared_coefficients.as_slice()),
         ("nnue/weights/l0w", weights.l0w.as_slice()),
         ("nnue/weights/l0b", weights.l0b.as_slice()),
         ("nnue/weights/l1w", weights.l1w.as_slice()),
@@ -23049,8 +23338,13 @@ fn write_cuda_cpp_sfnn_nn_bin(
     let l0w_for_export: &[f32] = if shape.input_size == base_input_size {
         &weights.l0w
     } else if virtual_rows > 0 {
-        folded_l0w =
-            fold_sfnn_halfka2_piece_factorized_l0w(&weights.l0w, base_input_size, virtual_rows, shape.ft_size)?;
+        folded_l0w = fold_sfnn_halfka2_piece_factorized_l0w(
+            &weights.l0w,
+            base_input_size,
+            virtual_rows,
+            shape.ft_size,
+            factorizer_alpha.ft,
+        )?;
         &folded_l0w
     } else {
         return Err(format!(
@@ -23388,6 +23682,7 @@ fn fold_sfnn_halfka2_piece_factorized_l0w(
     base_input_size: usize,
     virtual_rows: usize,
     ft_size: usize,
+    alpha: f32,
 ) -> Result<Vec<f32>, String> {
     let expected =
         base_input_size.checked_add(virtual_rows).and_then(|rows| rows.checked_mul(ft_size)).ok_or_else(|| {
@@ -23405,7 +23700,7 @@ fn fold_sfnn_halfka2_piece_factorized_l0w(
         let base_start = row * ft_size;
         let virtual_start = virtual_row * ft_size;
         for col in 0..ft_size {
-            folded[base_start + col] = weights[base_start + col] + weights[virtual_start + col];
+            folded[base_start + col] = weights[base_start + col] + alpha * weights[virtual_start + col];
         }
     }
     Ok(folded)
@@ -24407,6 +24702,7 @@ fn resume_signature(args: &Args) -> String {
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
         format!("no_ft_factorize={}", args.no_ft_factorize),
+        format!("ft_factorizer_alpha={:.9}", args.ft_factorizer_alpha),
         format!("sfnn_init_bias={}", args.sfnn_init_bias.cli_name()),
         format!("sfnn_init_l2_l3_scale={:.9}", args.sfnn_init_l2_l3_scale),
         format!("sfnn_init_l2_scale={:.9}", effective_sfnn_init_l2_scale(args)),
@@ -24577,7 +24873,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "wrm_target_offset=", "wrm_in_scaling=", "wrm_target_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_target_scaling=", "wrm_target_offset=", "wrm_target_scaling=380.000000000");
     ensure_line_after(&mut out, "no_ft_factorize=", "nnue_pytorch_init_scale=", "no_ft_factorize=false");
-    ensure_line_after(&mut out, "sfnn_init_bias=", "no_ft_factorize=", "sfnn_init_bias=zero");
+    ensure_line_after(&mut out, "ft_factorizer_alpha=", "no_ft_factorize=", "ft_factorizer_alpha=1.000000000");
+    ensure_line_after(&mut out, "sfnn_init_bias=", "ft_factorizer_alpha=", "sfnn_init_bias=zero");
     ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_bias=", "sfnn_init_l2_l3_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l2_scale=", "sfnn_init_l2_l3_scale=", "sfnn_init_l2_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l3_scale=", "sfnn_init_l2_scale=", "sfnn_init_l3_scale=0.500000000");
@@ -29877,6 +30174,167 @@ mod tests {
     }
 
     #[test]
+    fn ft_alpha_cli_and_l1_all_are_independent() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--ft-factorizer-alpha",
+            "0.5",
+            "--sfnn-factorizer-alpha",
+            "all=0.25",
+        ])
+        .unwrap();
+        args.validate_arch_flags().unwrap();
+        assert_eq!(effective_sfnn_factorizer_alpha(&args).ft, 0.5);
+        assert_eq!(effective_sfnn_factorizer_alpha(&args).shared, 0.25);
+        assert!(resume_signature(&args).contains("ft_factorizer_alpha=0.500000000"));
+        args.no_ft_factorize = true;
+        assert!(args.validate_arch_flags().unwrap_err().contains("FT factorization enabled"));
+        for bad in ["-1", "NaN", "inf", "100.1"] {
+            assert!(parse_ft_factorizer_alpha(bad).is_err());
+        }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn shared_host_rebase_transposes_and_preserves_effective_weights() {
+        let mut base = vec![1.0; 8];
+        let mut common = vec![0.1, 0.2, 0.3, 0.4];
+        let original = common.clone();
+        let mut bo = CudaCppRangerGroupState::zero_from_weights(&base);
+        let mut co = CudaCppRangerGroupState::zero_from_weights(&common);
+        co.momentum.fill(2.0);
+        co.velocity.fill(4.0);
+        rebase_shared_host(
+            &mut base,
+            &mut common,
+            Some(shared_rebase_state(&mut bo)),
+            Some(shared_rebase_state(&mut co)),
+            2,
+            2,
+            None,
+            1.0,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(common, original.iter().map(|v| v * 2.0).collect::<Vec<_>>());
+        assert_eq!(co.momentum, vec![1.0; 4]);
+        assert_eq!(co.velocity, vec![1.0; 4]);
+        let unchanged = base.clone();
+        assert!(rebase_shared_host(&mut base, &mut common, None, None, 2, 2, Some(&[0.5, 0.0]), 0.5, 0.0).is_err());
+        assert_eq!(base, unchanged);
+        let gates = [0.5, 0.25];
+        rebase_shared_host(
+            &mut base,
+            &mut common,
+            Some(shared_rebase_state(&mut bo)),
+            Some(shared_rebase_state(&mut co)),
+            2,
+            2,
+            Some(&gates),
+            0.5,
+            0.0,
+        )
+        .unwrap();
+        for i in 0..8 {
+            let j = ((i % 4) % 2) * 2 + (i % 4) / 2;
+            let expected = 1.0 + original[j] / gates[i / 4];
+            assert!((base[i] - expected).abs() < 1e-6);
+            assert!((bo.slow_params[i] - expected).abs() < 1e-6);
+        }
+        assert!(common.iter().chain(&co.momentum).chain(&co.velocity).chain(&co.slow_params).all(|x| *x == 0.0));
+        common.fill(100.0);
+        co.slow_params.fill(100.0);
+        rebase_shared_host(
+            &mut base,
+            &mut common,
+            Some(shared_rebase_state(&mut bo)),
+            Some(shared_rebase_state(&mut co)),
+            2,
+            2,
+            None,
+            0.0,
+            2.0,
+        )
+        .unwrap();
+        assert!(common.iter().chain(&co.slow_params).all(|x| *x == 0.0));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn initial_state_rebases_saved_shared_coefficients() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--backend",
+            "cuda-cpp",
+            "--cuda-cpp-train-steps",
+            "1",
+            "--sfnn-factorizer",
+            "shared",
+        ])
+        .unwrap();
+        let kind = CudaCppSfnnFeatureKind::Halfka2;
+        let mut w = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        let split = kind.base_input_size() * w.shape.ft_size;
+        w.l0w[split..].fill(0.015625);
+        let path = std::env::temp_dir().join(format!("bulletou-alpha-state-{}.bin", std::process::id()));
+        let records = vec![
+            ("nnue/train/shared_coefficients", &[1.0, 1.0][..]),
+            ("nnue/weights/l0w", w.l0w.as_slice()),
+            ("nnue/weights/l0b", w.l0b.as_slice()),
+            ("nnue/weights/l1w", w.l1w.as_slice()),
+            ("nnue/weights/l1b", w.l1b.as_slice()),
+            ("nnue/weights/l1fw", w.l1fw.as_deref().unwrap()),
+            ("nnue/weights/l1fb", w.l1fb.as_deref().unwrap()),
+            ("nnue/weights/l2w", w.l2w.as_slice()),
+            ("nnue/weights/l2b", w.l2b.as_slice()),
+            ("nnue/weights/l3w", w.l3w.as_slice()),
+            ("nnue/weights/l3b", w.l3b.as_slice()),
+        ];
+        write_cuda_cpp_state_records_atomic(&path, records).unwrap();
+        args.ft_factorizer_alpha = 0.5;
+        args.sfnn_factorizer_alpha = Some("shared=2".parse().unwrap());
+        let loaded = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(&w.l0w[..split], &loaded.weights.l0w[..split]);
+        assert!(loaded.weights.l0w[split..].iter().all(|x| *x == 0.03125));
+        assert_eq!(w.l1w, loaded.weights.l1w);
+        assert_eq!(
+            w.l1fw.as_ref().unwrap().iter().map(|x| x * 0.5).collect::<Vec<_>>(),
+            *loaded.weights.l1fw.as_ref().unwrap()
+        );
+        assert!(loaded.optimizer_states.is_none());
+        let old = fold_sfnn_halfka2_piece_factorized_l0w(
+            &w.l0w,
+            kind.base_input_size(),
+            kind.virtual_rows(),
+            w.shape.ft_size,
+            1.0,
+        )
+        .unwrap();
+        let new = fold_sfnn_halfka2_piece_factorized_l0w(
+            &loaded.weights.l0w,
+            kind.base_input_size(),
+            kind.virtual_rows(),
+            w.shape.ft_size,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(old, new);
+        let mut train = BTreeMap::new();
+        assert_eq!(load_sfnn_shared_coefficients(&train).unwrap(), None);
+        train.insert("shared_coefficients".into(), vec![1.0, f32::NAN]);
+        assert!(load_sfnn_shared_coefficients(&train).is_err());
+    }
+
+    #[test]
     fn no_ft_factorize_is_independent_of_stack_sharing_and_recorded_for_resume() {
         let mut args = Args::try_parse_from([
             "bulletou",
@@ -29938,6 +30396,7 @@ mod tests {
             kind.base_input_size(),
             kind.virtual_rows(),
             on.shape.ft_size,
+            1.0,
         )
         .unwrap();
         assert_eq!(off.l0w, folded);
@@ -30589,11 +31048,12 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11).unwrap();
+        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11, [0.5, 0.75]).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let records = parse_model_weights_bin(&bytes).unwrap();
 
+        assert_eq!(records["nnue/train/shared_coefficients"], vec![0.5, 0.75]);
         assert_eq!(records["nnue/weights/l1fw"], vec![14.0]);
         assert_eq!(records["nnue/weights/l2fw"], vec![18.0]);
         assert_eq!(records["nnue/weights/l3fb"], vec![23.0]);
@@ -30804,7 +31264,8 @@ mod tests {
             20.0, 21.0, 22.0, // virtual piece 1
         ];
 
-        let folded = fold_sfnn_halfka2_piece_factorized_l0w(&weights, base_input_size, virtual_rows, ft_size).unwrap();
+        let folded =
+            fold_sfnn_halfka2_piece_factorized_l0w(&weights, base_input_size, virtual_rows, ft_size, 1.0).unwrap();
 
         assert_eq!(
             folded,
@@ -31034,6 +31495,7 @@ mod tests {
             ..SfnnFactorizerSpec::NONE
         };
         let alpha = SfnnFactorizerAlphaSpec {
+            ft: 1.0,
             shared: 1.0,
             king_axis: 0.5,
             hand_axis: 1.0,

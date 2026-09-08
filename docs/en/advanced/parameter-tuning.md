@@ -221,7 +221,7 @@ Here `K` is the axis/pair multiplier produced by count confidence. This reduces 
 
 The rebase scales existing GPU tensors in place and does not allocate a large extra VRAM buffer. Ranger slow params, momentum, and velocity are transformed consistently.
 
-The rebase currently applies to axis/pair factorizer tensors only. It does not rebase the shared factorizer or residual count gate.
+The worker also transforms L1 residual terms when count gates change. FT alpha and L1 shared alpha are rebased too. See [SFNN factorizer rebase](sfnn-factorizer.md#rebasing-when-alpha-changes) for zero transitions, optimizer state, and checkpoint coefficient records.
 
 ## Run
 

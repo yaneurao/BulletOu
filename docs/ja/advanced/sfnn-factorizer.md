@@ -12,7 +12,7 @@
 玉位置を `k`、駒の種類・所属・位置などの特徴を `p` とすると、各FTニューロンに使う重みは次の形です。
 
 ```text
-FTの実効重み[k, p] = 個別重み[k, p] + 共通重み[p]
+FTの実効重み[k, p] = 個別重み[k, p] + α_FT * 共通重み[p]
 ```
 
 同じ駒特徴の共通重みには、異なる玉位置の局面から勾配が集まります。
@@ -49,6 +49,78 @@ workerでもセッション内のON/OFF変更はできません。
 L2・L3のfactorizerを含む `state.bin` は、学習用に読み込むと明示エラーになります。
 保存時のalpha・count補正を無視して共有項を捨てると出力が変わるため、自動変換は行いません。
 L2・L3のfactorizerを含まないcheckpointから再開するか、新規学習してください。保存済みのファイルは変更しません。
+
+### FTとL1 sharedの強さ
+
+`SFNN_halfka2` では `--ft-factorizer-alpha` でFTの共通重みに掛ける係数を指定します。
+デフォルトは1.0、指定範囲は0～100です。L1 sharedは `--sfnn-factorizer-alpha shared=...` で独立に指定します。
+
+```powershell
+--ft-factorizer-alpha 0.5 `
+--sfnn-factorizer shared `
+--sfnn-factorizer-alpha shared=0.5
+```
+
+同じ指定を `bulletou-settings.json` に書く場合：
+
+```json
+{
+  "ft_factorizer_alpha": 0.5,
+  "sfnn_factorizer": "shared",
+  "sfnn_factorizer_alpha": "shared=0.5"
+}
+```
+
+どちらも「学習率だけを0.5倍する」という意味ではありません。実際に使う重みを
+`個別重み + 0.5 * 共通重み` とし、共通重みへ渡す勾配にも0.5が掛かります。
+L1のcount補正を使う場合は、個別項が `c(count) * 個別重み` になります。
+`nn.bin` への足し込みとGPU/CPUの量子化後検証にも同じ係数を使います。
+FTのbiasは共有項ではないため、この係数は掛かりません。
+
+`sfnn_factorizer_alpha: "all=0.5"` はL1のshared・axis・pairを指定するもので、FTには影響しません。
+FTの係数0は、共通重みの配列を残したまま寄与を0にします。
+`no_ft_factorize: true` はその配列自体を作らない指定で、同じ意味ではありません。
+非デフォルトのFT係数はFT共有が有効な `SFNN_halfka2` 専用です。
+`NNUE_halfkp` などや `no_ft_factorize: true` との組み合わせはエラーになります。
+
+### αを変えて追加学習する場合のrebase
+
+重みをそのままにαだけ変えると、その瞬間に出力が変わります。
+それを避けるため、workerのtrial間、および係数を記録した `state.bin` を
+`--initial-state` / `--resume` で読むときは、FTとL1 sharedを自動的に変換します（rebase）。
+正のα同士では次の計算です。
+
+```text
+r = 変更前のα / 変更後のα
+新しい共通重み = r * 保存されている共通重み
+
+変更後のα * 新しい共通重み = 変更前のα * 保存されている共通重み
+```
+
+例えば1.0から0.5へ変えると共通重みは2倍になり、変更直後の実効重みは保たれます。
+その後の勾配と更新のされ方は変わるので、変更前と同じ学習軌跡になる保証ではありません。
+Rangerのslow paramsは `r` 倍、momentumは `1/r` 倍、velocityは `1/r²` 倍に変換します。
+比率を勝手に上限へ丸めることはせず、数値として扱えない比率はエラーにします。
+
+0を含む場合は次の扱いです。
+
+- 正のαから0へ：共通重みの寄与を個別重みに足し込み、共通重みとそのoptimizer stateを0にします。
+  個別側のslow paramsにも同じ足し込みを行います。合算後のmomentum/velocityは厳密に引き継げないため、
+  影響を受ける個別重みのmomentum/velocityを0にします。
+- 0から正のαへ：無効中の値が突然加算されないよう、共通重みとそのoptimizer stateを0にしてから有効化します。
+- L1 sharedを0へ変えるとき、count補正で個別項の係数が0のbucketがあると、そこへ共通項を移せません。
+  この場合は重みを変更せずにエラーにします。sharedのαは正の値にしてください。
+
+この説明はαの変更についてです。count補正やfactorizer構成まで同時に変えた場合に、
+それらの変更の影響もすべて解消する保証ではありません。
+
+workerのrebaseは既存のGPUバッファをその場で更新し、重み一式のVRAMコピーを追加しません。
+通常のcheckpoint読み込みでは、アップロード前のCPU上の重み・optimizer stateをその場で変換します。
+
+`state.bin` には `nnue/train/shared_coefficients` としてFTとL1 sharedの係数を保存します。
+この記録がないファイルは、FT係数を1として読み、L1 sharedは保存時の係数が不明なため自動rebaseせず警告します。
+そのファイルから再開する際は、保存時と同じL1 shared係数を指定してください。
+元の `state.bin` を上書きすることはありません。
 
 ## 1. factorizer は何をするものか
 

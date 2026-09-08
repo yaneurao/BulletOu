@@ -12,7 +12,7 @@ You do not need this page for a first training run. Read it when you want to com
 For king position `k` and piece feature `p` (piece type, ownership, square, etc.), each FT neuron's weight is:
 
 ```text
-effective_FT_weight[k, p] = individual_weight[k, p] + shared_weight[p]
+effective_FT_weight[k, p] = individual_weight[k, p] + alpha_FT * shared_weight[p]
 ```
 
 The shared weight receives gradients from the same piece feature across king positions. Individual weights remain trainable, so king-specific differences can still be learned.
@@ -49,6 +49,84 @@ A worker session also cannot change its FT ON/OFF setting between trials.
 Training rejects `state.bin` files containing L2/L3 factorizer tensors with an explicit error.
 Dropping these tensors without applying their saved alpha/count settings would change the output, so no automatic conversion is performed.
 Resume from a checkpoint without L2/L3 factorizers or start a fresh run. Existing files are not modified.
+
+### FT and L1 shared strength
+
+For `SFNN_halfka2`, `--ft-factorizer-alpha` controls the shared FT coefficient.
+Its default is 1.0 and its range is 0–100. L1 shared uses the independent
+`--sfnn-factorizer-alpha shared=...` option.
+
+```powershell
+--ft-factorizer-alpha 0.5 `
+--sfnn-factorizer shared `
+--sfnn-factorizer-alpha shared=0.5
+```
+
+Equivalent fields in `bulletou-settings.json`:
+
+```json
+{
+  "ft_factorizer_alpha": 0.5,
+  "sfnn_factorizer": "shared",
+  "sfnn_factorizer_alpha": "shared=0.5"
+}
+```
+
+These are not learning-rate-only multipliers: forward uses
+`individual_weight + 0.5 * shared_weight`, and the shared-weight gradient also
+gets multiplied by 0.5. With L1 count gating, the individual term is
+`c(count) * individual_weight`. Export folding and both GPU/CPU quantized
+validation use the same coefficient. FT biases are not shared terms and are not scaled.
+
+`sfnn_factorizer_alpha: "all=0.5"` controls L1 shared/axis/pair, not the FT.
+FT alpha 0 keeps the shared array allocated with zero contribution;
+`no_ft_factorize: true` removes the array entirely. These are different settings.
+Non-default FT alpha is supported only for `SFNN_halfka2` with FT sharing enabled.
+Other architectures, including `NNUE_halfkp`, or `no_ft_factorize: true` produce an error.
+
+### Rebasing when alpha changes
+
+Changing alpha without transforming the weights changes the output immediately.
+Between worker trials, and when loading a `state.bin` that records its coefficients
+through `--initial-state` / `--resume`, FT and L1 shared terms are automatically
+rebased. For positive coefficients:
+
+```text
+r = old_alpha / new_alpha
+new_shared_weight = r * saved_shared_weight
+new_alpha * new_shared_weight = old_alpha * saved_shared_weight
+```
+
+Changing 1.0 to 0.5 doubles the shared weight, preserving its immediate effective
+contribution. Future gradients and updates differ; this does not promise the same
+training trajectory. Ranger slow params are multiplied by `r`, momentum by
+`1/r`, and velocity by `1/r²`. Ratios are not silently capped;
+unrepresentable ratios produce an error.
+
+Zero transitions have separate rules:
+
+- Positive to zero: fold the shared contribution into individual weights and their
+  slow params, then clear the shared weights and their optimizer state. Because
+  merged momentum/velocity cannot be transferred exactly, clear those two states
+  for the affected individual weights.
+- Zero to positive: clear dormant shared weights and their optimizer state before
+  enabling the term, preventing stale values from reappearing.
+- If any L1 residual count gate is zero, its individual term cannot absorb the
+  shared contribution. Setting L1 shared alpha to zero fails before changing weights;
+  keep its alpha positive.
+
+This describes alpha changes. It does not guarantee preservation of all effects
+when count settings or factorizer structure are changed at the same time.
+
+Worker rebase updates existing GPU buffers in place without allocating another
+full weight copy in VRAM. Checkpoint loading transforms host weights and optimizer
+state in place before upload.
+
+`state.bin` records the FT and L1 shared coefficients in
+`nnue/train/shared_coefficients`. If that record is absent, FT alpha is read as 1;
+L1 shared cannot be automatically rebased because its saved coefficient is unknown,
+so a warning is printed. Use the same L1 shared coefficient as at save time for
+such files. The source `state.bin` is not overwritten.
 
 ## 1. What the factorizer does
 

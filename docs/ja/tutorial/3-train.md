@@ -180,7 +180,9 @@ python .\tuning_parameters.py `
 
 次へ: [4. validation を有効にする](4-validation.md)
 
-HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"no_ft_factorize": true`、CLIなら `--no-ft-factorize` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。再開時は保存元と同じFT設定にしてください。[FTとL1の共有の違い・設定例](../advanced/sfnn-factorizer.md)
+HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"no_ft_factorize": true`、CLIなら `--no-ft-factorize` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。再開時は保存元と同じFTのON/OFF設定にしてください。
+
+`SFNN_halfka2` では `"ft_factorizer_alpha": 0.5` のようにFT共有の強さも指定できます（デフォルト1.0）。L1共有の強さは `"sfnn_factorizer_alpha": "shared=0.5"` で別に指定します。係数を記録したcheckpointからαを変更して再開すると、開始直後の実効重みを保つrebaseを行います。[設定例とrebaseの注意点](../advanced/sfnn-factorizer.md)
 
 学習中の重み制限はデフォルトで無効です。範囲を制限したい場合は `--optimizer-weight-clip N` を指定します（JSONでは `"optimizer_weight_clip": N`）。[設定の意味と注意点](../advanced/tuning.md#学習中の重み制限)
 

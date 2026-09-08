@@ -221,7 +221,7 @@ scale = (alpha_old * K_old) / (alpha_new * K_new)
 
 この処理は GPU 上の既存 tensor を in-place でスケールします。大きな追加 VRAM buffer は確保しません。Ranger の slow params / momentum / velocity も同じ変数変換に合わせて更新します。
 
-対象は axis/pair factorizer tensor です。shared factorizer と residual count gate は rebase しません。
+workerではL1 residual count gateの変更にも対応する変換を行います。FTのαとL1 sharedのαもrebase対象です。FT/L1 sharedの0を含む変更、optimizer state、checkpointの係数記録については、[SFNN factorizerのrebase](sfnn-factorizer.md#αを変えて追加学習する場合のrebase)を参照してください。
 
 ## 実行
 

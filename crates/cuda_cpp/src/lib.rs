@@ -1206,6 +1206,7 @@ impl SfnnFactorizerActive {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnFactorizerAlpha {
+    pub ft: f32,
     pub shared: f32,
     pub king_axis: f32,
     pub hand_axis: f32,
@@ -1214,11 +1215,12 @@ pub struct SfnnFactorizerAlpha {
 }
 
 impl SfnnFactorizerAlpha {
-    pub const ONE: Self = Self { shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
+    pub const ONE: Self = Self { ft: 1.0, shared: 1.0, king_axis: 1.0, hand_axis: 1.0, progress_axis: 1.0, pair: 1.0 };
     const MAX: f32 = 100.0;
 
     fn validate(self) -> Result<()> {
         for (name, value) in [
+            ("ft", self.ft),
             ("shared", self.shared),
             ("king-axis", self.king_axis),
             ("hand-axis", self.hand_axis),
@@ -1234,6 +1236,70 @@ impl SfnnFactorizerAlpha {
         }
         Ok(())
     }
+}
+
+pub fn shared_rebase_ratio(old: f32, new: f32) -> Result<f32> {
+    if !old.is_finite() || !new.is_finite() || !(0.0..=100.0).contains(&old) || !(0.0..=100.0).contains(&new) {
+        return Err(CudaCppError::message("shared rebase coefficients must be finite and in [0, 100]"));
+    }
+    if old == new {
+        return Ok(1.0);
+    }
+    let ratio = if new == 0.0 { 0.0 } else { old / new };
+    if !ratio.is_finite()
+        || (old > 0.0
+            && new > 0.0
+            && (ratio == 0.0
+                || !(ratio * ratio).is_finite()
+                || !(1.0 / ratio).is_finite()
+                || !(1.0 / (ratio * ratio)).is_finite()))
+    {
+        return Err(CudaCppError::message("shared rebase ratio is not representable; no clipping is performed"));
+    }
+    Ok(ratio)
+}
+
+fn rebase_shared_device(
+    ctx: &Context,
+    base: &F32Buffer,
+    base_state: &RangerParamState,
+    shared: &F32Buffer,
+    shared_state: &RangerParamState,
+    gates: Option<&F32Buffer>,
+    base_count: usize,
+    shared_count: usize,
+    shared_offset: usize,
+    input_dim: usize,
+    output_dim: usize,
+    old: f32,
+    new: f32,
+) -> Result<()> {
+    shared_rebase_ratio(old, new)?;
+    if old == new {
+        return Ok(());
+    }
+    // SAFETY: runner validates ownership/shapes; backend validates all lengths.
+    check(unsafe {
+        ffi::bulletou_cuda_cpp_rebase_shared_device(
+            ctx.as_ptr(),
+            base.as_ptr(),
+            base_state.slow_params.as_ptr(),
+            base_state.momentum.as_ptr(),
+            base_state.velocity.as_ptr(),
+            shared.as_ptr(),
+            shared_state.slow_params.as_ptr(),
+            shared_state.momentum.as_ptr(),
+            shared_state.velocity.as_ptr(),
+            gates.map_or(std::ptr::null_mut(), F32Buffer::as_ptr),
+            base_count,
+            shared_count,
+            shared_offset,
+            input_dim,
+            output_dim,
+            old,
+            new,
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2042,6 +2108,7 @@ fn sfnn_forward_device_with_factorizer_impl(
             i32::from(factorizer.king_hand_pair),
             i32::from(factorizer.king_progress_pair),
             i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.ft,
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
@@ -2223,6 +2290,7 @@ pub fn sfnn_build_quantized_proxy_device(
             i32::from(factorizer.king_hand_pair),
             i32::from(factorizer.king_progress_pair),
             i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.ft,
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
@@ -3547,6 +3615,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             i32::from(factorizer.king_hand_pair),
             i32::from(factorizer.king_progress_pair),
             i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.ft,
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
@@ -3739,6 +3808,7 @@ fn sfnn_backward_device_impl(
                 i32::from(factorizer.king_hand_pair),
                 i32::from(factorizer.king_progress_pair),
                 i32::from(factorizer.hand_progress_pair),
+                factorizer_alpha.ft,
                 factorizer_alpha.shared,
                 factorizer_alpha.king_axis,
                 factorizer_alpha.hand_axis,
@@ -3823,6 +3893,7 @@ fn sfnn_backward_device_impl(
                 i32::from(factorizer.king_hand_pair),
                 i32::from(factorizer.king_progress_pair),
                 i32::from(factorizer.hand_progress_pair),
+                factorizer_alpha.ft,
                 factorizer_alpha.shared,
                 factorizer_alpha.king_axis,
                 factorizer_alpha.hand_axis,
@@ -6535,6 +6606,93 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    /// Preserve FT/L1-shared contributions when their coefficients change.
+    /// Positive -> zero folds into base and slow weights, resets mixed moments.
+    /// Zero -> positive clears dormant shared weights and optimizer state.
+    pub fn rebase_shared_factorizer_terms(
+        &mut self,
+        ctx: &Context,
+        old_ft: f32,
+        new_ft: f32,
+        old_shared: f32,
+        new_shared: f32,
+    ) -> Result<()> {
+        shared_rebase_ratio(old_ft, new_ft)?;
+        shared_rebase_ratio(old_shared, new_shared)?;
+        let l1w_state = self.optimizer_states.l1fw.as_ref();
+        let l1b_state = self.optimizer_states.l1fb.as_ref();
+        let has_shared = self.weights.l1fw.is_some() && self.weights.l1fb.is_some();
+        if has_shared && (l1w_state.is_none() || l1b_state.is_none()) {
+            return Err(CudaCppError::message("L1 shared optimizer state missing during rebase"));
+        }
+        let gates = self.residual_count_gates();
+        if has_shared && old_shared > 0.0 && new_shared == 0.0 {
+            if let Some(gates) = gates {
+                if gates.download(ctx)?.iter().any(|&g| g <= 0.0) {
+                    return Err(CudaCppError::message(
+                        "cannot rebase L1 shared alpha to zero: a residual count gate is zero; shared contribution cannot be folded into that bucket",
+                    ));
+                }
+            }
+        }
+        const BASE: usize = 131_949;
+        const VIRTUAL: usize = 1_629;
+        if self.shape.input_size == BASE + VIRTUAL {
+            rebase_shared_device(
+                ctx,
+                &self.weights.l0w,
+                &self.optimizer_states.l0w,
+                &self.weights.l0w,
+                &self.optimizer_states.l0w,
+                None,
+                BASE * self.shape.ft_size,
+                VIRTUAL * self.shape.ft_size,
+                BASE * self.shape.ft_size,
+                0,
+                0,
+                old_ft,
+                new_ft,
+            )?;
+        } else if old_ft != new_ft {
+            return Err(CudaCppError::message("FT alpha requires SFNN HalfKA2 with FT factorization enabled"));
+        }
+        if let (Some(w), Some(b), Some(ws), Some(bs)) =
+            (self.weights.l1fw.as_ref(), self.weights.l1fb.as_ref(), l1w_state, l1b_state)
+        {
+            rebase_shared_device(
+                ctx,
+                &self.weights.l1w,
+                &self.optimizer_states.l1w,
+                w,
+                ws,
+                gates,
+                self.weights.l1w.len(),
+                w.len(),
+                0,
+                self.shape.ft_size,
+                self.shape.l1_out(),
+                old_shared,
+                new_shared,
+            )?;
+            rebase_shared_device(
+                ctx,
+                &self.weights.l1b,
+                &self.optimizer_states.l1b,
+                b,
+                bs,
+                gates,
+                self.weights.l1b.len(),
+                b.len(),
+                0,
+                0,
+                0,
+                old_shared,
+                new_shared,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn rebase_axis_factorizer_terms(&mut self, ctx: &Context, weight_ratios: &[f32]) -> Result<()> {
         let axes = self.shape.factorizer_axis_count();
         expect_len("SFNN axis factorizer rebase ratios", axes, weight_ratios.len())?;
@@ -8158,6 +8316,7 @@ fn sfnn_add_saturation_penalty_gradients_device(
             i32::from(factorizer.king_hand_pair),
             i32::from(factorizer.king_progress_pair),
             i32::from(factorizer.hand_progress_pair),
+            factorizer_alpha.ft,
             factorizer_alpha.shared,
             factorizer_alpha.king_axis,
             factorizer_alpha.hand_axis,
@@ -8817,6 +8976,25 @@ mod ffi {
             value: f32,
             len: usize,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_rebase_shared_device(
+            ctx: *mut BulletOuCudaCppContext,
+            base: *mut BulletOuCudaCppF32Buffer,
+            base_slow: *mut BulletOuCudaCppF32Buffer,
+            base_m: *mut BulletOuCudaCppF32Buffer,
+            base_v: *mut BulletOuCudaCppF32Buffer,
+            shared: *mut BulletOuCudaCppF32Buffer,
+            shared_slow: *mut BulletOuCudaCppF32Buffer,
+            shared_m: *mut BulletOuCudaCppF32Buffer,
+            shared_v: *mut BulletOuCudaCppF32Buffer,
+            gates: *mut BulletOuCudaCppF32Buffer,
+            base_count: usize,
+            shared_count: usize,
+            shared_offset: usize,
+            input_dim: usize,
+            output_dim: usize,
+            old_alpha: f32,
+            new_alpha: f32,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_scale_axis_rows_f32_device(
             ctx: *mut BulletOuCudaCppContext,
             values: *mut BulletOuCudaCppF32Buffer,
@@ -9050,6 +9228,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9112,6 +9291,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9173,6 +9353,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9255,6 +9436,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9338,6 +9520,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9401,6 +9584,7 @@ mod ffi {
             use_king_hand_pair: i32,
             use_king_progress_pair: i32,
             use_hand_progress_pair: i32,
+            ft_factorizer_alpha: f32,
             factorizer_shared_alpha: f32,
             factorizer_king_axis_alpha: f32,
             factorizer_hand_axis_alpha: f32,
@@ -9512,6 +9696,239 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_rebase_ratios_validate_without_clamping() {
+        assert_eq!(shared_rebase_ratio(1.0, 0.5).unwrap(), 2.0);
+        assert_eq!(shared_rebase_ratio(0.0, 2.0).unwrap(), 0.0);
+        assert_eq!(shared_rebase_ratio(2.0, 0.0).unwrap(), 0.0);
+        for (old, new) in [(f32::NAN, 1.0), (1.0, -1.0), (101.0, 1.0), (1.0, f32::MIN_POSITIVE)] {
+            assert!(shared_rebase_ratio(old, new).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_ft_alpha_forward_gradients_and_quantization() {
+        const BASE: usize = 131949;
+        const VIRTUAL: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
+        weights.l2fw = None;
+        weights.l2fb = None;
+        weights.l3fw = None;
+        weights.l3fb = None;
+        weights.shape.input_size = BASE + VIRTUAL;
+        let shape = weights.shape;
+        let l0w: Vec<f32> =
+            (0..shape.input_size * shape.ft_size)
+                .map(|i| {
+                    if i < BASE * shape.ft_size { 0.01 * ((i % 9) as f32 - 4.0) } else { 0.03 * ((i % 7) as f32 - 3.0) }
+                })
+                .collect();
+        weights.l0w = &l0w;
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1629, 1, 1629, -1, -1],
+            nstm_indices: &[2, -1, -1, 3, 1630, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let active = SfnnFactorizerActive::from_available(&device_weights);
+        let forward = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 2)).unwrap();
+        let backward = SfnnBackwardWorkspace::new(&ctx, SfnnBackwardWorkspaceLayout::new(shape, 2, 3)).unwrap();
+        let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(2)).unwrap();
+        let target = F32Buffer::from_host(&ctx, &[0.25, 0.75]).unwrap();
+        let ew = F32Buffer::from_host(&ctx, &[1.0, 1.0]).unwrap();
+        for alpha in [0.0, 0.5, 1.0, 2.0] {
+            let a = SfnnFactorizerAlpha { ft: alpha, ..SfnnFactorizerAlpha::ONE };
+            let folded: Vec<_> = (0..BASE * shape.ft_size)
+                .map(|i| l0w[i] + alpha * l0w[BASE * shape.ft_size + i % (VIRTUAL * shape.ft_size)])
+                .collect();
+            let folded_host = SfnnForwardHostWeights {
+                shape: SfnnForwardShape { input_size: BASE, ..shape },
+                l0w: &folded,
+                ..weights
+            };
+            sfnn_forward_device_with_factorizer_and_alpha(&ctx, &device_batch, &device_weights, &forward, active, a)
+                .unwrap();
+            assert_close_slice(
+                "FT scaled forward",
+                &forward.download_output(&ctx).unwrap(),
+                &tiny_sfnn_forward_cpu(batch, folded_host),
+                1e-6,
+            );
+            sfnn_forward_train_device_with_factorizer(
+                &ctx,
+                &device_batch,
+                &device_weights,
+                &forward,
+                active,
+                a,
+                &backward.l0w_gradients,
+                None,
+                None,
+            )
+            .unwrap();
+            assert_close_slice(
+                "FT pre-folded training forward",
+                &forward.download_output(&ctx).unwrap(),
+                &tiny_sfnn_forward_cpu(batch, folded_host),
+                1e-6,
+            );
+            scalar_loss_device_from_buffers(
+                &ctx,
+                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                1.0,
+                2,
+                &forward.output,
+                &target,
+                &ew,
+                &loss,
+            )
+            .unwrap();
+            // Both the diagnostic and the production backward paths must scale
+            // only the virtual gradient, including repeated piece features.
+            for train in [false, true] {
+                if train {
+                    sfnn_backward_train_device_with_factorizer_and_alpha(
+                        &ctx,
+                        &device_batch,
+                        &device_weights,
+                        &forward,
+                        &loss,
+                        &backward,
+                        active,
+                        a,
+                    )
+                    .unwrap();
+                } else {
+                    sfnn_backward_device_with_factorizer_and_alpha(
+                        &ctx,
+                        &device_batch,
+                        &device_weights,
+                        &forward,
+                        &loss,
+                        &backward,
+                        active,
+                        a,
+                    )
+                    .unwrap();
+                }
+                let grad = backward.download(&ctx).unwrap().l0w_gradients;
+                let mut expected = vec![0.0; VIRTUAL * shape.ft_size];
+                for (i, g) in grad[..BASE * shape.ft_size].iter().enumerate() {
+                    expected[i % (VIRTUAL * shape.ft_size)] += alpha * g;
+                }
+                assert!(
+                    grad[..BASE * shape.ft_size].iter().any(|x| x.abs() > 1e-10),
+                    "must exercise a nonzero gradient"
+                );
+                assert_close_slice("FT shared gradient", &grad[BASE * shape.ft_size..], &expected, 1e-6);
+            }
+            let proxy_shape = SfnnForwardShape { input_size: BASE, ..shape };
+            let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, proxy_shape).unwrap();
+            sfnn_build_quantized_proxy_device(&ctx, BASE, VIRTUAL, &device_weights, &proxy, active, a, None, None)
+                .unwrap();
+            let expected: Vec<_> =
+                folded.iter().map(|x| (x * 127.0).round().clamp(-32768.0, 32767.0) / 127.0).collect();
+            assert_close_slice("FT quantization", &proxy.l0w.download(&ctx).unwrap(), &expected, 1e-6);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_shared_rebase_preserves_forward_and_optimizer() {
+        const BASE: usize = 131949;
+        const VIRTUAL: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
+        weights.l2fw = None;
+        weights.l2fb = None;
+        weights.l3fw = None;
+        weights.l3fb = None;
+        weights.shape.input_size = BASE + VIRTUAL;
+        let l0w = vec![0.01; weights.shape.input_size * weights.shape.ft_size];
+        weights.l0w = &l0w;
+        let shape = weights.shape;
+        let mut runner = SfnnTrainStepRunner::new(&ctx, weights, 2, 3).unwrap();
+        let active = runner.factorizer;
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let forward = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 2)).unwrap();
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.25])).unwrap();
+        runner
+            .optimizer_states
+            .l1fw
+            .as_ref()
+            .unwrap()
+            .momentum
+            .upload(&ctx, &vec![2.0; shape.ft_size * shape.l1_out()])
+            .unwrap();
+        runner
+            .optimizer_states
+            .l1fw
+            .as_ref()
+            .unwrap()
+            .velocity
+            .upload(&ctx, &vec![4.0; shape.ft_size * shape.l1_out()])
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        let expected = forward.download_output(&ctx).unwrap();
+        let old_l1_shared = runner.weights.l1fw.as_ref().unwrap().download(&ctx).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 1.0, 2.0, 1.0, 0.5).unwrap();
+        runner
+            .set_factorizer_config(active, SfnnFactorizerAlpha { ft: 2.0, shared: 0.5, ..SfnnFactorizerAlpha::ONE })
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("positive rebase forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+        assert_close_slice(
+            "shared weight ratio",
+            &runner.weights.l1fw.as_ref().unwrap().download(&ctx).unwrap(),
+            &old_l1_shared.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            1e-7,
+        );
+        let state = runner.read_optimizer_states(&ctx).unwrap();
+        assert!(state.l1fw.as_ref().unwrap().momentum.iter().all(|x| *x == 1.0));
+        assert!(state.l1fw.as_ref().unwrap().velocity.iter().all(|x| *x == 1.0));
+        assert_close_slice(
+            "shared slow ratio",
+            &state.l1fw.as_ref().unwrap().slow_params,
+            &old_l1_shared.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            1e-7,
+        );
+        let ft = runner.weights.l0w.download(&ctx).unwrap();
+        assert!((ft[BASE * shape.ft_size] - 0.005).abs() < 1e-7);
+
+        // Failure must leave FT as well as L1 unchanged.
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.0])).unwrap();
+        assert!(runner.rebase_shared_factorizer_terms(&ctx, 2.0, 1.0, 0.5, 0.0).is_err());
+        assert_eq!(ft, runner.weights.l0w.download(&ctx).unwrap());
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.25])).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 2.0, 0.0, 0.5, 0.0).unwrap();
+        runner
+            .set_factorizer_config(active, SfnnFactorizerAlpha { ft: 0.0, shared: 0.0, ..SfnnFactorizerAlpha::ONE })
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("zero rebase forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+        let state = runner.read_optimizer_states(&ctx).unwrap();
+        assert!(state.l1w.momentum.iter().all(|x| *x == 0.0));
+        assert!(state.l1fw.as_ref().unwrap().slow_params.iter().all(|x| *x == 0.0));
+        // Dormant shared momentum/slow weights must not reappear on reactivation.
+        runner.weights.l1fw.as_ref().unwrap().upload(&ctx, &vec![99.0; shape.ft_size * shape.l1_out()]).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 0.0, 1.0, 0.0, 1.0).unwrap();
+        runner.set_factorizer_config(active, SfnnFactorizerAlpha::ONE).unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("reactivated forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+    }
 
     #[test]
     fn ranger_default_disables_weight_clipping() {

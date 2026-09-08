@@ -988,7 +988,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -1017,8 +1017,8 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
             size_t virtual_feature = 0;
             if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
                 size_t virtual_weight_base = virtual_feature * ft_size;
-                stm_sum0 += weights[virtual_weight_base + row0];
-                stm_sum1 += weights[virtual_weight_base + row1];
+                stm_sum0 += ft_factorizer_alpha * weights[virtual_weight_base + row0];
+                stm_sum1 += ft_factorizer_alpha * weights[virtual_weight_base + row1];
             }
         }
 
@@ -1031,8 +1031,8 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
             size_t virtual_feature = 0;
             if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
                 size_t virtual_weight_base = virtual_feature * ft_size;
-                nstm_sum0 += weights[virtual_weight_base + row0];
-                nstm_sum1 += weights[virtual_weight_base + row1];
+                nstm_sum0 += ft_factorizer_alpha * weights[virtual_weight_base + row0];
+                nstm_sum1 += ft_factorizer_alpha * weights[virtual_weight_base + row1];
             }
         }
     }
@@ -1052,7 +1052,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
 __global__ void sfnn_fold_halfka2_l0w_kernel(
     const float* weights,
     float* folded_weights,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total = SFNN_HALFKA2_BASE_INPUT_SIZE * ft_size;
     if (tid >= total) {
@@ -1063,7 +1063,7 @@ __global__ void sfnn_fold_halfka2_l0w_kernel(
     const size_t row = tid - feature * ft_size;
     const size_t piece = feature % SFNN_HALFKA2_PIECE_INPUTS;
     const size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
-    folded_weights[tid] = weights[tid] + weights[virtual_feature * ft_size + row];
+    folded_weights[tid] = weights[tid] + ft_factorizer_alpha * weights[virtual_feature * ft_size + row];
 }
 
 __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
@@ -1255,7 +1255,7 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     size_t dst_input_size,
     size_t virtual_rows,
     size_t ft_size,
-    float scale) {
+    float scale, float ft_factorizer_alpha) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total = dst_input_size * ft_size;
     if (tid >= total) {
@@ -1267,7 +1267,7 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     float value = src[tid];
     if (src_input_size != dst_input_size && virtual_rows != 0) {
         const size_t virtual_feature = dst_input_size + (feature % virtual_rows);
-        value += src[virtual_feature * ft_size + row];
+        value += ft_factorizer_alpha * src[virtual_feature * ft_size + row];
     }
     dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -32768.0f, 32767.0f);
 }
@@ -3601,7 +3601,7 @@ __device__ void sfnn_atomic_add_l0w_gradient(
     size_t input_size,
     size_t rows,
     size_t row,
-    float value);
+    float value, float ft_factorizer_alpha);
 
 __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     const int* stm_indices,
@@ -3614,7 +3614,7 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -3657,10 +3657,10 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
         if (stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
             size_t feature = static_cast<size_t>(stm_feature);
             if (stm_grad0 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, stm_grad0);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, stm_grad0, ft_factorizer_alpha);
             }
             if (stm_grad1 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, stm_grad1);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, stm_grad1, ft_factorizer_alpha);
             }
         }
 
@@ -3668,10 +3668,10 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
         if (nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
             size_t feature = static_cast<size_t>(nstm_feature);
             if (nstm_grad0 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, nstm_grad0);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row0, nstm_grad0, ft_factorizer_alpha);
             }
             if (nstm_grad1 != 0.0f) {
-                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, nstm_grad1);
+                sfnn_atomic_add_l0w_gradient(l0w_gradients, feature, input_size, ft_size, row1, nstm_grad1, ft_factorizer_alpha);
             }
         }
     }
@@ -3877,7 +3877,7 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
 
 __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float* l0w_gradients,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     size_t piece = blockIdx.x;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
     if (piece >= SFNN_HALFKA2_PIECE_INPUTS || row >= ft_size) {
@@ -3906,15 +3906,15 @@ __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     }
     float sum = (sum0 + sum1) + (sum2 + sum3);
     size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
-    l0w_gradients[virtual_feature * ft_size + row] = sum;
+    l0w_gradients[virtual_feature * ft_size + row] = ft_factorizer_alpha * sum;
 }
 
-__device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value) {
+__device__ void sfnn_atomic_add_l0w_gradient(float* gradients, size_t feature, size_t input_size, size_t rows, size_t row, float value, float ft_factorizer_alpha) {
     size_t weight_idx = feature * rows + row;
     atomicAdd(&gradients[weight_idx], value);
     size_t virtual_feature = 0;
     if (sfnn_factorized_virtual_feature(feature, input_size, &virtual_feature)) {
-        atomicAdd(&gradients[virtual_feature * rows + row], value);
+        atomicAdd(&gradients[virtual_feature * rows + row], ft_factorizer_alpha * value);
     }
 }
 
@@ -3932,7 +3932,7 @@ __global__ void sfnn_l0_sparse_backward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t l0_len = batch * ft_size;
     if (tid >= l0_len) {
@@ -3956,13 +3956,13 @@ __global__ void sfnn_l0_sparse_backward_kernel(
     for (size_t slot = 0; slot < max_active; ++slot) {
         int stm_feature = stm_indices[sparse_base + slot];
         if (stm_grad != 0.0f && stm_feature >= 0 && static_cast<size_t>(stm_feature) < input_size) {
-            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad);
+            sfnn_atomic_add_l0w_gradient(l0w_gradients, static_cast<size_t>(stm_feature), input_size, ft_size, row, stm_grad, ft_factorizer_alpha);
         }
 
         int nstm_feature = nstm_indices[sparse_base + slot];
         if (nstm_grad != 0.0f && nstm_feature >= 0 && static_cast<size_t>(nstm_feature) < input_size) {
             sfnn_atomic_add_l0w_gradient(
-                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad);
+                l0w_gradients, static_cast<size_t>(nstm_feature), input_size, ft_size, row, nstm_grad, ft_factorizer_alpha);
         }
     }
 }
@@ -4902,6 +4902,7 @@ int launch_sfnn_forward_kernels(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -4954,7 +4955,7 @@ int launch_sfnn_forward_kernels(
         if (block_count_1d(fold_len, threads, &blocks, "sfnn_fold_halfka2_l0w_kernel") != 0) {
             return -1;
         }
-        sfnn_fold_halfka2_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w, folded_l0w, ft_size);
+        sfnn_fold_halfka2_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w, folded_l0w, ft_size, ft_factorizer_alpha);
         if (check_kernel_launch("sfnn_fold_halfka2_l0w_kernel launch") != 0) {
             return -1;
         }
@@ -4976,7 +4977,7 @@ int launch_sfnn_forward_kernels(
         batch,
         max_active,
         effective_input_size,
-        ft_size);
+        ft_size, ft_factorizer_alpha);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
     }
@@ -5819,7 +5820,7 @@ int launch_sfnn_inverse_index_l0_backward(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size) {
+    size_t ft_size, float ft_factorizer_alpha) {
     constexpr int threads = 256;
     int blocks = 0;
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
@@ -5875,7 +5876,7 @@ int launch_sfnn_inverse_index_l0_backward(
             1);
         sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
             l0w_gradients,
-            ft_size);
+            ft_size, ft_factorizer_alpha);
         if (check_kernel_launch("sfnn_reduce_halfka2_virtual_l0w_gradients_kernel launch") != 0) {
             return -1;
         }
@@ -5929,6 +5930,7 @@ int launch_sfnn_backward_kernels(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -6574,7 +6576,7 @@ int launch_sfnn_backward_kernels(
                 batch,
                 max_active,
                 input_size,
-                ft_size) != 0) {
+                ft_size, ft_factorizer_alpha) != 0) {
             return -1;
         }
     } else {
@@ -6604,7 +6606,7 @@ int launch_sfnn_backward_kernels(
             batch,
             max_active,
             input_size,
-            ft_size);
+            ft_size, ft_factorizer_alpha);
         if (check_kernel_launch("sfnn_l0_sparse_backward_kernel launch") != 0) {
             return -1;
         }
@@ -8150,6 +8152,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -8302,7 +8305,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         dst_input_size,
         virtual_rows,
         ft_size,
-        qa);
+        qa, ft_factorizer_alpha);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l0w_kernel launch") != 0) return -1;
 
     if (block_count_1d(ft_size, threads, &blocks, "sfnn proxy l0b") != 0) return -1;
@@ -8543,6 +8546,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -8730,6 +8734,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
+            ft_factorizer_alpha,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
@@ -9399,6 +9404,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -9615,6 +9621,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
+            ft_factorizer_alpha,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
@@ -9706,6 +9713,7 @@ int sfnn_backward_train_device_impl(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -9910,6 +9918,7 @@ int sfnn_backward_train_device_impl(
             use_king_hand_pair,
             use_king_progress_pair,
             use_hand_progress_pair,
+            ft_factorizer_alpha,
             factorizer_shared_alpha,
             factorizer_king_axis_alpha,
             factorizer_hand_axis_alpha,
@@ -10001,6 +10010,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -10106,6 +10116,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
+        ft_factorizer_alpha,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
@@ -10192,6 +10203,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -10299,6 +10311,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         use_king_hand_pair,
         use_king_progress_pair,
         use_hand_progress_pair,
+        ft_factorizer_alpha,
         factorizer_shared_alpha,
         factorizer_king_axis_alpha,
         factorizer_hand_axis_alpha,
@@ -10363,6 +10376,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_add_saturation_penalty_gradients_device(
     int use_king_hand_pair,
     int use_king_progress_pair,
     int use_hand_progress_pair,
+    float ft_factorizer_alpha,
     float factorizer_shared_alpha,
     float factorizer_king_axis_alpha,
     float factorizer_hand_axis_alpha,
@@ -10588,6 +10602,88 @@ extern "C" int bulletou_cuda_cpp_axpy_host(
         return -1;
     }
     return ok();
+}
+
+__global__ void rebase_shared_fold_kernel(
+    float* base, float* slow, float* momentum, float* velocity,
+    const float* shared, const float* shared_slow, const float* gates,
+    size_t count, size_t shared_count, size_t input_dim, size_t output_dim, float old_alpha) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const size_t cell = i % shared_count;
+    const size_t j = input_dim == 0 ? cell : (cell % input_dim) * output_dim + cell / input_dim;
+    const float gate = gates == nullptr ? 1.0f : gates[i / shared_count];
+    base[i] += old_alpha * shared[j] / gate;
+    slow[i] += old_alpha * shared_slow[j] / gate;
+    // Mixing coordinates has no exact diagonal-moment transformation.
+    momentum[i] = 0.0f;
+    velocity[i] = 0.0f;
+}
+
+__global__ void rebase_shared_scale_kernel(
+    float* weights, float* slow, float* momentum, float* velocity, size_t count, float ratio) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    if (ratio == 0.0f) {
+        weights[i] = slow[i] = momentum[i] = velocity[i] = 0.0f;
+    } else {
+        weights[i] *= ratio;
+        slow[i] *= ratio;
+        momentum[i] /= ratio;
+        velocity[i] /= ratio * ratio;
+    }
+}
+
+extern "C" int bulletou_cuda_cpp_rebase_shared_device(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* base, BulletOuCudaCppF32Buffer* base_slow,
+    BulletOuCudaCppF32Buffer* base_m, BulletOuCudaCppF32Buffer* base_v,
+    BulletOuCudaCppF32Buffer* shared, BulletOuCudaCppF32Buffer* shared_slow,
+    BulletOuCudaCppF32Buffer* shared_m, BulletOuCudaCppF32Buffer* shared_v,
+    BulletOuCudaCppF32Buffer* gates,
+    size_t base_count, size_t shared_count, size_t shared_offset,
+    size_t input_dim, size_t output_dim, float old_alpha, float new_alpha) {
+    if (set_context_device(ctx) != 0) return -1;
+    if (base_count == 0 || shared_count == 0 || base_count % shared_count != 0 ||
+        shared_offset > SIZE_MAX - shared_count ||
+        !std::isfinite(old_alpha) || !std::isfinite(new_alpha) || old_alpha < 0.0f || new_alpha < 0.0f)
+        return fail_message("invalid shared rebase dimensions or coefficients");
+    if (base == nullptr || base_slow == nullptr || base_m == nullptr || base_v == nullptr ||
+        shared == nullptr || shared_slow == nullptr || shared_m == nullptr || shared_v == nullptr)
+        return fail_message("null shared rebase buffer");
+    const size_t n = shared_offset + shared_count;
+    // Buffers may contain an appended FT virtual-row region.
+    if (validate_buffer(ctx, base, base->len, "rebase base") != 0 || base->len < base_count ||
+        validate_buffer(ctx, base_slow, base_slow->len, "rebase base slow") != 0 || base_slow->len < base_count ||
+        validate_buffer(ctx, base_m, base_m->len, "rebase base momentum") != 0 || base_m->len < base_count ||
+        validate_buffer(ctx, base_v, base_v->len, "rebase base velocity") != 0 || base_v->len < base_count ||
+        validate_buffer(ctx, shared, shared->len, "rebase shared") != 0 || shared->len < n ||
+        validate_buffer(ctx, shared_slow, shared_slow->len, "rebase shared slow") != 0 || shared_slow->len < n ||
+        validate_buffer(ctx, shared_m, shared_m->len, "rebase shared momentum") != 0 || shared_m->len < n ||
+        validate_buffer(ctx, shared_v, shared_v->len, "rebase shared velocity") != 0 || shared_v->len < n)
+        return fail_message("invalid shared rebase buffer length");
+    if (input_dim != 0 && (output_dim == 0 || input_dim > SIZE_MAX / output_dim || input_dim * output_dim != shared_count))
+        return fail_message("invalid shared rebase transpose dimensions");
+    if (gates != nullptr && validate_buffer(ctx, gates, base_count / shared_count, "rebase gates") != 0) return -1;
+    if (old_alpha == new_alpha) return 0;
+    const float ratio = new_alpha == 0.0f ? 0.0f : old_alpha / new_alpha;
+    if (!std::isfinite(ratio) || (ratio != 0.0f && (!std::isfinite(1.0f / ratio) || !std::isfinite(1.0f / (ratio * ratio)))))
+        return fail_message("shared rebase ratio is not representable");
+    constexpr int threads = 256;
+    int blocks = 0;
+    if (new_alpha == 0.0f && old_alpha != 0.0f) {
+        if (block_count_1d(base_count, threads, &blocks, "shared rebase fold") != 0) return -1;
+        rebase_shared_fold_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            base->ptr, base_slow->ptr, base_m->ptr, base_v->ptr,
+            shared->ptr + shared_offset, shared_slow->ptr + shared_offset,
+            gates == nullptr ? nullptr : gates->ptr, base_count, shared_count, input_dim, output_dim, old_alpha);
+        if (check_kernel_launch("shared rebase fold") != 0) return -1;
+    }
+    if (block_count_1d(shared_count, threads, &blocks, "shared rebase scale") != 0) return -1;
+    rebase_shared_scale_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        shared->ptr + shared_offset, shared_slow->ptr + shared_offset,
+        shared_m->ptr + shared_offset, shared_v->ptr + shared_offset, shared_count, ratio);
+    return check_kernel_launch("shared rebase scale");
 }
 
 extern "C" int bulletou_cuda_cpp_ranger_update_host(
