@@ -6,6 +6,9 @@
 
 前のページ: [2. 教師データを用意する](2-data.md)
 
+量子化による精度低下を調べる場合は、実験用の `--sfnn-qat-l1`（JSON: `"sfnn_qat_l1": true`、デフォルトOFF）でL1だけQATにできます。
+対象層、計測値の意味、同一checkpointからのA/B方法は、[L1のQATをON/OFFで比較する](../advanced/quantized-nn-bin.md#l1のqatをonoffで比較する)を参照してください。
+
 ## 3.1 まずビルドする
 
 CUDA C++ backend を使う場合は、次のコマンドでビルドします。

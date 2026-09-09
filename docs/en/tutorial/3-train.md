@@ -6,6 +6,10 @@ Goal: create an evaluation-function file that YaneuraOu can load.
 
 This page continues from [2. Prepare training data](2-data.md).
 
+To experiment with quantization-aware training, SFNN dense L1 supports `--sfnn-qat-l1`
+(JSON: `"sfnn_qat_l1": true`, **off by default**). See [L1 QAT](../advanced/quantized-nn-bin.md#compare-l1-qat-onoff)
+for scope, metric definitions and a same-checkpoint A/B comparison.
+
 ## 3.1 Build once
 
 ```powershell

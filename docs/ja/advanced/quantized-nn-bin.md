@@ -17,6 +17,51 @@
 
 ## 量子化後のaccuracy / lossを測る
 
+### L1のQATをON/OFFで比較する
+
+QAT（Quantization-Aware Training、量子化を考慮した学習）は、丸めた重みでの出力を改善するように学習する方法です。
+SFNNの通常のdense L1では、学習コマンドに `--sfnn-qat-l1` を追加して試せます。**デフォルトはOFF**です。
+JSON設定なら、既存の `bulletou-settings.json` のトップレベルに次の項目を追加します。
+
+```json
+"sfnn_qat_l1": true
+```
+
+`false` または省略で従来の学習です。通常学習・worker・profilingの各経路で有効です。
+grouped/common-shard L1（`g...` / `c..._s...`）は対象外で、指定するとエラーになります。
+
+今回のQATは **L1のweightとbiasだけ**です。FT・L2・L3の丸めや、活性値の整数演算は模擬しません。
+shared / axis / pair / count gateを使っている場合は、それらを足し合わせた実効重み `W` に対して、次の計算をします。
+
+```text
+W = gate * residual + alpha_shared * shared + Σ(alpha_axis * confidence_axis * axis)
+Q(W) = clamp(round(64 * W), -128, 127) / 64
+Q(b) = clamp(round(8128 * b), INT32_MIN, INT32_MAX) / 8128
+L1出力 = Q(W) * 入力 + Q(b)
+```
+
+丸めは最近傍（ちょうど中間ならゼロから遠い側）で、GPU量子化検証と共通の処理を使います。
+逆伝播では、入力への勾配にも `Q(W)` を使います。重みへの勾配は、丸め・clampの微分を1と近似する **identity STE** でFP32の元の重みに流します。
+clamp範囲外でもSTE自体は勾配を止めません。既存のoptimizer weight clipやsaturation penaltyの設定は変更しません。
+factorizerの係数・count gateに対する通常のchain ruleも維持します。
+
+重み・optimizer stateはFP32のまま `state.bin` に保存し、`nn.bin` の形式は変更しません。
+既存のcheckpointから `--initial-state` / `--initial-dataloader-pos` で追加学習でき、`--resume` 時にQATを切り替えることもできます。
+QATのON/OFFは起動ログと保存設定に記録されます。再開時にも使用したい値を指定してください。
+
+`test_value_accuracy/loss` は従来どおり **丸めないFP32モデル**、`quantized_value_accuracy/loss` は従来どおり **全層を量子化したモデル**の指標です。
+QATをONにしても指標の定義や教師のscale、loss target、LRは変わりません。
+FP32と量子化後の差が縮まるだけでなく、量子化後の精度そのものが改善するか確認してください。
+
+A/Bでは、同一の `state.bin` と `dataloader_pos.txt` から、教師局面・LR・bpu・学習量を揃え、QATだけをON/OFFにします。
+保存先は別tagにしてください。改善や棋力向上は保証されないため、最後は実際の `nn.bin` で棋力も比較します。
+
+追加処理はGPU内だけです。丸めたL1を重み更新まで再利用し、復元やfactorizer設定変更でも再計算します。
+追加VRAMは `4 * stacks * L1出力数 * (FT幅 + 1)` byteです。`1024_8_64_progress8` なら約0.25 MiBですが、大量bucketのarchでは比例して増えます。
+OFFではこの作業領域を確保しません。学習速度への影響は未測定で、ON/OFFの同条件比較が必要です。
+
+### 保存済みのnn.binを計測する
+
 ```powershell
 .\target\release\examples\bulletou.exe quantized-test `
   --arch SFNN_halfka2_1024_7_64_k3k3 `

@@ -17,6 +17,47 @@ This page covers two commands for inspecting an exported `nn.bin` directly. Thes
 
 ## Test quantized accuracy / loss
 
+### Compare L1 QAT on/off
+
+SFNN dense L1 supports optional quantization-aware training with `--sfnn-qat-l1`.
+It is **off by default**. In the top level of `bulletou-settings.json`, use:
+
+```json
+"sfnn_qat_l1": true
+```
+
+`false` or omission preserves ordinary training. The normal, worker and profiling paths support it;
+grouped/common-shard L1 is rejected. Only **L1 weights and biases** are fake-quantized, not FT/L2/L3 or activations.
+Factorizers and count gates are folded before quantization:
+
+```text
+W = gate * residual + alpha_shared * shared + sum(alpha_axis * confidence_axis * axis)
+Q(W) = clamp(round(64 * W), -128, 127) / 64
+Q(b) = clamp(round(8128 * b), INT32_MIN, INT32_MAX) / 8128
+L1 output = Q(W) * input + Q(b)
+```
+
+Rounding uses nearest, ties away from zero, sharing the GPU quantized-validation kernels.
+Backward input gradients also use `Q(W)`. FP32 master weights use **identity STE**: the derivative of
+rounding/clamping is approximated as 1, even outside the clamp range. The factorizer/count-gate chain rule
+is retained. Existing optimizer clipping and saturation penalty settings are not changed.
+
+Masters and optimizer state stay FP32 in `state.bin`; the `nn.bin` format is unchanged.
+Existing checkpoints can be fine-tuned with `--initial-state` and `--initial-dataloader-pos`, or QAT can
+be toggled on `--resume`. Specify the desired QAT setting when restarting; it is logged and saved in settings.
+
+`test_value_accuracy/loss` still evaluates the **unrounded FP32 model**, while `quantized_value_accuracy/loss`
+still evaluates **all-layer quantization**. The loss target, scale, LR and metric definitions do not change.
+Compare separate tags from identical weights, optimizer state and dataloader position, holding LR, data,
+bpu and training length fixed. Check absolute quantized accuracy and engine strength, not just a smaller FP32/Q gap.
+
+QAT uses GPU-only scratch cached until an update, restore or factorizer change.
+Extra VRAM is `4 * stacks * L1_outputs * (FT_width + 1)` bytes: about 0.25 MiB for `1024_8_64_progress8`,
+but proportional to the number of buckets for larger architectures. OFF allocates no QAT scratch.
+Training overhead and accuracy improvements are not yet established by a full training benchmark.
+
+### Evaluate a saved nn.bin
+
 ```powershell
 .\target\release\examples\bulletou.exe quantized-test `
   --arch SFNN_halfka2_1024_7_64_k3k3 `

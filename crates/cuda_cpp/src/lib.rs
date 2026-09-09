@@ -1867,6 +1867,13 @@ impl SfnnForwardWorkspaceLayout {
 }
 
 #[derive(Debug)]
+struct SfnnL1Qat {
+    weights: F32Buffer,
+    bias: F32Buffer,
+    refresh: std::cell::Cell<bool>,
+}
+
+#[derive(Debug)]
 pub struct SfnnForwardWorkspace {
     pub layout: SfnnForwardWorkspaceLayout,
     pub stm_l0: F32Buffer,
@@ -1876,6 +1883,9 @@ pub struct SfnnForwardWorkspace {
     pub l2_input: F32Buffer,
     pub l2: F32Buffer,
     pub output: F32Buffer,
+    // Training-only fake-quantized L1, never part of a checkpoint or validation weights.
+    qat_l1: Option<SfnnL1Qat>,
+    qat_l1_active: std::cell::Cell<bool>,
 }
 
 impl SfnnForwardWorkspace {
@@ -1890,7 +1900,19 @@ impl SfnnForwardWorkspace {
             l2_input: F32Buffer::new(ctx, layout.l2_input_len())?,
             l2: F32Buffer::new(ctx, layout.l2_len())?,
             output: F32Buffer::new(ctx, layout.output_len())?,
+            qat_l1: None,
+            qat_l1_active: std::cell::Cell::new(false),
         })
+    }
+
+    fn invalidate_l1_qat(&self) {
+        if let Some(qat) = &self.qat_l1 {
+            qat.refresh.set(true);
+        }
+    }
+
+    fn qat_l1_backward_weights(&self) -> *mut ffi::BulletOuCudaCppF32Buffer {
+        self.qat_l1.as_ref().filter(|_| self.qat_l1_active.get()).map_or(std::ptr::null_mut(), |q| q.weights.as_ptr())
     }
 
     fn validate(&self) -> Result<()> {
@@ -2055,6 +2077,9 @@ fn sfnn_forward_device_with_factorizer_impl(
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
         _ => return Err(CudaCppError::message("SFNN factorized L1 state is partial")),
     };
+    // Validation keeps its FP32 semantics, even when called on a training runner.
+    let qat = workspace.qat_l1.as_ref().filter(|_| folded_l0w_scratch.is_some());
+    workspace.qat_l1_active.set(false);
     // SAFETY: all device buffers have been length-validated; backend validates device ownership.
     check(unsafe {
         ffi::bulletou_cuda_cpp_sfnn_forward_device(
@@ -2123,8 +2148,16 @@ fn sfnn_forward_device_with_factorizer_impl(
             workspace.l2_input.as_ptr(),
             workspace.l2.as_ptr(),
             workspace.output.as_ptr(),
+            qat.map_or(std::ptr::null_mut(), |q| q.weights.as_ptr()),
+            qat.map_or(std::ptr::null_mut(), |q| q.bias.as_ptr()),
+            i32::from(qat.is_some_and(|q| q.refresh.get())),
         )
-    })
+    })?;
+    if let Some(qat) = qat {
+        qat.refresh.set(false);
+    }
+    workspace.qat_l1_active.set(qat.is_some());
+    Ok(())
 }
 
 pub fn sfnn_build_quantized_proxy_device(
@@ -3595,6 +3628,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
             forward.l2_input.as_ptr(),
             forward.l2.as_ptr(),
             weights.l1w.as_ptr(),
+            forward.qat_l1_backward_weights(),
             l1fw,
             has_l1f,
             l1axw,
@@ -3788,6 +3822,7 @@ fn sfnn_backward_device_impl(
                 forward.l2_input.as_ptr(),
                 forward.l2.as_ptr(),
                 weights.l1w.as_ptr(),
+                forward.qat_l1_backward_weights(),
                 l1fw,
                 has_l1f,
                 l1axw,
@@ -3873,6 +3908,7 @@ fn sfnn_backward_device_impl(
                 forward.l2_input.as_ptr(),
                 forward.l2.as_ptr(),
                 weights.l1w.as_ptr(),
+                forward.qat_l1_backward_weights(),
                 l1fw,
                 has_l1f,
                 l1axw,
@@ -6113,6 +6149,8 @@ pub struct SfnnLayerLrMultipliers {
     /// Apply tatara's per-tensor bounds after RAdam (not after Lookahead).
     /// When false, use RangerUpdateParams' bounds for every tensor.
     pub tatara_weight_clip: bool,
+    /// Training-only L1 fake quantization; FP32 master parameters use identity STE.
+    pub qat_l1: bool,
 }
 
 impl Default for SfnnLayerLrMultipliers {
@@ -6127,6 +6165,7 @@ impl Default for SfnnLayerLrMultipliers {
             saturation_penalty: 0.0,
             saturation_threshold: 127.0,
             tatara_weight_clip: false,
+            qat_l1: false,
         }
     }
 }
@@ -6189,6 +6228,22 @@ impl SfnnLayerLrMultipliers {
 }
 
 impl SfnnTrainStepRunner {
+    fn prepare_l1_qat(&mut self, ctx: &Context, enabled: bool) -> Result<()> {
+        if !enabled {
+            self.forward_workspace.qat_l1 = None;
+            self.forward_workspace.qat_l1_active.set(false);
+        } else if self.shape.has_compact_l1() {
+            return Err(CudaCppError::message("L1 QAT supports dense SFNN L1 only (not grouped/common-shard L1)"));
+        } else if self.forward_workspace.qat_l1.is_none() {
+            self.forward_workspace.qat_l1 = Some(SfnnL1Qat {
+                weights: F32Buffer::new(ctx, self.shape.l1w_len()?)?,
+                bias: F32Buffer::new(ctx, self.shape.num_stacks * self.shape.l1_out())?,
+                refresh: std::cell::Cell::new(true),
+            });
+        }
+        Ok(())
+    }
+
     pub fn new(
         ctx: &Context,
         initial_weights: SfnnForwardHostWeights<'_>,
@@ -6346,6 +6401,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn set_residual_count_gates_by_stack(&mut self, ctx: &Context, values: Option<&[f32]>) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         match values {
             Some(values) => {
                 expect_len("SFNN residual count gates by-stack coefficients", self.shape.num_stacks, values.len())?;
@@ -6368,6 +6424,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn set_factorizer_axis_confidences(&mut self, ctx: &Context, values: Option<&[f32]>) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         match values {
             Some(values) => {
                 expect_len(
@@ -6640,6 +6697,7 @@ impl SfnnTrainStepRunner {
         old_shared: f32,
         new_shared: f32,
     ) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         shared_rebase_ratio(old_ft, new_ft)?;
         shared_rebase_ratio(old_shared, new_shared)?;
         let l1w_state = self.optimizer_states.l1fw.as_ref();
@@ -6717,6 +6775,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn rebase_axis_factorizer_terms(&mut self, ctx: &Context, weight_ratios: &[f32]) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         let axes = self.shape.factorizer_axis_count();
         expect_len("SFNN axis factorizer rebase ratios", axes, weight_ratios.len())?;
         if axes == 0 || weight_ratios.iter().all(|&ratio| ratio == 1.0) {
@@ -6764,6 +6823,7 @@ impl SfnnTrainStepRunner {
         old_factorizer: SfnnFactorizerActive,
         new_factorizer: SfnnFactorizerActive,
     ) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         let stacks = self.shape.num_stacks;
         expect_len("SFNN residual count gate rebase ratios", stacks, weight_ratios.len())?;
         if stacks == 0 || weight_ratios.iter().all(|&ratio| ratio == 1.0) {
@@ -6843,6 +6903,7 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         factorizer.validate_for_shape(self.shape)?;
         factorizer_alpha.validate()?;
         self.factorizer = factorizer;
@@ -6861,6 +6922,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         src.factorizer.validate_for_shape(self.shape)?;
         src.factorizer_alpha.validate()?;
         self.weights.copy_from_device(ctx, &src.weights)?;
@@ -6878,6 +6940,7 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         weights.validate()?;
         if self.shape != weights.shape {
             return Err(CudaCppError::message(format!(
@@ -6999,6 +7062,7 @@ impl SfnnTrainStepRunner {
     ) -> Result<()> {
         self.validate()?;
         lr_multipliers.validate()?;
+        self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7160,6 +7224,7 @@ impl SfnnTrainStepRunner {
     ) -> Result<()> {
         self.validate()?;
         lr_multipliers.validate()?;
+        self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7287,6 +7352,7 @@ impl SfnnTrainStepRunner {
     ) -> Result<SfnnTrainStepProfile> {
         self.validate()?;
         lr_multipliers.validate()?;
+        self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -7895,6 +7961,7 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        self.forward_workspace.invalidate_l1_qat();
         lr_multipliers.validate()?;
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
@@ -9272,6 +9339,9 @@ mod ffi {
             l2_input: *mut BulletOuCudaCppF32Buffer,
             l2: *mut BulletOuCudaCppF32Buffer,
             output: *mut BulletOuCudaCppF32Buffer,
+            qat_l1w: *mut BulletOuCudaCppF32Buffer,
+            qat_l1b: *mut BulletOuCudaCppF32Buffer,
+            refresh_qat_l1: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
             ctx: *mut BulletOuCudaCppContext,
@@ -9362,6 +9432,7 @@ mod ffi {
             l2_input: *mut BulletOuCudaCppF32Buffer,
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
+            qat_l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,
@@ -9445,6 +9516,7 @@ mod ffi {
             l2_input: *mut BulletOuCudaCppF32Buffer,
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
+            qat_l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,
@@ -9529,6 +9601,7 @@ mod ffi {
             l2_input: *mut BulletOuCudaCppF32Buffer,
             l2: *mut BulletOuCudaCppF32Buffer,
             l1w: *mut BulletOuCudaCppF32Buffer,
+            qat_l1w: *mut BulletOuCudaCppF32Buffer,
             l1fw: *mut BulletOuCudaCppF32Buffer,
             has_l1f: i32,
             l1axw: *mut BulletOuCudaCppF32Buffer,
@@ -9727,6 +9800,9 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    mod qat {
+        include!("qat_tests.rs");
+    }
     use super::*;
 
     #[test]

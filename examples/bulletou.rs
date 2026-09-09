@@ -4960,6 +4960,13 @@ struct Args {
     #[arg(long = "sfnn-hand-progress-pair-count-confidence")]
     sfnn_hand_progress_pair_count_confidence: Option<f32>,
 
+    /// Experimental L1-only quantization-aware training (default off).
+    /// Fold L1 factors, fake-quantize weights to i8/QB=64 and bias to
+    /// i32/(127*64), then train FP32 masters with identity STE. Other layers,
+    /// validation metrics, optimizer settings and nn.bin format are unchanged.
+    #[arg(long = "sfnn-qat-l1")]
+    sfnn_qat_l1: bool,
+
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
     /// term before each update and does not change the reported value loss.
@@ -5088,6 +5095,14 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.sfnn_qat_l1 {
+            if !self.eval_type().uses_layerstack() {
+                return Err("--sfnn-qat-l1 requires an SFNN arch".to_string());
+            }
+            if self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some() {
+                return Err("--sfnn-qat-l1 supports dense L1 only (not grouped/common-shard L1)".to_string());
+            }
+        }
         if self.ft_factorizer_alpha != 1.0
             && (self.no_ft_factorize || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
         {
@@ -10009,6 +10024,7 @@ struct WorkerSfnnSession {
 #[cfg(feature = "cuda-cpp-backend")]
 impl WorkerSfnnSession {
     fn open(args: Args) -> Result<Self, String> {
+        print_sfnn_qat_mode(&args);
         if args.lr_schedule == LrScheduleKind::Plateau {
             return Err("worker train-session does not support --lr-schedule plateau yet".to_string());
         }
@@ -10167,6 +10183,7 @@ impl WorkerSfnnSession {
     }
 
     fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
+        print_sfnn_qat_mode(args);
         if self.feature_kind.input_size_for_args(args) != self.shape.input_size {
             return Err("worker FT factorizer setting differs from the opened session; --no-ft-factorize cannot change within a session".to_string());
         }
@@ -16971,6 +16988,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ConsoleColor::Magenta,
         );
     }
+    print_sfnn_qat_mode(args);
     if args.sfnn_saturation_penalty != 0.0 {
         print_startup_kv_colored(
             "saturation penalty",
@@ -23971,6 +23989,18 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn print_sfnn_qat_mode(args: &Args) {
+    print_startup_kv(
+        "L1 QAT",
+        if args.sfnn_qat_l1 {
+            "on: folded weight round(64*w)/64, bias round(8128*b)/8128; identity STE; FT/L2/L3 unchanged"
+        } else {
+            "off"
+        },
+    );
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_layer_lr_multipliers(
     args: &Args,
     _progress: Option<CudaCppScheduleProgress>,
@@ -23982,6 +24012,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         saturation_penalty: args.sfnn_saturation_penalty,
         saturation_threshold: args.sfnn_saturation_threshold,
         tatara_weight_clip: uses_tatara_weight_clip(args),
+        qat_l1: args.sfnn_qat_l1,
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -24618,6 +24649,7 @@ fn resume_signature(args: &Args) -> String {
         ),
         format!("sfnn_saturation_penalty={:.9}", args.sfnn_saturation_penalty),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
+        format!("sfnn_qat_l1={}", args.sfnn_qat_l1),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
@@ -24844,7 +24876,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
         "sfnn_saturation_penalty=",
         "sfnn_saturation_threshold=127.000000000",
     );
-    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_saturation_threshold=", "sfnn_l1_lr_mult=1.000000000");
+    ensure_line_after(&mut out, "sfnn_qat_l1=", "sfnn_saturation_threshold=", "sfnn_qat_l1=false");
+    ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_qat_l1=", "sfnn_l1_lr_mult=1.000000000");
     ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
 
@@ -24855,6 +24888,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
 
 fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
+    // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
+    let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "test_batch_size=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_rate=");
     let signature = resume_signature_without_line(&signature, "quantized_validation_exact=");
@@ -32570,6 +32605,42 @@ mod tests {
                 assert!(resume_signature_matches(&stored, &args));
                 assert!(!resume_signature_matches(&stored.replace("lr=0.000875000", "lr=0.000123000"), &args));
             }
+        }
+    }
+
+    #[test]
+    fn sfnn_qat_l1_cli_json_and_resume() {
+        let base = ["bulletou", "--arch", "SFNN_halfka2_1024_8_64_progress8", "--teacher", "/dev/null"];
+        let off = Args::try_parse_from(base).unwrap();
+        assert!(!off.sfnn_qat_l1);
+        let on = Args::try_parse_from(base.into_iter().chain(["--sfnn-qat-l1"])).unwrap();
+        assert!(on.sfnn_qat_l1);
+        assert!(on.validate_arch_flags().is_ok());
+        for enabled in [false, true] {
+            let mut argv: Vec<std::ffi::OsString> = base.map(Into::into).to_vec();
+            bulletou_settings_json_value_to_args(
+                std::path::Path::new("settings.json"),
+                "sfnn_qat_l1",
+                &serde_json::json!(enabled),
+                &mut argv,
+            )
+            .unwrap();
+            assert_eq!(Args::try_parse_from(argv).unwrap().sfnn_qat_l1, enabled);
+        }
+        let legacy = resume_signature_without_line(&resume_signature(&off), "sfnn_qat_l1=");
+        assert!(resume_signature_matches(&legacy, &on));
+        assert!(resume_signature_matches(&resume_signature(&on), &off));
+        assert!(resume_signature(&on).contains("sfnn_qat_l1=true"));
+        assert!(resume_signature(&off).contains("sfnn_qat_l1=false"));
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            assert!(cuda_cpp_sfnn_layer_lr_multipliers(&on, None).qat_l1);
+            assert!(!cuda_cpp_sfnn_layer_lr_multipliers(&off, None).qat_l1);
+        }
+        for arch in ["NNUE_halfkp_256x2_32_32", "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3"] {
+            let args =
+                Args::try_parse_from(["bulletou", "--arch", arch, "--teacher", "/dev/null", "--sfnn-qat-l1"]).unwrap();
+            assert!(args.validate_arch_flags().unwrap_err().contains("--sfnn-qat-l1"));
         }
     }
 

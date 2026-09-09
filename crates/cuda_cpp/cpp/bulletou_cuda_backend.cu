@@ -3357,6 +3357,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     const float* inputs,
     const float* output_gradients,
     const float* weights,
+    const float* qat_weights,
     const float* shared_weights,
     const float* axis_weights,
     const int* buckets,
@@ -3438,11 +3439,12 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 float grad = output_gradients[sample * output_dim + out_col];
                 if (grad != 0.0f) {
-                    float weight = residual_gate * weights[stack_base + out_col * input_dim + in_col];
-                    if (has_shared != 0) {
+                    const size_t weight_idx = stack_base + out_col * input_dim + in_col;
+                    float weight = qat_weights != nullptr ? qat_weights[weight_idx] : residual_gate * weights[weight_idx];
+                    if (qat_weights == nullptr && has_shared != 0) {
                         weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
                     }
-                    if (has_axis != 0) {
+                    if (qat_weights == nullptr && has_axis != 0) {
                         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
                             const float axis_alpha = axis_alphas[axis_idx];
                             weight += axis_alpha *
@@ -5910,6 +5912,7 @@ int launch_sfnn_backward_kernels(
     const float* l2_input,
     const float* l2,
     const float* l1w,
+    const float* qat_l1w,
     const float* l1fw,
     int has_l1f,
     const float* l1axw,
@@ -6384,6 +6387,7 @@ int launch_sfnn_backward_kernels(
             combined,
             l1_gradients,
             l1w,
+            qat_l1w,
             l1fw,
             l1axw,
             buckets,
@@ -6504,7 +6508,7 @@ int launch_sfnn_backward_kernels(
         sfnn_stacked_affine_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,
-            l1w,
+            qat_l1w != nullptr ? qat_l1w : l1w,
             buckets,
             combined_gradients,
             l1w_gradients,
@@ -8566,7 +8570,10 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     BulletOuCudaCppF32Buffer* l1,
     BulletOuCudaCppF32Buffer* l2_input,
     BulletOuCudaCppF32Buffer* l2,
-    BulletOuCudaCppF32Buffer* output) {
+    BulletOuCudaCppF32Buffer* output,
+    BulletOuCudaCppF32Buffer* qat_l1w,
+    BulletOuCudaCppF32Buffer* qat_l1b,
+    int refresh_qat_l1) {
     const size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     const size_t l2_in = l1_hidden * 2;
     const size_t axis_count = sfnn_factorizer_axis_count(
@@ -8689,6 +8696,47 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         residual_count_gates_ptr = residual_count_gates->ptr;
     }
 
+    // L1-only QAT: fold first, then use exactly the GPU export quantizer.
+    // Keep FP32 master tensors untouched. Rebuild only after an update/restore.
+    if ((qat_l1w == nullptr) != (qat_l1b == nullptr)) {
+        return fail_message("L1 QAT requires both weight and bias scratch buffers");
+    }
+    if (qat_l1w != nullptr) {
+        if (grouped_l1 || common_shard_l1) {
+            return fail_message("L1 QAT supports dense SFNN L1 only");
+        }
+        if (validate_buffer(ctx, qat_l1w, l1w_len, "QAT L1 weights") != 0 ||
+            validate_buffer(ctx, qat_l1b, num_stacks * l1_out, "QAT L1 bias") != 0) return -1;
+        if (refresh_qat_l1 != 0) {
+            constexpr int threads = 256;
+            int blocks = 0;
+            if (block_count_1d(l1w_len, threads, &blocks, "QAT L1 weights") != 0) return -1;
+            sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
+                qat_l1w->ptr, ft_size, l1_out, num_stacks,
+                factorizer_king_axis_dim, factorizer_hand_axis_dim,
+                has_l1f, 1, has_l1ax,
+                use_king_axis, use_hand_axis, use_progress_axis,
+                use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
+                factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
+                factorizer_progress_axis_alpha, factorizer_pair_alpha,
+                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 64.0f);
+            if (check_kernel_launch("QAT L1 weights launch") != 0) return -1;
+            if (block_count_1d(num_stacks * l1_out, threads, &blocks, "QAT L1 bias") != 0) return -1;
+            sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
+                l1b->ptr, has_l1f ? l1fb->ptr : nullptr, has_l1ax ? l1axb->ptr : nullptr,
+                qat_l1b->ptr, l1_out, num_stacks,
+                factorizer_king_axis_dim, factorizer_hand_axis_dim,
+                has_l1f, has_l1ax,
+                use_king_axis, use_hand_axis, use_progress_axis,
+                use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
+                factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
+                factorizer_progress_axis_alpha, factorizer_pair_alpha,
+                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 127.0f * 64.0f);
+            if (check_kernel_launch("QAT L1 bias launch") != 0) return -1;
+        }
+    }
+
     if (launch_sfnn_forward_kernels(
             ctx,
             input_size,
@@ -8710,14 +8758,14 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             l0w->ptr,
             folded_l0w != nullptr ? folded_l0w->ptr : nullptr,
             l0b->ptr,
-            l1w->ptr,
-            l1b->ptr,
-            has_l1f != 0 ? l1fw->ptr : nullptr,
-            has_l1f != 0 ? l1fb->ptr : nullptr,
-            has_l1f,
-            has_l1ax != 0 ? l1axw->ptr : nullptr,
-            has_l1ax != 0 ? l1axb->ptr : nullptr,
-            has_l1ax,
+            qat_l1w != nullptr ? qat_l1w->ptr : l1w->ptr,
+            qat_l1b != nullptr ? qat_l1b->ptr : l1b->ptr,
+            has_l1f != 0 && qat_l1w == nullptr ? l1fw->ptr : nullptr,
+            has_l1f != 0 && qat_l1w == nullptr ? l1fb->ptr : nullptr,
+            qat_l1w != nullptr ? 0 : has_l1f,
+            has_l1ax != 0 && qat_l1w == nullptr ? l1axw->ptr : nullptr,
+            has_l1ax != 0 && qat_l1w == nullptr ? l1axb->ptr : nullptr,
+            qat_l1w != nullptr ? 0 : has_l1ax,
             l2w->ptr,
             l2b->ptr,
             has_l2f != 0 ? l2fw->ptr : nullptr,
@@ -9390,6 +9438,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
     const BulletOuCudaCppF32Buffer* l2_input,
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* qat_l1w,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -9461,6 +9510,10 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
+    if (qat_l1w != nullptr && (grouped_l1 || common_shard_l1 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(qat_l1w), l1w_len, "QAT L1 backward weights") != 0)) {
+        return fail_message("invalid L1 QAT backward buffer/shape");
+    }
     const float* residual_count_gates_ptr = nullptr;
     const float* factorizer_axis_confidences_ptr = nullptr;
     if (validate_sfnn_shape(
@@ -9607,6 +9660,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
             l2_input->ptr,
             l2->ptr,
             l1w->ptr,
+            qat_l1w != nullptr ? qat_l1w->ptr : nullptr,
             has_l1f != 0 ? l1fw->ptr : nullptr,
             has_l1f,
             has_l1ax != 0 ? l1axw->ptr : nullptr,
@@ -9699,6 +9753,7 @@ int sfnn_backward_train_device_impl(
     const BulletOuCudaCppF32Buffer* l2_input,
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* qat_l1w,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -9773,6 +9828,10 @@ int sfnn_backward_train_device_impl(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
+    if (qat_l1w != nullptr && (grouped_l1 || common_shard_l1 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(qat_l1w), l1w_len, "QAT L1 backward weights") != 0)) {
+        return fail_message("invalid L1 QAT backward buffer/shape");
+    }
     if (validate_sfnn_shape(
             input_size,
             ft_size,
@@ -9904,6 +9963,7 @@ int sfnn_backward_train_device_impl(
             l2_input->ptr,
             l2->ptr,
             l1w->ptr,
+            qat_l1w != nullptr ? qat_l1w->ptr : nullptr,
             has_l1f != 0 ? l1fw->ptr : nullptr,
             has_l1f,
             has_l1ax != 0 ? l1axw->ptr : nullptr,
@@ -9996,6 +10056,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
     const BulletOuCudaCppF32Buffer* l2_input,
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* qat_l1w,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -10102,6 +10163,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_device(
         l2_input,
         l2,
         l1w,
+        qat_l1w,
         l1fw,
         has_l1f,
         l1axw,
@@ -10189,6 +10251,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
     const BulletOuCudaCppF32Buffer* l2_input,
     const BulletOuCudaCppF32Buffer* l2,
     const BulletOuCudaCppF32Buffer* l1w,
+    const BulletOuCudaCppF32Buffer* qat_l1w,
     const BulletOuCudaCppF32Buffer* l1fw,
     int has_l1f,
     const BulletOuCudaCppF32Buffer* l1axw,
@@ -10297,6 +10360,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_train_profile_device(
         l2_input,
         l2,
         l1w,
+        qat_l1w,
         l1fw,
         has_l1f,
         l1axw,
