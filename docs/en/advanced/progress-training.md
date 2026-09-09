@@ -16,7 +16,39 @@ target = i / (L - 1)
 - last evaluable position: `1`
 - positions in between: their relative location in the game
 
-A `.pack` file has no evaluable board after its terminal marker, so the position before the final stored move is assigned `1`. The learned logits are exported as q16 `progress.bin` parameters and converted to an integer in `0..255` at runtime.
+A `.pack` file has no evaluable board after its terminal marker, so the position before the final stored move is assigned `1`. The learned weights are exported as bias-free, headerless f64 `progress.bin` parameters and converted to an integer in `0..255` at runtime.
+
+## File format and inference
+
+The format matches tatara / [YaneuraOu PR #326](https://github.com/yaneurao/YaneuraOu/pull/326): **headerless `f64 little-endian[81][1548]`**, 125,388 weights, exactly **1,003,104 bytes**. There is no bias, hash or bucket count. The index is `king_square * 1548 + BonaPiece`; active non-king features from both king perspectives contribute to the sum.
+
+The separate `progress-train` command learns:
+
+```text
+z = Σ w[active_KP_feature]
+prediction = sigmoid(z)
+loss = (prediction - i / (L - 1))²
+```
+
+NNUE training, counting and validation use `round(w * 65536)` (clamped to i32). Fixed sigmoid thresholds in the source convert the integer sum to `0..255`; thresholds are not stored in the file.
+
+`nn.bin` does **not** embed progress data. Its layout is `NNUE header → FeatureTransformer → stack networks`, without a progress-specific hash. Checkpoint saves also write a sibling `progress.bin`, containing the effective integer weights divided by 65536 as exact f64 values, so reloading preserves bucket assignments.
+
+Deploy both files with an engine supporting external progress files and the matching architecture. The old embedded-progress engine format is not supported. BulletOu's quantized diagnostics load `progress.bin` from the same directory as `nn.bin` for progress architectures.
+
+### Migrating the current checkpoint
+
+Normal file loading accepts only the new format. A one-time converter is available:
+
+```powershell
+.\convert_progress_format.ps1 `
+  -InputPath C:\path\to\progress.bin `
+  -OutputPath C:\path\to\progress.bin
+```
+
+An in-place conversion backs up the source as `.q16-with-bias.bak`. Instead of discarding the old bias, it adds `bias_q16 / 4` to rook-related weights: two rooks (including dragons and held rooks) contribute four KP terms across both perspectives. Integer sums remain exact when the bias is divisible by four. **This guarantee does not apply to rook-odds games.** Fresh `progress-train` runs do not use this migration or any fixed offset.
+
+To continue the current older `state.bin`, its bias-prefixed progress record is migrated the same way. Value-network weights, their optimizer state and the dataloader cursor are preserved. Use the converted `--sfnn-progress-bin` and normal `--resume`. Newly saved progress records contain weights only. `export-progress-bin` now accepts `--state-bin` only; `nn.bin` no longer contains a classifier to extract.
 
 ## Why `.pack` is required
 
@@ -40,7 +72,7 @@ Numbers embedded in the filename are not interpreted as game counts. The command
 | Option | Meaning |
 |---|---|
 | `--teacher` | One `.pack` file containing complete games |
-| `--output` | Destination q16 `progress.bin` |
+| `--output` | Destination headerless f64 `progress.bin` |
 | `--epochs` | Number of full training passes over the file |
 | `--batch-size` | Positions averaged into one Adam update |
 | `--lr` | Adam learning rate; no hidden multiplier is applied |

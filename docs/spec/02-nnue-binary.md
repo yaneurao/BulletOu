@@ -251,6 +251,12 @@ signed-LEB128 詳細:
 | fc_0 / fc_1 / fc_2 biases | i32 | qa × qb = 8128 |
 | fc_0 / fc_1 / fc_2 weights | i8 | qb = 64 (= 1 << kWeightScaleBits = `nnue_common.h::kWeightScaleBits = 6`) |
 
+### 外部 progress.bin（progressN）
+
+SFNN の `progressN` でも、`nn.bin` の構造は上記と同じです。FT と network の間に進行度 section は挿入せず、header hash への progress 固有 XOR も行いません。
+
+進行度分類器は、tatara / YaneuraOu PR #326 と同じ **ヘッダーなし f64 little-endian `[81][1548]`** を、別ファイル `progress.bin` に保存します。サイズは `81 * 1548 * 8 = 1,003,104` bytes。index は `king_square * 1548 + BonaPiece` で、独立した bias はありません。実行時は各重みを Q16 に丸め、両視点の特徴を整数加算します。詳しい式は [進行度分類器](../ja/advanced/progress-training.md#ファイル形式と推論式) を参照してください。
+
 ### Per-stack byte count
 
 ```

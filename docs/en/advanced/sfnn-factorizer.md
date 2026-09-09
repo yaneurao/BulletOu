@@ -432,7 +432,7 @@ First, create a count.bin file:
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
-For architectures containing `progressN`, `--progress-bin` or `--nn-bin` is required. The progress bucket is determined by the `bias_q16` / `weights_q16` values in the Progress section. In normal workflows, use the `progress.bin` saved next to the checkpoint. If you only have an existing `state.bin` or `nn.bin`, extract `progress.bin` first:
+For architectures containing `progressN`, `--progress-bin` or `--nn-bin` is required. The bucket is determined by weights in the external `progress.bin`, with no bias. `--nn-bin` locates the sibling `progress.bin`. In normal workflows, use the `progress.bin` saved next to the checkpoint. If you only have an existing `state.bin`, extract `progress.bin` first:
 
 ```powershell
 .\target\release\examples\bulletou.exe export-progress-bin `
@@ -640,7 +640,7 @@ Counts are stored as `u32`, so one bucket cannot exceed 4,294,967,295 occurrence
 
 ### `progress.bin` file format
 
-`progress.bin` stores only the progress-bucket classifier for `progressN` SFNN architectures. BulletOu writes it next to each checkpoint. Use `export-progress-bin` if you need to extract it from an existing `state.bin` or `nn.bin`:
+`progress.bin` stores only the progress-bucket classifier for `progressN` SFNN architectures. BulletOu writes it next to each checkpoint. Use `export-progress-bin` if you need to extract it from an existing `state.bin`:
 
 ```powershell
 .\target\release\examples\bulletou.exe export-progress-bin `
@@ -649,12 +649,6 @@ Counts are stored as `u32`, so one bucket cannot exceed 4,294,967,295 occurrence
   --output D:\...\0029\progress.bin
 ```
 
-The payload is the same as the YaneuraOu `nn.bin` Progress section:
-
-| Order | Type | Meaning |
-|---:|---|---|
-| 1 | `u32` | Progress section hash |
-| 2 | `i32` | `bias_q16` |
-| 3 | `i32[progress_weight_count]` | `weights_q16` |
+The format is `f64 little-endian[81][1548]`, matching tatara / YaneuraOu PR #326: no header or bias, exactly 1,003,104 bytes. It is not embedded in `nn.bin`. See [file format and inference](progress-training.md#file-format-and-inference).
 
 The file is intentionally separate from `count.bin`. BulletOu does not enforce that the two files were produced together, so you can swap progress classifiers during experiments.

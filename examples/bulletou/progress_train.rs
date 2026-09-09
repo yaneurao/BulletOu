@@ -7,7 +7,7 @@ use std::{
 
 use bulletou_lib::{
     game::outputs::{
-        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiProgressKPAbs, ShogiSfnnProgressQ16Params,
+        SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiProgressKPAbs, ShogiSfnnProgressQ16Params,
         shogi_sfnn_progress_0_to_255_from_sum_q16,
     },
     shogi::PackedSfenValue,
@@ -31,7 +31,7 @@ pub struct ProgressTrainArgs {
     #[arg(long)]
     teacher: PathBuf,
 
-    /// Output YaneuraOu-compatible q16 progress.bin.
+    /// Output bias-free progress.bin: 125,388 f64 little-endian weights (tatara / PR #326 format).
     #[arg(long)]
     output: PathBuf,
 
@@ -265,7 +265,7 @@ pub fn run_progress_train(args: &ProgressTrainArgs) -> Result<(), String> {
         return Err("no training positions remain after validation splitting".to_string());
     }
 
-    let parameter_count = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT + 1;
+    let parameter_count = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT;
     let mut parameters = vec![0.0f32; parameter_count];
     let mut adam = AdamState::new(parameter_count);
     let baseline = evaluate_f32(&parameters, &prepared.validation);
@@ -301,7 +301,7 @@ pub fn run_progress_train(args: &ProgressTrainArgs) -> Result<(), String> {
     if quantized_metrics.positions > 0 {
         print_metrics("quantized validation", &quantized_metrics);
     }
-    write_progress_bin(&args.output, &q16, args.overwrite)?;
+    write_progress_bin(&args.output, &best_parameters, args.overwrite)?;
 
     println!("progress-train complete:");
     println!("  source games       = {}", format_u64(prepared.total_games));
@@ -433,9 +433,8 @@ fn train_epoch(
 
             let error = prediction - target;
             let scale = 2.0 * error * prediction * (1.0 - prediction);
-            gradient[0] += scale;
             for &feature in &active {
-                gradient[feature + 1] += scale;
+                gradient[feature] += scale;
             }
             batch_positions += 1;
             if batch_positions == args.batch_size {
@@ -468,9 +467,7 @@ fn evaluate_q16(parameters: &ShogiSfnnProgressQ16Params, samples: &[ValidationSa
     let mut active = Vec::with_capacity(96);
     for sample in samples {
         ShogiProgressKPAbs::collect_active_indices(&sample.pos, &mut active);
-        let sum = active
-            .iter()
-            .fold(i64::from(parameters.bias_q16), |sum, &feature| sum + i64::from(parameters.weights_q16[feature]));
+        let sum = active.iter().fold(0i64, |sum, &feature| sum + i64::from(parameters.weights_q16[feature]));
         let progress = shogi_sfnn_progress_0_to_255_from_sum_q16(sum);
         metrics.add(f32::from(progress) / 255.0, sample.target, sample.endpoint);
     }
@@ -478,7 +475,7 @@ fn evaluate_q16(parameters: &ShogiSfnnProgressQ16Params, samples: &[ValidationSa
 }
 
 fn predict_f32(parameters: &[f32], active: &[usize]) -> f32 {
-    let sum = active.iter().fold(parameters[0], |sum, &feature| sum + parameters[feature + 1]);
+    let sum = active.iter().fold(0.0, |sum, &feature| sum + parameters[feature]);
     sigmoid(sum)
 }
 
@@ -510,16 +507,15 @@ fn is_validation_game(game_number: u64, stride: u64) -> bool {
 }
 
 fn quantize_parameters(parameters: &[f32]) -> Result<ShogiSfnnProgressQ16Params, String> {
-    let bias_q16 = f64_to_i32_q16(f64::from(parameters[0]));
-    let weights_q16 = parameters[1..].iter().map(|&value| f64_to_i32_q16(f64::from(value))).collect();
-    ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)
+    let weights_q16 = parameters.iter().map(|&value| f64_to_i32_q16(f64::from(value))).collect();
+    ShogiSfnnProgressQ16Params::new(weights_q16)
 }
 
 fn f64_to_i32_q16(value: f64) -> i32 {
     (value * Q16_SCALE).round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
 }
 
-fn write_progress_bin(path: &Path, parameters: &ShogiSfnnProgressQ16Params, overwrite: bool) -> Result<(), String> {
+fn write_progress_bin(path: &Path, parameters: &[f32], overwrite: bool) -> Result<(), String> {
     if path.exists() && !overwrite {
         return Err(format!("{} already exists; pass --overwrite to replace it", path.display()));
     }
@@ -530,12 +526,10 @@ fn write_progress_bin(path: &Path, parameters: &ShogiSfnnProgressQ16Params, over
     let temp = temporary_output_path(path);
     let file = File::create(&temp).map_err(|e| format!("failed to create {}: {e}", temp.display()))?;
     let mut writer = BufWriter::new(file);
-    writer
-        .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
-        .and_then(|_| writer.write_all(&parameters.bias_q16.to_le_bytes()))
-        .map_err(|e| format!("failed to write {}: {e}", temp.display()))?;
-    for &weight in parameters.weights_q16.iter() {
-        writer.write_all(&weight.to_le_bytes()).map_err(|e| format!("failed to write {}: {e}", temp.display()))?;
+    for &weight in parameters {
+        writer
+            .write_all(&f64::from(weight).to_le_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", temp.display()))?;
     }
     writer.flush().map_err(|e| format!("failed to flush {}: {e}", temp.display()))?;
     drop(writer);

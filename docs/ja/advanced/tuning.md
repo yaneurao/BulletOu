@@ -392,7 +392,7 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
-`progressN` を含む arch では `--progress-bin` または `--nn-bin` が必要です。progress bucket は Progress section の進行度パラメーターで決まるため、通常は checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から `progress.bin` を取り出すには `export-progress-bin` を使います。
+`progressN` を含む arch では `--progress-bin` または `--nn-bin` が必要です。`--nn-bin` は隣の `progress.bin` を参照します。progress bucket は外部の進行度パラメーターで決まるため、通常は checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から `progress.bin` を取り出すには `export-progress-bin` を使います。
 
 `--positions` を省略すると、teacher path 内の全ファイルを1回だけ読んで count します。
 

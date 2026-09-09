@@ -426,7 +426,7 @@ BulletOu では、教師データから bucket の出現回数を事前に数え
   --output D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 
-`progressN` を含む architecture では、`--progress-bin` または `--nn-bin` が必要です。progress bucket は Progress section の `bias_q16` / `weights_q16` で決まります。通常は、checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から取り出す場合は次のようにします。
+`progressN` を含む architecture では、`--progress-bin` または `--nn-bin` が必要です。progress bucket は外部 `progress.bin` の重みだけで決まります（bias なし）。`--nn-bin` は隣の `progress.bin` を参照する指定です。通常は、checkpoint と一緒に保存された `progress.bin` を指定します。既存 checkpoint から取り出す場合は次のようにします。
 
 ```powershell
 .\target\release\examples\bulletou.exe export-progress-bin `
@@ -448,7 +448,7 @@ count-aware な追加学習では、count.bin を作ったときと同じ分類�
 
 `--sfnn-progress-bin` を指定すると、学習開始時にその進行度分類器を読み込みます。再開時に省略すると `state.bin` 内の分類器を使います。新規学習には、専用の [`progress-train`](progress-training.md) で作った `progress.bin` を指定してください。省略すると未学習の初期値が固定されたままになります。
 
-通常学習では進行度分類器を常に固定し、`nn.bin` に書き出す q16 Progress section と同じ判定で一つの bucket を選びます。評価関数の loss は分類器を更新しません。validation 用の局面データも GPU cache を再利用します。
+通常学習では進行度分類器を常に固定し、外部 `progress.bin` を q16 に丸めた重みと同じ判定で一つの bucket を選びます。評価関数の loss は分類器を更新しません。validation 用の局面データも GPU cache を再利用します。
 
 `count.bin` と `progress.bin` は厳密な一致チェックをしません。仮の count と仮の progress 分類器を意図的に組み合わせたい実験があるためです。通常運用では、count を作ったときと同じ `progress.bin` を学習にも指定してください。
 
@@ -626,7 +626,7 @@ W_effective =
 
 ### `progress.bin` のファイル形式
 
-`progress.bin` は、`progressN` 付き SFNN の progress bucket を決める分類器だけを保存するファイルです。checkpoint 保存時に自動で書き出されます。既存の `state.bin` や `nn.bin` から作る場合は `export-progress-bin` を使います。
+`progress.bin` は、`progressN` 付き SFNN の progress bucket を決める分類器だけを保存するファイルです。checkpoint 保存時に自動で書き出されます。既存の `state.bin` から作る場合は `export-progress-bin` を使います。
 
 ```powershell
 .\target\release\examples\bulletou.exe export-progress-bin `
@@ -635,12 +635,6 @@ W_effective =
   --output D:\...\0029\progress.bin
 ```
 
-形式は、やねうら王 `nn.bin` の Progress section と同じ payload です。
-
-| 順序 | 型 | 内容 |
-|---:|---|---|
-| 1 | `u32` | Progress section hash |
-| 2 | `i32` | `bias_q16` |
-| 3 | `i32[progress_weight_count]` | `weights_q16` |
+形式は tatara / YaneuraOu PR #326 と同じ、`f64 little-endian[81][1548]` です。ヘッダー・bias はなく、1,003,104 bytes 固定です。`nn.bin` にも埋め込みません。重みの順序・推論式・移行時の注意は [進行度分類器のファイル形式](progress-training.md#ファイル形式と推論式) を参照してください。
 
 `progress.bin` は `count.bin` に埋め込まれていません。差し替えて使いたい場合があるため、BulletOu は `count.bin` と `progress.bin` の由来が同じかどうかを強制チェックしません。

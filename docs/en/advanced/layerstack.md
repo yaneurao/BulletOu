@@ -405,13 +405,13 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `progressN` computes a scalar progress value in `0..255`, then maps that value to N buckets.
 
-Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. The Progress section required by `progressN` is exported by BulletOu as part of `nn.bin`.
+Add `progress8` or `progress16` to the architecture name, and progress becomes the third LayerStack axis. BulletOu exports the required classifier separately as `progress.bin`, not inside `nn.bin`.
 
 Use the dedicated `progress-train` command to learn a classifier whose target is `0` at the start of a complete `.pack` game and `255` at its last evaluable position. Pass the resulting `progress.bin` through `--sfnn-progress-bin`; SFNN training always keeps this classifier fixed. See [Training a progress classifier from complete games](progress-training.md) for the command and target formula.
 
 Evaluation-network loss never updates the classifier. Training and validation select one progress bucket using its q16 parameters. Because the classifier stays fixed, validation can cache bucket assignments.
 
-When exporting, BulletOu rounds the active progress parameters to q16 integers and writes them into the Progress section of `nn.bin`. YaneuraOu then reads that section and uses hard progress buckets during search.
+BulletOu exports the effective q16 weights as exact f64 values in a headerless, bias-free `progress.bin`, matching tatara / [YaneuraOu PR #326](https://github.com/yaneurao/YaneuraOu/pull/326). A compatible engine loads this external file, rounds to q16 and selects hard buckets.
 
 | Token | Progress buckets |
 |---|---:|
@@ -431,13 +431,12 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 For example, `progress8` splits `0..255` into roughly 32-point ranges. `progress16` uses roughly 16-point ranges.
 
-When `progressN` is used, the exported `nn.bin` includes a Progress section. If `--sfnn-progress-bin` is supplied, that classifier is stored in the section.
+Even for `progressN`, `nn.bin` has no progress payload. Deploy it together with the accompanying `progress.bin`. Quantized diagnostics load `progress.bin` from the same directory as `nn.bin`.
 
 | Section | Contents |
 |---|---|
 | header | NNUE/SFNN header |
 | FeatureTransformer | L0 bias/weight |
-| Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
 `progressN` can be combined with factorizer settings. `--sfnn-factorizer axis` shares the single king, hand, and progress axes. `--sfnn-factorizer pair` also enables available two-axis factorizers such as `king-progress` and `hand-progress`. See [SFNN factorizer](sfnn-factorizer.md) for the detailed decomposition formulas.

@@ -428,13 +428,13 @@ hand64z_bucket = stm_bucket * 8 + non_stm_bucket
 
 `progressN` は、局面から `0..255` の進行度値を計算し、それを N 個の bucket に割り当てる仕組みです。
 
-architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3の分け方として progress bucket が使われます。必要な進行度情報は、BulletOu が `nn.bin` の一部として出力します。
+architecture 名に `progress8` や `progress16` を付けると、LayerStack の第3の分け方として progress bucket が使われます。必要な進行度情報は、BulletOu が `nn.bin` とは別の `progress.bin` に出力します。
 
 対局の開始を `0`、最後に評価可能な局面を `255` とする分類器は、`.pack` の対局境界を教師として専用の `progress-train` で学習します。作成した `progress.bin` を SFNN の `--sfnn-progress-bin` に指定すると、通常学習ではその分類器を固定して使います。コマンドと教師値の式は [対局棋譜から進行度分類器を作る](progress-training.md) を参照してください。
 
 SFNN 本体では、評価関数の loss で進行度分類器を更新しません。学習・検証ともに、分類器の q16 パラメーターから一つの progress bucket を決めます。分類器が変わらないので、検証局面の bucket 判定も cache に保持できます。
 
-保存時には、使用中の progress パラメーターを q16 整数に丸めて `nn.bin` の Progress section に書き出します。やねうら王側は、その Progress section を読んで hard bucket として使います。
+保存時には、使用中の q16 重みを正確に表す f64 値を、ヘッダー・bias なしの `progress.bin` に書き出します。形式は tatara / [YaneuraOu PR #326](https://github.com/yaneurao/YaneuraOu/pull/326) に合わせています。対応するやねうら王側でも外部ファイルを読み込み、q16 に丸めて hard bucket を選びます。
 
 | 指定 | progress buckets |
 |---|---:|
@@ -454,13 +454,12 @@ progress_bucket = min(progress_0_255 * progress_bucket_count / 256,
 
 たとえば `progress8` なら、進行度 `0..255` をほぼ 32 刻みで 8 個に分けます。`progress16` なら 16 刻みです。
 
-`progressN` を使うと、出力される `nn.bin` には進行度計算用のデータも入ります。`--sfnn-progress-bin` を指定した場合は、その分類器が Progress section に入ります。
+`progressN` でも `nn.bin` に進行度計算データは埋め込みません。同じ保存先に出る `progress.bin` とセットで使います。量子化後の診断コマンドも `nn.bin` と同じディレクトリの `progress.bin` を読みます。
 
 | `nn.bin` 内の部分 | 内容 |
 |---|---|
 | header | NNUE/SFNN header |
 | FeatureTransformer | L0 bias/weight |
-| Progress | `0x6f50524f`, `bias_q16`, `weights_q16[81][1548]` |
 | LayerStack network | stack 0, stack 1, ... |
 
 `progressN` は factorizer と併用できます。`--sfnn-factorizer axis` は king / hand / progress の単独軸を共有します。`--sfnn-factorizer pair` はそれに加えて、archに存在する範囲で `king-progress` や `hand-progress` などの2軸factorizerも使います。詳しい分解式は [SFNN factorizer](sfnn-factorizer.md) を参照してください。

@@ -16,7 +16,39 @@ target = i / (L - 1)
 - 最後に評価可能な局面: `1`
 - 途中の局面: 対局内での位置に応じて `0..1`
 
-`.pack` の終局マーカー後には評価対象の盤面がないため、最後の着手直前の局面を `1` とします。学習結果は q16 の `progress.bin` に保存され、実行時には `0..255` の整数へ変換されます。
+`.pack` の終局マーカー後には評価対象の盤面がないため、最後の着手直前の局面を `1` とします。学習結果は bias なし・f64 形式の `progress.bin` に保存され、実行時には `0..255` の整数へ変換されます。
+
+## ファイル形式と推論式
+
+`progress.bin` は tatara / [YaneuraOu PR #326](https://github.com/yaneurao/YaneuraOu/pull/326) と同じ、**ヘッダーなしの `f64 little-endian[81][1548]`** です。125,388 個の重み、合計 **1,003,104 bytes** で、bias・hash・bucket 数は格納しません。index は `king_square * 1548 + BonaPiece`、両玉の視点から非玉駒の特徴を足します。
+
+専用の `progress-train` が学習する式は次の通りです。独立した bias はありません。
+
+```text
+z = Σ w[active_KP_feature]
+prediction = sigmoid(z)
+loss = (prediction - i / (L - 1))²
+```
+
+通常の NNUE 学習・count・検証では、ファイルの各重みを `round(w * 65536)` で整数化します（i32 範囲外は clamp）。その和を、sigmoid に対応する固定閾値で `0..255` に変換します。閾値はソース側にあり、ファイルには入りません。
+
+`nn.bin` にはこの分類器を**埋め込みません**。構造は `NNUE header → FeatureTransformer → 各 stack の network` で、progress 専用 hash も追加しません。checkpoint 保存時には同じフォルダへ `progress.bin` も出力します。これは実際に使用した整数重みを `q16 / 65536` の f64 として保存するため、読み直しても bucket 判定が変わりません。
+
+探索で使うときは、外部分類器形式に対応したやねうら王と、arch の一致する `nn.bin` / `progress.bin` をセットで使ってください。旧「nn.bin に分類器を埋め込む」実装には対応しません。BulletOu の `quantized-test` なども、progress 付き arch なら `nn.bin` と同じディレクトリの `progress.bin` を読みます。
+
+### 旧形式から現在の学習を継続する場合
+
+通常の読み込みは新形式だけに対応します。既存の進行度を維持して移行するための一度限りの変換は、次のスクリプトで行えます。同じ出力先なら元ファイルを `.q16-with-bias.bak` に退避します。
+
+```powershell
+.\convert_progress_format.ps1 `
+  -InputPath C:\path\to\progress.bin `
+  -OutputPath C:\path\to\progress.bin
+```
+
+単に bias を捨てると bucket が変わります。この変換では、平手で常に飛車が2枚（龍・持ち飛車を含む）あり、両視点で合計4項になることを利用して、対応する重みへ `bias_q16 / 4` を加えます。bias が4の倍数なら整数和が厳密に一致します。**飛車を落とした駒落ち局面には、この保存則は適用できません。** 学習し直す場合の `progress-train` には、この移行処理も固定の加算値もありません。
+
+現在の旧 `state.bin` からの継続に限り、先頭 bias を含む進行度レコードを同じ方法で移行します。評価 NN の重み・その optimizer state・教師読み込み位置は変更しません。変換済み `--sfnn-progress-bin` のパスと通常の `--resume` を使えます。新しく保存した state の進行度レコードには bias を含めません。`export-progress-bin` の入力は `--state-bin` です（`nn.bin` からの抽出は廃止）。
 
 ## `.pack` が必要な理由
 
@@ -42,7 +74,7 @@ PSV、HCPE、固定長 `.bin` は局面単位のデータです。シャッフ�
 | オプション | 内容 |
 |---|---|
 | `--teacher` | 完結した対局を保持する `.pack` 1ファイル |
-| `--output` | 出力する q16 `progress.bin` |
+| `--output` | 出力するヘッダーなし f64 `progress.bin` |
 | `--epochs` | `.pack` 全体を学習に使う回数 |
 | `--batch-size` | 1回の Adam update にまとめる局面数 |
 | `--lr` | Adam の learning rate。内部倍率はかかりません |

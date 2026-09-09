@@ -1181,7 +1181,7 @@ impl ShogiSfnnLayerStackBucketKind {
     /// The normal path decodes a full [`ShogiBoard`].  Bucket assignment only
     /// needs side-to-move, king squares, and hand counts when no explicit
     /// progress parameters are installed.  If progress parameters are loaded,
-    /// this method falls back to the full decode path so the Progress section
+    /// this method falls back to the full decode path so the external progress.bin
     /// is applied exactly.
     pub fn bucket_fast(self, pos: &PackedSfenValue) -> usize {
         let (stm, black_king, white_king) = shogi_sfnn_fast_side_and_kings(pos);
@@ -1504,29 +1504,26 @@ pub const SHOGI_SFNN_PROGRESS_MAX_ACTIVE: usize = 160;
 /// Number of scalar progress values used by YaneuraOu SFNN progress buckets.
 pub const SHOGI_SFNN_PROGRESS_VALUE_COUNT: usize = 256;
 
-/// YaneuraOu hash block for SFNN progress parameters (`"oPRO"`).
-pub const SHOGI_SFNN_PROGRESS_HASH: u32 = 0x6F50_524F;
-
-/// YaneuraOu-compatible SFNN progress parameters.
+/// Integer runtime weights for a bias-free KP-absolute progress classifier.
+/// The external file contains 125,388 f64 little-endian weights, without a header.
 ///
 /// The values are q16 logits:
 ///
-/// `sum_q16 = bias_q16 + sum(active_kp_abs_weights_q16)`
+/// `sum_q16 = sum(active_kp_abs_weights_q16)`
 ///
 /// `sum_q16` is converted to a scalar `0..=255`; each architecture-specific
 /// progress bucket then uses `progress * bucket_count / 256`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShogiSfnnProgressQ16Params {
-    pub bias_q16: i32,
     pub weights_q16: Box<[i32]>,
 }
 
 impl ShogiSfnnProgressQ16Params {
     pub fn zero() -> Self {
-        Self { bias_q16: 0, weights_q16: vec![0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT].into_boxed_slice() }
+        Self { weights_q16: vec![0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT].into_boxed_slice() }
     }
 
-    pub fn new(bias_q16: i32, weights_q16: Vec<i32>) -> Result<Self, String> {
+    pub fn new(weights_q16: Vec<i32>) -> Result<Self, String> {
         if weights_q16.len() != SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
             return Err(format!(
                 "SFNN progress q16 weight count mismatch: got {}, expected {}",
@@ -1534,7 +1531,53 @@ impl ShogiSfnnProgressQ16Params {
                 SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
             ));
         }
-        Ok(Self { bias_q16, weights_q16: weights_q16.into_boxed_slice() })
+        Ok(Self { weights_q16: weights_q16.into_boxed_slice() })
+    }
+
+    pub fn from_bin_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let expected = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT * 8;
+        if bytes.len() != expected {
+            return Err(format!(
+                "progress.bin size {} != {expected}: expected headerless f64 LE weights, no bias",
+                bytes.len()
+            ));
+        }
+        let mut weights = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+        for (index, chunk) in bytes.chunks_exact(8).enumerate() {
+            let value = f64::from_le_bytes(chunk.try_into().unwrap());
+            if !value.is_finite() {
+                return Err(format!("progress.bin weight[{index}] is not finite"));
+            }
+            weights.push((value * 65_536.0).round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32);
+        }
+        Self::new(weights)
+    }
+
+    /// Serializes the effective integer model exactly in the headerless f64 format.
+    pub fn to_bin_bytes(&self) -> Vec<u8> {
+        self.weights_q16.iter().flat_map(|&w| (f64::from(w) / 65_536.0).to_le_bytes()).collect()
+    }
+
+    /// Resume migration for a classifier with an explicit q16 bias.
+    /// In a full-material game, two rooks (including dragons and held rooks)
+    /// contribute four KP terms across both perspectives. Adding bias/4 to
+    /// those terms preserves the integer sum exactly. Not valid for rook odds.
+    pub fn fold_resume_bias(&mut self, bias_q16: i32) -> Result<(), String> {
+        use crate::shogi::bona_piece::{E_HAND_ROOK, F_HAND_ROOK, F_ROOK, FE_OLD_END};
+        if bias_q16 % 4 != 0 {
+            return Err("cannot remove progress bias exactly in q16: bias must be divisible by 4; use an explicitly converted --sfnn-progress-bin".to_string());
+        }
+        let delta = bias_q16 / 4;
+        for (index, weight) in self.weights_q16.iter_mut().enumerate() {
+            let piece = index % FE_OLD_END;
+            if piece >= usize::from(F_ROOK)
+                || (usize::from(F_HAND_ROOK)..usize::from(F_HAND_ROOK) + 2).contains(&piece)
+                || (usize::from(E_HAND_ROOK)..usize::from(E_HAND_ROOK) + 2).contains(&piece)
+            {
+                *weight = weight.checked_add(delta).ok_or("progress bias folding overflows i32")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1604,13 +1647,13 @@ fn shogi_sfnn_progress_sum_q16_from_board(board: &ShogiBoard, params: &ShogiSfnn
 
 fn shogi_sfnn_progress_sum_q16_from_board_explicit(board: &ShogiBoard, params: &ShogiSfnnProgressQ16Params) -> i64 {
     if !board.black_king_sq.is_valid() || !board.white_king_sq.is_valid() {
-        return i64::from(params.bias_q16);
+        return 0;
     }
 
     let weights = &params.weights_q16;
     let bk_base = board.black_king_sq.index() * FE_OLD_END;
     let wk_base = board.white_king_sq.inverse().index() * FE_OLD_END;
-    let mut sum_q16 = i64::from(params.bias_q16);
+    let mut sum_q16 = 0i64;
 
     // ShogiBoard::pieces scans all 81 squares. Visit the board once instead
     // of once for each of 13 piece types x 2 colors. Integer addition keeps
@@ -2476,9 +2519,98 @@ mod tests {
     }
 
     #[test]
+    fn progress_headerless_f64_roundtrip_and_validation() {
+        let mut params = ShogiSfnnProgressQ16Params::zero();
+        for (i, w) in params.weights_q16.iter_mut().enumerate() {
+            *w = i as i32 - 80_000;
+        }
+        let bytes = params.to_bin_bytes();
+        assert_eq!(bytes.len(), 1_003_104);
+        assert_eq!(f64::from_le_bytes(bytes[..8].try_into().unwrap()), -80_000.0 / 65536.0);
+        assert_eq!(ShogiSfnnProgressQ16Params::from_bin_bytes(&bytes).unwrap(), params);
+        assert!(ShogiSfnnProgressQ16Params::from_bin_bytes(&bytes[..501_560]).is_err());
+        let mut invalid = bytes;
+        invalid[..8].copy_from_slice(&f64::NAN.to_le_bytes());
+        assert!(ShogiSfnnProgressQ16Params::from_bin_bytes(&invalid).is_err());
+    }
+
+    #[test]
+    fn progress_bias_migration_preserves_two_rook_positions() {
+        let mut before = ShogiSfnnProgressQ16Params::zero();
+        for (i, w) in before.weights_q16.iter_mut().enumerate() {
+            *w = (i % 2003) as i32 - 1001;
+        }
+        let bias = 7260;
+        let mut after = before.clone();
+        after.fold_resume_bias(bias).unwrap();
+        // All king squares, rook colors, promoted/unpromoted and hand cases.
+        for k in 0..81 {
+            for variant in 0..8 {
+                let mut board = ShogiBoard::default();
+                board.black_king_sq = Square::from_index(k);
+                board.white_king_sq = Square::from_index((k + 40) % 81);
+                board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+                board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+                for rook in 0..2 {
+                    let color = if (variant + rook) % 2 == 0 { Color::Black } else { Color::White };
+                    if variant & (1 << rook) == 0 {
+                        let sq = (k + 10 + rook) % 81;
+                        let pt = if variant & 4 == 0 { PieceType::Rook } else { PieceType::Dragon };
+                        board.board[sq] = Piece::new(color, pt);
+                    } else if color == Color::Black {
+                        board.black_hand.add(PieceType::Rook, 1);
+                    } else {
+                        board.white_hand.add(PieceType::Rook, 1);
+                    }
+                }
+                let old = shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &before) + i64::from(bias);
+                let new = shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &after);
+                assert_eq!(old, new, "king={k}, variant={variant}");
+                assert_eq!(
+                    shogi_sfnn_progress_0_to_255_from_sum_q16(old),
+                    shogi_sfnn_progress_0_to_255_from_sum_q16(new)
+                );
+            }
+        }
+        assert!(before.fold_resume_bias(1).is_err());
+    }
+
+    #[test]
+    #[ignore = "set BULLETOU_MIGRATION_OLD_PROGRESS, BULLETOU_MIGRATION_NEW_PROGRESS, BULLETOU_MIGRATION_PSV"]
+    fn verify_progress_migration_on_teacher() {
+        use std::io::Read;
+        let old = std::fs::read(std::env::var("BULLETOU_MIGRATION_OLD_PROGRESS").unwrap()).unwrap();
+        assert_eq!(old.len(), 501_560);
+        assert_eq!(u32::from_le_bytes(old[..4].try_into().unwrap()), 0x6f50524f);
+        let bias = i64::from(i32::from_le_bytes(old[4..8].try_into().unwrap()));
+        let before = ShogiSfnnProgressQ16Params::new(
+            old[8..].chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect(),
+        )
+        .unwrap();
+        let new = std::fs::read(std::env::var("BULLETOU_MIGRATION_NEW_PROGRESS").unwrap()).unwrap();
+        let after = ShogiSfnnProgressQ16Params::from_bin_bytes(&new).unwrap();
+        let file = std::fs::File::open(std::env::var("BULLETOU_MIGRATION_PSV").unwrap()).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+        let mut record = [0u8; 40];
+        for i in 0..100_000 {
+            reader.read_exact(&mut record).unwrap();
+            let mut position = PackedSfenValue::default();
+            position.as_bytes_mut().copy_from_slice(&record);
+            let board = position.decode();
+            let old_sum = bias + shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &before);
+            let new_sum = shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &after);
+            assert_eq!(old_sum, new_sum, "position {i}");
+            assert_eq!(
+                shogi_sfnn_progress_0_to_255_from_sum_q16(old_sum),
+                shogi_sfnn_progress_0_to_255_from_sum_q16(new_sum)
+            );
+        }
+        println!("100,000 teacher positions: integer sum and all progress buckets identical");
+    }
+
+    #[test]
     fn progress_single_board_scan_matches_kp_abs_index_sum() {
         let mut params = ShogiSfnnProgressQ16Params::zero();
-        params.bias_q16 = -56789;
         for (i, weight) in params.weights_q16.iter_mut().enumerate() {
             *weight = ((i * 137 % 2003) as i32 - 1001) * 1234;
         }
@@ -2503,8 +2635,7 @@ mod tests {
                 board.white_hand.add(pt, ((2 * i + variant) % 3) as u8);
             }
             ShogiProgressKPAbs::collect_active_indices_from_board(&board, &mut indices);
-            let reference =
-                indices.iter().fold(i64::from(params.bias_q16), |sum, &idx| sum + i64::from(params.weights_q16[idx]));
+            let reference = indices.iter().fold(0i64, |sum, &idx| sum + i64::from(params.weights_q16[idx]));
             assert_eq!(shogi_sfnn_progress_sum_q16_from_board_explicit(&board, &params), reference);
         }
     }

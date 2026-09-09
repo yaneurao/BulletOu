@@ -3235,7 +3235,7 @@ mod tests {
                 );
                 let progress = reference.progress.as_ref().unwrap();
                 for bias in [-5 * 65536, 0, 5 * 65536] {
-                    params.bias_q16 = bias;
+                    params.weights_q16.fill(bias);
                     config.hard_progress_params = Some(params.clone());
                     config.threads = 3;
                     let parallel = prepare_sfnn_fast_batch_from_board_features(
@@ -3269,7 +3269,7 @@ mod tests {
                         let sum = indices
                             .iter()
                             .filter(|&&idx| idx >= 0)
-                            .fold(i64::from(bias), |sum, &idx| sum + i64::from(params.weights_q16[idx as usize]));
+                            .fold(0i64, |sum, &idx| sum + i64::from(params.weights_q16[idx as usize]));
                         let value = shogi_sfnn_progress_0_to_255_from_sum_q16(sum);
                         let expected = progress.base_buckets[i] as usize * count
                             + shogi_sfnn_progress_bucket_from_value(value, count);

@@ -406,7 +406,7 @@ With many bucket stacks, rare stacks can sometimes learn unstable residuals. You
   --output D:\BulletOu-snapshots\counts\count.bin
 ```
 
-For arch names containing `progressN`, `--progress-bin` or `--nn-bin` is required. The progress bucket is determined by the Progress section parameters, so normally pass the `progress.bin` saved next to the checkpoint. Use `export-progress-bin` to extract one from an existing checkpoint.
+For arch names containing `progressN`, `--progress-bin` or `--nn-bin` is required. `--nn-bin` locates the sibling `progress.bin`. The bucket is determined by this external classifier, so normally pass the `progress.bin` saved next to the checkpoint. Use `export-progress-bin` to extract one from an existing checkpoint.
 
 If you omit `--positions`, BulletOu scans every file in the teacher path once.
 

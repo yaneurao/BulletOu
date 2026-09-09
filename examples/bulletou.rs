@@ -74,7 +74,7 @@ use bulletou_lib::{
         ShogiKkp, ShogiKp, ShogiKpp, SparseInputType,
     },
     game::outputs::{
-        SHOGI_SFNN_PROGRESS_HASH, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
+        SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind,
         ShogiSfnnLayerStackBucketKind, ShogiSfnnProgressBucketKind, ShogiSfnnProgressQ16Params,
         set_shogi_sfnn_progress_q16_params, shogi_sfnn_progress_0_to_255_from_sum_q16,
         shogi_sfnn_progress_bucket_from_value,
@@ -1539,19 +1539,15 @@ struct AverageSfnnStateArgs {
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Parser, Debug, Clone)]
 #[command(name = "bulletou export-progress-bin")]
-#[command(about = "Extract SFNN progress bucket parameters from state.bin or nn.bin into progress.bin")]
+#[command(about = "Extract SFNN progress bucket parameters from state.bin into bias-free progress.bin")]
 struct ExportProgressBinArgs {
     /// SFNN architecture. Must contain progress2/3/4/8/16/32.
     #[arg(long)]
     arch: NnueArch,
 
     /// cuda-cpp SFNN training state (`state.bin`) to read.
-    #[arg(long = "state-bin", conflicts_with = "nn_bin")]
-    state_bin: Option<PathBuf>,
-
-    /// Exported YaneuraOu-compatible quantized `nn.bin` to read.
-    #[arg(long = "nn-bin", conflicts_with = "state_bin")]
-    nn_bin: Option<PathBuf>,
+    #[arg(long = "state-bin")]
+    state_bin: PathBuf,
 
     /// Output progress.bin path.
     #[arg(long)]
@@ -1575,11 +1571,11 @@ struct BucketStatsArgs {
     #[arg(long)]
     arch: NnueArch,
 
-    /// nn.bin used to read the Progress section for progressN architectures.
+    /// nn.bin path whose sibling progress.bin supplies progressN parameters.
     #[arg(long = "nn-bin")]
     nn_bin: Option<PathBuf>,
 
-    /// progress.bin used to read the Progress section for progressN architectures.
+    /// Headerless f64 progress.bin for progressN architectures (no bias).
     /// Prefer this over --nn-bin when you want to manage the progress classifier separately.
     #[arg(long = "progress-bin", conflicts_with = "nn_bin")]
     progress_bin: Option<PathBuf>,
@@ -1639,14 +1635,14 @@ struct BucketCountArgs {
     #[arg(long)]
     arch: NnueArch,
 
-    /// nn.bin used to read the Progress section for progressN architectures.
+    /// nn.bin path whose sibling progress.bin supplies progressN parameters.
     ///
     /// Required when --arch contains progress2/3/4/8/16/32, because progress
     /// bucket assignment is part of the exported NNUE parameters.
     #[arg(long = "nn-bin")]
     nn_bin: Option<PathBuf>,
 
-    /// progress.bin used to read the Progress section for progressN architectures.
+    /// Headerless f64 progress.bin for progressN architectures (no bias).
     /// Prefer this over --nn-bin when you want to manage the progress classifier separately.
     #[arg(long = "progress-bin", conflicts_with = "nn_bin")]
     progress_bin: Option<PathBuf>,
@@ -1726,20 +1722,8 @@ impl ExportProgressBinArgs {
                 self.arch.cli_name()
             ));
         }
-        match (&self.state_bin, &self.nn_bin) {
-            (Some(_), Some(_)) => return Err("--state-bin and --nn-bin are mutually exclusive".to_string()),
-            (None, None) => return Err("export-progress-bin requires either --state-bin or --nn-bin".to_string()),
-            _ => {}
-        }
-        if let Some(path) = &self.state_bin {
-            if !path.exists() {
-                return Err(format!("--state-bin {} does not exist", path.display()));
-            }
-        }
-        if let Some(path) = &self.nn_bin {
-            if !path.exists() {
-                return Err(format!("--nn-bin {} does not exist", path.display()));
-            }
+        if !self.state_bin.exists() {
+            return Err(format!("--state-bin {} does not exist", self.state_bin.display()));
         }
         if self.output.exists() && !self.overwrite {
             return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
@@ -4080,7 +4064,7 @@ fn effective_sfnn_factorizer_alpha(args: &Args) -> SfnnFactorizerAlphaSpec {
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_progress_parameter_count() -> usize {
-    1 + SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
+    SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -4293,7 +4277,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(about = "BulletOu unified trainer")]
 #[command(args_override_self = true)]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin or nn.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Read BulletOu training options from a JSON file. Keys use snake_case
@@ -6155,20 +6139,6 @@ fn sfnn_network_base_offset(bytes: &[u8]) -> Result<usize, String> {
     }
     pos = skip_leb128_block(bytes, pos, "FeatureTransformer biases")?;
     pos = skip_leb128_block(bytes, pos, "FeatureTransformer weights")?;
-    if pos.checked_add(4).is_some_and(|end| end <= bytes.len())
-        && read_u32_le(bytes, pos, "SFNN progress hash")? == SHOGI_SFNN_PROGRESS_HASH
-    {
-        pos += 4; // progress hash
-        pos = pos.checked_add(4).ok_or_else(|| "SFNN progress bias offset overflow".to_string())?;
-        let progress_weight_bytes = SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
-            .checked_mul(std::mem::size_of::<i32>())
-            .ok_or_else(|| "SFNN progress weight byte count overflow".to_string())?;
-        pos =
-            pos.checked_add(progress_weight_bytes).ok_or_else(|| "SFNN progress weight offset overflow".to_string())?;
-        if pos > bytes.len() {
-            return Err(format!("SFNN progress parameter section extends beyond file size {}", bytes.len()));
-        }
-    }
     Ok(pos)
 }
 
@@ -6355,6 +6325,32 @@ fn nerf_sfnn_bytes(mut bytes: Vec<u8>, args: &NerfArgs) -> Result<(Vec<u8>, Nerf
     Ok((bytes, report))
 }
 
+fn copy_progress_sidecar_for_nn_bin(input: &Path, output: &Path, arch: NnueArch) -> Result<(), String> {
+    if arch.layerstack.is_none_or(|mode| mode.progress_bucket_count() <= 1) {
+        return Ok(());
+    }
+    let source = input.with_file_name("progress.bin");
+    let destination = output.with_file_name("progress.bin");
+    let bytes = std::fs::read(&source).map_err(|e| format!("failed to read {}: {e}", source.display()))?;
+    bulletou_lib::game::outputs::ShogiSfnnProgressQ16Params::from_bin_bytes(&bytes)?;
+    if destination.exists() {
+        let existing =
+            std::fs::read(&destination).map_err(|e| format!("failed to read {}: {e}", destination.display()))?;
+        if existing != bytes {
+            return Err(format!(
+                "{} contains a different classifier; choose a separate output directory",
+                destination.display()
+            ));
+        }
+    } else {
+        if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&destination, bytes).map_err(|e| format!("failed to write {}: {e}", destination.display()))?;
+    }
+    Ok(())
+}
+
 fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
     args.validate_arch_flags()?;
     if args.input == args.output {
@@ -6381,6 +6377,7 @@ fn run_nerf(args: &NerfArgs) -> Result<NerfReport, String> {
             std::fs::create_dir_all(parent).map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
         }
     }
+    copy_progress_sidecar_for_nn_bin(&args.input, &args.output, args.arch)?;
     std::fs::write(&args.output, nerfed).map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
 
     Ok(report)
@@ -6777,175 +6774,31 @@ fn cuda_cpp_sfnn_feature_kind_from_arch(arch: NnueArch) -> Result<CudaCppSfnnFea
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn read_exact_array<const N: usize, R: std::io::Read>(
-    reader: &mut R,
-    path: &Path,
-    label: &str,
-) -> Result<[u8; N], String> {
-    let mut buf = [0u8; N];
-    reader.read_exact(&mut buf).map_err(|err| format!("failed to read {} from {}: {err}", label, path.display()))?;
-    Ok(buf)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn read_u32_le_from_reader<R: std::io::Read>(reader: &mut R, path: &Path, label: &str) -> Result<u32, String> {
-    Ok(u32::from_le_bytes(read_exact_array::<4, _>(reader, path, label)?))
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn read_i32_le_from_reader<R: std::io::Read>(reader: &mut R, path: &Path, label: &str) -> Result<i32, String> {
-    Ok(i32::from_le_bytes(read_exact_array::<4, _>(reader, path, label)?))
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn seek_forward<R: std::io::Seek>(reader: &mut R, bytes: u64, path: &Path, label: &str) -> Result<(), String> {
-    let offset = i64::try_from(bytes)
-        .map_err(|_| format!("{label}: cannot seek forward {bytes} byte(s) in {}", path.display()))?;
-    reader
-        .seek(std::io::SeekFrom::Current(offset))
-        .map_err(|err| format!("failed to skip {label} in {}: {err}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn skip_leb128_block_reader<R: std::io::Read + std::io::Seek>(
-    reader: &mut R,
-    path: &Path,
-    label: &str,
-) -> Result<(), String> {
-    let mut magic = vec![0u8; LEB128_MAGIC.len()];
-    reader
-        .read_exact(&mut magic)
-        .map_err(|err| format!("failed to read {label} LEB128 magic from {}: {err}", path.display()))?;
-    if magic.as_slice() != LEB128_MAGIC {
-        return Err(format!(
-            "{label}: missing LEB128 magic in {}; this command expects an exported SFNN nn.bin",
-            path.display()
-        ));
-    }
-    let payload_size = u64::from(read_u32_le_from_reader(reader, path, &format!("{label} payload size"))?);
-    seek_forward(reader, payload_size, path, label)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
-fn read_sfnn_progress_params_from_nn_bin(
-    path: &Path,
-    arch: NnueArch,
+fn read_sfnn_progress_sidecar(
+    nn_bin: &Path,
+    _arch: NnueArch,
     layerstack: LayerStackMode,
 ) -> Result<Option<ShogiSfnnProgressQ16Params>, String> {
-    let wants_progress = layerstack.progress_bucket_count() > 1;
-    let file = std::fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-
-    let version = read_u32_le_from_reader(&mut reader, path, "NNUE header version")?;
-    if version != SFNN_NNUE_VERSION {
-        return Err(format!(
-            "{}: NNUE version mismatch: expected 0x{SFNN_NNUE_VERSION:08X}, got 0x{version:08X}",
-            path.display()
-        ));
-    }
-    let model_hash = read_u32_le_from_reader(&mut reader, path, "NNUE header hash")?;
-    let desc_len = read_u32_le_from_reader(&mut reader, path, "NNUE header desc_len")?;
-    seek_forward(&mut reader, u64::from(desc_len), path, "NNUE header description")?;
-
-    let ft_hash = read_u32_le_from_reader(&mut reader, path, "FeatureTransformer hash")?;
-    if ft_hash != FT_HASH_SFNN && ft_hash != FT_HASH_SFNN_LEGACY_SUISHO11PLUS {
-        return Err(format!(
-            "{}: FeatureTransformer hash mismatch: expected 0x{FT_HASH_SFNN:08X} or legacy 0x{FT_HASH_SFNN_LEGACY_SUISHO11PLUS:08X}, got 0x{ft_hash:08X}",
-            path.display()
-        ));
-    }
-    let expected_hash = if wants_progress { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
-    if model_hash != expected_hash {
-        eprintln!(
-            "  WARN: NNUE header hash 0x{model_hash:08X} differs from expected 0x{expected_hash:08X} for --arch {}",
-            arch.cli_name()
-        );
-    }
-
-    skip_leb128_block_reader(&mut reader, path, "FeatureTransformer biases")?;
-    skip_leb128_block_reader(&mut reader, path, "FeatureTransformer weights")?;
-
-    let progress_hash = match read_u32_le_from_reader(&mut reader, path, "SFNN progress hash") {
-        Ok(hash) => hash,
-        Err(err) => {
-            if wants_progress {
-                return Err(format!(
-                    "--arch {} uses progress buckets, but {} has no readable SFNN progress parameter section: {err}",
-                    arch.cli_name(),
-                    path.display()
-                ));
-            }
-            return Ok(None);
-        }
-    };
-    if progress_hash != SHOGI_SFNN_PROGRESS_HASH {
-        if wants_progress {
-            return Err(format!(
-                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section at the expected position",
-                arch.cli_name(),
-                path.display()
-            ));
-        }
+    if layerstack.progress_bucket_count() <= 1 {
         return Ok(None);
     }
-
-    let bias_q16 = read_i32_le_from_reader(&mut reader, path, "SFNN progress bias")?;
-    let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
-    for index in 0..SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
-        weights_q16.push(read_i32_le_from_reader(&mut reader, path, &format!("SFNN progress weight[{index}]"))?);
-    }
-    Ok(Some(ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)?))
+    let path = nn_bin.with_file_name("progress.bin");
+    read_sfnn_progress_params_from_progress_bin(&path).map(Some)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn read_sfnn_progress_params_from_progress_bin(path: &Path) -> Result<ShogiSfnnProgressQ16Params, String> {
-    use std::io::Read as _;
-
-    let file = std::fs::File::open(path).map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let progress_hash = read_u32_le_from_reader(&mut reader, path, "SFNN progress hash")?;
-    if progress_hash != SHOGI_SFNN_PROGRESS_HASH {
-        return Err(format!(
-            "{} is not a BulletOu/YaneuraOu SFNN progress.bin: expected Progress hash 0x{SHOGI_SFNN_PROGRESS_HASH:08X}, got 0x{progress_hash:08X}",
-            path.display()
-        ));
-    }
-    let bias_q16 = read_i32_le_from_reader(&mut reader, path, "SFNN progress bias")?;
-    let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
-    for index in 0..SHOGI_SFNN_PROGRESS_WEIGHT_COUNT {
-        weights_q16.push(read_i32_le_from_reader(&mut reader, path, &format!("SFNN progress weight[{index}]"))?);
-    }
-    let mut trailing = [0u8; 1];
-    let trailing_len = reader
-        .read(&mut trailing)
-        .map_err(|err| format!("failed to check trailing data in {}: {err}", path.display()))?;
-    if trailing_len != 0 {
-        return Err(format!("{} has trailing byte(s) after the SFNN progress payload", path.display()));
-    }
-    ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)
+    let bytes = std::fs::read(path).map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    ShogiSfnnProgressQ16Params::from_bin_bytes(&bytes).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn write_sfnn_progress_params_bin(path: &Path, params: &ShogiSfnnProgressQ16Params) -> Result<(), String> {
-    use std::io::Write as _;
-
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
-            .map_err(|err| format!("failed to create progress.bin output directory {}: {err}", parent.display()))?;
+            .map_err(|err| format!("failed to create progress.bin directory {}: {err}", parent.display()))?;
     }
-    let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
-    let mut writer = std::io::BufWriter::new(file);
-    writer
-        .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
-        .and_then(|_| writer.write_all(&params.bias_q16.to_le_bytes()))
-        .map_err(|err| format!("failed to write SFNN progress header {}: {err}", path.display()))?;
-    for &weight in params.weights_q16.iter() {
-        writer
-            .write_all(&weight.to_le_bytes())
-            .map_err(|err| format!("failed to write SFNN progress weights {}: {err}", path.display()))?;
-    }
-    writer.flush().map_err(|err| format!("failed to flush {}: {err}", path.display()))
+    std::fs::write(path, params.to_bin_bytes()).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -6989,14 +6842,14 @@ fn load_sfnn_progress_params_from_external_input(
         return Ok((params, format!("progress.bin: {}", path.display())));
     }
     if let Some(path) = nn_bin {
-        let params = read_sfnn_progress_params_from_nn_bin(path, arch, layerstack)?.ok_or_else(|| {
+        let params = read_sfnn_progress_sidecar(path, arch, layerstack)?.ok_or_else(|| {
             format!(
-                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
+                "--arch {} uses progress buckets, but {} has no progress.bin classifier",
                 arch.cli_name(),
                 path.display()
             )
         })?;
-        return Ok((params, format!("nn.bin Progress section: {}", path.display())));
+        return Ok((params, format!("nn.bin sidecar: {}", path.with_file_name("progress.bin").display())));
     }
     Err(format!(
         "--progress-bin or --nn-bin is required for --arch {} because progressN bucket assignment needs progress parameters",
@@ -7045,8 +6898,7 @@ fn parse_quantized_sfnn_nn_bin(
     if ft_hash == FT_HASH_SFNN_LEGACY_SUISHO11PLUS {
         eprintln!("  WARN: accepting legacy SFNN FeatureTransformer hash 0x{ft_hash:08X} in {}", path.display());
     }
-    let wants_progress = layerstack.progress_bucket_count() > 1;
-    let expected_hash = if wants_progress { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
+    let expected_hash = KHASH_SFNN;
     if model_hash != expected_hash {
         eprintln!(
             "  WARN: NNUE header hash 0x{model_hash:08X} differs from expected 0x{expected_hash:08X} for --arch {}",
@@ -7076,33 +6928,7 @@ fn parse_quantized_sfnn_nn_bin(
     let (l0w, next) = read_sfnn_leb128_i16_chunk(&bytes, pos, l0w_count, "FeatureTransformer weights")?;
     pos = next;
 
-    let has_progress_blob = pos.checked_add(4).is_some_and(|end| end <= bytes.len())
-        && read_u32_le(&bytes, pos, "SFNN progress hash")? == SHOGI_SFNN_PROGRESS_HASH;
-    let progress_params = if has_progress_blob {
-        if !wants_progress {
-            return Err(format!(
-                "{} contains SFNN progress parameters, but --arch {} has no progressN suffix",
-                path.display(),
-                arch.cli_name()
-            ));
-        }
-        pos += 4;
-        let bias_q16 = read_i32_le(&bytes, pos, "SFNN progress bias")?;
-        pos += 4;
-        let (weights_q16, next) =
-            read_i32_vec_le(&bytes, pos, SHOGI_SFNN_PROGRESS_WEIGHT_COUNT, "SFNN progress weights")?;
-        pos = next;
-        Some(ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)?)
-    } else {
-        if wants_progress {
-            return Err(format!(
-                "--arch {} uses progress buckets, but {} has no SFNN progress parameter section",
-                arch.cli_name(),
-                path.display()
-            ));
-        }
-        None
-    };
+    let progress_params = read_sfnn_progress_sidecar(path, arch, layerstack)?;
 
     let mut l1b = Vec::with_capacity(num_stacks * l1_out);
     let mut l1w = Vec::with_capacity(num_stacks * l1_out * l1_pad_in);
@@ -7940,7 +7766,7 @@ fn run_compare_sfnn_quantization(args: &CompareSfnnQuantizationArgs) -> Result<C
     let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
     if layerstack.progress_bucket_count() > 1 && weights.progress_params.is_none() {
         return Err(format!(
-            "{} has no Progress section, but --arch {} uses progressN",
+            "{} has no progress.bin classifier, but --arch {} uses progressN",
             args.nn_bin.display(),
             args.arch.cli_name()
         ));
@@ -8471,7 +8297,7 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
     let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
     if layerstack.progress_bucket_count() > 1 && weights.progress_params.is_none() {
         return Err(format!(
-            "{} has no Progress section, but --arch {} uses progressN",
+            "{} has no progress.bin classifier, but --arch {} uses progressN",
             args.nn_bin.display(),
             args.arch.cli_name()
         ));
@@ -9653,7 +9479,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
     let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
     if layerstack.progress_bucket_count() > 1 && weights.progress_params.is_none() {
         return Err(format!(
-            "{} has no Progress section, but --arch {} uses progressN",
+            "{} has no progress.bin classifier, but --arch {} uses progressN",
             args.nn_bin.display(),
             args.arch.cli_name()
         ));
@@ -9803,6 +9629,7 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
 
     let bytes = std::fs::read(&args.nn_bin).map_err(|e| format!("failed to read {}: {e}", args.nn_bin.display()))?;
     let patched = patch_sfnn_l3b_delta(bytes, args.arch, layerstack, best.raw_delta)?;
+    copy_progress_sidecar_for_nn_bin(&args.nn_bin, &args.output, args.arch)?;
     write_bytes_atomic(&args.output, &patched)
         .map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
 
@@ -16529,18 +16356,10 @@ fn run_bucket_stats(args: &BucketStatsArgs) -> Result<(), String> {
 fn run_export_progress_bin(args: &ExportProgressBinArgs) -> Result<(), String> {
     args.validate()?;
     let layerstack = args.effective_layerstack();
-    let (params, source) = if let Some(path) = args.state_bin.as_deref() {
-        let params = read_sfnn_progress_params_from_state_bin(path, args.arch, layerstack)?.ok_or_else(|| {
-            format!("{} has no progress parameters for --arch {}", path.display(), args.arch.cli_name())
-        })?;
-        (params, format!("state.bin: {}", path.display()))
-    } else if let Some(path) = args.nn_bin.as_deref() {
-        let params = read_sfnn_progress_params_from_nn_bin(path, args.arch, layerstack)?
-            .ok_or_else(|| format!("{} has no Progress section for --arch {}", path.display(), args.arch.cli_name()))?;
-        (params, format!("nn.bin Progress section: {}", path.display()))
-    } else {
-        return Err("export-progress-bin requires either --state-bin or --nn-bin".to_string());
-    };
+    let path = &args.state_bin;
+    let params = read_sfnn_progress_params_from_state_bin(path, args.arch, layerstack)?
+        .ok_or_else(|| format!("{} has no progress parameters for --arch {}", path.display(), args.arch.cli_name()))?;
+    let source = format!("state.bin: {}", path.display());
 
     write_sfnn_progress_params_bin(&args.output, &params)?;
     println!("export-progress-bin complete:");
@@ -16549,7 +16368,7 @@ fn run_export_progress_bin(args: &ExportProgressBinArgs) -> Result<(), String> {
     println!("  source       = {source}");
     println!("  output       = {}", args.output.display());
     println!(
-        "  format       = Progress section payload (hash + bias_q16 + {} weights_q16)",
+        "  format       = {} f64 little-endian weights, no header, no bias (tatara / YaneuraOu PR #326)",
         SHOGI_SFNN_PROGRESS_WEIGHT_COUNT
     );
     Ok(())
@@ -16743,7 +16562,7 @@ fn run_cuda_cpp_sfnn_teacher_prepare_benchmark(args: &Args) -> Result<(), String
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
     if layerstack.progress_bucket_count() > 1 {
         return Err(format!(
-            "--bench-teacher-prepare-batches is not supported for progressN arch {} because the benchmark command has no nn.bin Progress section input",
+            "--bench-teacher-prepare-batches is not supported for progressN arch {} because the benchmark command has no progress.bin input",
             args.arch().cli_name()
         ));
     }
@@ -17174,7 +16993,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv_colored(
             "SFNN progress",
             format!(
-                "{mode}: buckets={}, params={} ({source}), export=q16 Progress section + progress.bin",
+                "{mode}: buckets={}, params={} ({source}), export=external f64 progress.bin (no bias; nn.bin has no progress payload)",
                 progress_bucket_count,
                 format_count(sfnn_progress_parameter_count())
             ),
@@ -20499,9 +20318,9 @@ struct CudaCppSfnnOptimizerState {
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppSfnnProgressTrainState {
-    /// f32 logits, `[bias, kp_abs_weights...]`.
+    /// Bias-free f32 KP weights, `[kp_abs_weights...]`.
     ///
-    /// Export converts this vector to YaneuraOu's q16 Progress section.
+    /// Export writes the effective q16 model as headerless f64 progress.bin.
     params: Vec<f32>,
     // Preserved when reading/writing checkpoint records; never updated by
     // evaluation-network training.
@@ -20616,6 +20435,11 @@ fn load_cuda_cpp_sfnn_progress_train_state_from_path(
     }
 
     let params = if let Some(values) = weights_records.get("progress") {
+        // Migration of the current pre-format-change checkpoint only. Value
+        // weights and their optimizer state are not modified here.
+        if values.len() == sfnn_progress_parameter_count() + 1 {
+            return CudaCppSfnnProgressTrainState::from_params(values.clone(), None).map(Some);
+        }
         if values.len() != sfnn_progress_parameter_count() {
             return Err(format!(
                 "cuda-cpp SFNN state {} has nnue/weights/progress length {}, expected {}",
@@ -22622,6 +22446,18 @@ impl CudaCppRangerGroupState {
 #[cfg(feature = "cuda-cpp-backend")]
 impl CudaCppSfnnProgressTrainState {
     fn from_params(params: Vec<f32>, optimizer: Option<CudaCppRangerGroupState>) -> Result<Self, String> {
+        if params.len() == sfnn_progress_parameter_count() + 1 {
+            if params.iter().any(|v| !v.is_finite()) {
+                return Err("legacy progress state contains a non-finite parameter".to_string());
+            }
+            let q16 = |v: f32| (f64::from(v) * 65_536.0).round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            let mut migrated = ShogiSfnnProgressQ16Params::new(params[1..].iter().map(|&v| q16(v)).collect())?;
+            migrated.fold_resume_bias(q16(params[0]))?;
+            eprintln!(
+                "  progress state migration = bias folded into rook features (two-rook positions); value NN/optimizer unchanged"
+            );
+            return Self::from_q16_params(&migrated);
+        }
         if params.len() != sfnn_progress_parameter_count() {
             return Err(format!(
                 "SFNN progress parameter length mismatch: got {}, expected {}",
@@ -22650,16 +22486,14 @@ impl CudaCppSfnnProgressTrainState {
 
     fn from_q16_params(params: &ShogiSfnnProgressQ16Params) -> Result<Self, String> {
         let mut values = Vec::with_capacity(sfnn_progress_parameter_count());
-        values.push(params.bias_q16 as f32 / 65_536.0);
         values.extend(params.weights_q16.iter().map(|&weight| weight as f32 / 65_536.0));
         Self::from_params(values, None)
     }
 
     fn scratch() -> Result<Self, String> {
-        let mut params = cuda_cpp_tatara_uniform_abs_init(sfnn_progress_parameter_count(), 0x5f11_e0f0, 0.001);
+        let params = cuda_cpp_tatara_uniform_abs_init(sfnn_progress_parameter_count(), 0x5f11_e0f0, 0.001);
         // Deterministic fallback for states without a classifier. It stays
         // fixed; use progress-train and --sfnn-progress-bin for a trained model.
-        params[0] = 0.0;
         Self::from_params(params, None)
     }
 
@@ -22672,12 +22506,11 @@ impl CudaCppSfnnProgressTrainState {
             Ok(scaled.clamp(i32::MIN as f32, i32::MAX as f32) as i32)
         }
 
-        let bias_q16 = q16(self.params[0])?;
         let mut weights_q16 = Vec::with_capacity(SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
-        for &value in &self.params[1..] {
+        for &value in &self.params {
             weights_q16.push(q16(value)?);
         }
-        ShogiSfnnProgressQ16Params::new(bias_q16, weights_q16)
+        ShogiSfnnProgressQ16Params::new(weights_q16)
     }
 }
 
@@ -22717,7 +22550,7 @@ fn prepare_cuda_cpp_sfnn_hard_progress_buckets(
         if base_bucket < 0 {
             return Err(format!("SFNN progress base bucket is negative at sample {i}: {base_bucket}"));
         }
-        let mut sum_q16 = i64::from(progress_params.bias_q16);
+        let mut sum_q16 = 0i64;
         let active_base = i * progress.max_active;
         for &idx in &progress.active_indices[active_base..active_base + progress.max_active] {
             if idx < 0 {
@@ -23409,7 +23242,7 @@ fn write_cuda_cpp_sfnn_nn_bin(
         shape.ft_size,
         shape.num_stacks
     );
-    let sfnn_hash = if progress_params.is_some() { KHASH_SFNN ^ SHOGI_SFNN_PROGRESS_HASH } else { KHASH_SFNN };
+    let sfnn_hash = KHASH_SFNN;
     writer
         .write_all(&SFNN_NNUE_VERSION.to_le_bytes())
         .and_then(|_| writer.write_all(&sfnn_hash.to_le_bytes()))
@@ -23420,17 +23253,6 @@ fn write_cuda_cpp_sfnn_nn_bin(
 
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0b", &weights.l0b, f32::from(SFNN_QA))?;
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0w", l0w_for_export, f32::from(SFNN_QA))?;
-    if let Some(params) = progress_params {
-        writer
-            .write_all(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes())
-            .and_then(|_| writer.write_all(&params.bias_q16.to_le_bytes()))
-            .map_err(|err| format!("failed to write SFNN progress params header {}: {err}", path.display()))?;
-        for &weight in params.weights_q16.iter() {
-            writer
-                .write_all(&weight.to_le_bytes())
-                .map_err(|err| format!("failed to write SFNN progress params {}: {err}", path.display()))?;
-        }
-    }
 
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
@@ -23617,7 +23439,11 @@ fn write_cuda_cpp_sfnn_nn_bin(
         write_nnue_bin_chunk(&mut writer, path, "sfnn l3w", &l3w_bytes)?;
     }
 
-    writer.flush().map_err(|err| format!("failed to flush SFNN nn.bin {}: {err}", path.display()))
+    writer.flush().map_err(|err| format!("failed to flush SFNN nn.bin {}: {err}", path.display()))?;
+    if let Some(params) = progress_params {
+        write_sfnn_progress_params_bin(&path.with_file_name("progress.bin"), params)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -34998,21 +34824,53 @@ mod tests {
     }
 
     #[test]
-    fn sfnn_network_base_offset_skips_progress_params() {
+    fn sfnn_network_base_offset_has_no_embedded_progress() {
         let arch =
             NnueArch::new(NnueArchFamily::Sfnn, NnueArchFeature::Halfka2, 32, 1, 4, Some(LayerStackMode::Kingrank3by3));
         let layerstack = LayerStackMode::Kingrank3by3;
-        let mut bytes = fake_sfnn_nn_bin(arch, layerstack.num_stacks());
+        let bytes = fake_sfnn_nn_bin(arch, layerstack.num_stacks());
         let base = sfnn_network_base_offset(&bytes).unwrap();
-        let mut progress = Vec::new();
-        progress.extend_from_slice(&SHOGI_SFNN_PROGRESS_HASH.to_le_bytes());
-        progress.extend_from_slice(&0i32.to_le_bytes());
-        progress.resize(progress.len() + SHOGI_SFNN_PROGRESS_WEIGHT_COUNT * 4, 0);
-        bytes.splice(base..base, progress);
+        assert_eq!(read_u32_le(&bytes, base, "network").unwrap(), NETWORK_HASH_SFNN);
 
         let offsets = collect_sfnn_l3b_offsets(&bytes, arch, layerstack).unwrap();
         assert_eq!(offsets.len(), layerstack.num_stacks());
         assert!(offsets[0] > base);
+    }
+
+    #[test]
+    fn progress_state_migrates_current_bias_record_and_roundtrips() {
+        let mut legacy = vec![0.0; SHOGI_SFNN_PROGRESS_WEIGHT_COUNT + 1];
+        legacy[0] = 7260.0 / 65536.0;
+        legacy[1] = -123.0 / 65536.0;
+        let state = CudaCppSfnnProgressTrainState::from_params(legacy, None).unwrap();
+        assert_eq!(state.params.len(), SHOGI_SFNN_PROGRESS_WEIGHT_COUNT);
+        let params = state.to_q16_params().unwrap();
+        assert_eq!(params.weights_q16[0], -123);
+        assert_eq!(params.weights_q16[1224], 1815);
+        assert_eq!(params.weights_q16[85], 1815);
+        let loaded = CudaCppSfnnProgressTrainState::from_params(state.params.clone(), Some(state.optimizer)).unwrap();
+        assert_eq!(loaded.to_q16_params().unwrap(), params);
+    }
+
+    #[test]
+    fn progress_sidecar_follows_postprocessed_nn_without_overwriting_other_classifier() {
+        let arch: NnueArch = "SFNN_halfka2_1024_8_64_progress8".parse().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "bulletou-progress-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let bytes = ShogiSfnnProgressQ16Params::zero().to_bin_bytes();
+        std::fs::write(root.join("progress.bin"), &bytes).unwrap();
+        let input = root.join("nn.bin");
+        let output = root.join("new").join("nn.bin");
+        copy_progress_sidecar_for_nn_bin(&input, &output, arch).unwrap();
+        assert_eq!(std::fs::read(output.with_file_name("progress.bin")).unwrap(), bytes);
+        copy_progress_sidecar_for_nn_bin(&input, &input, arch).unwrap();
+        std::fs::write(output.with_file_name("progress.bin"), b"other classifier").unwrap();
+        assert!(copy_progress_sidecar_for_nn_bin(&input, &output, arch).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
