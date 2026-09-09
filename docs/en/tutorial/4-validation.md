@@ -117,7 +117,7 @@ Quantized validation is heavier, so start with only `--test-teacher` and `--vali
 
 ## 4.7 Compare epoch results in CSV
 
-BulletOu automatically writes `summary-epoch-last.csv` in the training directory. No extra option or script is needed. Each column contains the final sb of a completed epoch:
+BulletOu automatically writes `summary-epoch-last.csv` in the training directory. No extra option or script is needed. Each column contains the final-sb results and the best recorded values of a completed epoch:
 
 ```csv
 metric,epoch 1,epoch 2
@@ -125,19 +125,31 @@ acc,0.620000,0.630000
 loss,0.130000,0.120000
 qacc,0.619000,0.629000
 qloss,0.131000,0.121000
+max-acc,0.622000,0.632000
+min-loss,0.129000,0.119000
+max-qacc,0.621000,0.631000
+min-qloss,0.130000,0.120000
 lr,0.000875,0.000500
 lr-min,0.000030,0.000020
 sb,324,324
 bpu,1,4
 ```
 
-A new run creates the file at startup with just the header line `metric`. Each completed epoch adds a column on the right. Rows are ordered as `acc`, `loss`, `qacc`, `qloss`, `lr`, `lr-min`, `sb`, and `bpu`. Accuracies are ratios from 0 to 1, not percentages.
+A new run creates the file at startup with just the header line `metric`. Each completed epoch adds a column on the right. Rows are ordered as `acc`, `loss`, `qacc`, `qloss`, `max-acc`, `min-loss`, `max-qacc`, `min-qloss`, `lr`, `lr-min`, `sb`, and `bpu`. Accuracies are ratios from 0 to 1, not percentages.
 
 `lr` is the LR at the start of sb 1; `lr-min` is the LR actually used at the end of the final sb, not necessarily the configured lower bound. `sb` is the final sb number (the number of sb in that epoch). `bpu` is the `batches_per_update` used in the final sb, including when this setting changed during the epoch.
 
-If this CSV is missing when resuming, it is reconstructed from `summary-learn.csv` and the recorded training settings. Incomplete epochs and results rolled back on resume are excluded. If the latest epoch cannot be confirmed complete, it is omitted.
+On resume, nonempty cells already in `summary-epoch-last.csv` take precedence. `summary-learn.csv` and the recorded settings fill new epochs, new rows, and blanks. Manually entered `bpu` values are preserved, even if the source log has a different value or no value. Deleting checkpoint directories or source logs does not erase recorded CSV values. Keep this CSV: if it is deleted, manual values absent from the source logs cannot be recovered.
 
-The four validation metrics come from the final sb, not the best or average metrics of that epoch. Unmeasured metrics are blank. `lr` is also blank if sb 1 is missing, and historical `bpu` values without a record are blank. Neither is inferred from the current settings.
+Incomplete epochs are not added. Removing epochs explicitly rolled back when resuming training is a separate operation. A latest epoch not already recorded in this CSV is not added unless it can be confirmed complete.
+
+The first four rows (`acc`, `loss`, `qacc`, `qloss`) come from the final sb. A metric is blank if it was not measured at that sb.
+
+`max-acc` and `max-qacc` are the epoch's maxima; `min-loss` and `min-qloss` are its minima. Each metric is aggregated independently, so its best value may come from a different sb. Only finite validation values recorded in `summary-learn.csv` are included. With validation every 8 sb, these are the best of those measurements; values at unmeasured sb are not estimated. A metric with no valid measurement in the epoch is blank.
+
+When epoch completion or quantized-validation backfill provides new measurements, the four best-value rows update only if the measurement improves on the recorded best. Missing source rows never replace a recorded best with a worse value or a blank.
+
+`lr` is also blank if sb 1 is missing, and historical `bpu` values without a record are blank. Neither is inferred from the current settings.
 
 `batches_per_update` is also recorded immediately before `checkpoint` in `summary-learn.csv`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
 
