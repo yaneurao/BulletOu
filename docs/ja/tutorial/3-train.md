@@ -184,6 +184,6 @@ HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有�
 
 `SFNN_halfka2` では `"ft_factorizer_alpha": 0.5` のようにFT共有の強さも指定できます（デフォルト1.0）。L1共有の強さは `"sfnn_factorizer_alpha": "shared=0.5"` で別に指定します。係数を記録したcheckpointからαを変更して再開すると、開始直後の実効重みを保つrebaseを行います。[設定例とrebaseの注意点](../advanced/sfnn-factorizer.md)
 
-学習中の重み制限はデフォルトで無効です。範囲を制限したい場合は `--optimizer-weight-clip N` を指定します（JSONでは `"optimizer_weight_clip": N`）。[設定の意味と注意点](../advanced/tuning.md#学習中の重み制限)
+SFNNでは、学習中の重み制限がデフォルトで有効です。tataraと同じくL1・L2の重みとbias、L3の重みを±1.984375に収め、FTと出力biasは制限しません。無効にする場合は `--optimizer-weight-clip 0`（JSONでは `"optimizer_weight_clip": 0`）を指定します。[設定の意味と注意点](../advanced/tuning.md#学習中の重み制限)
 
 詳しい調整や比較実験: [応用編](../advanced/)

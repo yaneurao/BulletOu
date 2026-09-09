@@ -102,24 +102,34 @@ Fuller option table:
 | `--sfnn-saturation-threshold` | Quantized i8 value where the saturation penalty starts | 127.0 |
 | `--optimizer` | Optimizer | `ranger` |
 | `--optimizer-weight-decay` | Weight decay | 0.0 |
-| `--optimizer-weight-clip` | Limit each updated weight and bias to `[-N, +N]`; `0` disables clipping | 0.0 (off) |
+| `--optimizer-weight-clip` | Override weight clipping: `0` disables it everywhere; positive `N` limits all updated tensors to `[-N, +N]` | Tatara per-layer bounds for SFNN; off otherwise |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | Fine-grained optimizer coefficients | omitted |
 
 ### Weight clipping during training
 
-Weight clipping is disabled by default. For example, `--optimizer-weight-clip 1.98` keeps each updated weight and bias between `-1.98` and `+1.98`. Omit the option or pass `--optimizer-weight-clip 0` to disable it. The value must be finite and non-negative.
+For SFNN, omitting this option applies the same per-tensor bounds as tatara's LayerStack trainer. Immediately after RAdam updates a tensor, out-of-range values are brought back to the nearest endpoint. Values within the bounds are not rounded.
 
-In `bulletou-settings.json`, add:
+| Tensor | Bounds |
+|---|---|
+| L1 bucket-specific weights/biases and L1 shared weights/biases | `[-127/64, +127/64]` = `[-1.984375, +1.984375]` |
+| L2 weights/biases and L3 weights | Same bounds |
+| FT weights/biases (including the FT factorizer) and L3 output bias | Unbounded |
+
+L1 axis/pair weights and biases use the L1 bounds as well. **Each tensor is constrained separately, not the sum of factorizer components.** Their sum can therefore still exceed the quantization range.
+
+To disable clipping, pass `--optimizer-weight-clip 0`. In `bulletou-settings.json`, use:
 
 ```json
-"optimizer_weight_clip": 1.98
+"optimizer_weight_clip": 0
 ```
 
-This applies to updated weights and biases in FT, L1, L2, L3, and the L1 factorizer components, including after Ranger's Lookahead update. Frozen layers and untouched buckets in dirty-bucket updates remain unchanged. It does not constrain the sum of factorizer components.
+Remove this field to restore SFNN's default per-layer bounds. An explicit positive `N` instead limits **all** updated weights and biases, including FT and the output bias, to `[-N, +N]`, also after Lookahead. For example, `--optimizer-weight-clip 0.5` applies ±0.5 uniformly. Values must be finite and non-negative. Non-SFNN architectures default to no clipping.
 
-This clips **weights after updating them, not the gradients themselves**. Disabling it lets updates move past the limits, but does not guarantee better accuracy. CReLU activation limits, rounding and integer saturation during `nn.bin` export, and `--sfnn-saturation-penalty` are separate operations and remain unchanged.
+With the default per-layer policy, clipping happens after RAdam, while Ranger's Lookahead only interpolates with its stored slow weights, matching tatara. Momentum, variance, and slow weights are not forcibly reset. When resuming a state trained without clipping, out-of-range slow weights may have a temporary effect. Frozen layers and untouched buckets in dirty-bucket updates remain unchanged.
 
-The setting applies to both standalone and worker training. Startup logs show `optimizer weight clip = off` or the selected range. Resume uses the value supplied for that run, so specify the limit again in the command or settings file if clipping is wanted. Use `--resume` when changing the clipping setting while continuing from the same output directory. An already-running process is unaffected until you launch the new executable.
+This clips **weights after updating them, not the gradients themselves**. The loss formula, CReLU activation limits, rounding and integer saturation during `nn.bin` export, and `--sfnn-saturation-penalty` remain unchanged. Clipping alone does not make acc and qacc identical.
+
+The setting applies to both standalone and worker training. Startup logs show `optimizer weight clip = tatara: ...`, `off`, or the explicit range. Resume uses the current run's settings. Use `--resume` when continuing from the same output directory. An already-running process is unaffected until you launch the new executable.
 
 ## 3. Learning-rate schedules
 

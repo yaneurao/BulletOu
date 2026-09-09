@@ -102,24 +102,34 @@
 | `--sfnn-saturation-threshold` | 飽和ペナルティをかけ始めるi8量子化値 | 127.0 |
 | `--optimizer` | optimizer | `ranger` |
 | `--optimizer-weight-decay` | weight decay | 0.0 |
-| `--optimizer-weight-clip` | 更新後の各重み・biasを `[-N, +N]` に制限する。`0` は制限なし | 0.0（無効） |
+| `--optimizer-weight-clip` | 重み制限の上書き。`0` は全層で無効、正数 `N` は全更新対象を `[-N, +N]` に制限 | SFNNはtataraと同じ層別制限。それ以外は無効 |
 | `--optimizer-epsilon` / `--optimizer-beta1` / `--optimizer-beta2` | optimizerの詳細パラメータ | 省略 |
 
 ### 学習中の重み制限
 
-重み制限はデフォルトで無効です。有効にする場合は、たとえば `--optimizer-weight-clip 1.98` を指定すると、optimizerで更新した各重み・biasを `-1.98` から `+1.98` に収めます。`--optimizer-weight-clip 0` または省略で無効です。値は有限の非負数を指定してください。
+SFNNでは、指定を省略するとtataraのLayerStack学習と同じ範囲制限を行います。RAdamで更新した直後に、範囲外の値を端点に戻します。範囲内の値は丸めません。
 
-`bulletou-settings.json` では、次の項目を追加します。
+| 対象 | 範囲 |
+|---|---|
+| L1のbucket個別重み・bias、L1 sharedの重み・bias | `[-127/64, +127/64]` = `[-1.984375, +1.984375]` |
+| L2の重み・bias、L3の重み | 同上 |
+| FTの重み・bias（FT factorizerを含む）、L3の出力bias | 制限なし |
+
+L1のaxis/pairを使う場合も、それぞれの重み・biasにL1と同じ制限を適用します。**factorizerを足し合わせた後の値を制限するわけではありません。** そのため、個々の成分が範囲内でも、合算後の重みが量子化範囲を超える可能性は残ります。
+
+無効にするには `--optimizer-weight-clip 0` を指定します。`bulletou-settings.json` なら次の項目です。
 
 ```json
-"optimizer_weight_clip": 1.98
+"optimizer_weight_clip": 0
 ```
 
-対象はFT・L1・L2・L3などの更新対象の重みとbiasで、L1のfactorizer成分も含みます。RangerのLookahead更新後もこの範囲に収めます。固定した層やdirty-bucket更新で更新しないbucketは変更しません。factorizerを足し合わせた後の値への制限ではありません。
+この項目を削除すると、SFNNのデフォルトの層別制限に戻ります。正数 `N` を明示した場合は、層別制限ではなく、FTと出力biasも含めた全更新対象を `[-N, +N]` に制限します。たとえば `--optimizer-weight-clip 0.5` なら全更新対象が±0.5となり、Lookahead更新後にも制限します。値は有限の非負数を指定してください。SFNN以外は、省略時に制限なしです。
 
-これは**勾配そのものの制限ではなく、更新後の重みを切り詰める処理**です。無効にすると上限・下限で更新が止まることはなくなりますが、必ず精度が上がるわけではありません。活性化関数のCReLU、`nn.bin`への量子化時の丸め・整数範囲への飽和処理、`--sfnn-saturation-penalty` は別の処理で、この設定では変わりません。
+デフォルトの層別制限ではtataraと同じく、RAdam後に制限し、RangerのLookaheadでは保存されたslow weightsと補間するだけです。momentum・velocity・slow weightsを強制的にリセットしません。制限なしで学習したstateから再開すると、範囲外のslow weightsの影響が一時的に残る場合があります。固定した層やdirty-bucket更新で更新しないbucketは変更しません。
 
-通常学習・worker経由の学習ともに適用され、起動ログに `optimizer weight clip = off` または指定範囲が出ます。再開時も今回指定した値を使うため、制限したい場合は再開コマンドや設定ファイルにも明示してください。制限の設定を変えて同じ保存先から再開する場合は `--resume` を付けます。新しい実行ファイルを起動するまでは、実行中の学習の動作は変わりません。
+これは**勾配そのものの制限ではなく、更新後の重みを切り詰める処理**です。lossの式、活性化関数のCReLU、`nn.bin`への量子化時の丸め・整数範囲への飽和処理、`--sfnn-saturation-penalty` は変わりません。範囲制限だけでaccとqaccが一致するわけではありません。
+
+通常学習・worker経由の学習ともに適用され、起動ログに `optimizer weight clip = tatara: ...`、`off`、または指定範囲が出ます。再開時は今回の設定を使います。同じ保存先から再開する場合は `--resume` を付けます。新しい実行ファイルを起動するまでは、実行中の学習の動作は変わりません。
 
 ## 3. 学習率schedule
 

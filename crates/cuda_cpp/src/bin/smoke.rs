@@ -181,6 +181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         lookahead_alpha: 0.5,
         lookahead_period: 6,
+        clip_after_lookahead: true,
     };
     let mut train_runner =
         bulletou_cuda_cpp::NnueTrainStepRunner::new(&ctx, weights, batch.batch_size, batch.max_active)?;
@@ -230,6 +231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         lookahead_alpha: 0.5,
         lookahead_period: 6,
+        clip_after_lookahead: true,
     };
     bulletou_cuda_cpp::ranger_update_host(
         device,

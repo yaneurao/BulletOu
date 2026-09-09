@@ -7790,6 +7790,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     float max_weight,
     int do_lookahead,
     float lookahead_alpha,
+    int clip_after_lookahead,
     BulletOuCudaCppF32Buffer* gradients,
     BulletOuCudaCppF32Buffer* weights,
     BulletOuCudaCppF32Buffer* momentum,
@@ -7857,15 +7858,17 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     }
 
     if (do_lookahead != 0) {
+        const float lookahead_min = clip_after_lookahead ? min_weight : -FLT_MAX;
+        const float lookahead_max = clip_after_lookahead ? max_weight : FLT_MAX;
         if (use_vec4) {
             ranger_lookahead_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                weights->ptr, slow_params->ptr, len / 4, lookahead_alpha, min_weight, max_weight);
+                weights->ptr, slow_params->ptr, len / 4, lookahead_alpha, lookahead_min, lookahead_max);
             if (check_kernel_launch("ranger_lookahead_vec4_kernel launch") != 0) {
                 return -1;
             }
         } else {
             ranger_lookahead_kernel<<<blocks, threads, 0, ctx->stream>>>(
-                weights->ptr, slow_params->ptr, len, lookahead_alpha, min_weight, max_weight);
+                weights->ptr, slow_params->ptr, len, lookahead_alpha, lookahead_min, lookahead_max);
             if (check_kernel_launch("ranger_lookahead_kernel launch") != 0) {
                 return -1;
             }
@@ -7892,6 +7895,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
     float max_weight,
     int do_lookahead,
     float lookahead_alpha,
+    int clip_after_lookahead,
     const BulletOuCudaCppI32Buffer* dirty_buckets,
     BulletOuCudaCppF32Buffer* gradients,
     BulletOuCudaCppF32Buffer* weights,
@@ -7998,6 +8002,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
     }
 
     if (do_lookahead != 0) {
+        const float lookahead_min = clip_after_lookahead ? min_weight : -FLT_MAX;
+        const float lookahead_max = clip_after_lookahead ? max_weight : FLT_MAX;
         if (use_vec4) {
             ranger_lookahead_stacked_dirty_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
                 dirty_buckets->ptr,
@@ -8007,8 +8013,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
                 weights->ptr,
                 slow_params->ptr,
                 lookahead_alpha,
-                min_weight,
-                max_weight);
+                lookahead_min,
+                lookahead_max);
             if (check_kernel_launch("ranger_lookahead_stacked_dirty_vec4_kernel launch") != 0) {
                 return -1;
             }
@@ -8021,8 +8027,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
                 weights->ptr,
                 slow_params->ptr,
                 lookahead_alpha,
-                min_weight,
-                max_weight);
+                lookahead_min,
+                lookahead_max);
             if (check_kernel_launch("ranger_lookahead_stacked_dirty_kernel launch") != 0) {
                 return -1;
             }
@@ -10701,6 +10707,7 @@ extern "C" int bulletou_cuda_cpp_ranger_update_host(
     float max_weight,
     int do_lookahead,
     float lookahead_alpha,
+    int clip_after_lookahead,
     float* gradients,
     float* weights,
     float* momentum,
@@ -10760,8 +10767,10 @@ extern "C" int bulletou_cuda_cpp_ranger_update_host(
         }
 
         if (do_lookahead != 0) {
+            const float lookahead_min = clip_after_lookahead ? min_weight : -FLT_MAX;
+            const float lookahead_max = clip_after_lookahead ? max_weight : FLT_MAX;
             ranger_lookahead_kernel<<<blocks, threads>>>(
-                dw.ptr, dslow.ptr, len, lookahead_alpha, min_weight, max_weight);
+                dw.ptr, dslow.ptr, len, lookahead_alpha, lookahead_min, lookahead_max);
             if (sync_after_kernel("ranger_lookahead_kernel launch", "ranger_lookahead_kernel sync") != 0) {
                 return -1;
             }

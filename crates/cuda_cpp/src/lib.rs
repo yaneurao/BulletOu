@@ -6110,6 +6110,9 @@ pub struct SfnnLayerLrMultipliers {
     pub factorizer_residual_decay: f32,
     pub saturation_penalty: f32,
     pub saturation_threshold: f32,
+    /// Apply tatara's per-tensor bounds after RAdam (not after Lookahead).
+    /// When false, use RangerUpdateParams' bounds for every tensor.
+    pub tatara_weight_clip: bool,
 }
 
 impl Default for SfnnLayerLrMultipliers {
@@ -6123,6 +6126,7 @@ impl Default for SfnnLayerLrMultipliers {
             factorizer_residual_decay: 0.0,
             saturation_penalty: 0.0,
             saturation_threshold: 127.0,
+            tatara_weight_clip: false,
         }
     }
 }
@@ -6162,6 +6166,25 @@ impl SfnnLayerLrMultipliers {
 
     fn param_multiplier(self, layer: SfnnUpdateLayer, kind: SfnnUpdateParamKind) -> f32 {
         if self.update_scope.allows(layer, kind) { self.layer_multiplier(layer) } else { 0.0 }
+    }
+
+    fn clip_params(
+        self,
+        mut params: RangerUpdateParams,
+        layer: SfnnUpdateLayer,
+        kind: SfnnUpdateParamKind,
+    ) -> RangerUpdateParams {
+        if self.tatara_weight_clip {
+            // FT uses i16; the output bias uses i32. L1/L2 biases deliberately
+            // share the dense-weight bound, matching tatara's LayerStack trainer.
+            let bounded = matches!(layer, SfnnUpdateLayer::L1 | SfnnUpdateLayer::L2)
+                || matches!((layer, kind), (SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight));
+            let limit = if bounded { 127.0 / 64.0 } else { f32::MAX };
+            params.radam.min_weight = -limit;
+            params.radam.max_weight = limit;
+            params.clip_after_lookahead = false;
+        }
+        params
     }
 }
 
@@ -7890,7 +7913,7 @@ impl SfnnTrainStepRunner {
         let l3_residual_params = self.params_with_residual_decay(params, lr_multipliers, SfnnUpdateLayer::L3)?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight),
             &self.backward_workspace.l0w_gradients,
             &self.weights.l0w,
             &self.optimizer_states.l0w,
@@ -7898,7 +7921,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_param_group_with_lr_multiplier(
             ctx,
-            params,
+            lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias),
             &self.backward_workspace.l0b_gradients,
             &self.weights.l0b,
             &self.optimizer_states.l0b,
@@ -7906,7 +7929,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l1_residual_params,
+            lr_multipliers.clip_params(l1_residual_params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
@@ -7916,7 +7939,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l1_residual_params,
+            lr_multipliers.clip_params(l1_residual_params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias),
             &self.backward_workspace.l1b_gradients,
             &self.weights.l1b,
             &self.optimizer_states.l1b,
@@ -7928,7 +7951,7 @@ impl SfnnTrainStepRunner {
             (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l1fw_gradients,
                     l1fw,
                     l1fw_state,
@@ -7936,7 +7959,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l1fb_gradients,
                     l1fb,
                     l1fb_state,
@@ -7951,7 +7974,7 @@ impl SfnnTrainStepRunner {
             (Some(l1axw), Some(l1axb), Some(l1axw_state), Some(l1axb_state)) if self.factorizer.any_axis() => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l1axw_gradients,
                     l1axw,
                     l1axw_state,
@@ -7959,7 +7982,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l1axb_gradients,
                     l1axb,
                     l1axb_state,
@@ -7972,7 +7995,7 @@ impl SfnnTrainStepRunner {
         }
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l2_residual_params,
+            lr_multipliers.clip_params(l2_residual_params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight),
             &self.backward_workspace.l2w_gradients,
             &self.weights.l2w,
             &self.optimizer_states.l2w,
@@ -7982,7 +8005,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l2_residual_params,
+            lr_multipliers.clip_params(l2_residual_params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias),
             &self.backward_workspace.l2b_gradients,
             &self.weights.l2b,
             &self.optimizer_states.l2b,
@@ -7994,7 +8017,7 @@ impl SfnnTrainStepRunner {
             (Some(l2fw), Some(l2fb), Some(l2fw_state), Some(l2fb_state)) if self.factorizer.shared => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l2fw_gradients,
                     l2fw,
                     l2fw_state,
@@ -8002,7 +8025,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l2fb_gradients,
                     l2fb,
                     l2fb_state,
@@ -8017,7 +8040,7 @@ impl SfnnTrainStepRunner {
             (Some(l2axw), Some(l2axb), Some(l2axw_state), Some(l2axb_state)) if self.factorizer.any_axis() => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l2axw_gradients,
                     l2axw,
                     l2axw_state,
@@ -8025,7 +8048,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l2axb_gradients,
                     l2axb,
                     l2axb_state,
@@ -8038,7 +8061,7 @@ impl SfnnTrainStepRunner {
         }
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l3_residual_params,
+            lr_multipliers.clip_params(l3_residual_params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight),
             &self.backward_workspace.l3w_gradients,
             &self.weights.l3w,
             &self.optimizer_states.l3w,
@@ -8048,7 +8071,7 @@ impl SfnnTrainStepRunner {
         )?;
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            l3_residual_params,
+            lr_multipliers.clip_params(l3_residual_params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias),
             &self.backward_workspace.l3b_gradients,
             &self.weights.l3b,
             &self.optimizer_states.l3b,
@@ -8060,7 +8083,7 @@ impl SfnnTrainStepRunner {
             (Some(l3fw), Some(l3fb), Some(l3fw_state), Some(l3fb_state)) if self.factorizer.shared => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l3fw_gradients,
                     l3fw,
                     l3fw_state,
@@ -8068,7 +8091,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l3fb_gradients,
                     l3fb,
                     l3fb_state,
@@ -8083,7 +8106,7 @@ impl SfnnTrainStepRunner {
             (Some(l3axw), Some(l3axb), Some(l3axw_state), Some(l3axb_state)) if self.factorizer.any_axis() => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l3axw_gradients,
                     l3axw,
                     l3axw_state,
@@ -8091,7 +8114,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    params,
+                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l3axb_gradients,
                     l3axb,
                     l3axb_state,
@@ -8581,6 +8604,8 @@ pub struct RangerUpdateParams {
     pub radam: RAdamUpdateParams,
     pub lookahead_alpha: f32,
     pub lookahead_period: u64,
+    /// Also apply radam's weight bounds after the slow-weight interpolation.
+    pub clip_after_lookahead: bool,
 }
 
 impl Default for RangerUpdateParams {
@@ -8589,6 +8614,7 @@ impl Default for RangerUpdateParams {
             radam: RAdamUpdateParams { decay: 0.0, ..RAdamUpdateParams::default() },
             lookahead_alpha: 0.5,
             lookahead_period: 6,
+            clip_after_lookahead: true,
         }
     }
 }
@@ -8739,6 +8765,7 @@ pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: Ranger
             params.radam.max_weight,
             i32::from(do_lookahead),
             params.lookahead_alpha,
+            i32::from(params.clip_after_lookahead),
             state.gradients.as_mut_ptr(),
             state.weights.as_mut_ptr(),
             state.momentum.as_mut_ptr(),
@@ -8771,6 +8798,7 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
             params.radam.max_weight,
             i32::from(do_lookahead),
             params.lookahead_alpha,
+            i32::from(params.clip_after_lookahead),
             state.gradients.as_ptr(),
             state.weights.as_ptr(),
             state.momentum.as_ptr(),
@@ -8812,6 +8840,7 @@ pub fn ranger_update_stacked_dirty_device(
             params.radam.max_weight,
             i32::from(do_lookahead),
             params.lookahead_alpha,
+            i32::from(params.clip_after_lookahead),
             state.dirty_buckets.as_ptr(),
             state.gradients.as_ptr(),
             state.weights.as_ptr(),
@@ -9639,6 +9668,7 @@ mod ffi {
             max_weight: f32,
             do_lookahead: i32,
             lookahead_alpha: f32,
+            clip_after_lookahead: i32,
             gradients: *mut f32,
             weights: *mut f32,
             momentum: *mut f32,
@@ -9660,6 +9690,7 @@ mod ffi {
             max_weight: f32,
             do_lookahead: i32,
             lookahead_alpha: f32,
+            clip_after_lookahead: i32,
             gradients: *mut BulletOuCudaCppF32Buffer,
             weights: *mut BulletOuCudaCppF32Buffer,
             momentum: *mut BulletOuCudaCppF32Buffer,
@@ -9683,6 +9714,7 @@ mod ffi {
             max_weight: f32,
             do_lookahead: i32,
             lookahead_alpha: f32,
+            clip_after_lookahead: i32,
             dirty_buckets: *mut BulletOuCudaCppI32Buffer,
             gradients: *mut BulletOuCudaCppF32Buffer,
             weights: *mut BulletOuCudaCppF32Buffer,
@@ -9935,6 +9967,192 @@ mod tests {
         let params = RangerUpdateParams::default();
         params.validate().unwrap();
         assert_eq!((params.radam.min_weight, params.radam.max_weight), (f32::MIN, f32::MAX));
+    }
+
+    #[test]
+    fn sfnn_tatara_clip_policy_matches_tensor_groups() {
+        let policy = SfnnLayerLrMultipliers { tatara_weight_clip: true, ..Default::default() };
+        for layer in [SfnnUpdateLayer::L0, SfnnUpdateLayer::L1, SfnnUpdateLayer::L2, SfnnUpdateLayer::L3] {
+            for kind in [SfnnUpdateParamKind::Weight, SfnnUpdateParamKind::Bias] {
+                let original = RangerUpdateParams::default();
+                let p = policy.clip_params(original, layer, kind);
+                let limit = match (layer, kind) {
+                    (SfnnUpdateLayer::L0, _) | (SfnnUpdateLayer::L3, SfnnUpdateParamKind::Bias) => f32::MAX,
+                    _ => 1.984375,
+                };
+                assert_eq!((p.radam.min_weight, p.radam.max_weight), (-limit, limit));
+                assert!(!p.clip_after_lookahead);
+                // A uniform override, including "off", must pass through untouched.
+                for limit in [f32::MAX, 0.5] {
+                    let custom = RangerUpdateParams {
+                        radam: RAdamUpdateParams { min_weight: -limit, max_weight: limit, ..Default::default() },
+                        ..original
+                    };
+                    assert_eq!(SfnnLayerLrMultipliers::default().clip_params(custom, layer, kind), custom);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_tatara_clipping_gpu_dispatch_and_disable() {
+        // Keep this small enough to run alongside a real trainer. Check actual
+        // tensor dispatch, not only the policy helper, including L1 shared/axis.
+        fn groups(r: &SfnnTrainStepRunner) -> Vec<(&str, &F32Buffer, &F32Buffer, &RangerParamState, bool, bool, bool)> {
+            macro_rules! group {
+                ($w:ident, $g:ident, $bounded:expr, $l1:expr, $stacked:expr) => {
+                    (
+                        stringify!($w),
+                        &r.weights.$w,
+                        &r.backward_workspace.$g,
+                        &r.optimizer_states.$w,
+                        $bounded,
+                        $l1,
+                        $stacked,
+                    )
+                };
+            }
+            let mut out = vec![
+                group!(l0w, l0w_gradients, false, false, false),
+                group!(l0b, l0b_gradients, false, false, false),
+                group!(l1w, l1w_gradients, true, true, true),
+                group!(l1b, l1b_gradients, true, true, true),
+                group!(l2w, l2w_gradients, true, false, true),
+                group!(l2b, l2b_gradients, true, false, true),
+                group!(l3w, l3w_gradients, true, false, true),
+                group!(l3b, l3b_gradients, false, false, true),
+            ];
+            macro_rules! optional {
+                ($w:ident, $g:ident) => {
+                    out.push((
+                        stringify!($w),
+                        r.weights.$w.as_ref().unwrap(),
+                        &r.backward_workspace.$g,
+                        r.optimizer_states.$w.as_ref().unwrap(),
+                        true,
+                        true,
+                        false,
+                    ));
+                };
+            }
+            optional!(l1fw, l1fw_gradients);
+            optional!(l1fb, l1fb_gradients);
+            optional!(l1axw, l1axw_gradients);
+            optional!(l1axb, l1axb_gradients);
+            out
+        }
+        let ctx = Context::new(0).unwrap();
+        let mut host = tiny_sfnn_weights(tiny_sfnn_shape());
+        host.shape.factorizer_king_axis_dim = 1;
+        let axw = vec![0.0; host.shape.factorizer_axis_count() * host.shape.ft_size * host.shape.l1_out()];
+        let axb = vec![0.0; host.shape.factorizer_axis_count() * host.shape.l1_out()];
+        host.l1axw = Some(&axw);
+        host.l1axb = Some(&axb);
+        host.l2fw = None;
+        host.l2fb = None;
+        host.l3fw = None;
+        host.l3fb = None;
+        let mut runner = SfnnTrainStepRunner::new(&ctx, host, 2, 3).unwrap();
+        for dirty in [false, true] {
+            for freeze_l1 in [false, true] {
+                // None: tatara defaults; 0: off; 0.5: explicit uniform override.
+                for clip in [None, Some(0.0), Some(0.5)] {
+                    for (_, w, g, state, _, _, _) in groups(&runner) {
+                        let values: Vec<_> = (0..w.len()).map(|i| [-3.0, 3.0, 0.123][i % 3]).collect();
+                        w.upload(&ctx, &values).unwrap();
+                        g.fill(&ctx, 0.5).unwrap();
+                        state.momentum.fill(&ctx, 0.0).unwrap();
+                        state.velocity.fill(&ctx, 0.0).unwrap();
+                        state.slow_params.upload(&ctx, &values).unwrap();
+                    }
+                    let limit = clip.filter(|x| *x > 0.0).unwrap_or(f32::MAX);
+                    let params = RangerUpdateParams {
+                        radam: RAdamUpdateParams {
+                            step: 1,
+                            learning_rate: 0.01,
+                            min_weight: -limit,
+                            max_weight: limit,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let policy = SfnnLayerLrMultipliers {
+                        l1: if freeze_l1 { 0.0 } else { 1.0 },
+                        tatara_weight_clip: clip.is_none(),
+                        ..Default::default()
+                    };
+                    runner
+                        .update_weights_with_lr_multipliers_and_dirty_buckets(
+                            &ctx,
+                            params,
+                            policy,
+                            if dirty { Some(&[1]) } else { None },
+                        )
+                        .unwrap();
+                    for (name, w, _, state, bounded, l1, stacked) in groups(&runner) {
+                        let values = w.download(&ctx).unwrap();
+                        let m = state.momentum.download(&ctx).unwrap();
+                        let v = state.velocity.download(&ctx).unwrap();
+                        let limit = if clip.is_none() && bounded { 1.984375 } else { limit };
+                        for (i, actual) in values.iter().enumerate() {
+                            let initial: f32 = [-3.0, 3.0, 0.123][i % 3];
+                            let updated = !(freeze_l1 && l1 || dirty && stacked && i < w.len() / 2);
+                            let expected = if updated { (initial - 0.005).clamp(-limit, limit) } else { initial };
+                            assert!(
+                                (actual - expected).abs() < 1e-6,
+                                "{name}[{i}] dirty={dirty} freeze={freeze_l1} clip={clip:?}: {actual} != {expected}"
+                            );
+                            assert!((m[i] - if updated { 0.05 } else { 0.0 }).abs() < 1e-6);
+                            assert!((v[i] - if updated { 0.00025 } else { 0.0 }).abs() < 1e-7);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn ranger_tatara_lookahead_interpolates_without_second_clip() {
+        let ctx = Context::new(0).unwrap();
+        // Simulate resuming a state whose slow weights are outside the bounds.
+        // tatara clamps the RAdam result, then interpolates without a second clamp.
+        for stride in [3, 4] {
+            for dirty in [false, true] {
+                let len = stride * 2;
+                let weights = F32Buffer::from_host(&ctx, &vec![3.0; len]).unwrap();
+                let gradients = F32Buffer::from_host(&ctx, &vec![0.5; len]).unwrap();
+                let state = RangerParamState::from_host_weights(&ctx, &vec![3.0; len]).unwrap();
+                let params = SfnnLayerLrMultipliers { tatara_weight_clip: true, ..Default::default() }.clip_params(
+                    RangerUpdateParams {
+                        radam: RAdamUpdateParams { step: 6, learning_rate: 0.01, ..Default::default() },
+                        ..Default::default()
+                    },
+                    SfnnUpdateLayer::L1,
+                    SfnnUpdateParamKind::Weight,
+                );
+                let buckets = I32Buffer::from_host(&ctx, &[1]).unwrap();
+                update_stacked_param_group_with_lr_multiplier(
+                    &ctx,
+                    params,
+                    &gradients,
+                    &weights,
+                    &state,
+                    1.0,
+                    if dirty { Some((&buckets, 1)) } else { None },
+                    stride,
+                )
+                .unwrap();
+                let got = weights.download(&ctx).unwrap();
+                let slow = state.slow_params.download(&ctx).unwrap();
+                for i in 0..len {
+                    let expected = if dirty && i < stride { 3.0 } else { (1.984375 + 3.0) * 0.5 };
+                    assert_eq!(got[i], expected);
+                    assert_eq!(slow[i], expected);
+                }
+            }
+        }
     }
 
     #[test]
@@ -10735,6 +10953,7 @@ mod tests {
                         radam: RAdamUpdateParams { step: 1, learning_rate: 0.01, ..Default::default() },
                         lookahead_alpha: 0.5,
                         lookahead_period: 6,
+                        clip_after_lookahead: true,
                     },
                     ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
                     1.0,
@@ -10792,6 +11011,7 @@ mod tests {
             },
             lookahead_alpha: 0.5,
             lookahead_period: 6,
+            clip_after_lookahead: true,
         };
         let expected_gradients = tiny_sfnn_backward_cpu(batch, weights, &targets, &entry_weights);
         let expected = host_ranger_updated_tiny_sfnn_weights(0, weights, &expected_gradients, params);

@@ -4697,10 +4697,12 @@ struct Args {
     #[arg(long, default_value = "0.0")]
     optimizer_weight_decay: f32,
 
-    /// Clip each updated weight and bias to [-N, +N]. 0 disables clipping.
-    /// This does not change activation or nn.bin quantization limits.
-    #[arg(long, default_value_t = 0.0)]
-    optimizer_weight_clip: f32,
+    /// Override training weight clipping: 0 disables it; N > 0 clips all updated
+    /// weights and biases to [-N, +N]. Omitted: tatara per-layer bounds for SFNN
+    /// (L1/L2 weights+biases and L3 weights at +/-127/64; FT and L3 bias unbounded).
+    /// Other architectures default to no clipping. Quantization limits are unchanged.
+    #[arg(long)]
+    optimizer_weight_clip: Option<f32>,
 
     /// Optimizer epsilon override for the selected optimizer. If omitted,
     /// the optimizer's own default is used.
@@ -5107,7 +5109,7 @@ impl Args {
         {
             return Err("--ft-factorizer-alpha requires SFNN_halfka2 with FT factorization enabled".to_string());
         }
-        if !self.optimizer_weight_clip.is_finite() || self.optimizer_weight_clip < 0.0 {
+        if self.optimizer_weight_clip.is_some_and(|clip| !clip.is_finite() || clip < 0.0) {
             return Err("--optimizer-weight-clip must be finite and non-negative (0 disables clipping)".to_string());
         }
         if self.count_teacher || self.analyze_score_winrate || self.cuda_cpp_smoke {
@@ -5673,12 +5675,16 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     } else {
         resolve_sigmoid_scale(args)?;
     }
-    if args.optimizer_weight_clip == 0.0 {
+    if uses_tatara_weight_clip(args) {
+        eprintln!(
+            "  optimizer weight clip        = tatara: L1/L2 weights+biases, L3 weights +/-1.984375; FT and L3 bias off (individual tensors, after RAdam)"
+        );
+    } else if args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
         eprintln!("  optimizer weight clip        = off");
     } else {
         eprintln!(
             "  optimizer weight clip        = [-{0}, +{0}] (weights and biases after each update)",
-            args.optimizer_weight_clip
+            args.optimizer_weight_clip.unwrap()
         );
     }
     Ok(())
@@ -5768,9 +5774,26 @@ fn quantized_loss_label(args: &QuantizedTestArgs) -> String {
 #[cfg(feature = "cuda-cpp-backend")]
 const STATE_BACKEND_CUDA_CPP: &str = "cuda-cpp";
 
+fn uses_tatara_weight_clip(args: &Args) -> bool {
+    args.optimizer_weight_clip.is_none()
+        && matches!(
+            args.resolved_eval_type(),
+            Some(EvalType::SfnnKa2 | EvalType::SfnnHalfka1hm | EvalType::SfnnHalfka2hm | EvalType::SfnnHalfka2)
+        )
+}
+
+fn optimizer_weight_clip_signature(args: &Args) -> String {
+    if uses_tatara_weight_clip(args) {
+        "tatara".to_string()
+    } else {
+        format!("{:.9}", args.optimizer_weight_clip.unwrap_or(0.0))
+    }
+}
+
 fn ranger_params(args: &Args) -> optimiser::RangerParams {
     // The CUDA backend recognizes the full finite range as clipping disabled.
-    let clip = if args.optimizer_weight_clip == 0.0 { f32::MAX } else { args.optimizer_weight_clip };
+    // SFNN's default per-layer bounds are applied when dispatching each tensor.
+    let clip = args.optimizer_weight_clip.filter(|clip| *clip > 0.0).unwrap_or(f32::MAX);
     let mut params = optimiser::RangerParams {
         decay: args.optimizer_weight_decay,
         min_weight: -clip,
@@ -10795,6 +10818,7 @@ impl WorkerSfnnSession {
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                clip_after_lookahead: true,
             };
             let lr_multipliers =
                 cuda_cpp_sfnn_layer_lr_multipliers(&trial_args, schedule.progress_for_step(seen_steps));
@@ -12385,6 +12409,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 },
                 lookahead_alpha: 0.5,
                 lookahead_period: 6,
+                clip_after_lookahead: true,
             },
             RangerStateMut {
                 gradients: &mut gradients,
@@ -12418,6 +12443,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
                 },
                 lookahead_alpha: 0.5,
                 lookahead_period: 6,
+                clip_after_lookahead: true,
             },
             RangerDeviceStateMut {
                 gradients: &gradients_dev,
@@ -13328,6 +13354,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                clip_after_lookahead: true,
             }
         };
         let batch = KpptTableTrainStepHostBatch {
@@ -14115,6 +14142,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                             },
                             lookahead_alpha: ranger.alpha,
                             lookahead_period: ranger.k as u64,
+                            clip_after_lookahead: true,
                         };
                         let batch = NnueTrainStepHostBatch {
                             stm_indices: &fast.stm,
@@ -14403,6 +14431,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                clip_after_lookahead: true,
             }
         };
         let batch = NnueTrainStepHostBatch {
@@ -17462,6 +17491,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         },
                         lookahead_alpha: ranger.alpha,
                         lookahead_period: ranger.k as u64,
+                        clip_after_lookahead: true,
                     };
                     let batch = SfnnTrainStepHostBatch {
                         stm_indices: &fast.stm,
@@ -17820,6 +17850,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 },
                 lookahead_alpha: ranger.alpha,
                 lookahead_period: ranger.k as u64,
+                clip_after_lookahead: true,
             }
         };
         let should_report = cuda_cpp_should_read_loss(seen_steps, train_steps, args.cuda_cpp_loss_readback_interval);
@@ -24124,6 +24155,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         factorizer_residual_decay: args.sfnn_factorizer_residual_decay,
         saturation_penalty: args.sfnn_saturation_penalty,
         saturation_threshold: args.sfnn_saturation_threshold,
+        tatara_weight_clip: uses_tatara_weight_clip(args),
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -24695,7 +24727,7 @@ fn resume_signature(args: &Args) -> String {
         format!("wrm_target_offset={:.9}", effective_wrm_target_params(args).offset),
         format!("wrm_target_scaling={:.9}", effective_wrm_target_params(args).scaling),
         format!("optimizer_weight_decay={:.9}", args.optimizer_weight_decay),
-        format!("optimizer_weight_clip={:.9}", args.optimizer_weight_clip),
+        format!("optimizer_weight_clip={}", optimizer_weight_clip_signature(args)),
         format!(
             "optimizer_epsilon={}",
             args.optimizer_epsilon.map(|v| format!("{v:.9}")).unwrap_or_else(|| "none".to_string())
@@ -32617,29 +32649,34 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_weight_clip_defaults_off_and_validates_ranges() {
+    fn optimizer_weight_clip_defaults_to_tatara_and_validates_ranges() {
         let mut args =
             Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--teacher", "/dev/null"])
                 .unwrap();
-        assert_eq!(args.optimizer_weight_clip, 0.0);
+        assert_eq!(args.optimizer_weight_clip, None);
+        assert!(uses_tatara_weight_clip(&args));
+        assert!(resume_signature(&args).contains("optimizer_weight_clip=tatara"));
         assert!(args.validate_arch_flags().is_ok());
         let params = ranger_params(&args);
         assert_eq!((params.min_weight, params.max_weight), (f32::MIN, f32::MAX));
-        let off_signature = resume_signature(&args);
+        let default_signature = resume_signature(&args);
         for limit in [0.5, 1.98, 3.0] {
-            args.optimizer_weight_clip = limit;
+            args.optimizer_weight_clip = Some(limit);
+            assert!(!uses_tatara_weight_clip(&args));
             assert!(args.validate_arch_flags().is_ok());
             let params = ranger_params(&args);
             assert_eq!((params.min_weight, params.max_weight), (-limit, limit));
-            assert!(!resume_signature_matches(&off_signature, &args));
+            assert!(!resume_signature_matches(&default_signature, &args));
         }
-        args.optimizer_weight_clip = 1.98;
+        args.optimizer_weight_clip = Some(1.98);
         let old_signature = resume_signature_without_line(&resume_signature(&args), "optimizer_weight_clip=");
         assert!(resume_signature_matches(&old_signature, &args));
-        args.optimizer_weight_clip = 0.0;
+        args.optimizer_weight_clip = Some(0.0);
+        assert!(!uses_tatara_weight_clip(&args));
+        assert_eq!(ranger_params(&args).max_weight, f32::MAX);
         assert!(!resume_signature_matches(&old_signature, &args));
         for invalid in [-0.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            args.optimizer_weight_clip = invalid;
+            args.optimizer_weight_clip = Some(invalid);
             assert!(args.validate_arch_flags().unwrap_err().contains("--optimizer-weight-clip"));
         }
     }
@@ -32653,11 +32690,38 @@ mod tests {
         let json = Args::try_parse_from(json_args).unwrap();
         let cli =
             Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0.5"]).unwrap();
-        assert_eq!(json.optimizer_weight_clip, 0.5);
+        assert_eq!(json.optimizer_weight_clip, Some(0.5));
         assert_eq!(json.optimizer_weight_clip, cli.optimizer_weight_clip);
         let disabled =
             Args::try_parse_from(["bulletou", "--teacher", "/dev/null", "--optimizer-weight-clip", "0"]).unwrap();
         assert_eq!(ranger_params(&disabled).max_weight, f32::MAX);
+    }
+
+    #[test]
+    fn optimizer_weight_clip_default_is_sfnn_only_and_off_reaches_worker_update_policy() {
+        for arch in ["SFNN_halfka2_1024_8_64_k3k3", "NNUE_halfkp_256x2_32_32", "KPPT"] {
+            let mut args = Args::try_parse_from(["bulletou", "--arch", arch, "--teacher", "/dev/null"]).unwrap();
+            assert_eq!(uses_tatara_weight_clip(&args), arch.starts_with("SFNN"));
+            #[cfg(feature = "cuda-cpp-backend")]
+            assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&args, None).tatara_weight_clip, arch.starts_with("SFNN"));
+            args.optimizer_weight_clip = Some(0.0);
+            assert!(!uses_tatara_weight_clip(&args));
+            #[cfg(feature = "cuda-cpp-backend")]
+            assert!(!cuda_cpp_sfnn_layer_lr_multipliers(&args, None).tatara_weight_clip);
+            assert!(resume_signature(&args).contains("optimizer_weight_clip=0.000000000"));
+        }
+        let mut json_args: Vec<std::ffi::OsString> =
+            ["bulletou", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--teacher", "/dev/null"].map(Into::into).to_vec();
+        bulletou_settings_json_value_to_args(
+            std::path::Path::new("settings.json"),
+            "optimizer_weight_clip",
+            &serde_json::json!(0),
+            &mut json_args,
+        )
+        .unwrap();
+        let args = Args::try_parse_from(json_args).unwrap();
+        assert_eq!(args.optimizer_weight_clip, Some(0.0));
+        assert!(!uses_tatara_weight_clip(&args));
     }
 
     #[test]
