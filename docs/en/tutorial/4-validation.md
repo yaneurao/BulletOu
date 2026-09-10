@@ -44,7 +44,15 @@ Use a validation file that is separate from the training teacher. Measuring accu
 
 ## 4.3 Number of validation positions
 
-If `test_positions` / `--test-positions` is omitted, BulletOu uses every position in the validation file.
+To explicitly validate every position, pass `--test-positions all`, or use:
+
+```json
+{
+  "test_positions": "all"
+}
+```
+
+Omission (or JSON `null`) means the same thing. `all` uses the full-file reader, not an artificially large sample count. `test_sample` / `test_seed` are ignored in this case. Resume signatures and validation cache keys are identical to omission. This applies to ordinary training, worker mode, and `quantized-test`.
 
 For a quick check, limit the count:
 

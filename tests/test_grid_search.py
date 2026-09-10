@@ -117,6 +117,25 @@ class GridSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate normalized"):
             self.plan()
 
+    def test_validation_count_all_and_numeric_values(self):
+        for value in ("invalid", "300000", 0, -1, 1.5, True):
+            with self.subTest(value=value):
+                grid.atomic_json(self.settings_path, {**self.common, "test_positions": value})
+                with self.assertRaisesRegex(ValueError, "positive integer or 'all'"):
+                    self.plan()
+                self.assertFalse(self.output.exists())
+        for value in (None, "all", 300000):
+            grid.atomic_json(self.settings_path, {**self.common, "test_positions": value})
+            self.assertEqual(self.plan()["trials"][0]["settings"]["test_positions"], value)
+        grid.atomic_json(self.settings_path, self.common)
+        self.assertNotIn("test_positions", self.plan()["trials"][0]["settings"])
+
+    def test_bundled_settings_use_explicit_all_positions(self):
+        example = Path(grid.__file__).parent / "docs/examples/grid-search-bulletou-settings.json"
+        settings = grid.read_json(example)
+        grid.check_settings(settings)
+        self.assertEqual(settings["test_positions"], "all")
+
     def test_common_checkpoint_both_files_and_independent_starts(self):
         cp = self.checkpoint(self.root / "base")
         plan = self.plan(["--checkpoint", str(cp)])

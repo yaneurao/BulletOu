@@ -44,7 +44,15 @@
 
 ## 4.3 検証に使う局面数
 
-`test_positions` / `--test-positions` を省略すると、検証用ファイルの全局面を使います。
+全件検証を明示する場合は、`--test-positions all`、またはJSONに次のように書きます。
+
+```json
+{
+  "test_positions": "all"
+}
+```
+
+省略（JSONでは `null` も可）でも同じ全件検証です。`all` は大きな件数で代用するのではなく全件読込の経路を使います。この場合、`test_sample` / `test_seed` は使いません。resume判定と検証cacheも、省略時と同じ扱いです。通常学習・worker・`quantized-test` で共通です。
 
 短時間で動作確認したい場合だけ、次のように局面数を制限します。
 

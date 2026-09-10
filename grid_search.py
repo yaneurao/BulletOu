@@ -163,6 +163,9 @@ def check_settings(settings: dict) -> None:
             raise ValueError(f"{key} must be specified in common settings")
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
+    test_positions = settings.get("test_positions")
+    if test_positions not in (None, "all") and (type(test_positions) is not int or test_positions < 1):
+        raise ValueError("test_positions must be a positive integer or 'all'; omission/null also uses all validation positions")
     for key in ("batch_size", "batches_per_update", "positions_per_superbatch"):
         if key in settings:
             positive_int(settings, key)

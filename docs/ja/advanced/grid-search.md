@@ -12,6 +12,8 @@ TPEの `tuning_parameters.py` とは別です。勝者から次の条件へ追�
 
 BulletOuフォルダで実行する例です。
 
+検証局面を全件使う場合は、JSONに `"test_positions": "all"` と書けます。省略・`null` でも同じ全件検証です。件数を制限する場合は `"test_positions": 300000` のように正の整数を指定します。古い実行ファイルで `all` がエラーになる場合は、本体を再ビルドしてください。
+
 ```powershell
 python .\grid_search.py `
   --settings-file .\docs\examples\grid-search-bulletou-settings.json `

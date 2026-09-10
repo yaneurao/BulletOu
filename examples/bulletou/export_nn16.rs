@@ -361,7 +361,7 @@ pub(super) fn test(args: &QuantizedTestArgs, verbose: bool) -> Result<QuantizedT
         );
     }
     let teacher = args.test_teacher.to_str().ok_or("non UTF-8 teacher path")?;
-    let positions = match args.test_positions {
+    let positions = match args.test_positions.and_then(ValidationPositionCount::limit) {
         None => read_all_teacher_positions(teacher),
         Some(n) => match args.test_sample {
             TestSampleMode::Sequential => read_teacher_positions_prefix(teacher, n),

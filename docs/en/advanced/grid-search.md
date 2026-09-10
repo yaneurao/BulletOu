@@ -12,6 +12,8 @@ Use an ordinary **bulletou-settings.json**, not tuning-settings.json. The [sampl
 
 From the BulletOu directory:
 
+Use `"test_positions": "all"` in the JSON to validate all positions. Omission or `null` means the same thing. To limit the sample, use a positive integer such as `"test_positions": 300000`. Rebuild BulletOu if an older executable rejects `all`.
+
 ```powershell
 python .\grid_search.py `
   --settings-file .\docs\examples\grid-search-bulletou-settings.json `

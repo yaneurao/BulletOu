@@ -1221,13 +1221,13 @@ struct QuantizedTestArgs {
     #[arg(long = "test-teacher")]
     test_teacher: PathBuf,
 
-    /// Number of positions to test. If omitted, all positions in the
-    /// fixed-record validation teacher are used.
-    #[arg(long)]
-    test_positions: Option<usize>,
+    /// Number of positions to test, or `all`. If omitted, all positions in
+    /// the fixed-record validation teacher are used.
+    #[arg(long, value_name = "N|all")]
+    test_positions: Option<ValidationPositionCount>,
 
     /// How to choose validation positions when `--test-positions` is set.
-    /// Omitted `--test-positions` always means all positions.
+    /// Omitted `--test-positions` or `all` always means all positions.
     #[arg(long, value_enum, default_value = "sequential")]
     test_sample: TestSampleMode,
 
@@ -1374,13 +1374,13 @@ struct CompareSfnnQuantizationArgs {
     #[arg(long = "test-teacher")]
     test_teacher: PathBuf,
 
-    /// Number of positions to test. If omitted, all positions in the
-    /// fixed-record validation teacher are used.
-    #[arg(long)]
-    test_positions: Option<usize>,
+    /// Number of positions to test, or `all`. If omitted, all positions in
+    /// the fixed-record validation teacher are used.
+    #[arg(long, value_name = "N|all")]
+    test_positions: Option<ValidationPositionCount>,
 
     /// How to choose validation positions when `--test-positions` is set.
-    /// Omitted `--test-positions` always means all positions.
+    /// Omitted `--test-positions` or `all` always means all positions.
     #[arg(long, value_enum, default_value = "sequential")]
     test_sample: TestSampleMode,
 
@@ -1510,10 +1510,10 @@ struct AverageSfnnStateArgs {
     #[arg(long = "test-teacher")]
     test_teacher: Option<PathBuf>,
 
-    /// Number of positions to test. If omitted, all positions in the
-    /// fixed-record validation teacher are used.
-    #[arg(long)]
-    test_positions: Option<usize>,
+    /// Number of positions to test, or `all`. If omitted, all positions in
+    /// the fixed-record validation teacher are used.
+    #[arg(long, value_name = "N|all")]
+    test_positions: Option<ValidationPositionCount>,
 
     /// How to choose validation positions when `--test-positions` is set.
     #[arg(long, value_enum, default_value = "sequential")]
@@ -2157,10 +2157,10 @@ struct QuantizedCalibrateArgs {
     #[arg(long = "test-teacher")]
     test_teacher: PathBuf,
 
-    /// Number of positions to test. If omitted, all positions in the
-    /// fixed-record validation teacher are used.
-    #[arg(long)]
-    test_positions: Option<usize>,
+    /// Number of positions to test, or `all`. If omitted, all positions in
+    /// the fixed-record validation teacher are used.
+    #[arg(long, value_name = "N|all")]
+    test_positions: Option<ValidationPositionCount>,
 
     /// How to choose validation positions when `--test-positions` is set.
     #[arg(long, value_enum, default_value = "sequential")]
@@ -2712,6 +2712,34 @@ impl PlateauMonitor {
             PlateauMonitor::Accuracy => "validation accuracy",
             PlateauMonitor::LossOrAccuracy => "validation loss/accuracy",
         }
+    }
+}
+
+/// Normalize explicit `all` and omission to the same unlimited reader/cache
+/// key. Do not encode `all` as a large numeric sample size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidationPositionCount {
+    All,
+    Count(usize),
+}
+
+impl ValidationPositionCount {
+    fn limit(self) -> Option<usize> {
+        match self {
+            Self::All => None,
+            Self::Count(n) => Some(n),
+        }
+    }
+}
+
+impl std::str::FromStr for ValidationPositionCount {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value == "all" {
+            return Ok(Self::All);
+        }
+        value.parse::<usize>().map(Self::Count).map_err(|_| "expected a position count (integer) or 'all'".to_string())
     }
 }
 
@@ -5006,16 +5034,16 @@ struct Args {
     test_teacher: Option<PathBuf>,
 
     /// Number of positions to sample from `--test-teacher` per validation
-    /// event. If omitted, all positions in the fixed-record validation
-    /// teacher are used.
-    #[arg(long)]
-    test_positions: Option<usize>,
+    /// event, or `all`. If omitted, all positions in the fixed-record
+    /// validation teacher are used.
+    #[arg(long, value_name = "N|all")]
+    test_positions: Option<ValidationPositionCount>,
 
     /// How to choose validation positions from `--test-teacher`.
     /// `sequential` reads the first `--test-positions` fixed records and
     /// is useful for byte-for-byte parity against external trainers. This
-    /// option has no effect when `--test-positions` is omitted because all
-    /// validation positions are used.
+    /// option has no effect when `--test-positions` is omitted or `all`
+    /// because all validation positions are used.
     #[arg(long, value_enum, default_value = "random")]
     test_sample: TestSampleMode,
 
@@ -7665,7 +7693,7 @@ fn read_compare_sfnn_quantization_positions(
         .test_teacher
         .to_str()
         .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
-    match args.test_positions {
+    match args.test_positions.and_then(ValidationPositionCount::limit) {
         None => read_all_teacher_positions(teacher),
         Some(n) => match args.test_sample {
             TestSampleMode::Random => read_random_teacher_positions(teacher, n, args.test_seed),
@@ -8378,18 +8406,19 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
         .test_teacher
         .to_str()
         .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
-    let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
-    let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+    let test_positions = args.test_positions.and_then(ValidationPositionCount::limit);
+    let positions_label = test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
+    let sample_label = if test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
     if verbose {
         eprintln!(
             "  loading test positions from {} (positions={}, sample={}, seed={})...",
             args.test_teacher.display(),
             positions_label,
             sample_label,
-            if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
+            if test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
         );
     }
-    let positions = match args.test_positions {
+    let positions = match test_positions {
         None => read_all_teacher_positions(teacher),
         Some(n) => match args.test_sample {
             TestSampleMode::Random => read_random_teacher_positions(teacher, n, args.test_seed),
@@ -9547,16 +9576,17 @@ fn run_quantized_calibration(args: &QuantizedCalibrateArgs) -> Result<QuantizedC
         .test_teacher
         .to_str()
         .ok_or_else(|| format!("--test-teacher path is not valid UTF-8: {}", args.test_teacher.display()))?;
-    let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
-    let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+    let test_positions = args.test_positions.and_then(ValidationPositionCount::limit);
+    let positions_label = test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
+    let sample_label = if test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
     eprintln!(
         "  loading test positions from {} (positions={}, sample={}, seed={})...",
         args.test_teacher.display(),
         positions_label,
         sample_label,
-        if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
+        if test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() }
     );
-    let positions = match args.test_positions {
+    let positions = match test_positions {
         None => read_all_teacher_positions(teacher),
         Some(n) => match args.test_sample {
             TestSampleMode::Random => read_random_teacher_positions(teacher, n, args.test_seed),
@@ -24676,9 +24706,10 @@ fn resume_signature(args: &Args) -> String {
     let superbatches = args.superbatches.map(|n| n.to_string()).unwrap_or_else(|| "none".to_string());
     let test_teacher =
         args.test_teacher.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".to_string());
-    let test_positions = args.test_positions.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
-    let test_sample = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
-    let test_seed = if args.test_positions.is_some() { args.test_seed.to_string() } else { "-".to_string() };
+    let test_limit = args.test_positions.and_then(ValidationPositionCount::limit);
+    let test_positions = test_limit.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
+    let test_sample = if test_limit.is_some() { args.test_sample.cli_name() } else { "all" };
+    let test_seed = if test_limit.is_some() { args.test_seed.to_string() } else { "-".to_string() };
     let residual_count_decay_signature = effective_sfnn_residual_count_decay(args);
     [
         "schema=bulletou-resume-v3".to_string(),
@@ -26646,11 +26677,12 @@ impl TestPositionsCache {
                 return None;
             }
         };
+        let test_positions = args.test_positions.and_then(ValidationPositionCount::limit);
         let key = TestPositionsCacheKey {
             path,
-            positions: args.test_positions,
-            sample: if args.test_positions.is_some() { args.test_sample } else { TestSampleMode::Sequential },
-            seed: if args.test_positions.is_some() { args.test_seed } else { 0 },
+            positions: test_positions,
+            sample: if test_positions.is_some() { args.test_sample } else { TestSampleMode::Sequential },
+            seed: if test_positions.is_some() { args.test_seed } else { 0 },
             score_drop_abs: args.score_drop_abs,
         };
         let cache_cell = TEST_POSITIONS_CACHE.get_or_init(|| Mutex::new(None));
@@ -26661,9 +26693,9 @@ impl TestPositionsCache {
         {
             return Some(cache);
         }
-        let positions_label = args.test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
-        let sample_label = if args.test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
-        let seed_label = if args.test_positions.is_some() && args.test_sample == TestSampleMode::Random {
+        let positions_label = test_positions.map(format_count).unwrap_or_else(|| "all".to_string());
+        let sample_label = if test_positions.is_some() { args.test_sample.cli_name() } else { "all" };
+        let seed_label = if test_positions.is_some() && args.test_sample == TestSampleMode::Random {
             args.test_seed.to_string()
         } else {
             "-".to_string()
@@ -26672,7 +26704,7 @@ impl TestPositionsCache {
             "  loading {} test positions from {} (sample={}, seed={}) for validation...",
             positions_label, key.path, sample_label, seed_label,
         );
-        let loaded = match args.test_positions {
+        let loaded = match test_positions {
             None => read_all_teacher_positions(&key.path),
             Some(n) => match args.test_sample {
                 TestSampleMode::Random => read_random_teacher_positions(&key.path, n, args.test_seed),
@@ -29821,11 +29853,88 @@ mod tests {
         ])
         .unwrap();
 
-        assert_eq!(explicit.test_positions, Some(300000));
+        assert_eq!(explicit.test_positions, Some(ValidationPositionCount::Count(300000)));
         let explicit_sig = resume_signature(&explicit);
         assert!(explicit_sig.contains("test_positions=300000"));
         assert!(explicit_sig.contains("test_sample=random"));
         assert!(explicit_sig.contains("test_seed=0"));
+    }
+
+    #[test]
+    fn explicit_all_test_positions_matches_omission() {
+        let base = [
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--teacher",
+            "/dev/null",
+            "--test-teacher",
+            "heldout.psv",
+        ];
+        let omitted = Args::try_parse_from(base).unwrap();
+        let all = Args::try_parse_from(base.into_iter().chain([
+            "--test-positions",
+            "all",
+            "--test-sample",
+            "random",
+            "--test-seed",
+            "123",
+        ]))
+        .unwrap();
+        assert_eq!(all.test_positions, Some(ValidationPositionCount::All));
+        assert_eq!(all.test_positions.and_then(ValidationPositionCount::limit), None);
+        assert_eq!(resume_signature(&all), resume_signature(&omitted));
+        assert!(resume_signature_matches(&resume_signature(&omitted), &all));
+        assert!(resume_signature_matches(&resume_signature(&all), &omitted));
+        for value in ["invalid", "1.5", "-1"] {
+            assert!(Args::try_parse_from(base.into_iter().chain(["--test-positions", value])).is_err());
+        }
+    }
+
+    #[test]
+    fn settings_test_positions_all_and_numeric_cli_override_each_other() {
+        let path = std::env::temp_dir().join(format!("bulletou-test-positions-all-{}.json", std::process::id()));
+        for (json_value, cli_value, expected) in [
+            ("\"all\"", None, None),
+            ("null", None, None),
+            ("\"all\"", Some("17"), Some(17)),
+            ("17", Some("all"), None),
+        ] {
+            std::fs::write(&path, format!(r#"{{"teacher":"/dev/null","test_positions":{json_value}}}"#)).unwrap();
+            let mut raw =
+                vec![OsString::from("bulletou"), OsString::from("--settings-file"), path.as_os_str().to_owned()];
+            if let Some(value) = cli_value {
+                raw.extend([OsString::from("--test-positions"), OsString::from(value)]);
+            }
+            let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+            assert_eq!(args.test_positions.and_then(ValidationPositionCount::limit), expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_validation_commands_accept_all_test_positions() {
+        let common = [
+            "bulletou",
+            "--arch",
+            "SFNN_halfka2_1024_7_64_k3k3",
+            "--nn-bin",
+            "nn.bin",
+            "--test-teacher",
+            "heldout.psv",
+            "--test-positions",
+            "all",
+        ];
+        let quantized = QuantizedTestArgs::try_parse_from(common).unwrap();
+        assert_eq!(quantized.test_positions, Some(ValidationPositionCount::All));
+        let compare =
+            CompareSfnnQuantizationArgs::try_parse_from(common.into_iter().chain(["--state-bin", "state.bin"]))
+                .unwrap();
+        assert_eq!(compare.test_positions.and_then(ValidationPositionCount::limit), None);
+        let calibrate =
+            QuantizedCalibrateArgs::try_parse_from(common.into_iter().chain(["--output", "calibrated.bin"])).unwrap();
+        assert_eq!(calibrate.test_positions.and_then(ValidationPositionCount::limit), None);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
