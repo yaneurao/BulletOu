@@ -9,6 +9,7 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | Page | Topic |
 | --- | --- |
 | [Adjust training settings](tuning.md) | Learning rate, save frequency, validation frequency, and loss |
+| [Compare conditions with grid search](grid-search.md) | Sequential Cartesian-product runs and per-epoch acc / loss / qacc / qloss CSV summaries |
 | [Fixed-length trial parameter tuning](parameter-tuning.md) | Short fixed-parameter trials for `lr`, `lr_min`, factorizer, and count confidence |
 | [Automatic population search tuning](auto-tuning.md) | Tuning that continues from accepted checkpoints |
 | [Loss scale and `FV_SCALE`](scale-and-fv-scale.md) | WRM loss, plain sigmoid loss, and quantized output scale |
