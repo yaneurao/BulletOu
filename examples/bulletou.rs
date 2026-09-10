@@ -54,6 +54,10 @@ Usage:
 mod progress_train;
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[path = "bulletou/export_nn16.rs"]
+mod export_nn16;
+
+#[cfg(feature = "cuda-cpp-backend")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -4277,7 +4281,7 @@ fn effective_lr_step_gamma(args: &Args, batches_per_superbatch: usize) -> Result
 #[command(about = "BulletOu unified trainer")]
 #[command(args_override_self = true)]
 #[command(
-    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
+    after_help = "Subcommands:\n  nerf                       Post-process a supported nn.bin by adding reproducible ±1 noise to selected i8 weights\n  quantized-test             Measure accuracy/loss using an exported quantized SFNN nn.bin\n  quantized-weight-stats     Print layer-wise integer saturation statistics for an exported SFNN nn.bin\n  compare-sfnn-quantization  Compare fp32 state.bin and quantized nn.bin outputs on one validation set\n  calibrate-nn-bin           Fold a validation-tuned score offset into an exported SFNN nn.bin L3 bias\n  export-nn16                Export FP32 SFNN state.bin with int16 L1/L2/L3 weights (default QB=4096)\n  average-sfnn-state         Average multiple cuda-cpp SFNN state.bin files and export one nn.bin\n  progress-train             Train a shared 0..255 SFNN progress classifier from complete .pack games\n  export-progress-bin        Extract SFNN progress parameters from state.bin\n  bucket-count               Write SFNN LayerStack bucket occurrence counts to count.bin\n  bucket-stats               Measure SFNN LayerStack bucket dispersion without training\n  worker                     Run a long-lived JSON Lines worker process\n\nStandalone diagnostics:\n  --count-teacher           Count fixed-record teacher positions and exit\n  --analyze-score-winrate   Fit a sigmoid score->win-rate curve on teacher W/D/L data and exit\n\nRun `bulletou <subcommand> --help` for subcommand-specific options."
 )]
 struct Args {
     /// Read BulletOu training options from a JSON file. Keys use snake_case
@@ -7097,16 +7101,14 @@ fn quantized_final_division(output: i32, fv_scale: i32, round: QuantizedRoundMod
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn quantized_sfnn_forward_sample(
+fn quantized_sfnn_ft_forward_sample(
     weights: &QuantizedSfnnWeights,
     batch: &bulletou_lib::value::FastBatchHost,
     sample: usize,
     ft_shift: u32,
     ft_round: QuantizedRoundMode,
-    crelu_round: QuantizedRoundMode,
-    sqrcrelu_round: QuantizedRoundMode,
-    state: &mut QuantizedSfnnThreadState,
-) -> Result<QuantizedSfnnForwardOutput, String> {
+    ft: &mut [u8],
+) -> Result<usize, String> {
     let max_active = batch.layout.max_active;
     let sparse_offset =
         sample.checked_mul(max_active).ok_or_else(|| format!("sample {sample}: sparse offset overflow"))?;
@@ -7148,9 +7150,24 @@ fn quantized_sfnn_forward_sample(
             }
         }
 
-        state.ft[j] = quantized_sfnn_ft_pair_value(stm0, stm1, ft_shift, ft_round);
-        state.ft[pairwise + j] = quantized_sfnn_ft_pair_value(nstm0, nstm1, ft_shift, ft_round);
+        ft[j] = quantized_sfnn_ft_pair_value(stm0, stm1, ft_shift, ft_round);
+        ft[pairwise + j] = quantized_sfnn_ft_pair_value(nstm0, nstm1, ft_shift, ft_round);
     }
+    Ok(stack)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn quantized_sfnn_forward_sample(
+    weights: &QuantizedSfnnWeights,
+    batch: &bulletou_lib::value::FastBatchHost,
+    sample: usize,
+    ft_shift: u32,
+    ft_round: QuantizedRoundMode,
+    crelu_round: QuantizedRoundMode,
+    sqrcrelu_round: QuantizedRoundMode,
+    state: &mut QuantizedSfnnThreadState,
+) -> Result<QuantizedSfnnForwardOutput, String> {
+    let stack = quantized_sfnn_ft_forward_sample(weights, batch, sample, ft_shift, ft_round, &mut state.ft)?;
 
     let l1_out = weights.l1_out();
     let l1b_base = stack * l1_out;
@@ -8307,6 +8324,15 @@ fn run_quantized_test(args: &QuantizedTestArgs) -> Result<QuantizedTestReport, S
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<QuantizedTestReport, String> {
     args.validate_arch_flags()?;
+    {
+        use std::io::Read;
+        let mut header = [0u8; 4];
+        let mut file = std::fs::File::open(&args.nn_bin).map_err(|e| e.to_string())?;
+        file.read_exact(&mut header).map_err(|e| e.to_string())?;
+        if u32::from_le_bytes(header) == export_nn16::VERSION {
+            return export_nn16::test(args, verbose);
+        }
+    }
     let layerstack = args.effective_layerstack();
     let feature_kind = cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
     let weights = parse_quantized_sfnn_nn_bin(&args.nn_bin, args.arch, layerstack)?;
@@ -11554,6 +11580,26 @@ fn main() {
         }
         return;
     }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("export-nn16")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) {
+            *program = std::ffi::OsString::from("bulletou export-nn16");
+        }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = export_nn16::ExportNn16Args::parse_from(raw_args);
+            if let Err(e) = export_nn16::run(&args) {
+                eprintln!("error: export-nn16 failed: {e}");
+                std::process::exit(2);
+            }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        {
+            eprintln!("error: export-nn16 requires --features cuda-cpp-backend");
+            std::process::exit(2);
+        }
+        return;
+    }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("average-sfnn-state")) {
         raw_args.remove(1);
         if let Some(program) = raw_args.get_mut(0) {
@@ -11697,6 +11743,12 @@ fn main() {
                         "  loss_engine_scale = {:.8} (n={})",
                         report.engine_scale.test_loss.unwrap_or(f32::NAN),
                         format_count(report.engine_scale.loss_sampled)
+                    );
+                    println!(
+                        "  accuracy_train_scale = {:.9} ({}/{} decisive; sign of raw output)",
+                        report.train_scale.sign_matches as f64 / report.train_scale.compared.max(1) as f64,
+                        report.train_scale.sign_matches,
+                        report.train_scale.compared,
                     );
                     println!(
                         "  loss_train_scale  = {:.8} (n={})",
@@ -23215,6 +23267,35 @@ fn write_cuda_cpp_sfnn_nn_bin(
     factorizer_axis_confidences: Option<&[f32]>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
 ) -> Result<(), String> {
+    write_cuda_cpp_sfnn_nn_bin_format(
+        path,
+        feature_kind,
+        shape,
+        weights,
+        factorizer,
+        factorizer_alpha,
+        residual_count_gates,
+        factorizer_axis_confidences,
+        progress_params,
+        None,
+    )
+}
+
+/// The existing i8 exporter and the explicit nn16 exporter share the exact
+/// same FT/residual/shared/axis folding and padding implementation.
+#[cfg(feature = "cuda-cpp-backend")]
+fn write_cuda_cpp_sfnn_nn_bin_format(
+    path: &Path,
+    feature_kind: CudaCppSfnnFeatureKind,
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    weights: &bulletou_cuda_cpp::SfnnTrainWeightsReadback,
+    factorizer: SfnnFactorizerSpec,
+    factorizer_alpha: SfnnFactorizerAlphaSpec,
+    residual_count_gates: Option<&[f32]>,
+    factorizer_axis_confidences: Option<&[f32]>,
+    progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    nn16_weight_scale: Option<u32>,
+) -> Result<(), String> {
     use std::io::Write as _;
 
     let feature_set = feature_kind.feature_set();
@@ -23250,9 +23331,12 @@ fn write_cuda_cpp_sfnn_nn_bin(
         ));
     };
 
+    if nn16_weight_scale.is_some() && l0w_for_export.iter().any(|x| !x.is_finite()) {
+        return Err("nn16 folded FT contains non-finite values".to_string());
+    }
     let file = std::fs::File::create(path).map_err(|err| format!("failed to create {}: {err}", path.display()))?;
     let mut writer = std::io::BufWriter::new(file);
-    let arch = format!(
+    let mut arch = format!(
         "ModelType=SFNNWithoutPsqt;Features={}[{}->{}x2],Network=SFNN-{}{{LayerStack={}}}",
         feature_set.display_name(),
         base_input_size,
@@ -23260,22 +23344,35 @@ fn write_cuda_cpp_sfnn_nn_bin(
         shape.ft_size,
         shape.num_stacks
     );
+    if let Some(qb) = nn16_weight_scale {
+        export_nn16::validate_scale(qb)?;
+        arch.push_str(&format!(
+            ";FCWeightBits=16;QB={qb};H1={};Skip={};H2={}",
+            shape.l1_hidden,
+            u8::from(shape.l1_skip),
+            shape.l2_size
+        ));
+    }
     let sfnn_hash = KHASH_SFNN;
+    let version = if nn16_weight_scale.is_some() { export_nn16::VERSION } else { SFNN_NNUE_VERSION };
     writer
-        .write_all(&SFNN_NNUE_VERSION.to_le_bytes())
+        .write_all(&version.to_le_bytes())
         .and_then(|_| writer.write_all(&sfnn_hash.to_le_bytes()))
         .and_then(|_| writer.write_all(&(arch.len() as u32).to_le_bytes()))
         .and_then(|_| writer.write_all(arch.as_bytes()))
-        .and_then(|_| writer.write_all(&FT_HASH_SFNN.to_le_bytes()))
         .map_err(|err| format!("failed to write SFNN nn.bin header {}: {err}", path.display()))?;
+    if let Some(qb) = nn16_weight_scale {
+        write_nnue_bin_chunk(&mut writer, path, "nn16 QB", &qb.to_le_bytes())?;
+    }
+    write_nnue_bin_chunk(&mut writer, path, "FT hash", &FT_HASH_SFNN.to_le_bytes())?;
 
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0b", &weights.l0b, f32::from(SFNN_QA))?;
     write_sfnn_leb128_i16_chunk(&mut writer, path, "l0w", l0w_for_export, f32::from(SFNN_QA))?;
 
     let l1_out = shape.l1_out();
     let l2_in = shape.l2_in();
-    let fc_bias_scale = f32::from(SFNN_QA) * f32::from(SFNN_QB);
-    let fc_weight_scale = f32::from(SFNN_QB);
+    let fc_weight_scale = nn16_weight_scale.map_or(f32::from(SFNN_QB), |qb| qb as f32);
+    let fc_bias_scale = f32::from(SFNN_QA) * fc_weight_scale;
     let use_axis = factorizer.any_axis();
     let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
     let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
@@ -23392,6 +23489,19 @@ fn write_cuda_cpp_sfnn_nn_bin(
         factorizer_axis_confidences,
     )?;
 
+    if nn16_weight_scale.is_some() {
+        // Never silently saturate the new high-precision FC representation.
+        for (name, values, scale, min, max) in [
+            ("l1w", &l1w_for_export, fc_weight_scale, i16::MIN as f64, i16::MAX as f64),
+            ("l2w", &l2w_for_export, fc_weight_scale, i16::MIN as f64, i16::MAX as f64),
+            ("l3w", &l3w_for_export, fc_weight_scale, i16::MIN as f64, i16::MAX as f64),
+            ("l1b", &l1b_for_export, fc_bias_scale, i32::MIN as f64, i32::MAX as f64),
+            ("l2b", &l2b_for_export, fc_bias_scale, i32::MIN as f64, i32::MAX as f64),
+            ("l3b", &l3b_for_export, fc_bias_scale, i32::MIN as f64, i32::MAX as f64),
+        ] {
+            export_nn16::validate_quantization(name, values, scale, min, max)?;
+        }
+    }
     for stack in 0..shape.num_stacks {
         writer
             .write_all(&NETWORK_HASH_SFNN.to_le_bytes())
@@ -23410,11 +23520,19 @@ fn write_cuda_cpp_sfnn_nn_bin(
             for in_col in 0..l1_pad_in {
                 let q = if in_col < shape.ft_size {
                     let value = l1w_for_export[stack * l1_out * shape.ft_size + out_col * shape.ft_size + in_col];
-                    sfnn_quantise_i8(value, fc_weight_scale)
+                    if nn16_weight_scale.is_some() {
+                        sfnn_quantise_i16(value, fc_weight_scale)
+                    } else {
+                        i16::from(sfnn_quantise_i8(value, fc_weight_scale))
+                    }
                 } else {
                     0
                 };
-                l1w_bytes.push(q as u8);
+                if nn16_weight_scale.is_some() {
+                    l1w_bytes.extend_from_slice(&q.to_le_bytes());
+                } else {
+                    l1w_bytes.push(q as u8);
+                }
             }
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l1w", &l1w_bytes)?;
@@ -23432,11 +23550,19 @@ fn write_cuda_cpp_sfnn_nn_bin(
             for in_col in 0..l2_pad_in {
                 let q = if in_col < l2_in {
                     let value = l2w_for_export[stack * shape.l2_size * l2_in + out_col * l2_in + in_col];
-                    sfnn_quantise_i8(value, fc_weight_scale)
+                    if nn16_weight_scale.is_some() {
+                        sfnn_quantise_i16(value, fc_weight_scale)
+                    } else {
+                        i16::from(sfnn_quantise_i8(value, fc_weight_scale))
+                    }
                 } else {
                     0
                 };
-                l2w_bytes.push(q as u8);
+                if nn16_weight_scale.is_some() {
+                    l2w_bytes.extend_from_slice(&q.to_le_bytes());
+                } else {
+                    l2w_bytes.push(q as u8);
+                }
             }
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l2w", &l2w_bytes)?;
@@ -23448,11 +23574,20 @@ fn write_cuda_cpp_sfnn_nn_bin(
         let mut l3w_bytes = Vec::with_capacity(l3_pad_in);
         for in_col in 0..l3_pad_in {
             let q = if in_col < shape.l2_size {
-                sfnn_quantise_i8(l3w_for_export[stack * shape.l2_size + in_col], fc_weight_scale)
+                let value = l3w_for_export[stack * shape.l2_size + in_col];
+                if nn16_weight_scale.is_some() {
+                    sfnn_quantise_i16(value, fc_weight_scale)
+                } else {
+                    i16::from(sfnn_quantise_i8(value, fc_weight_scale))
+                }
             } else {
                 0
             };
-            l3w_bytes.push(q as u8);
+            if nn16_weight_scale.is_some() {
+                l3w_bytes.extend_from_slice(&q.to_le_bytes());
+            } else {
+                l3w_bytes.push(q as u8);
+            }
         }
         write_nnue_bin_chunk(&mut writer, path, "sfnn l3w", &l3w_bytes)?;
     }

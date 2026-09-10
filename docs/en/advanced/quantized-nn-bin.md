@@ -14,6 +14,7 @@ This page covers two commands for inspecting an exported `nn.bin` directly. Thes
 |---|---|
 | `quantized-test` | Measure quantized accuracy / loss |
 | `calibrate-nn-bin` | Inspect output scale and fold an offset into the final bias |
+| `export-nn16` | [Export FP32 state with int16 L1/L2/L3 weights](nn16.md) (requires a matching engine) |
 
 ## Test quantized accuracy / loss
 

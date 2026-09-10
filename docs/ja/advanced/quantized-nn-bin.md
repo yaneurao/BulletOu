@@ -14,6 +14,7 @@
 |---|---|
 | `quantized-test` | 量子化後のaccuracy / lossを測る |
 | `calibrate-nn-bin` | 出力scaleを調べ、最終biasにoffsetを畳み込む |
+| `export-nn16` | [FP32 checkpointからL1/L2/L3を16bitで書き出す](nn16.md)（対応エンジンが必要） |
 
 ## 量子化後のaccuracy / lossを測る
 
