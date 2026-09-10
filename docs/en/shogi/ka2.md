@@ -156,6 +156,21 @@ make normal YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_ka2_3072_7_64_c1024_s256x8_k
 
 YaneuraOu's `Makefile` auto-runs `nnue_arch_gen.py` for unknown editions, so the matching architecture header is generated on the fly. Use **underscores** (not hyphens) in the dimension part of the edition name to avoid a `clang -Wc99-extensions` warning. See [tutorial: Load into an engine](../tutorial/7-engine.md) for the load procedure.
 
+### CPU feature extraction and training throughput
+
+KA2 scans the board once, groups occupied squares by piece type and colour, and
+then emits feature indices. It no longer scans all 81 squares separately for each
+of the 13 piece types and two colours. Feature indices, multiplicities, and their
+piece-type/colour/square order are preserved, including the FT accumulation order.
+No additional option or GPU memory is required. Existing settings, checkpoints,
+and the `nn.bin` format are unchanged.
+
+A smaller network does not necessarily train faster when teacher I/O or CPU
+feature extraction limits throughput. Temporarily use
+`--cuda-cpp-diagnostics-rate 1` to record per-superbatch preparation and batch-queue
+wait times in `cuda-cpp-diagnostics.log` under the output directory. Diagnostics
+synchronise CUDA, so leave this option disabled for normal training.
+
 ### Common CLI flags
 
 | Flag | Meaning | Default |

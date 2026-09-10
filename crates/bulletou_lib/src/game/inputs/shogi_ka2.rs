@@ -22,7 +22,7 @@ use super::SparseInputType;
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::{E_KING, F_KING},
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, Square},
+    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, PieceType, Square},
 };
 
 /// `FeatureSet<K, A2>` の合成 feature hash。
@@ -142,9 +142,22 @@ fn map_ka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     f(k_index_opp(stm_opp_king), k_index_own(nstm_own_king));
 
     // ---- A2: 玉以外の盤上駒 (BonaPiece は < E_KING なので collapse は no-op) ----
+    // Collect squares in one board scan. Keep the old piece-type / colour /
+    // ascending-square order: changing the sparse input order also changes
+    // floating-point accumulation order in the FT. These small bitsets live
+    // on the stack; no per-position heap allocation is needed.
+    let mut piece_squares = [[0u128; 2]; PieceType::Dragon as usize + 1];
+    for (sq_idx, &piece) in board.board.iter().enumerate() {
+        if !piece.is_none() && piece.piece_type != PieceType::King {
+            piece_squares[piece.piece_type as usize][piece.color as usize] |= 1u128 << sq_idx;
+        }
+    }
     for &pt in &BOARD_PIECE_TYPES {
         for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
+            let mut squares = piece_squares[pt as usize][color as usize];
+            while squares != 0 {
+                let sq = Square::from_index(squares.trailing_zeros() as usize);
+                squares &= squares - 1;
                 let piece = Piece::new(color, pt);
 
                 let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
@@ -192,9 +205,175 @@ fn map_ka2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
 
 #[cfg(test)]
 mod tests {
-    use crate::shogi::{PieceType, Square};
-
     use super::*;
+
+    // Keep the pre-optimisation implementation as an independent reference.
+    // Compare sequences, not just sets: FT floating-point sums depend on order.
+    fn legacy_features(board: &ShogiBoard) -> Vec<(usize, usize)> {
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
+        let stm_king_sq = board.king_square(stm);
+        let nstm_king_sq = board.king_square(nstm);
+        if !stm_king_sq.is_valid() || !nstm_king_sq.is_valid() {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        result.push((
+            k_index_own(sq_from_perspective(stm_king_sq, stm)),
+            k_index_opp(sq_from_perspective(stm_king_sq, nstm)),
+        ));
+        result.push((
+            k_index_opp(sq_from_perspective(nstm_king_sq, stm)),
+            k_index_own(sq_from_perspective(nstm_king_sq, nstm)),
+        ));
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in board.pieces(color, pt) {
+                    let piece = Piece::new(color, pt);
+                    let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+                    if stm_bp == BonaPiece::ZERO {
+                        continue;
+                    }
+                    let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+                    result.push((a2_index(stm_bp.value()), a2_index(nstm_bp.value())));
+                }
+            }
+        }
+        result.push((
+            a2_index(F_KING + sq_from_perspective(stm_king_sq, stm) as u16),
+            a2_index(E_KING + sq_from_perspective(stm_king_sq, nstm) as u16),
+        ));
+        result.push((
+            a2_index(E_KING + sq_from_perspective(nstm_king_sq, stm) as u16),
+            a2_index(F_KING + sq_from_perspective(nstm_king_sq, nstm) as u16),
+        ));
+        for owner in [Color::Black, Color::White] {
+            for &pt in &HAND_PIECE_TYPES {
+                for i in 1..=board.hand(owner).count(pt) {
+                    let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                    if stm_bp == BonaPiece::ZERO {
+                        continue;
+                    }
+                    let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                    result.push((a2_index(stm_bp.value()), a2_index(nstm_bp.value())));
+                }
+            }
+        }
+        result
+    }
+
+    fn assert_legacy_sequence(board: &ShogiBoard) {
+        let expected = legacy_features(board);
+        let mut actual = Vec::new();
+        map_ka2_features(board, |s, n| actual.push((s, n)));
+        assert_eq!(actual, expected, "stm={:?}, pieces={:?}", board.side_to_move, board.board);
+        assert!(actual.iter().all(|&(s, n)| s < KA2_DIMENSIONS && n < KA2_DIMENSIONS));
+        // Also check counts and the public fixed-buffer interface, including
+        // short/unequal buffers and the untouched padding of a full buffer.
+        for (stm_len, nstm_len) in [(0, 0), (1, 3), (17, 7), (KA2_MAX_ACTIVE, KA2_MAX_ACTIVE)] {
+            let mut stm = vec![-1; stm_len];
+            let mut nstm = vec![-1; nstm_len];
+            assert_eq!(
+                fill_ka2_feature_indices_from_board(board, &mut stm, &mut nstm),
+                (expected.len(), expected.len())
+            );
+            for (i, &value) in stm.iter().enumerate() {
+                assert_eq!(value, expected.get(i).map_or(-1, |&(s, _)| s as i32));
+            }
+            for (i, &value) in nstm.iter().enumerate() {
+                assert_eq!(value, expected.get(i).map_or(-1, |&(_, n)| n as i32));
+            }
+        }
+    }
+
+    #[test]
+    fn single_scan_matches_legacy_for_every_piece_colour_and_square() {
+        for &pt in &BOARD_PIECE_TYPES {
+            for color in [Color::Black, Color::White] {
+                for sq in 0..81 {
+                    let mut board = ShogiBoard {
+                        black_king_sq: Square::from_index((sq + 1) % 81),
+                        white_king_sq: Square::from_index((sq + 2) % 81),
+                        ..Default::default()
+                    };
+                    board.board[board.black_king_sq.index()] = Piece::new(Color::Black, PieceType::King);
+                    board.board[board.white_king_sq.index()] = Piece::new(Color::White, PieceType::King);
+                    board.board[sq] = Piece::new(color, pt);
+                    for stm in [Color::Black, Color::White] {
+                        board.side_to_move = stm;
+                        assert_legacy_sequence(&board);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_scan_preserves_order_on_varied_boards_with_hands_and_promotions() {
+        let mut seed = 0x19da_8632_a149_c771u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..1024 {
+            let mut squares: Vec<usize> = (0..81).collect();
+            for i in (1..squares.len()).rev() {
+                squares.swap(i, next() as usize % (i + 1));
+            }
+            let mut board = ShogiBoard {
+                black_king_sq: Square::from_index(squares[0]),
+                white_king_sq: Square::from_index(squares[1]),
+                ..Default::default()
+            };
+            board.board[squares[0]] = Piece::new(Color::Black, PieceType::King);
+            board.board[squares[1]] = Piece::new(Color::White, PieceType::King);
+            let mut cursor = 2;
+            for (&pt, count) in HAND_PIECE_TYPES.iter().zip([18, 4, 4, 4, 4, 2, 2]) {
+                for _ in 0..count {
+                    let color = if next() & 1 == 0 { Color::Black } else { Color::White };
+                    match next() % 4 {
+                        0 => {} // piece box / handicap position
+                        1 => match color {
+                            Color::Black => board.black_hand.add(pt, 1),
+                            Color::White => board.white_hand.add(pt, 1),
+                        },
+                        _ => {
+                            let piece_type = if next() & 1 == 0 { pt } else { pt.promote() };
+                            board.board[squares[cursor]] = Piece::new(color, piece_type);
+                            cursor += 1;
+                        }
+                    }
+                }
+            }
+            for stm in [Color::Black, Color::White] {
+                board.side_to_move = stm;
+                assert_legacy_sequence(&board);
+            }
+        }
+    }
+
+    #[test]
+    fn single_scan_preserves_missing_king_skip_and_repeated_piece_order() {
+        let mut board = ShogiBoard {
+            black_king_sq: Square::from_index(4),
+            white_king_sq: Square::from_index(76),
+            ..Default::default()
+        };
+        // Stress both halves of the 81-bit board and many occurrences of a
+        // single piece type, without assuming a maximum per-type array size.
+        board.board.fill(Piece::new(Color::White, PieceType::Pawn));
+        board.board[4] = Piece::new(Color::Black, PieceType::King);
+        board.board[76] = Piece::new(Color::White, PieceType::King);
+        assert_legacy_sequence(&board);
+        board.black_king_sq = Square::NONE;
+        assert_legacy_sequence(&board);
+        board.side_to_move = Color::White;
+        assert_legacy_sequence(&board);
+        board.white_king_sq = Square::NONE;
+        assert_legacy_sequence(&board);
+    }
 
     #[test]
     fn dims() {
