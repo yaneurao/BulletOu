@@ -277,14 +277,58 @@ class GridSearchTests(unittest.TestCase):
         code, calls = self.run_grid([*extra, "--resume"], resumed)
         self.assertEqual((code, calls.call_count), (0, 2))
 
-    def test_resume_does_not_erase_progress_without_checkpoint(self):
+    def test_resume_archives_unsaved_progress_and_restarts_initial_state(self):
         def interrupted(command, directory, cwd, trial_id):
             self.summary(directory, [self.metrics(sb=2)])
             raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
             self.run_grid(child=interrupted)
-        with self.assertRaisesRegex(ValueError, "no resumable checkpoint"):
-            self.run_grid(["--resume"])
+        old = grid.trial_dir(self.output, self.plan()["trials"][0])
+        original_log = (old / grid.SUMMARY_CSV_NAME).read_bytes()
+        (old / "resume-config.txt").write_text("stale-pointer", encoding="utf-8")
+        def restarted(command, directory, cwd, trial_id):
+            self.assertNotIn("--resume", command)
+            self.assertFalse((directory / "resume-config.txt").exists())
+            self.assertEqual(grid.log_rows(directory), [])
+            return self.fake_run(command, directory, cwd, trial_id)
+        code, run = self.run_grid(["--resume"], restarted)
+        self.assertEqual((code, run.call_count), (0,2))
+        archives = list((self.output / "interrupted-runs").iterdir())
+        self.assertEqual(len(archives),1)
+        self.assertEqual((archives[0] / grid.SUMMARY_CSV_NAME).read_bytes(), original_log)
+        self.assertEqual((archives[0] / "resume-config.txt").read_text(), "stale-pointer")
+
+    def test_unsaved_restart_retains_common_initial_checkpoint(self):
+        cp = self.checkpoint(self.root / "base")
+        extra = ["--checkpoint", str(cp)]
+        def interrupted(command,directory,cwd,trial_id):
+            self.summary(directory,[self.metrics(sb=2)])
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_grid(extra,interrupted)
+        def restarted(command,directory,cwd,trial_id):
+            self.assertNotIn("--resume",command)
+            s=grid.read_json(Path(command[2]))
+            self.assertEqual(s["initial_state"],str(cp / "state.bin"))
+            self.assertEqual(s["initial_dataloader_pos"],str(cp / "dataloader_pos.txt"))
+            return self.fake_run(command,directory,cwd,trial_id)
+        self.assertEqual(self.run_grid([*extra,"--resume"],restarted)[0],0)
+
+    def test_unsaved_restart_handles_truncated_csv_and_dry_run_is_read_only(self):
+        def interrupted(command,directory,cwd,trial_id):
+            self.summary(directory,[self.metrics(sb=2)])
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_grid(child=interrupted)
+        directory=grid.trial_dir(self.output,self.plan()["trials"][0])
+        path=directory / grid.SUMMARY_CSV_NAME
+        path.write_text("epoch,superbatch,test_value_accuracy\n1,",encoding="utf-8")
+        with patch.object(grid,"preflight_exe"),redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*self.argv,"--resume","--dry-run"]),0)
+        self.assertFalse((self.output / "interrupted-runs").exists())
+        self.assertEqual(self.run_grid(["--resume"])[0],0)
+        archive=next((self.output / "interrupted-runs").iterdir())
+        self.assertEqual((archive / grid.SUMMARY_CSV_NAME).read_text(),"epoch,superbatch,test_value_accuracy\n1,")
 
     def test_failed_run_even_with_final_save_not_skipped(self):
         plan = self.plan()
@@ -387,13 +431,17 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 2}, {"incomplete"})
         self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 1}, {"done"})
 
-    def test_extension_rejects_missing_checkpoint_without_writes(self):
+    def test_extension_with_missing_checkpoint_restarts_only_that_condition(self):
         argv, old = self.saved_scale_grid()
         (grid.trial_dir(self.output, old["trials"][1]) / "0002" / "state.bin").unlink()
-        before = (self.output / grid.MANIFEST).read_bytes()
-        with self.assertRaisesRegex(ValueError, "no resumable checkpoint"):
-            grid.main([*argv, "--resume", "--epochs", "7"])
-        self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
+        def child(command,directory,cwd,trial_id):
+            self.assertEqual("--resume" in command,trial_id != 2)
+            return self.fake_run(command,directory,cwd,trial_id)
+        with patch.object(grid,"preflight_exe"),patch.object(grid,"run_child",side_effect=child),redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*argv,"--resume","--epochs","7"]),0)
+        archives=list((self.output / "interrupted-runs").iterdir())
+        self.assertEqual(len(archives),1)
+        self.assertTrue(archives[0].name.startswith(old["trials"][1]["name"]))
 
     def test_extension_rejects_changed_condition_shrink_and_new_values(self):
         argv, old = self.saved_scale_grid()

@@ -39,7 +39,7 @@ Lists form a Cartesian product, not zipped pairs. Invalid combinations such as `
 | `--summary-only` | Rebuild aggregate CSV from the manifest and logs; no training, executable, or original settings needed |
 | `--summary-csv PATH` | Defaults to `<grid root>/grid_summary.csv`. Must be a `.csv` outside `trials/` to protect source logs |
 | `--dry-run` | Plan only; no writes or training |
-| `--resume` | Resume unfinished conditions from their own latest saved checkpoints |
+| `--resume` | Resume unfinished conditions from their latest checkpoints; archive unsaved attempts and restart from the original initial state if no checkpoint exists |
 | `--continue-on-error` | Continue remaining conditions after a child training failure. Runner still exits nonzero if any failed |
 
 The runner controls `output`, `output_folder`, `tag`, `resume`, and `no_resume` per trial. Other common settings are preserved except explicit grid overrides and `--epochs`. The original JSON is never edited. Relative input paths use the **invocation working directory**, just as in standalone BulletOu. Resume from the same directory with the same command.
@@ -120,7 +120,11 @@ For saves only at each epoch end, set `"save_rate": 0` or `"save_rate": "none"` 
 
 ## Resume and summary-only
 
-Repeating a command skips completed conditions. Add `--resume` for unfinished conditions with checkpoints; unsaved progress rolls back according to native BulletOu resume rules. If interrupted before any resumable checkpoint, the runner refuses to erase recorded progress. Preserve that result and restart using a new dedicated grid root.
+Repeating a command skips completed conditions. Add `--resume` for unfinished conditions. If a checkpoint exists, resume from it; unsaved progress rolls back according to native BulletOu resume rules.
+
+**If no resumable checkpoint exists, the trial restarts from its original initial state within the same grid.** An interruption before the first save in epoch 1 therefore restarts at the beginning of epoch 1. The original common initial checkpoint and dataloader position are honored if configured; otherwise initialization is from scratch. The interrupted sb's unsaved state cannot be recovered.
+
+The previous trial directory is moved intact to `<grid root>/interrupted-runs/<trial-name>-<timestamp>-<identifier>/`, and the trial restarts under its original ID and output directory. Old logs and incomplete saves are preserved but excluded from the new run's aggregate. Stdout prints `[RESTART]` and `[ARCHIVE]`. Completed and unselected conditions are not restarted. No manual deletion or new grid root is necessary.
 
 Ordinary reruns reject a changed plan. With `--resume`, you may select a subset of existing grid conditions and increase their total epoch budget. Other training settings (LR, teacher, batch size, etc.) must remain unchanged. Rebuilding the executable at the same path is allowed, but comparisons across implementations require care. Keep input files, initial state, progress.bin and count.bin contents fixed as well.
 
@@ -143,7 +147,7 @@ python .\grid_search.py `
 - IDs and directory names, including their original hashes, stay unchanged. Original `bulletou-settings.json` files stay intact; updated launch settings go into `bulletou-resume-settings.json` and the manifest. The common JSON is never written back.
 - Existing report epochs are preserved and every newly added epoch is included in the same `grid_summary.csv`. With the original epochs 1–5, `--epochs 10` reports 1–10 on extension.
 - Unselected 1800 retains its original budget and results. It is not launched and does not get fictitious rows for epochs 6–10.
-- Progress without a resumable checkpoint is an error, never a silent restart from scratch.
+- If an extended condition has no usable checkpoint, its previous result is archived and training restarts from the original initial state through the target epoch. Extending five to ten without a checkpoint therefore trains epochs 1–10 again.
 - Repeat the same `--resume --epochs 10` command after interruption. Once complete, it skips completed conditions instead of adding more epochs. Reducing the target is rejected.
 - Add `--dry-run` to inspect mapped trials, existing folders and target epochs without writing files or starting training.
 

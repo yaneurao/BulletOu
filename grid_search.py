@@ -326,6 +326,43 @@ def has_resume_checkpoint(directory: Path) -> bool:
                for p in directory.glob("*/state.bin"))
 
 
+def restart_unsaved_trials(root: Path, plan: dict, selected: set[int]) -> None:
+    """Under the grid lock, archive unsaved attempts before parsing their logs.
+
+    A killed process can leave a partial CSV row or stale resume-config. Move
+    the whole attempt intact so neither can contaminate a fresh native run.
+    Completed conditions and all usable native checkpoints remain untouched.
+    """
+    for trial in plan["trials"]:
+        if trial["id"] not in selected:
+            continue
+        directory = trial_dir(root, trial)
+        if not directory.exists() or not any(directory.iterdir()) or has_resume_checkpoint(directory):
+            continue
+        check_trial_settings_file(directory, trial)
+        state_path = directory / "grid-state.json"
+        state = read_json(state_path) if state_path.is_file() else {}
+        try:
+            if is_complete(directory, trial, state):
+                continue
+        except (ValueError, csv.Error):
+            pass  # Preserve the truncated/malformed unsaved log in the archive.
+        archive = root / "interrupted-runs" / f"{directory.name}-{time.strftime('%Y%m%d-%H%M%S')}-{time.time_ns()}"
+        resolved_root = root.resolve()
+        if (not directory.resolve().is_relative_to(resolved_root)
+                or not archive.resolve().is_relative_to(resolved_root)):
+            raise ValueError("unsafe unsaved-trial archive path; nothing was moved")
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        directory.rename(archive)
+        directory.mkdir()
+        atomic_json(directory / "grid-state.json", {
+            "status": "pending", "elapsed_seconds": state.get("elapsed_seconds", 0),
+            "restarted_from_archive": str(archive),
+        })
+        print(f"[RESTART] trial={trial['id']} no resumable checkpoint; restarting from the original initial state (epoch 1), not the interrupted sb", flush=True)
+        print(f"[ARCHIVE] previous attempt preserved: {archive}", flush=True)
+
+
 def training_identity(settings: dict) -> dict:
     """Epoch budget may increase; all actual training conditions must match."""
     return {k: v for k, v in settings.items() if k not in {"output", "tag", "max_epochs"}}
@@ -365,11 +402,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             raise ValueError(f"cannot reduce trial {trial['id']} max_epochs from {old} to {new}; use --epochs {old} or higher")
         directory = trial_dir(root, trial)
         check_trial_settings_file(directory, trial)
-        state_path = directory / "grid-state.json"
-        state = read_json(state_path) if state_path.exists() else {}
         if new > old:
-            if (log_rows(directory) or state.get("status") == "done") and not has_resume_checkpoint(directory):
-                raise ValueError(f"trial {trial['id']} has no resumable checkpoint for extension; nothing was overwritten")
             report_epochs.update(range(old + 1, new + 1))
             trial["settings"]["max_epochs"] = new
         selected.add(trial["id"])
@@ -551,6 +584,8 @@ def main(argv=None) -> int:
             if (root / "trials").exists() or summary_path.exists():
                 raise ValueError("output contains trials/ or a summary but no manifest; use an empty grid root")
             atomic_json(manifest_path, plan)
+        if args.resume:
+            restart_unsaved_trials(root, plan, selected)
         write_summary(root, plan, summary_path)
         print(f"[SUMMARY] initialized: {summary_path}", flush=True)
         for trial in plan["trials"]:
@@ -566,8 +601,6 @@ def main(argv=None) -> int:
             resume = has_resume_checkpoint(directory)
             if (resume or log_rows(directory)) and not args.resume:
                 raise ValueError(f"trial {trial['id']} is incomplete; rerun the same command with --resume")
-            if log_rows(directory) and not resume:
-                raise ValueError(f"trial {trial['id']} has progress but no resumable checkpoint; keep this result and choose a new grid root to restart from the common base")
             directory.mkdir(parents=True, exist_ok=True)
             settings_path = directory / "bulletou-settings.json"
             check_trial_settings_file(directory, trial)
