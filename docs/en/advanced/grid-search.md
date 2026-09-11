@@ -116,6 +116,8 @@ Missing/non-finite metrics remain blank. Older measured values are never substit
 
 Native save frequency and epoch-end saves are unchanged. **The runner neither deletes checkpoints nor makes best-checkpoint copies.** Budget disk space for all conditions' saves.
 
+For saves only at each epoch end, set `"save_rate": 0` or `"save_rate": "none"` in the common settings. Explicit `validation_rate: 1` / `quantized_validation_rate: 1` still measure every sb independently. See the [validation tutorial](../tutorial/4-validation.md#45-save-frequency-is-separate) for disabling epoch-end saves and the associated caveats.
+
 ## Resume and summary-only
 
 Repeating a command skips completed conditions. Add `--resume` for unfinished conditions with checkpoints; unsaved progress rolls back according to native BulletOu resume rules. If interrupted before any resumable checkpoint, the runner refuses to erase recorded progress. Preserve that result and restart using a new dedicated grid root.

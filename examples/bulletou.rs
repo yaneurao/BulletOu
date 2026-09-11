@@ -3491,6 +3491,13 @@ fn effective_save_rate(args: &Args) -> usize {
     args.save_rate.unwrap_or(DEFAULT_SAVE_RATE)
 }
 
+fn parse_save_rate(value: &str) -> Result<usize, String> {
+    if value == "none" {
+        return Ok(0);
+    }
+    value.parse::<usize>().map_err(|_| "expected a non-negative integer or 'none' (same as 0)".to_string())
+}
+
 fn validation_rate_label(args: &Args) -> String {
     args.validation_rate.map(|n| n.to_string()).unwrap_or_else(|| effective_save_rate(args).to_string())
 }
@@ -3500,12 +3507,12 @@ fn validation_period(args: &Args) -> Option<usize> {
         Some(n) if n < 0 => None,
         Some(0) => None,
         Some(n) => Some(n as usize),
-        None => Some(effective_save_rate(args)),
+        None => Some(effective_save_rate(args)).filter(|&rate| rate > 0),
     }
 }
 
 fn validation_is_epoch_end_only(args: &Args) -> bool {
-    args.validation_rate == Some(0)
+    args.validation_rate == Some(0) || (args.validation_rate.is_none() && effective_save_rate(args) == 0)
 }
 
 fn quantized_validation_period(args: &Args, save_rate: usize) -> Option<usize> {
@@ -3513,7 +3520,7 @@ fn quantized_validation_period(args: &Args, save_rate: usize) -> Option<usize> {
         Some(n) if n < 0 => None,
         Some(0) => None,
         Some(n) => Some(n as usize),
-        None => Some(save_rate),
+        None => Some(save_rate).filter(|&rate| rate > 0),
     }
 }
 
@@ -4743,7 +4750,9 @@ struct Args {
     yaneuraou_quant_scale: Option<f32>,
 
     /// Save every N superbatches (1 = save every superbatch, 5 = every 5th).
-    #[arg(long)]
+    /// Use 0 or none to disable periodic saves; each epoch's final superbatch
+    /// is still saved unless --no-save-epoch-end is set. Omission defaults to 20.
+    #[arg(long, value_parser = parse_save_rate, value_name = "N|none")]
     save_rate: Option<usize>,
 
     /// Run held-out validation every N superbatches. Use 0 for epoch-end only,
@@ -24423,7 +24432,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
 
     let mut chunks = Vec::new();
     let mut cumulative_steps = 0usize;
-    let save_rate = effective_save_rate(args).max(1);
+    let save_rate = effective_save_rate(args);
+    let save_period_sbs = Some(save_rate).filter(|&rate| rate > 0);
     let validation_enabled = cuda_cpp_should_schedule_validation(args);
     let validation_period_sbs = if validation_enabled { validation_period(args) } else { None };
     let validation_epoch_end_only = validation_enabled && validation_is_epoch_end_only(args);
@@ -24436,7 +24446,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     for epoch in start_epoch..=max_epochs {
         let mut first_superbatch = if epoch == start_epoch { first_epoch_start_superbatch } else { 1 };
         while first_superbatch <= superbatches {
-            let save_boundary = next_superbatch_rate_boundary(first_superbatch, save_rate);
+            let save_boundary = save_period_sbs.map(|rate| next_superbatch_rate_boundary(first_superbatch, rate));
             let validation_boundary = if let Some(rate) = validation_period_sbs {
                 next_superbatch_rate_boundary(first_superbatch, rate)
             } else {
@@ -24449,10 +24459,13 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
             } else {
                 usize::MAX
             };
-            let last_superbatch =
-                save_boundary.min(validation_boundary).min(quantized_validation_boundary).min(superbatches);
-            let save_checkpoint = (save_boundary <= superbatches && last_superbatch == save_boundary)
-                || (last_superbatch == superbatches && save_boundary > superbatches && save_epoch_end);
+            let last_superbatch = save_boundary
+                .unwrap_or(usize::MAX)
+                .min(validation_boundary)
+                .min(quantized_validation_boundary)
+                .min(superbatches);
+            let save_checkpoint =
+                save_boundary == Some(last_superbatch) || (last_superbatch == superbatches && save_epoch_end);
             let run_validation = validation_enabled
                 && ((validation_epoch_end_only && last_superbatch == superbatches)
                     || (!validation_epoch_end_only && (last_superbatch == validation_boundary || save_checkpoint)));
@@ -28577,6 +28590,93 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
+    fn cuda_cpp_run_schedule_zero_save_rate_preserves_epoch_ends_and_validation() {
+        for save_rate in ["0", "none"] {
+            let base = Args::try_parse_from([
+                "bulletou",
+                "--teacher",
+                "/dev/null",
+                "--backend",
+                "cuda-cpp",
+                "--arch",
+                "SFNN_halfka2_1024_7_64_k3k3",
+                "--test-teacher",
+                "validation.psv",
+                "--superbatches",
+                "3",
+                "--max-epochs",
+                "2",
+                "--save-rate",
+                save_rate,
+                "--batch-size",
+                "64",
+                "--positions-per-superbatch",
+                "128",
+            ])
+            .unwrap();
+            base.validate_backend_flags().unwrap();
+            assert_eq!(effective_save_rate(&base), 0);
+            assert_eq!(validation_period(&base), None);
+            assert!(validation_is_epoch_end_only(&base));
+            assert_eq!(quantized_validation_period(&base, 0), None);
+
+            let schedule = cuda_cpp_run_schedule(&base).unwrap();
+            assert_eq!(schedule.total_steps, 12);
+            assert_eq!(
+                schedule.chunks.iter().map(|c| (c.epoch, c.superbatch)).collect::<Vec<_>>(),
+                vec![(1, 3), (2, 3)]
+            );
+            assert!(
+                schedule.chunks.iter().all(|c| c.save_checkpoint && c.run_validation && c.run_quantized_validation)
+            );
+
+            // Independent per-sb measurements must not create intermediate checkpoints.
+            let mut frequent = base.clone();
+            frequent.validation_rate = Some(1);
+            frequent.quantized_validation_rate = Some(1);
+            let schedule = cuda_cpp_run_schedule(&frequent).unwrap();
+            assert_eq!(schedule.total_steps, 12);
+            assert_eq!(schedule.chunks.len(), 6);
+            for chunk in &schedule.chunks {
+                assert_eq!(chunk.save_checkpoint, chunk.superbatch == 3);
+                assert!(chunk.run_validation && chunk.run_quantized_validation);
+            }
+
+            // Disable epoch-end saves too, without suppressing explicit validation.
+            frequent.no_save_epoch_end = true;
+            let schedule = cuda_cpp_run_schedule(&frequent).unwrap();
+            assert_eq!(schedule.total_steps, 12);
+            assert_eq!(schedule.chunks.len(), 6);
+            assert!(
+                schedule.chunks.iter().all(|c| !c.save_checkpoint && c.run_validation && c.run_quantized_validation)
+            );
+
+            let mut unsaved = base.clone();
+            unsaved.no_save_epoch_end = true;
+            let schedule = cuda_cpp_run_schedule(&unsaved).unwrap();
+            assert_eq!(schedule.chunks.len(), 2);
+            // Default ordinary validation inherits rate=0 (epoch-end); default qvalid follows saves.
+            assert!(
+                schedule.chunks.iter().all(|c| !c.save_checkpoint && c.run_validation && !c.run_quantized_validation)
+            );
+            unsaved.validation_rate = Some(-1);
+            unsaved.quantized_validation_rate = Some(-1);
+            let schedule = cuda_cpp_run_schedule(&unsaved).unwrap();
+            assert_eq!(schedule.total_steps, 12);
+            assert!(
+                schedule.chunks.iter().all(|c| !c.save_checkpoint && !c.run_validation && !c.run_quantized_validation)
+            );
+
+            // Disabling implicit epoch-end saves must still keep positive-rate saves on a boundary.
+            unsaved.save_rate = Some(3);
+            let schedule = cuda_cpp_run_schedule(&unsaved).unwrap();
+            assert_eq!(schedule.chunks.len(), 2);
+            assert!(schedule.chunks.iter().all(|c| c.save_checkpoint));
+        }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
     fn cuda_cpp_run_schedule_resumes_mid_epoch_from_next_superbatch() {
         use clap::Parser as _;
 
@@ -29116,6 +29216,43 @@ mod tests {
         assert_eq!(progress_only.king_hand_pair, 1.0);
         assert_eq!(progress_only.king_progress_pair, 1.0);
         assert_eq!(progress_only.hand_progress_pair, 1.0);
+    }
+
+    #[test]
+    fn save_rate_none_is_identical_to_zero() {
+        let base = ["bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_7_64_k3k3"];
+        let zero = Args::try_parse_from(base.into_iter().chain(["--save-rate", "0"])).unwrap();
+        let none = Args::try_parse_from(base.into_iter().chain(["--save-rate", "none"])).unwrap();
+        assert_eq!(zero.save_rate, Some(0));
+        assert_eq!(none.save_rate, Some(0));
+        assert_eq!(resume_signature(&zero), resume_signature(&none));
+        assert!(resume_signature_matches(&resume_signature(&zero), &none));
+        for invalid in ["-1", "1.5", "null", "invalid"] {
+            assert!(Args::try_parse_from(base.into_iter().chain(["--save-rate", invalid])).is_err());
+        }
+    }
+
+    #[test]
+    fn settings_save_rate_zero_none_and_cli_overrides() {
+        let path = std::env::temp_dir().join(format!("bulletou-save-rate-{}.json", std::process::id()));
+        for (json_value, cli_value, expected) in [
+            ("0", None, 0),
+            ("\"none\"", None, 0),
+            ("null", None, DEFAULT_SAVE_RATE),
+            ("\"none\"", Some("3"), 3),
+            ("3", Some("none"), 0),
+            ("3", Some("0"), 0),
+        ] {
+            std::fs::write(&path, format!(r#"{{"teacher":"/dev/null","save_rate":{json_value}}}"#)).unwrap();
+            let mut raw =
+                vec![OsString::from("bulletou"), OsString::from("--settings-file"), path.as_os_str().to_owned()];
+            if let Some(value) = cli_value {
+                raw.extend([OsString::from("--save-rate"), OsString::from(value)]);
+            }
+            let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+            assert_eq!(effective_save_rate(&args), expected);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

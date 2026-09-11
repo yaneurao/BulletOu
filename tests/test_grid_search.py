@@ -104,6 +104,16 @@ class GridSearchTests(unittest.TestCase):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.plan(extra)
 
+    def test_zero_and_none_save_rates_pass_through_without_affecting_validation(self):
+        for value in (0, "none"):
+            with self.subTest(value=value):
+                grid.atomic_json(self.settings_path, {**self.common, "save_rate": value,
+                                 "validation_rate": 1, "quantized_validation_rate": 1})
+                for trial in self.plan()["trials"]:
+                    self.assertEqual(trial["settings"]["save_rate"], value)
+                    self.assertEqual(trial["settings"]["validation_rate"], 1)
+                    self.assertEqual(trial["settings"]["quantized_validation_rate"], 1)
+
     def test_invalid_values_rejected(self):
         for extra in (["--grid", "wrm_target_scaling", "NaN"],
                       ["--grid", "superbatches", "0"], ["--grid", "batch_size", "1.5"],

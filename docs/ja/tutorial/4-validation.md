@@ -79,7 +79,7 @@
 
 ## 4.5 保存頻度とは別に考える
 
-`save_rate` / `--save-rate` は checkpoint を保存する頻度です。
+`save_rate` / `--save-rate` は checkpoint を保存する頻度（単位: sb）です。正の整数ならその間隔で保存し、`0` または `"none"` なら途中の定期保存を行いません。省略時は `20` です。
 
 `validation_rate` / `--validation-rate` は accuracy / loss を測る頻度です。
 
@@ -89,7 +89,7 @@
 たとえば、保存は epoch 末だけでよく、検証は毎 sb 見たい場合は次のようにします。
 
 ```powershell
---save-rate 9999 `
+--save-rate 0 `
 --validation-rate 1
 ```
 
@@ -97,12 +97,29 @@
 
 ```json
 {
-  "save_rate": 9999,
+  "save_rate": 0,
   "validation_rate": 1
 }
 ```
 
-`--save-epoch-end` はデフォルトで有効なので、`--save-rate` を大きくしても epoch 末の checkpoint は保存されます。
+JSON の `"save_rate": "none"`、CLI の `--save-rate none` も `0` と同じ意味です。JSONでは `none` を文字列として引用符で囲んでください。`null` は省略扱いで、`0` とは異なります。
+
+`--save-epoch-end` はデフォルトで有効なので、`save_rate: 0` でも**各epochの最後のsb**は保存されます。全学習の最終epochだけ、という意味ではありません。
+
+epoch末の暗黙保存も無効にするには、次のように指定します。
+
+```json
+{
+  "save_rate": 0,
+  "no_save_epoch_end": true
+}
+```
+
+CLIでは `--save-rate none --no-save-epoch-end` です。これで学習中の番号付きcheckpointを保存しなくなります。正常終了時の `cuda-cpp-direct/` への最終出力は別処理で、この指定では無効になりません。途中で停止した場合、未保存の重みからはresumeできません。
+
+正の `save_rate` を指定したままの場合、`no_save_epoch_end` は定期保存を止めません。例えば `superbatches: 324, save_rate: 81` なら、sb 324も定期保存の対象です。
+
+保存頻度を変えても、明示した検証頻度は変わりません。`save_rate: 0` で検証頻度を省略すると、通常のvalidationはepoch末のみ、量子化validationは保存時のみです。`lr_schedule: "plateau"` は従来どおり `save_rate: 1` が必要です。
 
 ## 4.6 量子化後の検証
 

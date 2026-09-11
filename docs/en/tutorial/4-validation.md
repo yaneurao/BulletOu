@@ -79,7 +79,7 @@ When validation is enabled, BulletOu prints lines like:
 
 ## 4.5 Save frequency is separate
 
-`save_rate` / `--save-rate` controls checkpoint saves.
+`save_rate` / `--save-rate` controls checkpoint saves in sb units. A positive integer saves at that interval; `0` or `"none"` disables periodic intermediate saves. Omission defaults to `20`.
 
 `validation_rate` / `--validation-rate` controls accuracy / loss measurement.
 
@@ -89,7 +89,7 @@ validation is not run, `test_value_accuracy` / `test_value_loss` are `-`.
 For example, to save only at epoch end but validate every sb:
 
 ```powershell
---save-rate 9999 `
+--save-rate 0 `
 --validation-rate 1
 ```
 
@@ -97,12 +97,29 @@ or in `bulletou-settings.json`:
 
 ```json
 {
-  "save_rate": 9999,
+  "save_rate": 0,
   "validation_rate": 1
 }
 ```
 
-`--save-epoch-end` is enabled by default, so epoch-end checkpoints are still written even when `--save-rate` is large.
+JSON `"save_rate": "none"` and CLI `--save-rate none` mean exactly the same as `0`. Quote `none` as a string in JSON. JSON `null` means omission, not `0`.
+
+`--save-epoch-end` is enabled by default, so `save_rate: 0` still saves **the final sb of each epoch**, not just the final epoch of the entire run.
+
+To disable implicit epoch-end saves as well:
+
+```json
+{
+  "save_rate": 0,
+  "no_save_epoch_end": true
+}
+```
+
+The CLI equivalent is `--save-rate none --no-save-epoch-end`. This disables numbered checkpoints during training. The final output to `cuda-cpp-direct/` on normal completion is a separate operation and is not disabled by these settings. Unsaved weights cannot be resumed after interruption.
+
+With a positive `save_rate`, `no_save_epoch_end` does not disable periodic saves. For example, `superbatches: 324, save_rate: 81` still saves at sb 324 because it is a periodic boundary.
+
+Explicit validation rates remain independent of saves. With `save_rate: 0` and omitted validation rates, ordinary validation runs at epoch end, while quantized validation runs only on saves. `lr_schedule: "plateau"` still requires `save_rate: 1`.
 
 ## 4.6 Quantized validation
 
