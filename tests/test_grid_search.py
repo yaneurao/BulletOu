@@ -329,6 +329,115 @@ class GridSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside trials"):
             self.run_grid(["--summary-csv", str(self.output / "trials" / "a" / "summary-learn.csv")])
 
+    def saved_scale_grid(self):
+        argv = [*self.argv[:-3], "--wrm-target-scalings", "600", "1200", "1800"]
+        plan = grid.make_plan(grid.parse_args(argv))
+        self.output.mkdir()
+        grid.atomic_json(self.output / grid.MANIFEST, plan)
+        for t in plan["trials"]:
+            directory = grid.trial_dir(self.output, t)
+            self.checkpoint(directory, "0002")
+            self.summary(directory, [self.metrics(epoch=1), self.metrics(epoch=2, checkpoint="0002")])
+            grid.atomic_json(directory / "bulletou-settings.json", t["settings"])
+            grid.atomic_json(directory / "grid-state.json", {"status": "done", "elapsed_seconds": 3.0})
+        return argv, plan
+
+    def test_extend_subset_preserves_ids_folders_and_old_csv_results(self):
+        argv, old = self.saved_scale_grid()
+        untouched = grid.trial_dir(self.output, old["trials"][2])
+        before = {p.name: p.read_bytes() for p in untouched.iterdir() if p.is_file()}
+        original = {t["id"]: (grid.trial_dir(self.output, t) / "bulletou-settings.json").read_bytes()
+                    for t in old["trials"]}
+        requested = [*argv[:-1], "--resume", "--epochs", "7"]  # 600 / 1200 only
+        seen = []
+
+        def resumed(command, directory, cwd, trial_id):
+            seen.append(trial_id)
+            self.assertIn("--resume", command)
+            s = grid.read_json(Path(command[2]))
+            self.assertEqual(s["max_epochs"], 7)
+            self.assertEqual(directory, grid.trial_dir(self.output, old["trials"][trial_id-1]))
+            self.checkpoint(directory, "0007")
+            self.summary(directory, [*grid.log_rows(directory), *[
+                self.metrics(epoch=e, checkpoint="0007" if e == 7 else "-") for e in range(3,8)]])
+            return 0, 1.0
+
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child", side_effect=resumed), redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main(requested), 0)
+            self.assertEqual(grid.main(requested), 0)  # Idempotent; no second extension.
+        self.assertEqual(seen, [1,2])
+        merged = grid.read_json(self.output / grid.MANIFEST)
+        self.assertEqual([t["settings"]["max_epochs"] for t in merged["trials"]], [7,7,2])
+        self.assertEqual(merged["axes"], old["axes"])
+        self.assertEqual(merged["report_epochs"], list(range(1,8)))
+        self.assertEqual(before, {p.name: p.read_bytes() for p in untouched.iterdir() if p.is_file()})
+        for t in old["trials"]:
+            self.assertEqual(original[t["id"]], (grid.trial_dir(self.output,t) / "bulletou-settings.json").read_bytes())
+        rows = grid.summarize(self.output, merged)[1]
+        self.assertEqual(len(rows), 16)  # 7 + 7 + 2; no fictitious extra 1800 epochs.
+        self.assertTrue(all(r["status"] == "done" for r in rows))
+
+    def test_resume_reordered_subset_keeps_original_trial_id(self):
+        argv, old = self.saved_scale_grid()
+        req = grid.make_plan(grid.parse_args([*argv[:-3], "1200", "--epochs", "7", "--resume"]))
+        merged, selected = grid.plan_resume(self.output, old, req)
+        self.assertEqual(selected, {2})
+        self.assertEqual(merged["trials"][1]["name"], old["trials"][1]["name"])
+        rows = grid.summarize(self.output, merged)[1]
+        self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 2}, {"incomplete"})
+        self.assertEqual({r["trial_status"] for r in rows if r["trial"] == 1}, {"done"})
+
+    def test_extension_rejects_missing_checkpoint_without_writes(self):
+        argv, old = self.saved_scale_grid()
+        (grid.trial_dir(self.output, old["trials"][1]) / "0002" / "state.bin").unlink()
+        before = (self.output / grid.MANIFEST).read_bytes()
+        with self.assertRaisesRegex(ValueError, "no resumable checkpoint"):
+            grid.main([*argv, "--resume", "--epochs", "7"])
+        self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
+
+    def test_extension_rejects_changed_condition_shrink_and_new_values(self):
+        argv, old = self.saved_scale_grid()
+        before = (self.output / grid.MANIFEST).read_bytes()
+        for arguments in ([*argv, "--resume", "--epochs", "1"],
+                          [*argv[:-3], "2400", "--resume", "--epochs", "7"]):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                grid.main(arguments)
+        grid.atomic_json(self.settings_path, {**self.common, "lr": 0.0003})
+        with self.assertRaisesRegex(ValueError, "training settings changed"):
+            grid.main([*argv, "--resume", "--epochs", "7"])
+        self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
+
+    def test_extension_dry_run_and_lock_failure_do_not_write(self):
+        argv, old = self.saved_scale_grid()
+        before = (self.output / grid.MANIFEST).read_bytes()
+        with patch.object(grid,"preflight_exe"), patch.object(grid,"run_child") as child, redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*argv,"--resume","--epochs","7","--dry-run"]),0)
+            with grid.grid_lock(self.output):
+                with self.assertRaisesRegex(ValueError, "another grid"):
+                    grid.main([*argv,"--resume","--epochs","7"])
+            child.assert_not_called()
+        self.assertEqual(before,(self.output / grid.MANIFEST).read_bytes())
+
+    def test_extension_resume_after_interrupt_keeps_new_target(self):
+        argv, old = self.saved_scale_grid()
+        requested=[*argv[:-3],"600","--resume","--epochs","7"]
+        def interrupted(command,directory,cwd,trial_id):
+            self.checkpoint(directory,"0003")
+            self.summary(directory,[*grid.log_rows(directory),self.metrics(epoch=3,checkpoint="0003")])
+            raise KeyboardInterrupt
+        with patch.object(grid,"preflight_exe"), patch.object(grid,"run_child",side_effect=interrupted), redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                grid.main(requested)
+        def resumed(command,directory,cwd,trial_id):
+            self.assertIn("--resume",command)
+            self.assertEqual(grid.log_rows(directory)[-1]["epoch"],"3")
+            self.assertEqual(grid.read_json(Path(command[2]))["max_epochs"],7)
+            self.summary(directory,[*grid.log_rows(directory),*[self.metrics(epoch=e) for e in range(4,8)]])
+            return 0,1.0
+        with patch.object(grid,"preflight_exe"), patch.object(grid,"run_child",side_effect=resumed) as child, redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main(requested),0)
+            self.assertEqual(child.call_count,1)
+
 
 if __name__ == "__main__":
     unittest.main()

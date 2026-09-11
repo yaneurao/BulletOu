@@ -122,7 +122,33 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 
 同じコマンドを再実行すると完了済みの条件をスキップします。未完了条件に保存checkpointがある場合は `--resume` を付けてください。保存時点より後の未保存分は本体の通常resumeと同じく巻き戻ります。保存前に中断してcheckpointが一つもない場合は、記録済みの進捗を勝手に消さずエラーにします。その結果を残したまま、新しいgrid専用出力先でやり直してください。
 
-開始後のgrid内容・epoch数・共通設定がmanifestと違う場合はエラーです。異なる条件を同じ試行として混ぜません。実行ファイルは同じpathで再ビルドして構いませんが、実装変更前後の比較には注意してください。データ・開始state・progress.bin・count.bin等の入力ファイルも内容を固定してください。
+通常の再実行ではmanifestと異なる計画を拒否します。ただし `--resume` では、既存gridの一部の条件だけを選び、最大epoch数を増やして延長できます。LR・教師・batch size等、epoch数以外の学習条件は変更できません。実行ファイルは同じpathで再ビルドして構いませんが、実装変更前後の比較には注意してください。データ・開始state・progress.bin・count.bin等の入力ファイルも内容を固定してください。
+
+### 完了した条件を延長する
+
+例えば600／1200／1800を各5epochで計画した既存gridで、600／1200だけをさらに5epoch、**通算10epochまで**学習するには、同じ出力先を指定します。共通JSONの `max_epochs: 5` は書き換えなくて構いません。
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
+  --output-folder D:\BulletOu-snapshots\20260911\grid-k3k3-b65536-sb40m `
+  --wrm-target-scalings 600 1200 `
+  --epochs 10 `
+  --resume
+```
+
+- `--epochs 10` は「追加10epoch」ではなく、通算の終了epochです。`--epochs 1 2 3 4 5 6 7 8 9 10` と列挙しても構いません。
+- 通常のgrid引数に書いた条件だけ実行します。専用のtrial選択オプションはありません。元のgrid軸名はすべて指定し、値のリストを絞ってください。未登録の条件は追加せずエラーです。
+- 600／1200それぞれの保存済みcheckpointから、本体の `--resume` で重み・optimizer・教師位置を継続します。完了した5epoch目の保存があればepoch 6から再開します。中断中なら最後の保存点から再開し、未保存分は巻き戻ります。
+- trial番号・フォルダ名は変えません。名前末尾のhashも作成時のものを維持します。
+- 元の `bulletou-settings.json` は保持し、延長後の設定は `bulletou-resume-settings.json` とmanifestに記録します。共通JSONへの書き戻しはしません。
+- 既存の集計epochを保持し、延長区間の各epochを同じ `grid_summary.csv` に追加します。元の集計が1～5なら、`--epochs 10` だけでも1～10を集計します。
+- 指定しなかった1800は学習・設定を変更せず、既存の1～5epochの結果だけCSVに残します。1800の6～10epochという空行は作りません。
+- 保存checkpointがなく、既に進捗がある条件は延長できません。勝手に初期化して学習し直すことはありません。
+- 延長中に止めた場合も、同じ `--resume --epochs 10` のコマンドで再開できます。10epoch完了後の再実行はスキップし、さらに5epochを勝手に追加しません。目標epochの縮小は拒否します。
+- `--dry-run` を追加すると、対応付けられた既存trial・フォルダ・終了epochを表示するだけです。ファイルを書き換えず、学習も開始しません。
+
+同じgridを実行中のrunnerがある場合は、先にそちらを停止してください。同じ出力先への実行・更新はファイルロックで排他します。
 
 ```powershell
 python .\grid_search.py `

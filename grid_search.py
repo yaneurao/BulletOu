@@ -9,6 +9,7 @@ survivor, reset optimizers, prune trials, or delete checkpoints.
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import itertools
@@ -105,7 +106,7 @@ def parse_args(argv=None):
     p.add_argument("--summary-csv", type=Path)
     p.add_argument("--summary-only", action="store_true", help="Rebuild CSV from the manifest and existing logs; no trainer needed")
     p.add_argument("--dry-run", action="store_true", help="Validate and display the plan without writing files or training")
-    p.add_argument("--resume", action="store_true", help="Resume unfinished conditions from their own latest saved checkpoint")
+    p.add_argument("--resume", action="store_true", help="Resume selected existing grid conditions; increase --epochs to extend their total epoch budget")
     p.add_argument("--continue-on-error", action="store_true")
     a = p.parse_args(argv)
     if a.epochs is not None and (not a.epochs or min(a.epochs) < 1):
@@ -325,6 +326,57 @@ def has_resume_checkpoint(directory: Path) -> bool:
                for p in directory.glob("*/state.bin"))
 
 
+def training_identity(settings: dict) -> dict:
+    """Epoch budget may increase; all actual training conditions must match."""
+    return {k: v for k, v in settings.items() if k not in {"output", "tag", "max_epochs"}}
+
+
+def check_trial_settings_file(directory: Path, trial: dict) -> None:
+    path = directory / "bulletou-settings.json"
+    if not path.exists():
+        return
+    saved = read_json(path)
+    expected = trial["settings"]
+    # Keep the original launch file immutable; extensions use resume-settings.
+    if (training_identity(saved) != training_identity(expected)
+            or saved.get("output") != expected.get("output") or saved.get("tag") != expected.get("tag")
+            or type(saved.get("max_epochs")) is not int
+            or not 1 <= saved["max_epochs"] <= expected["max_epochs"]):
+        raise ValueError(f"trial settings were edited: {path}; refusing to overwrite")
+
+
+def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[int]]:
+    """Read-only reconciliation. Preserve IDs, folders and unselected conditions."""
+    if (stored.get("version") != 1 or any(stored.get(k) != requested.get(k) for k in ("exe", "cwd"))
+            or set(stored.get("axes", {})) != set(requested["axes"])):
+        raise ValueError("existing grid manifest differs: resume requires the same executable path, cwd and grid axis names")
+    merged = copy.deepcopy(stored)
+    selected = set()
+    report_epochs = set(stored["report_epochs"]) | set(requested["report_epochs"])
+    for candidate in requested["trials"]:
+        matches = [t for t in merged["trials"] if t["parameters"] == candidate["parameters"]]
+        if len(matches) != 1:
+            raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
+        trial = matches[0]
+        old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
+        if training_identity(trial["settings"]) != training_identity(candidate["settings"]):
+            raise ValueError(f"existing grid manifest differs: trial {trial['id']} training settings changed; only max_epochs may increase")
+        if new < old:
+            raise ValueError(f"cannot reduce trial {trial['id']} max_epochs from {old} to {new}; use --epochs {old} or higher")
+        directory = trial_dir(root, trial)
+        check_trial_settings_file(directory, trial)
+        state_path = directory / "grid-state.json"
+        state = read_json(state_path) if state_path.exists() else {}
+        if new > old:
+            if (log_rows(directory) or state.get("status") == "done") and not has_resume_checkpoint(directory):
+                raise ValueError(f"trial {trial['id']} has no resumable checkpoint for extension; nothing was overwritten")
+            report_epochs.update(range(old + 1, new + 1))
+            trial["settings"]["max_epochs"] = new
+        selected.add(trial["id"])
+    merged["report_epochs"] = sorted(report_epochs)
+    return merged, selected
+
+
 def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict]]:
     parameter_columns = list(dict.fromkeys([*plan["axes"], *COMMON_COLUMNS]))
     parameter_columns = [key for key in parameter_columns
@@ -340,7 +392,13 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
         state_path = directory / "grid-state.json"
         state = read_json(state_path) if state_path.is_file() else {}
         rows = log_rows(directory)
+        trial_status = state.get("status", "pending")
+        target = (trial["settings"]["max_epochs"], trial["settings"]["superbatches"])
+        if trial_status == "done" and not any((int(r["epoch"]), int(r["superbatch"])) == target for r in rows):
+            trial_status = "incomplete"  # Completed the old budget, not the extended one.
         for epoch in epochs or plan["report_epochs"]:
+            if epoch > trial["settings"]["max_epochs"]:
+                continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
             closed = last and int(last["superbatch"]) == trial["settings"]["superbatches"]
@@ -349,7 +407,7 @@ def summarize(root: Path, plan: dict, epochs=None) -> tuple[list[str], list[dict
                 status = "incomplete"
             row = {key: trial["settings"].get(key, "") for key in parameter_columns}
             row.update(trial=trial["id"], epoch=epoch, superbatch=last.get("superbatch", ""),
-                       status=status, trial_status=state.get("status", "pending"),
+                       status=status, trial_status=trial_status,
                        elapsed_seconds=state.get("elapsed_seconds", ""), output_dir=str(directory),
                        checkpoint=checkpoint_path(directory, last))
             for key in (*METRICS, "positions", "lr_start", "lr_end"):
@@ -450,10 +508,19 @@ def main(argv=None) -> int:
         return 0
 
     plan = make_plan(args)
-    if manifest_path.is_file() and read_json(manifest_path) != plan:
+    stored = read_json(manifest_path) if manifest_path.is_file() else None
+    selected = {t["id"] for t in plan["trials"]}
+    if stored is not None and args.resume:
+        plan, selected = plan_resume(root, stored, plan)
+    elif stored is not None and stored != plan:
         raise ValueError("existing grid manifest differs from this plan; restore the original settings/grid or choose a different --output-folder (nothing was overwritten)")
-    preflight_exe(plan)
-    print(f"[CONFIG] conditions={len(plan['trials'])} report_epochs={plan['report_epochs']} sequential=true", flush=True)
+    execution_plan = {**plan, "trials": [t for t in plan["trials"] if t["id"] in selected]}
+    preflight_exe(execution_plan)
+    print(f"[CONFIG] conditions={len(selected)} total_conditions={len(plan['trials'])} report_epochs={plan['report_epochs']} sequential=true", flush=True)
+    if stored is not None and args.resume:
+        for trial in execution_plan["trials"]:
+            old = next(t for t in stored["trials"] if t["id"] == trial["id"])
+            print(f"[RESUME PLAN] trial={trial['id']} parameters={trial['parameters']} max_epochs={old['settings']['max_epochs']}->{trial['settings']['max_epochs']} output={trial_dir(root, trial)}", flush=True)
     print("[CONFIG] output/output_folder/tag/resume are controlled per trial; all other common settings are preserved", flush=True)
     print(f"[CONFIG] relative teacher/input paths use cwd={plan['cwd']}", flush=True)
     objective_keys = {"wrm_target_scaling", "wrm_target_offset", "wrm_in_scaling", "wrm_in_offset",
@@ -466,7 +533,7 @@ def main(argv=None) -> int:
         if s.get("validation_rate") == -1 or s.get("quantized_validation_rate") == -1:
             print(f"[WARN] trial={trial['id']}: validation disabled; unmeasured CSV cells will be blank", flush=True)
     if args.dry_run:
-        for trial in plan["trials"]:
+        for trial in execution_plan["trials"]:
             print(f"[PLAN {trial['id']}] {json.dumps(trial['parameters'], ensure_ascii=False)}", flush=True)
             print(f"  output={trial_dir(root, trial)}", flush=True)
             print(f"  settings={json.dumps(trial['settings'], ensure_ascii=False)}", flush=True)
@@ -476,8 +543,10 @@ def main(argv=None) -> int:
     failures = 0
     with grid_lock(root):
         if manifest_path.is_file():
-            if read_json(manifest_path) != plan:
+            if read_json(manifest_path) != stored:
                 raise ValueError("grid manifest changed before lock acquisition")
+            if stored != plan:
+                atomic_json(manifest_path, plan)
         else:
             if (root / "trials").exists() or summary_path.exists():
                 raise ValueError("output contains trials/ or a summary but no manifest; use an empty grid root")
@@ -485,6 +554,9 @@ def main(argv=None) -> int:
         write_summary(root, plan, summary_path)
         print(f"[SUMMARY] initialized: {summary_path}", flush=True)
         for trial in plan["trials"]:
+            if trial["id"] not in selected:
+                print(f"[SKIP] trial={trial['id']} not selected; existing results retained", flush=True)
+                continue
             directory = trial_dir(root, trial)
             state_path = directory / "grid-state.json"
             state = read_json(state_path) if state_path.is_file() else {}
@@ -498,8 +570,7 @@ def main(argv=None) -> int:
                 raise ValueError(f"trial {trial['id']} has progress but no resumable checkpoint; keep this result and choose a new grid root to restart from the common base")
             directory.mkdir(parents=True, exist_ok=True)
             settings_path = directory / "bulletou-settings.json"
-            if settings_path.exists() and read_json(settings_path) != trial["settings"]:
-                raise ValueError(f"trial settings were edited: {settings_path}; refusing to overwrite")
+            check_trial_settings_file(directory, trial)
             if not settings_path.exists():
                 atomic_json(settings_path, trial["settings"])
             if resume:

@@ -122,7 +122,32 @@ For saves only at each epoch end, set `"save_rate": 0` or `"save_rate": "none"` 
 
 Repeating a command skips completed conditions. Add `--resume` for unfinished conditions with checkpoints; unsaved progress rolls back according to native BulletOu resume rules. If interrupted before any resumable checkpoint, the runner refuses to erase recorded progress. Preserve that result and restart using a new dedicated grid root.
 
-Changes to grid contents, epoch budget, or common settings are rejected against the manifest. Restore the original plan or use another output root. Rebuilding the executable at the same path is allowed, but comparisons across implementations require care. Keep input files, initial state, progress.bin and count.bin contents fixed as well.
+Ordinary reruns reject a changed plan. With `--resume`, you may select a subset of existing grid conditions and increase their total epoch budget. Other training settings (LR, teacher, batch size, etc.) must remain unchanged. Rebuilding the executable at the same path is allowed, but comparisons across implementations require care. Keep input files, initial state, progress.bin and count.bin contents fixed as well.
+
+### Extend completed conditions
+
+For an existing 600/1200/1800 grid planned for five epochs each, extend only 600/1200 by five epochs, **to ten epochs total**, using the same output root:
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
+  --output-folder D:\BulletOu-snapshots\20260911\grid-k3k3-b65536-sb40m `
+  --wrm-target-scalings 600 1200 `
+  --epochs 10 `
+  --resume
+```
+
+- `--epochs 10` is the total endpoint, not ten additional epochs. It overrides the common JSON's `max_epochs`, so that file can remain at five.
+- Existing grid arguments select conditions; no separate selection flag is needed. Keep all original axis names and narrow their value lists. Unknown conditions are rejected, not added.
+- Each selected condition resumes its own saved weights, optimizer state and teacher position via native `--resume`. A completed epoch-five checkpoint starts at epoch six; interrupted unsaved progress rolls back to the last checkpoint.
+- IDs and directory names, including their original hashes, stay unchanged. Original `bulletou-settings.json` files stay intact; updated launch settings go into `bulletou-resume-settings.json` and the manifest. The common JSON is never written back.
+- Existing report epochs are preserved and every newly added epoch is included in the same `grid_summary.csv`. With the original epochs 1–5, `--epochs 10` reports 1–10 on extension.
+- Unselected 1800 retains its original budget and results. It is not launched and does not get fictitious rows for epochs 6–10.
+- Progress without a resumable checkpoint is an error, never a silent restart from scratch.
+- Repeat the same `--resume --epochs 10` command after interruption. Once complete, it skips completed conditions instead of adding more epochs. Reducing the target is rejected.
+- Add `--dry-run` to inspect mapped trials, existing folders and target epochs without writing files or starting training.
+
+Stop any runner already using this grid before executing the extension. The output root remains protected by an exclusive file lock.
 
 ```powershell
 python .\grid_search.py `
