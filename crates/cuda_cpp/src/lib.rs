@@ -1889,6 +1889,24 @@ pub struct SfnnForwardWorkspace {
 }
 
 impl SfnnForwardWorkspace {
+    /// Sum of FT/L1-normal/L1-square/L2 upper counts and normalized output squares.
+    /// Caller reuses 1280 floats of scratch; all intermediate activations stay on GPU.
+    pub fn validation_stats(&self, ctx: &Context, partials: &F32Buffer) -> Result<[f64; 5]> {
+        self.validate()?;
+        expect_len("validation stats partials", 1280, partials.len())?;
+        let shape = self.layout.shape;
+        // SAFETY: buffers are validated above; the backend checks context and lengths.
+        check(unsafe {
+            ffi::bulletou_cuda_cpp_sfnn_validation_stats(
+                ctx.as_ptr(), self.stm_l0.as_ptr(), self.nstm_l0.as_ptr(),
+                self.l2_input.as_ptr(), self.l2.as_ptr(), self.output.as_ptr(), partials.as_ptr(),
+                self.layout.batch_size, shape.ft_size, shape.l1_hidden, shape.l2_size,
+            )
+        })?;
+        let host = partials.download(ctx)?;
+        Ok(std::array::from_fn(|i| host[i * 256..(i + 1) * 256].iter().map(|v| f64::from(*v)).sum()))
+    }
+
     pub fn new(ctx: &Context, layout: SfnnForwardWorkspaceLayout) -> Result<Self> {
         layout.validate()?;
         Ok(Self {
@@ -8961,6 +8979,13 @@ mod ffi {
     }
 
     unsafe extern "C" {
+        pub fn bulletou_cuda_cpp_sfnn_validation_stats(
+            ctx: *mut BulletOuCudaCppContext,
+            stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
+            l2_input: *mut BulletOuCudaCppF32Buffer, l2: *mut BulletOuCudaCppF32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer, partials: *mut BulletOuCudaCppF32Buffer,
+            batch: usize, ft: usize, hidden: usize, l2_size: usize,
+        ) -> i32;
         pub fn bulletou_cuda_cpp_last_error(out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_device_name(device: i32, out: *mut c_char, out_len: usize) -> i32;
         pub fn bulletou_cuda_cpp_context_create(device: i32, out: *mut *mut BulletOuCudaCppContext) -> i32;
@@ -9800,6 +9825,9 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    mod validation_stats {
+        include!("validation_stats_tests.rs");
+    }
     mod qat {
         include!("qat_tests.rs");
     }

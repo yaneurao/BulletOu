@@ -176,7 +176,27 @@ epoch完了処理や量子化後の検証値の追記で新しい値が得られ
 
 sb 1の記録がないepochの `lr` や、bpuの記録がない過去epochの `bpu` も空欄にし、現在の設定からは推定しません。
 
-`batches_per_update` は `summary-learn.csv` のcheckpoint列の直前にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
+`batches_per_update` は `summary-learn.csv` にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
+
+## 4.8 qvalid時の飽和率と出力の大きさ
+
+SFNNのGPU量子化後検証では、qacc/qlossと同じforwardの中間値を使って、以下を自動集計します。追加の引数は不要です。`--quantized-validation-rate 1` なら毎sb、保存時のqvalidでも記録します。
+
+| `summary-learn.csv` の列 | 意味 |
+|---|---|
+| `quantized_ft_upper_ratio` | FTの上限到達率。先後両視点を含む |
+| `quantized_l1_upper_ratio` | L1通常枝の上限到達率。skip出力は含めない |
+| `quantized_l1_square_upper_ratio` | L1二乗枝の上限到達率。二乗と127/128倍を適用した後の値で判定 |
+| `quantized_l2_upper_ratio` | L2の上限到達率 |
+| `quantized_output_raw_rms` | 最終出力のRMS。`sqrt(mean(output²)) × 8128`。FV_SCALEで割る前のraw単位 |
+
+上限到達率は、検証した全局面で使用した要素のうち活性化上限1に到達した要素の割合です。重み自体のclipping率ではありません。CSVでは0〜1の割合（0.08456なら8.456%）、stdoutの `[qstats] mode=gpu` 行では百分率で表示します。最終batchが小さい場合も局面数・要素数で加重して集計します。
+
+列は既存のacc/loss/qacc/qlossの順序を変えず、`batches_per_update` と末尾の `checkpoint` の間に追加します。qvalid未実施sb、過去の未計測行、対象外arch、CPU厳密検証時の新しい診断列は空欄です。既存CSVは次回書き込み時に列名で移行し、既存値を保持します。過去の値を現在のモデルで埋め直しません。
+
+これらは**GPU簡易検証の値**です。CPU整数推論の丸めを全層で再現するものではなく、別途CPUで測定した飽和率・raw RMSとは差が生じ得ます。比較時は計算経路をそろえてください。
+
+追加処理はGPU内の集計と小さな集計結果の転送で、再forwardや中間テンソル全体のCPU転送は行いません。集計用追加VRAMは約5KiBです。処理時間はゼロではなく、qvalidのelapsedに含まれます。学習のforward・loss・勾配・重みは変更しません。
 
 ---
 

@@ -176,7 +176,27 @@ When epoch completion or quantized-validation backfill provides new measurements
 
 `lr` is also blank if sb 1 is missing, and historical `bpu` values without a record are blank. Neither is inferred from the current settings.
 
-`batches_per_update` is also recorded immediately before `checkpoint` in `summary-learn.csv`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
+`batches_per_update` is also recorded in `summary-learn.csv`, allowing this CSV to be reconstructed after deletion. Exporting the table performs no additional inference.
+
+## 4.8 Quantized activation saturation and output magnitude
+
+SFNN GPU quantized validation automatically aggregates the existing qacc/qloss forward buffers. No new option is needed. With `--quantized-validation-rate 1`, diagnostics are measured every sb; save-time GPU qvalid also records them.
+
+| `summary-learn.csv` column | Meaning |
+|---|---|
+| `quantized_ft_upper_ratio` | FT upper-saturation ratio, including both perspectives |
+| `quantized_l1_upper_ratio` | L1 normal-branch upper ratio, excluding the skip output |
+| `quantized_l1_square_upper_ratio` | L1 squared-branch upper ratio, after squaring and multiplying by 127/128 |
+| `quantized_l2_upper_ratio` | L2 upper-saturation ratio |
+| `quantized_output_raw_rms` | Final output RMS: `sqrt(mean(output²)) × 8128`, before FV_SCALE division |
+
+Upper ratios count activation elements reaching the upper bound of 1, not clipped weights. They cover the elements actually used by all validation positions. CSV ratios are 0–1 (0.08456 means 8.456%); stdout `[qstats] mode=gpu` displays percentages. Aggregation weights batches by their actual element counts, including a short final batch.
+
+The five columns follow `batches_per_update` and precede the final `checkpoint` column. The acc/loss/qacc/qloss order is unchanged. New diagnostic cells remain empty for unmeasured sb, historical rows, unsupported architectures and CPU-exact validation. Existing CSVs migrate by column name at the next write, preserving existing values; historical diagnostics are not inferred from current weights.
+
+These are **GPU approximate-validation diagnostics**, not exact integer-engine measurements. Layer rounding differs from CPU-exact inference; compare results from the same path.
+
+The extra operation reduces existing GPU buffers and downloads only small partial sums. It performs no second forward or full activation readback and adds about 5 KiB of VRAM. Its nonzero overhead is included in qvalid elapsed time. Training forward, loss, gradients and weights are unchanged.
 
 ---
 

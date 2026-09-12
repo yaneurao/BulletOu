@@ -2003,6 +2003,36 @@ __global__ void sfnn_stacked_l3_output_kernel(
     output[sample] = sum;
 }
 
+// Read existing forward buffers only. One row per diagnostic, 256 partials
+// per row; no full activation readback and no per-element global atomics.
+__global__ void sfnn_validation_stats_kernel(
+    const float* stm, const float* nstm, const float* l2_input,
+    const float* l2, const float* output, float* partials,
+    size_t batch, size_t ft, size_t hidden, size_t l2_size) {
+    const int metric = blockIdx.y;
+    const size_t n = metric == 0 ? batch * ft :
+        (metric == 1 || metric == 2) ? batch * hidden :
+        metric == 3 ? batch * l2_size : batch;
+    float sum = 0.0f;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        if (metric == 0) sum += float(stm[i] >= 1.0f) + float(nstm[i] >= 1.0f);
+        else if (metric == 1 || metric == 2) {
+            // Square branch first, normal branch second. Skip is excluded.
+            size_t j = (i / hidden) * (2 * hidden) + i % hidden + (metric == 1 ? hidden : 0);
+            sum += float(l2_input[j] >= 1.0f);
+        } else if (metric == 3) sum += float(l2[i] >= 1.0f);
+        else sum += output[i] * output[i];
+    }
+    __shared__ float scratch[256];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = 128; stride; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) partials[metric * 256 + blockIdx.x] = scratch[0];
+}
+
 __device__ float loss_sigmoid(float value) {
     float exp_neg = expf(-value);
     return 1.0f / (1.0f + exp_neg);
@@ -10629,6 +10659,28 @@ extern "C" int bulletou_cuda_cpp_sfnn_apply_residual_count_gates_to_gradients_de
         stride,
         num_stacks,
         "sfnn residual count gate gradients");
+}
+
+extern "C" int bulletou_cuda_cpp_sfnn_validation_stats(
+    BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* stm, BulletOuCudaCppF32Buffer* nstm,
+    BulletOuCudaCppF32Buffer* l2_input, BulletOuCudaCppF32Buffer* l2,
+    BulletOuCudaCppF32Buffer* output, BulletOuCudaCppF32Buffer* partials,
+    size_t batch, size_t ft, size_t hidden, size_t l2_size) {
+    if (set_context_device(ctx) != 0) return -1;
+    if (batch == 0 || ft == 0 || hidden == 0 || l2_size == 0 ||
+        ft > SIZE_MAX / batch || hidden > SIZE_MAX / batch / 2 || l2_size > SIZE_MAX / batch)
+        return fail_message("invalid SFNN validation stats dimensions");
+    if (validate_buffer(ctx, stm, batch * ft, "stats stm") != 0 ||
+        validate_buffer(ctx, nstm, batch * ft, "stats nstm") != 0 ||
+        validate_buffer(ctx, l2_input, batch * hidden * 2, "stats l2 input") != 0 ||
+        validate_buffer(ctx, l2, batch * l2_size, "stats l2") != 0 ||
+        validate_buffer(ctx, output, batch, "stats output") != 0 ||
+        validate_buffer(ctx, partials, 5 * 256, "stats partials") != 0) return -1;
+    sfnn_validation_stats_kernel<<<dim3(256, 5), 256, 0, ctx->stream>>>(
+        stm->ptr, nstm->ptr, l2_input->ptr, l2->ptr, output->ptr, partials->ptr,
+        batch, ft, hidden, l2_size);
+    return check_kernel_launch("sfnn_validation_stats_kernel launch");
 }
 
 extern "C" int bulletou_cuda_cpp_axpy_host(
