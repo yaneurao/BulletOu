@@ -74,9 +74,16 @@ are supported.
 
 FT width1024/batch65536 requires approximately 512 MiB extra VRAM just for
 normalized activations across both views. BN adds GPU reductions/backward.
-BN-enabled qvalid currently uses host readback/folding/upload instead of the
-fast device-only quantization path. These costs are absent with BN disabled.
-Speed and playing-strength improvements have not been established.
+GPU qvalid folds BN and quantizes on-device without host weight readback/upload;
+CPU-exact validation still runs on the CPU. With BN enabled, quantization uses
+f64 scaling before rounding, matching the CPU nn.bin exporter at rounding boundaries.
+Training reductions use 1024-row
+chunks and coalesced 8-unit tiles, preserving double-precision accumulation,
+two-pass variance and EMA definitions. Inference applies running statistics
+directly, without batch reductions. Reduction scratch adds about 1.6 MiB for
+FT1024/L1=8/L2=64, 8 buckets, batch65536 (separate from saved activations).
+BN-disabled runs do not use these buffers. Reduction ordering can cause small
+rounding differences. Playing-strength improvements have not been established.
 
 ## Grid search
 

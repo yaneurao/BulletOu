@@ -112,6 +112,117 @@ __global__ void bn_backward_kernel(float* da,float* db,const float* xa,const flo
     }
 }
 
+
+// Test/benchmark reference path only; default uses coalesced 8-unit tiles.
+// Scratch after stats[2*C]: double mean[C], partial_sum[T*C], partial_aux[T*C].
+// T = ceil(rows/1024). No atomics, no changes to BN/EMA definitions.
+template<int Mode>
+__global__ void bn_partial(const float* a,const float* b,const float* xa,const float* xb,
+    const int* ids,float* stats,size_t rows,size_t stride,size_t width,size_t groups) {
+    size_t lane=threadIdx.x%8,ch=blockIdx.x*8+lane,c=width*groups,u=ch%width,g=ch/width;
+    size_t tiles=(rows+1023)/1024,begin=blockIdx.y*1024,end=min(rows,begin+1024);
+    double* mean=reinterpret_cast<double*>(stats+2*c);
+    double* sums=mean+c;double* aux=sums+tiles*c;
+    __shared__ double s[256],t[256];
+    double p=0,q=0;
+    for(size_t i=begin+threadIdx.x/8;i<end;i+=32) {
+        if(ch>=c || (groups>1 && ids[i]!=static_cast<int>(g)))continue;
+        size_t j=i*stride+u;
+        if constexpr(Mode==0) {p+=a[j];q+=1;if(b){p+=b[j];q+=1;}}
+        if constexpr(Mode==1) {double d=double(a[j])-mean[ch];p+=d*d;q+=1;
+            if(b){d=double(b[j])-mean[ch];p+=d*d;q+=1;}}
+        if constexpr(Mode==2) {p+=a[j];q+=double(a[j])*xa[j];if(b){p+=b[j];q+=double(b[j])*xb[j];}}
+    }
+    s[threadIdx.x]=p;t[threadIdx.x]=q;__syncthreads();
+    for(int d=128;d>=8;d/=2){if(threadIdx.x<d){s[threadIdx.x]+=s[threadIdx.x+d];t[threadIdx.x]+=t[threadIdx.x+d];}__syncthreads();}
+    if(threadIdx.x<8 && ch<c){sums[blockIdx.y*c+ch]=s[lane];aux[blockIdx.y*c+ch]=t[lane];}
+}
+template<int Mode>
+__global__ void bn_finish(float* stats,float* running,float* grads,size_t rows,size_t c,float epsilon,float momentum) {
+    size_t ch=blockIdx.x*blockDim.x+threadIdx.x;if(ch>=c)return;
+    size_t tiles=(rows+1023)/1024;
+    double* mean=reinterpret_cast<double*>(stats+2*c);
+    double* sums=mean+c;double* aux=sums+tiles*c;
+    double p=0,q=0;for(size_t t=0;t<tiles;++t){p+=sums[t*c+ch];q+=aux[t*c+ch];}
+    if constexpr(Mode==0) {mean[ch]=q>0?p/q:0;}
+    if constexpr(Mode==1) {
+        double variance;
+        if(q>=2) {
+            variance=p/q;float m=running[2*c+ch]>0?momentum:1.0f;
+            running[ch]=(1-m)*running[ch]+m*float(mean[ch]);
+            running[c+ch]=(1-m)*running[c+ch]+m*float(p/(q-1));
+            running[2*c+ch]=1;stats[c+ch]=float(q);
+        } else {mean[ch]=running[ch];variance=running[c+ch];stats[c+ch]=0;}
+        stats[ch]=1.0f/sqrtf(float(variance)+epsilon);
+    }
+    if constexpr(Mode==2) {
+        grads[ch]+=float(q);grads[c+ch]+=float(p);
+        float n=stats[c+ch];
+        sums[ch]=n>0?float(p)/n:0;aux[ch]=n>0?float(q)/n:0;
+    }
+}
+template<bool Backward>
+__global__ void bn_apply(float* a,float* b,float* xa,float* xb,const int* ids,
+    const float* params,const float* stats,size_t rows,size_t stride,size_t width,size_t groups) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=rows*width)return;
+    size_t row=j/width,u=j%width,g=groups>1?static_cast<size_t>(ids[row]):0,c=width*groups,ch=g*width+u,k=row*stride+u;
+    const double* mean=reinterpret_cast<const double*>(stats+2*c);
+    if constexpr(!Backward) {
+        float x=float(double(a[k])-mean[ch])*stats[ch];xa[k]=x;a[k]=params[ch]*x+params[c+ch];
+        if(b){x=float(double(b[k])-mean[ch])*stats[ch];xb[k]=x;b[k]=params[ch]*x+params[c+ch];}
+    } else {
+        const double* sums=mean+c;const double* aux=sums+((rows+1023)/1024)*c;
+        float sm=float(sums[ch]),pm=float(aux[ch]),scale=params[ch]*stats[ch];
+        a[k]=scale*(a[k]-sm-xa[k]*pm);
+        if(b)b[k]=scale*(b[k]-sm-xb[k]*pm);
+    }
+}
+__global__ void bn_inference_kernel(float* a,float* b,const int* ids,const float* params,
+    const float* running,size_t rows,size_t stride,size_t width,size_t groups,float epsilon) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j>=rows*width)return;
+    size_t row=j/width,u=j%width,g=groups>1?static_cast<size_t>(ids[row]):0,c=width*groups,ch=g*width+u,k=row*stride+u;
+    float inv=1.0f/sqrtf(running[c+ch]+epsilon);
+    float x=float(double(a[k])-double(running[ch]))*inv;
+    a[k]=params[ch]*x+params[c+ch];
+    if(b) {x=float(double(b[k])-double(running[ch]))*inv;b[k]=params[ch]*x+params[c+ch];}
+}
+thread_local bool bn_reference_test=false;
+extern "C" void bulletou_bn_reference_mode(int enabled) {bn_reference_test=enabled!=0;}
+bool bn_use_reference() {return bn_reference_test || std::getenv("BULLETOU_BN_REFERENCE")!=nullptr;}
+void bn_launch_forward(BulletOuCudaCppContext* ctx,float* a,float* b,float* xa,float* xb,
+    const int* ids,const float* params,float* running,float* stats,
+    size_t rows,size_t stride,size_t width,size_t groups,float epsilon,float momentum,bool training) {
+    if(!training && !bn_use_reference()) {
+        bn_inference_kernel<<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(
+            a,b,ids,params,running,rows,stride,width,groups,epsilon);
+        return;
+    }
+    if(bn_use_reference()) bn_forward_kernel<<<static_cast<unsigned>(width*groups),256,0,ctx->stream>>>(
+        a,b,xa,xb,ids,params,running,stats,rows,stride,width,groups,epsilon,momentum,training);
+    else {
+        size_t c=width*groups;dim3 grid(static_cast<unsigned>((c+7)/8),static_cast<unsigned>((rows+1023)/1024));
+        bn_partial<0><<<grid,256,0,ctx->stream>>>(a,b,xa,xb,ids,stats,rows,stride,width,groups);
+        bn_finish<0><<<static_cast<unsigned>((c+255)/256),256,0,ctx->stream>>>(stats,running,nullptr,rows,c,epsilon,momentum);
+        bn_partial<1><<<grid,256,0,ctx->stream>>>(a,b,xa,xb,ids,stats,rows,stride,width,groups);
+        bn_finish<1><<<static_cast<unsigned>((c+255)/256),256,0,ctx->stream>>>(stats,running,nullptr,rows,c,epsilon,momentum);
+        bn_apply<false><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(a,b,xa,xb,ids,params,stats,rows,stride,width,groups);
+    }
+}
+void bn_launch_backward(BulletOuCudaCppContext* ctx,float* da,float* db,const float* xa,const float* xb,
+    const int* ids,const float* params,const float* stats,float* grads,
+    size_t rows,size_t stride,size_t width,size_t groups) {
+    if(bn_use_reference()) bn_backward_kernel<<<static_cast<unsigned>(width*groups),256,0,ctx->stream>>>(
+        da,db,xa,xb,ids,params,stats,grads,rows,stride,width,groups);
+    else {
+        size_t c=width*groups;dim3 grid(static_cast<unsigned>((c+7)/8),static_cast<unsigned>((rows+1023)/1024));
+        float* scratch=const_cast<float*>(stats);
+        bn_partial<2><<<grid,256,0,ctx->stream>>>(da,db,xa,xb,ids,scratch,rows,stride,width,groups);
+        bn_finish<2><<<static_cast<unsigned>((c+255)/256),256,0,ctx->stream>>>(scratch,nullptr,grads,rows,c,0,0);
+        bn_apply<true><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(da,db,const_cast<float*>(xa),const_cast<float*>(xb),ids,params,stats,rows,stride,width,groups);
+    }
+}
+
 extern "C" int bulletou_bn_forward(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* a,BulletOuCudaCppF32Buffer* b,
     BulletOuCudaCppF32Buffer* xa,BulletOuCudaCppF32Buffer* xb,
@@ -124,12 +235,12 @@ extern "C" int bulletou_bn_forward(BulletOuCudaCppContext* ctx,
     const size_t n=rows*stride,c=groups*width;
     if(validate_buffer(ctx,a,n,"BN input") || validate_buffer(ctx,xa,n,"BN normalized input") ||
        validate_buffer(ctx,params,2*c,"BN affine") || validate_buffer(ctx,running,3*c,"BN running stats") ||
-       validate_buffer(ctx,stats,2*c,"BN batch stats")) return -1;
+       validate_buffer(ctx,stats,(4+4*((rows+1023)/1024))*c,"BN batch stats/scratch")) return -1;
     if((b==nullptr)!=(xb==nullptr)) return fail_message("BN second view requires matching workspace");
     if(b && (validate_buffer(ctx,b,n,"BN second view") || validate_buffer(ctx,xb,n,"BN second view workspace"))) return -1;
     if(groups>1 && validate_i32_buffer(ctx,ids,rows,"BN buckets")) return -1;
     if(set_context_device(ctx)) return -1;
-    bn_forward_kernel<<<static_cast<unsigned>(c),256,0,ctx->stream>>>(a->ptr,b?b->ptr:nullptr,xa->ptr,xb?xb->ptr:nullptr,
+    bn_launch_forward(ctx,a->ptr,b?b->ptr:nullptr,xa->ptr,xb?xb->ptr:nullptr,
         ids?ids->ptr:nullptr,params->ptr,running->ptr,stats->ptr,rows,stride,width,groups,epsilon,momentum,training!=0);
     return check_kernel_launch("BN forward");
 }
@@ -144,13 +255,13 @@ extern "C" int bulletou_bn_backward(BulletOuCudaCppContext* ctx,
         return fail_message("invalid BN backward shape");
     const size_t n=rows*stride,c=groups*width;
     if(validate_buffer(ctx,da,n,"BN gradient") || validate_buffer(ctx,xa,n,"BN normalized input") ||
-       validate_buffer(ctx,params,2*c,"BN affine") || validate_buffer(ctx,stats,2*c,"BN batch stats") ||
+       validate_buffer(ctx,params,2*c,"BN affine") || validate_buffer(ctx,stats,(4+4*((rows+1023)/1024))*c,"BN batch stats/scratch") ||
        validate_buffer(ctx,grads,2*c,"BN affine gradients")) return -1;
     if((db==nullptr)!=(xb==nullptr)) return fail_message("BN backward second view requires matching workspace");
     if(db && (validate_buffer(ctx,db,n,"BN second gradient") || validate_buffer(ctx,xb,n,"BN second normalized input"))) return -1;
     if(groups>1 && validate_i32_buffer(ctx,ids,rows,"BN buckets")) return -1;
     if(set_context_device(ctx)) return -1;
-    bn_backward_kernel<<<static_cast<unsigned>(c),256,0,ctx->stream>>>(da->ptr,db?db->ptr:nullptr,xa->ptr,xb?xb->ptr:nullptr,
+    bn_launch_backward(ctx,da->ptr,db?db->ptr:nullptr,xa->ptr,xb?xb->ptr:nullptr,
         ids?ids->ptr:nullptr,params->ptr,stats->ptr,grads->ptr,rows,stride,width,groups);
     return check_kernel_launch("BN backward");
 }
@@ -158,16 +269,31 @@ extern "C" int bulletou_bn_backward(BulletOuCudaCppContext* ctx,
 int bn_forward_bound(BulletOuCudaCppContext* ctx,int layer,float* a,float* b,
     const int* ids,size_t rows,size_t stride) {
     const auto c=ctx->bn[layer];if(!c.params)return 0;
-    bn_forward_kernel<<<static_cast<unsigned>(c.width*c.groups),256,0,ctx->stream>>>(
+    bn_launch_forward(ctx,
         a,b,c.xa,c.xb,ids,c.params,c.running,c.stats,rows,stride,c.width,c.groups,c.epsilon,c.momentum,c.training);
     return check_kernel_launch("SFNN BN forward");
 }
 int bn_backward_bound(BulletOuCudaCppContext* ctx,int layer,float* a,float* b,
     const int* ids,size_t rows,size_t stride) {
     const auto c=ctx->bn[layer];if(!c.params)return 0;
-    bn_backward_kernel<<<static_cast<unsigned>(c.width*c.groups),256,0,ctx->stream>>>(
+    bn_launch_backward(ctx,
         a,b,c.xa,c.xb,ids,c.params,c.stats,c.grads,rows,stride,c.width,c.groups);
     return check_kernel_launch("SFNN BN backward");
+}
+__global__ void bn_bias_finish(const float* stats,float* gb,size_t rows,size_t width) {
+    size_t u=blockIdx.x*blockDim.x+threadIdx.x;if(u>=width)return;
+    const double* sums=reinterpret_cast<const double*>(stats+2*width)+width;
+    double s=0;for(size_t t=0;t<(rows+1023)/1024;++t)s+=sums[t*width+u];
+    gb[u]+=float(s);
+}
+void bn_bias_sum_bound(BulletOuCudaCppContext* ctx,const float* a,const float* b,float* gb,size_t rows,size_t width) {
+    if(bn_use_reference()) {
+        bn_bias_sum<<<static_cast<unsigned>((width+255)/256),256,0,ctx->stream>>>(a,b,gb,rows,width);
+    } else {
+        dim3 grid(static_cast<unsigned>((width+7)/8),static_cast<unsigned>((rows+1023)/1024));
+        bn_partial<0><<<grid,256,0,ctx->stream>>>(a,b,nullptr,nullptr,nullptr,ctx->bn[0].stats,rows,width,width,1);
+        bn_bias_finish<<<static_cast<unsigned>((width+255)/256),256,0,ctx->stream>>>(ctx->bn[0].stats,gb,rows,width);
+    }
 }
 extern "C" int bulletou_bn_bind(BulletOuCudaCppContext* ctx,int layer,
     BulletOuCudaCppF32Buffer* params,BulletOuCudaCppF32Buffer* running,BulletOuCudaCppF32Buffer* stats,
@@ -180,7 +306,7 @@ extern "C" int bulletou_bn_bind(BulletOuCudaCppContext* ctx,int layer,
         return fail_message("invalid BN binding");
     size_t c=width*groups,n=rows*stride;
     if(validate_buffer(ctx,params,2*c,"BN params") || validate_buffer(ctx,running,3*c,"BN running") ||
-       validate_buffer(ctx,stats,2*c,"BN stats") || validate_buffer(ctx,grads,2*c,"BN gradients") ||
+       validate_buffer(ctx,stats,(4+4*((rows+1023)/1024))*c,"BN stats/scratch") || validate_buffer(ctx,grads,2*c,"BN gradients") ||
        validate_buffer(ctx,xa,n,"BN workspace") || (layer==0 && validate_buffer(ctx,xb,n,"BN second workspace")))return -1;
     ctx->bn[layer]=BnConfig{params->ptr,running->ptr,stats->ptr,grads->ptr,xa->ptr,xb?xb->ptr:nullptr,width,groups,epsilon,momentum,training!=0};
     return 0;

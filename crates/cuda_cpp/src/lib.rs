@@ -6322,6 +6322,15 @@ impl SfnnLayerLrMultipliers {
 }
 
 impl SfnnTrainStepRunner {
+    /// Build the quantized inference model, folding BN on-device when enabled.
+    pub fn build_quantized_proxy(&self,ctx:&Context,base_input_size:usize,virtual_rows:usize,
+        proxy:&SfnnForwardDeviceWeights)->Result<()> {
+        let _bn=self.batch_norm.as_ref().map(|b|b.bind(ctx,1,false)).transpose()?;
+        sfnn_build_quantized_proxy_device(ctx,base_input_size,virtual_rows,&self.weights,proxy,
+            self.factorizer,self.factorizer_alpha,
+            self.residual_count_gates_enabled.then_some(&self.residual_count_gates_by_stack),
+            self.factorizer_axis_confidences_enabled.then_some(&self.factorizer_axis_confidences))
+    }
     fn prepare_l1_qat(&mut self, ctx: &Context, enabled: bool) -> Result<()> {
         if !enabled {
             self.forward_workspace.qat_l1 = None;

@@ -67,8 +67,12 @@ BNなしのcheckpointに新たにBNを追加すると、forwardが変わりま�
 - `average-sfnn-state`と`compare-sfnn-quantization`はBN付きstate.bin未対応です。BNを無視した結果を返さずエラーにします。学習中のvalidation/qvalidとnn.bin出力は対応しています。
 
 BNは追加のGPU集計とbackwardが必要です。FT幅1024・batch65536の場合、両視点の正規化済み値だけで約512 MiBのVRAMが追加されます。
-現実装のBN有効時qvalidはCPU readback・fold・再upload経路を使うため、BNなしのGPU直接変換より遅くなります。
-BN OFFならこの追加領域・経路は使いません。高速化や棋力改善は未保証です。
+GPU版qvalidはGPU上でBNをfold・量子化し、重みのCPU readback・再uploadは行いません。CPU exact版は従来どおりCPUで計算します。
+BN有効時のGPU量子化はnn.bin書き出しと同じく倍率との乗算を倍精度で行い、量子化境界の丸めを合わせます。
+学習の集計は1024局面単位に分割し、隣接8unitをまとめて読みます。倍精度の集計・二段階の分散計算・EMAの定義は変えていません。
+通常validationでは移動統計を直接適用し、batch統計を集計しません。
+集計用の追加scratchはFT1024/L1=8/L2=64、8bucket、batch65536で合計約1.6 MiBです（上記activation保存領域とは別）。
+BN OFFならこれらの追加領域・経路は使いません。加算順序変更による微小な丸め差はあり得ます。棋力改善は未保証です。
 
 ## Grid searchの例
 

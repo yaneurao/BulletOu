@@ -229,7 +229,7 @@ impl Layer {
             groups: self.groups,
             normalized: F32Buffer::new(ctx, rows * stride)?,
             second_normalized: if two_views { Some(F32Buffer::new(ctx, rows * stride)?) } else { None },
-            stats: F32Buffer::new(ctx, 2 * self.width * self.groups)?,
+            stats: F32Buffer::new(ctx, (4 + 4 * rows.div_ceil(1024)) * self.width * self.groups)?,
         })
     }
     fn validate_workspace(&self, w: &Workspace, second: bool, ids: Option<&I32Buffer>) -> Result<()> {
@@ -544,6 +544,48 @@ impl SfnnTrainWeightsReadback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "explicit serial reference/optimized comparison and GPU timing"]
+    fn bn_reference_parity_and_benchmark() {
+        let ctx=Context::new(0).unwrap();
+        for (rows,width,groups,views) in [(257,13,3,false),(259,32,1,true),(65536,1024,1,true),(65536,8,8,false),(65536,64,8,false)] {
+            let mut reference=None;
+            for old in [true,false] {
+                unsafe extern "C" {fn bulletou_bn_reference_mode(enabled:i32);}
+                struct ResetReference;
+                impl Drop for ResetReference {fn drop(&mut self) {unsafe {bulletou_bn_reference_mode(0);}}}
+                let _reset=ResetReference;
+                unsafe {bulletou_bn_reference_mode(old as i32);}
+                let l=Layer::new(&ctx,width,groups,Config::default()).unwrap();
+                let w=l.workspace(&ctx,rows,width,views).unwrap();
+                let x:Vec<_>=(0..rows*width).map(|i|((i*17%997) as f32-498.0)*0.002).collect();
+                let dy:Vec<_>=(0..rows*width).map(|i|((i*13%101) as f32-50.0)*0.00001).collect();
+                let a=F32Buffer::from_host(&ctx,&x).unwrap();
+                let b=views.then(||F32Buffer::from_host(&ctx,&x).unwrap());
+                let da=F32Buffer::from_host(&ctx,&dy).unwrap();
+                let db=views.then(||F32Buffer::from_host(&ctx,&dy).unwrap());
+                let ids=I32Buffer::from_host(&ctx,&(0..rows).map(|i|(i%groups) as i32).collect::<Vec<_>>()).unwrap();
+                l.forward(&ctx,&w,&a,b.as_ref(),Some(&ids),true).unwrap();
+                l.backward(&ctx,&w,&da,db.as_ref(),Some(&ids)).unwrap();
+                if rows<1000 {
+                    let values=[a.download(&ctx).unwrap(),da.download(&ctx).unwrap(),l.gradients.download(&ctx).unwrap(),l.read_state(&ctx).unwrap().running];
+                    if old {reference=Some(values);} else {
+                        for (r,v) in reference.take().unwrap().iter().zip(&values) {
+                            for (&r,&v) in r.iter().zip(v) {close(r,v,2e-5);}
+                        }
+                    }
+                }
+                ctx.synchronize().unwrap();
+                let start=std::time::Instant::now();
+                for _ in 0..5 {
+                    l.forward(&ctx,&w,&a,b.as_ref(),Some(&ids),true).unwrap();
+                    l.backward(&ctx,&w,&da,db.as_ref(),Some(&ids)).unwrap();
+                }
+                ctx.synchronize().unwrap();
+                eprintln!("BN rows={rows} width={width} groups={groups} reference={old} forward+backward={:.3}ms",start.elapsed().as_secs_f64()*200.0);
+            }
+        }
+    }
     fn close(a: f32, b: f32, tol: f32) {
         assert!((a - b).abs() < tol, "{a} != {b}");
     }
@@ -744,6 +786,36 @@ mod tests {
             ..initial
         };
         let dev = SfnnForwardDeviceWeights::from_host(&ctx, host).unwrap();
+        let gpu_proxy=SfnnForwardDeviceWeights::new_dense(&ctx,shape).unwrap();
+        let cpu_fold_proxy=SfnnForwardDeviceWeights::new_dense(&ctx,shape).unwrap();
+        r.build_quantized_proxy(&ctx,shape.input_size,0,&gpu_proxy).unwrap();
+        sfnn_build_quantized_proxy_device(&ctx,shape.input_size,0,&dev,&cpu_fold_proxy,
+            r.factorizer,r.factorizer_alpha,None,None).unwrap();
+        for (a,b) in [(&gpu_proxy.l0w,&cpu_fold_proxy.l0w),(&gpu_proxy.l0b,&cpu_fold_proxy.l0b),
+            (&gpu_proxy.l1w,&cpu_fold_proxy.l1w),(&gpu_proxy.l1b,&cpu_fold_proxy.l1b),
+            (&gpu_proxy.l2w,&cpu_fold_proxy.l2w),(&gpu_proxy.l2b,&cpu_fold_proxy.l2b),
+            (&gpu_proxy.l3w,&cpu_fold_proxy.l3w),(&gpu_proxy.l3b,&cpu_fold_proxy.l3b)] {
+            for (a,b) in a.download(&ctx).unwrap().iter().zip(b.download(&ctx).unwrap()) {
+                close(*a,b,2e-6); // Legacy GPU dequantization uses fast-math division.
+            }
+        }
+        let base=shape.input_size-1;
+        let virtual_shape=SfnnForwardShape {input_size:base,..shape};
+        let gpu_virtual=SfnnForwardDeviceWeights::new_dense(&ctx,virtual_shape).unwrap();
+        let cpu_virtual=SfnnForwardDeviceWeights::new_dense(&ctx,virtual_shape).unwrap();
+        for alpha in [0.0,0.3,1.0,2.0] {
+            let mut alphas=r.factorizer_alpha;alphas.ft=alpha;
+            {
+                let _bn=r.batch_norm.as_ref().unwrap().bind(&ctx,1,false).unwrap();
+                sfnn_build_quantized_proxy_device(&ctx,base,1,&r.weights,&gpu_virtual,
+                    r.factorizer,alphas,None,None).unwrap();
+            }
+            sfnn_build_quantized_proxy_device(&ctx,base,1,&dev,&cpu_virtual,
+                r.factorizer,alphas,None,None).unwrap();
+            for (a,b) in gpu_virtual.l0w.download(&ctx).unwrap().iter().zip(cpu_virtual.l0w.download(&ctx).unwrap()) {
+                close(*a,b,2e-6);
+            }
+        }
         sfnn_forward_device_with_factorizer_and_alpha(
             &ctx,
             &r.device_batch,

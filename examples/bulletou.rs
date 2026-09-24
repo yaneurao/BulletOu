@@ -9101,7 +9101,8 @@ impl CudaCppSfnnQuantizedValidationCache {
     ) -> Result<TestMetrics, String> {
         match self {
             Self::Proxy { inner, device_weights } => {
-                if shape.has_compact_l1() || runner.batch_norm.is_some() {
+                if shape.has_compact_l1()
+                    || (runner.batch_norm.is_some() && std::env::var_os("BULLETOU_BN_REFERENCE").is_some()) {
                     let weights = runner.read_weights(ctx).map_err(|e| e.to_string())?;
                     let proxy_weights = cuda_cpp_sfnn_quantized_proxy_weights_from_readback(
                         args,
@@ -9142,24 +9143,11 @@ impl CudaCppSfnnQuantizedValidationCache {
                     );
                 }
                 let device_weights_ref = device_weights.as_ref().expect("device weights initialized");
-                bulletou_cuda_cpp::sfnn_build_quantized_proxy_device(
+                runner.build_quantized_proxy(
                     ctx,
                     feature_kind.base_input_size(),
                     feature_kind.virtual_rows(),
-                    &runner.weights,
                     device_weights_ref,
-                    runner.factorizer,
-                    runner.factorizer_alpha,
-                    if runner.residual_count_gates_enabled {
-                        Some(&runner.residual_count_gates_by_stack)
-                    } else {
-                        None
-                    },
-                    if runner.factorizer_axis_confidences_enabled {
-                        Some(&runner.factorizer_axis_confidences)
-                    } else {
-                        None
-                    },
                 )
                 .map_err(|e| e.to_string())?;
                 inner.run_device_weights_with_factorizer(
@@ -34346,6 +34334,40 @@ mod tests {
         assert!(qat.effective_sfnn_qat_l1());
         invalid=bn.clone();invalid.sfnn_bn_epsilon=0.0;assert!(invalid.validate_arch_flags().is_err());
         invalid=bn.clone();invalid.sfnn_bn_momentum=1.1;assert!(invalid.validate_arch_flags().is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    #[ignore = "full-size BN checkpoint CPU/GPU quantization comparison; set BULLETOU_BN_TEST_STATE"]
+    fn bn_checkpoint_gpu_quantization_matches_host() {
+        let path=PathBuf::from(std::env::var_os("BULLETOU_BN_TEST_STATE").expect("state path"));
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_halfka2_1024_8_64_progress8","--sfnn-factorizer","shared",
+            "--sfnn-bn-ft","--sfnn-bn-l1","--sfnn-bn-l2"]).unwrap();
+        let feature=cuda_cpp_sfnn_feature_kind_from_arch(args.arch()).unwrap();
+        let state=load_cuda_cpp_sfnn_initial_state(&path,&args,feature).unwrap();
+        let shape=state.weights.shape;
+        let ctx=bulletou_cuda_cpp::Context::new(0).unwrap();
+        let mut runner=bulletou_cuda_cpp::SfnnTrainStepRunner::new(&ctx,state.weights.as_host(),1,1).unwrap();
+        runner.configure_batch_norm(&ctx,[true;3],Default::default(),&state.weights.batch_norm).unwrap();
+        let readback=sfnn_initial_weights_into_readback(state.weights);
+        let expected=cuda_cpp_sfnn_quantized_proxy_weights_from_readback(&args,feature,shape,&readback,None).unwrap();
+        let proxy=bulletou_cuda_cpp::SfnnForwardDeviceWeights::new_dense(&ctx,expected.shape).unwrap();
+        runner.build_quantized_proxy(&ctx,feature.base_input_size(),feature.virtual_rows(),&proxy).unwrap();
+        for (name,gpu,cpu) in [("FT weight",&proxy.l0w,&expected.l0w),("FT bias",&proxy.l0b,&expected.l0b),
+            ("L1 weight",&proxy.l1w,&expected.l1w),("L1 bias",&proxy.l1b,&expected.l1b),
+            ("L2 weight",&proxy.l2w,&expected.l2w),("L2 bias",&proxy.l2b,&expected.l2b),
+            ("L3 weight",&proxy.l3w,&expected.l3w),("L3 bias",&proxy.l3b,&expected.l3b)] {
+            let actual=gpu.download(&ctx).unwrap();
+            let different=actual.iter().zip(cpu).filter(|(a,b)|a!=b).count();
+            let scale=if name.starts_with("FT") {127.0} else if name.ends_with("bias") {8128.0} else {64.0};
+            let quantized_different=actual.iter().zip(cpu).filter(|(a,b)|(*a*scale).round()!=(*b*scale).round()).count();
+            let max_error=actual.iter().zip(cpu).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+            eprintln!("{name}: f32 different={different}/{} quantized different={quantized_different} max_error={max_error}",actual.len());
+            // BN qvalid must agree with CPU export, including quantization boundaries.
+            assert_eq!(quantized_different,0,"{name}");
+            assert_eq!(different,0,"{name} dequantized f32");
+        }
     }
 
     #[test]

@@ -1325,12 +1325,32 @@ __device__ __forceinline__ float sfnn_quantize_dequant_clamped(
     float value,
     float scale,
     float qmin,
-    float qmax) {
+    float qmax, bool precise=false) {
+    if(precise) {
+        // CPU nn.bin export multiplies in f64 before rounding, then dequantizes in f32.
+        double q=round(double(value)*double(scale));
+        double hi=qmax==2147483648.0f?2147483647.0:double(qmax);
+        q=fmin(fmax(q,double(qmin)),hi);
+        return __fdiv_rn(float(q),scale);
+    }
     float q = roundf(value * scale);
     q = fminf(fmaxf(q, qmin), qmax);
     return q / scale;
 }
 
+__device__ float bn_fold_weight(float value,BnConfig bn,size_t bucket,size_t unit) {
+    if(!bn.params || unit>=bn.width)return value;
+    size_t c=bn.width*bn.groups,ch=bucket*bn.width+unit;
+    float r=__fdiv_rn(bn.params[ch],__fsqrt_rn(__fadd_rn(bn.running[c+ch],bn.epsilon)));
+    return __fmul_rn(value,r);
+}
+__device__ float bn_fold_bias(float value,BnConfig bn,size_t bucket,size_t unit) {
+    if(!bn.params || unit>=bn.width)return value;
+    size_t c=bn.width*bn.groups,ch=bucket*bn.width+unit;
+    float r=__fdiv_rn(bn.params[ch],__fsqrt_rn(__fadd_rn(bn.running[c+ch],bn.epsilon)));
+    float shift=__fsub_rn(bn.params[c+ch],__fmul_rn(r,bn.running[ch]));
+    return __fadd_rn(__fmul_rn(value,r),shift);
+}
 __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     const float* src,
     float* dst,
@@ -1338,7 +1358,7 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     size_t dst_input_size,
     size_t virtual_rows,
     size_t ft_size,
-    float scale, float ft_factorizer_alpha) {
+    float scale, float ft_factorizer_alpha, BnConfig bn={}, bool precise=false) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     const size_t total = dst_input_size * ft_size;
     if (tid >= total) {
@@ -1347,12 +1367,13 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
 
     const size_t feature = tid / ft_size;
     const size_t row = tid - feature * ft_size;
-    float value = src[tid];
+    float value = bn_fold_weight(src[tid],bn,0,row);
     if (src_input_size != dst_input_size && virtual_rows != 0) {
         const size_t virtual_feature = dst_input_size + (feature % virtual_rows);
-        value += ft_factorizer_alpha * src[virtual_feature * ft_size + row];
+        float virtual_value=bn_fold_weight(src[virtual_feature * ft_size + row],bn,0,row);
+        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(ft_factorizer_alpha,virtual_value)) : value+ft_factorizer_alpha*virtual_value;
     }
-    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -32768.0f, 32767.0f);
+    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -32768.0f, 32767.0f, precise);
 }
 
 __global__ void sfnn_build_quantized_proxy_vector_kernel(
@@ -1361,12 +1382,12 @@ __global__ void sfnn_build_quantized_proxy_vector_kernel(
     size_t len,
     float scale,
     float qmin,
-    float qmax) {
+    float qmax, BnConfig bn={}, bool precise=false) {
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= len) {
         return;
     }
-    dst[tid] = sfnn_quantize_dequant_clamped(src[tid], scale, qmin, qmax);
+    dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_bias(src[tid],bn,0,tid), scale, qmin, qmax, precise);
 }
 
 __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
@@ -1395,7 +1416,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale) {
+    float scale, BnConfig bn={}, bool precise=false) {
     const size_t weight_cell_count = input_dim * output_dim;
     const size_t total = num_stacks * weight_cell_count;
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1414,7 +1435,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
     float value = residual_gate * weights[tid];
     if (has_shared != 0) {
-        value += shared_alpha * shared_weights[factorizer_cell];
+        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(shared_alpha,shared_weights[factorizer_cell])) : value+shared_alpha*shared_weights[factorizer_cell];
     }
 
     size_t axis_ids[8];
@@ -1452,7 +1473,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
         }
     }
 
-    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -128.0f, 127.0f);
+    dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_weight(value,bn,stack,out_col), scale, -128.0f, 127.0f, precise);
 }
 
 __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
@@ -1479,7 +1500,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale) {
+    float scale, BnConfig bn={}, bool precise=false) {
     const size_t total = num_stacks * output_dim;
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= total) {
@@ -1491,7 +1512,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
     float value = residual_gate * bias[tid];
     if (has_shared != 0) {
-        value += shared_alpha * shared_bias[out_col];
+        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(shared_alpha,shared_bias[out_col])) : value+shared_alpha*shared_bias[out_col];
     }
 
     size_t axis_ids[8];
@@ -1529,7 +1550,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
         }
     }
 
-    dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -2147483648.0f, 2147483647.0f);
+    dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_bias(value,bn,stack,out_col), scale, -2147483648.0f, 2147483647.0f, precise);
 }
 
 __global__ void sfnn_stacked_l1_kernel(
@@ -6075,7 +6096,7 @@ int launch_sfnn_inverse_index_l0_backward(
 
     if(ctx->bn[0].params) {
         if(bn_backward_bound(ctx,0,stm_l0_pre_gradients,nstm_l0_pre_gradients,nullptr,batch,ft_size))return -1;
-        bn_bias_sum<<<static_cast<unsigned>((ft_size+255)/256),256,0,ctx->stream>>>(stm_l0_pre_gradients,nstm_l0_pre_gradients,l0b_gradients,batch,ft_size);
+        bn_bias_sum_bound(ctx,stm_l0_pre_gradients,nstm_l0_pre_gradients,l0b_gradients,batch,ft_size);
         if(check_kernel_launch("BN FT bias backward"))return -1;
     }
     size_t n_features = input_size;
@@ -8644,7 +8665,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         dst_input_size,
         virtual_rows,
         ft_size,
-        qa, ft_factorizer_alpha);
+        qa, ft_factorizer_alpha, ctx->bn[0], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l0w_kernel launch") != 0) return -1;
 
     if (block_count_1d(ft_size, threads, &blocks, "sfnn proxy l0b") != 0) return -1;
@@ -8654,7 +8675,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         ft_size,
         qa,
         -32768.0f,
-        32767.0f);
+        32767.0f, ctx->bn[0], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l0b_kernel launch") != 0) return -1;
 
     if (block_count_1d(l1w_len, threads, &blocks, "sfnn proxy l1w") != 0) return -1;
@@ -8684,7 +8705,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        qb);
+        qb, ctx->bn[1], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l1w_kernel launch") != 0) return -1;
 
     if (block_count_1d(l1b_len, threads, &blocks, "sfnn proxy l1b") != 0) return -1;
@@ -8712,7 +8733,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        fc_bias_scale);
+        fc_bias_scale, ctx->bn[1], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l1b_kernel launch") != 0) return -1;
 
     if (block_count_1d(l2w_len, threads, &blocks, "sfnn proxy l2w") != 0) return -1;
@@ -8742,7 +8763,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        qb);
+        qb, ctx->bn[2], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l2w_kernel launch") != 0) return -1;
 
     if (block_count_1d(l2b_len, threads, &blocks, "sfnn proxy l2b") != 0) return -1;
@@ -8770,7 +8791,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        fc_bias_scale);
+        fc_bias_scale, ctx->bn[2], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l2b_kernel launch") != 0) return -1;
 
     if (block_count_1d(l3w_len, threads, &blocks, "sfnn proxy l3w") != 0) return -1;
@@ -8800,7 +8821,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        qb);
+        qb, {}, ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l3w_kernel launch") != 0) return -1;
 
     if (block_count_1d(l3b_len, threads, &blocks, "sfnn proxy l3b") != 0) return -1;
@@ -8828,7 +8849,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        fc_bias_scale);
+        fc_bias_scale, {}, ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l3b_kernel launch") != 0) return -1;
 
     return ok();
