@@ -19,6 +19,10 @@ class GridSearchTests(unittest.TestCase):
         plan=self.plan(["--grid","sfnn-l2-revive","false","true"])
         self.assertEqual({t["settings"]["sfnn_l2_revive"] for t in plan["trials"]},{False,True})
         self.assertIn("sfnn_l2_revive",grid.COMMON_COLUMNS)
+    def test_l2_revive_zero_grid(self):
+        plan=self.plan(["--grid","sfnn-l2-revive-zero","false","true"])
+        self.assertEqual({t["settings"]["sfnn_l2_revive_zero"] for t in plan["trials"]},{False,True})
+        self.assertIn("sfnn_l2_revive_zero",grid.COMMON_COLUMNS)
     def test_bn_l2_effective_clip_grid(self):
         plan=self.plan(["--grid","sfnn-bn-l2-effective-weight-clip","false","true"])
         self.assertEqual({t["settings"]["sfnn_bn_l2_effective_weight_clip"] for t in plan["trials"]},{False,True})

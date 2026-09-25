@@ -31,8 +31,12 @@ impl Calibration {
         Ok(())
     }
     pub fn candidates(&self) -> Vec<usize> {
+        self.candidates_for(true, false)
+    }
+    pub fn candidates_for(&self, upper: bool, zero: bool) -> Vec<usize> {
         self.upper.iter().enumerate().filter_map(|(i,&hits)| {
-            let n=self.counts[i/self.width]; (n>=1024 && hits==n).then_some(i)
+            let n=self.counts[i/self.width];
+            (n>=1024 && ((upper && hits==n) || (zero && self.lower[i]==n))).then_some(i)
         }).collect()
     }
 }
@@ -41,18 +45,26 @@ impl SfnnTrainStepRunner {
     pub fn l2_revival_done(&self) -> bool {
         self.batch_norm.as_ref().and_then(|b| b.layers[2].as_ref()).is_some_and(|(l,_)|l.revival_done)
     }
+    pub fn l2_zero_revival_done(&self) -> bool {
+        self.batch_norm.as_ref().and_then(|b| b.layers[2].as_ref()).is_some_and(|(l,_)|l.zero_revival_done)
+    }
     pub fn revive_l2(&mut self, ctx:&Context, c:&Calibration) -> Result<Vec<usize>> {
+        self.revive_l2_selected(ctx,c,true,false)
+    }
+    pub fn revive_l2_selected(&mut self, ctx:&Context, c:&Calibration, upper:bool, zero:bool) -> Result<Vec<usize>> {
+        let upper=upper && !self.l2_revival_done();
+        let zero=zero && !self.l2_zero_revival_done();
+        if !upper && !zero { return Ok(Vec::new()); }
         if self.pending_gradient_batches!=0 || !self.bn_qat.as_ref().is_some_and(|q|q.freeze_stats)
             || self.factorizer.any_axis() || self.residual_count_gates_enabled
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
             return Err(CudaCppError::message("L2 revival requires frozen BN QAT, no L2/L3 factorizer or residual gates, and no pending gradients"));
         }
-        if self.l2_revival_done() { return Ok(Vec::new()); }
         let s=self.shape;
         if c.input!=s.l2_in() || c.width!=s.l2_size || c.counts.len()!=s.num_stacks || c.counts.iter().sum::<usize>()==0 {
             return Err(CudaCppError::message("empty or incompatible L2 calibration"));
         }
-        let ids=c.candidates(); let n=s.l2_size*s.num_stacks;
+        let ids=c.candidates_for(upper,zero); let n=s.l2_size*s.num_stacks;
         let bn=self.batch_norm.as_ref().and_then(|b|b.layers[2].as_ref())
             .ok_or_else(||CudaCppError::message("L2 revival requires saved L2 BN"))?;
         let mut state=bn.0.read_state(ctx)?;
@@ -79,14 +91,16 @@ impl SfnnTrainStepRunner {
                     +((beta*8128.0).round()/8128.0) as f64; v.clamp(0.0,1.0)
             }).sum::<f64>()/count as f64;
             let v=if out[i]<0.0 {-1.0/64.0} else {1.0/64.0};
-            ob[g]+=out[i]-v*mean_y as f32; obs.slow_params[g]+=os.slow_params[i]-v*mean_y as f32;
+            let old_activation=if c.lower[i]==c.counts[g] {0.0} else {1.0};
+            ob[g]+=old_activation*out[i]-v*mean_y as f32;
+            obs.slow_params[g]+=old_activation*os.slow_params[i]-v*mean_y as f32;
             out[i]=v;os.slow_params[i]=v;os.momentum[i]=0.0;os.velocity[i]=0.0;
             b[i]=0.0;bs.slow_params[i]=0.0;bs.momentum[i]=0.0;bs.velocity[i]=0.0;
             state.affine[i]=1.0;state.affine[n+i]=beta;
             state.running[i]=0.0;state.running[n+i]=1.0-state.config.epsilon;state.running[2*n+i]=1.0;
             for j in [i,n+i] {state.optimizer.momentum[j]=0.0;state.optimizer.velocity[j]=0.0;state.optimizer.slow_params[j]=state.affine[j];}
         }
-        state.revival_done=true;state.validate()?;
+        state.revival_done|=upper;state.zero_revival_done|=zero;state.validate()?;
         // Validate all host results before modifying device state.
         if w.iter().chain(&b).chain(&out).chain(&ob).any(|x|!x.is_finite()) {return Err(CudaCppError::message("non-finite L2 revival result"));}
         self.weights.l2w.upload(ctx,&w)?;self.weights.l2b.upload(ctx,&b)?;
@@ -108,6 +122,11 @@ mod tests {
         let mut c=Calibration::new(1,3,2);
         c.add(&vec![0;1024],&vec![0.5;1024],&[1.0,0.0,0.5].repeat(1024)).unwrap();
         assert_eq!(c.candidates(),vec![0]);assert_eq!(c.lower[1],1024);
+        assert_eq!(c.candidates_for(false,true),vec![1]);
+        assert_eq!(c.candidates_for(true,true),vec![0,1]);
+        let mut short=Calibration::new(1,1,1);
+        short.add(&[0],&[0.5],&[0.0]).unwrap();
+        assert!(short.candidates_for(false,true).is_empty());
         c.add(&[0],&[0.5],&[0.99,0.0,0.5]).unwrap();assert!(c.candidates().is_empty());
         assert!(c.add(&[-1],&[0.0],&[0.0;3]).is_err());
     }
@@ -123,7 +142,7 @@ mod tests {
         r.configure_bn_qat_mode(&ctx,true,shape.input_size,0,true).unwrap();
         let old=r.weights.l2w.download(&ctx).unwrap();let ft=r.weights.l0w.download(&ctx).unwrap();
         let mut cal=Calibration::new(shape.l2_in(),shape.l2_size,shape.num_stacks);
-        let mut y=vec![0.5;1024*shape.l2_size];for row in 0..1024 {y[row*shape.l2_size]=1.0;}
+        let mut y=vec![0.5;1024*shape.l2_size];for row in 0..1024 {y[row*shape.l2_size]=1.0;y[row*shape.l2_size+1]=0.0;}
         cal.add(&vec![0;1024],&vec![0.2;1024*shape.l2_in()],&y).unwrap();
         assert_eq!(r.revive_l2(&ctx,&cal).unwrap(),vec![0]);
         assert_eq!(r.weights.l0w.download(&ctx).unwrap(),ft);
@@ -132,5 +151,29 @@ mod tests {
         let state=r.read_batch_norm_state(&ctx).unwrap().0[2].clone().unwrap();
         assert!(state.revival_done);assert_eq!(batch_norm::State::decode(&state.encode().unwrap()).unwrap(),state);
         assert!(r.revive_l2(&ctx,&cal).unwrap().is_empty());assert_eq!(r.weights.l2w.download(&ctx).unwrap(),new);
+        assert!(!r.l2_zero_revival_done());
+        let bias_before=r.weights.l3b.download(&ctx).unwrap();
+        assert_eq!(r.revive_l2_selected(&ctx,&cal,true,true).unwrap(),vec![1]);
+        let after=r.weights.l2w.download(&ctx).unwrap();
+        assert_eq!(&after[..shape.l2_in()],&new[..shape.l2_in()]);
+        assert_eq!(&after[2*shape.l2_in()..],&new[2*shape.l2_in()..]);
+        let out=r.weights.l3w.download(&ctx).unwrap();assert_eq!(out[1].abs(),1.0/64.0);
+        let zero_state=r.read_batch_norm_state(&ctx).unwrap().0[2].clone().unwrap();
+        let beta=zero_state.affine[c+1];
+        let activation=(after[shape.l2_in()..2*shape.l2_in()].iter()
+            .map(|w|0.2f64*((w*64.0).round()/64.0) as f64).sum::<f64>()
+            +((beta*8128.0).round()/8128.0) as f64).clamp(0.0,1.0) as f32;
+        let bias_after=r.weights.l3b.download(&ctx).unwrap();
+        assert!((bias_after[0]-bias_before[0]+out[1]*activation).abs()<1e-6);
+        assert_eq!(&bias_after[1..],&bias_before[1..]);
+        assert!(r.l2_revival_done() && r.l2_zero_revival_done());
+        assert!(r.revive_l2_selected(&ctx,&cal,true,true).unwrap().is_empty());
+        for upper in [false,true] {for zero in [false,true] {
+            let mut s=zero_state.clone();s.revival_done=upper;s.zero_revival_done=zero;
+            let decoded=batch_norm::State::decode(&s.encode().unwrap()).unwrap();
+            assert_eq!(s,decoded);
+            let layer=batch_norm::Layer::from_state(&ctx,&decoded).unwrap();
+            assert_eq!(layer.read_state(&ctx).unwrap(),decoded);
+        }}
     }
 }

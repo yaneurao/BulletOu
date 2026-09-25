@@ -41,6 +41,7 @@ impl Config {
 pub struct State {
     /// One-shot L2 revival calibration has already been performed on this lineage.
     pub revival_done: bool,
+    pub zero_revival_done: bool,
     pub width: usize,
     pub groups: usize,
     pub config: Config,
@@ -99,7 +100,7 @@ impl State {
     pub fn encode(&self) -> Result<Vec<f32>> {
         self.validate()?;
         let mut v = vec![
-            if self.revival_done { 2.0 } else { 1.0 },
+            1.0 + f32::from(self.revival_done) + 2.0 * f32::from(self.zero_revival_done),
             self.width as f32,
             self.groups as f32,
             self.config.epsilon,
@@ -120,7 +121,7 @@ impl State {
     }
     pub fn decode(v: &[f32]) -> Result<Self> {
         if v.len() < 7
-            || (v[0] != 1.0 && v[0] != 2.0)
+            || !matches!(v[0], 1.0 | 2.0 | 3.0 | 4.0)
             || v[1] < 1.0
             || v[2] < 1.0
             || !v[1].is_finite()
@@ -134,7 +135,8 @@ impl State {
         let c = channels(width, groups)?;
         expect_len("BN checkpoint", 7 + 11 * c, v.len())?;
         let state = Self {
-            revival_done: v[0] == 2.0,
+            revival_done: v[0] == 2.0 || v[0] == 4.0,
+            zero_revival_done: v[0] == 3.0 || v[0] == 4.0,
             width,
             groups,
             config: Config { epsilon: v[3], momentum: v[4], initial_gamma: v[5], initial_beta: v[6] },
@@ -161,6 +163,7 @@ fn channels(width: usize, groups: usize) -> Result<usize> {
 #[derive(Debug)]
 pub struct Layer {
     pub revival_done: bool,
+    pub zero_revival_done: bool,
     pub width: usize,
     pub groups: usize,
     pub config: Config,
@@ -191,6 +194,7 @@ impl Layer {
             ctx,
             &State {
                 revival_done: false,
+                zero_revival_done: false,
                 width,
                 groups,
                 config,
@@ -210,6 +214,7 @@ impl Layer {
         gradients.fill(ctx, 0.0)?;
         Ok(Self {
             revival_done: s.revival_done,
+            zero_revival_done: s.zero_revival_done,
             width: s.width,
             groups: s.groups,
             config: s.config,
@@ -230,6 +235,7 @@ impl Layer {
     pub fn read_state(&self, ctx: &Context) -> Result<State> {
         Ok(State {
             revival_done: self.revival_done,
+            zero_revival_done: self.zero_revival_done,
             width: self.width,
             groups: self.groups,
             config: self.config,
