@@ -1,4 +1,4 @@
-// Frozen-running-stat fold QAT. Identity STE through both rounding and clipping.
+// Fold QAT. Identity STE through both rounding and clipping.
 // The raw parameter tensors are never quantized in place.
 __global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha,BnConfig bn) {
     size_t j=blockIdx.x*blockDim.x+threadIdx.x;
@@ -8,6 +8,42 @@ __global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size
     float v=bn_fold_weight(src[j],bn,0,u);
     if(vr) v=__fadd_rn(v,__fmul_rn(alpha,bn_fold_weight(src[(base+f%vr)*width+u],bn,0,u)));
     dst[j]=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f,true);
+}
+// Return quantized folded tensors to pre-BN coordinates. Running scale is a
+// detached quantizer calibration, NOT another differentiable BN operation.
+// Unknown channels calibrate on their first batch. Gamma==0 uses raw weights
+// to avoid division by zero and permit gamma to learn away from zero.
+__global__ void bn_qat_unfold_training(const float* w,const float* b,const float* sw,const float* sb,
+    float* qw,float* qb,size_t input,size_t output,size_t groups,int layer,size_t vr,float alpha,BnConfig bn) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x,n=input*output*groups;
+    if(j>=n)return;
+    size_t ch=layer==0?j%output:j/input,u=ch%output,group=ch/output;
+    if(!bn.params || u>=bn.width)return;
+    size_t bc=group*bn.width+u,c=bn.width*bn.groups;
+    float r=bn.params[bc]/sqrtf(bn.running[c+bc]+bn.epsilon);
+    size_t k=layer==0?j/output:j%input;
+    bool calibrated=bn.running[2*c+bc]!=0 && r!=0;
+    float raw=w[j];
+    if(layer==0 && vr)raw+=alpha*w[(input+k%vr)*output+u];
+    if(sw)raw+=alpha*sw[k*output+u];
+    qw[j]=calibrated?qw[j]/r:raw;
+    if(k==0) {
+        // Batch centering cancels pre-BN bias. Keep it raw: unscaling rounded
+        // folded bias would amplify beta rounding by 1/gamma near gamma==0,
+        // destroying variance precision and polluting the running mean.
+        qb[ch]=b[ch]+(sb?alpha*sb[u]:0);
+    }
+}
+extern "C" int bulletou_bn_qat_unfold_training(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* sw,BulletOuCudaCppF32Buffer* sb,
+    BulletOuCudaCppF32Buffer* qw,BulletOuCudaCppF32Buffer* qb,size_t input,size_t output,size_t groups,int layer,size_t vr,float alpha) {
+    if(!ctx || !input || !output || !groups || layer<0 || layer>2 || (vr && layer!=0))return -1;
+    size_t n=input*output*groups;
+    if(validate_buffer(ctx,w,n,"BN QAT unfold raw") || validate_buffer(ctx,qw,n,"BN QAT unfold proxy") ||
+        validate_buffer(ctx,b,output*groups,"BN QAT unfold bias") || validate_buffer(ctx,qb,output*groups,"BN QAT unfold proxy bias"))return -1;
+    bn_qat_unfold_training<<<static_cast<unsigned>((n+255)/256),256,0,ctx->stream>>>(w->ptr,b->ptr,sw?sw->ptr:nullptr,sb?sb->ptr:nullptr,
+        qw->ptr,qb->ptr,input,output,groups,layer,vr,alpha,ctx->bn[layer]);
+    return check_kernel_launch("BN QAT train-mode unfold");
 }
 // Must run before replacing base gradients with raw-coordinate gradients.
 __global__ void bn_qat_ft_virtual(float* g,size_t base,size_t vr,size_t width,float alpha,BnConfig bn) {

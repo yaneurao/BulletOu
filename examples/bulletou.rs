@@ -5206,10 +5206,13 @@ struct Args {
     /// Bucket-wise BatchNorm before L2 clamp.
     #[arg(long)]
     sfnn_bn_l2: bool,
-    /// Fine-tune a saved BN model using folded FT/L1/L2/L3 weight/bias QAT.
-    /// Freezes BN running mean/variance; gamma/beta remain trainable.
+    /// BN-aware FT/L1/L2/L3 weight/bias QAT, including training from scratch.
+    /// Running statistics update unless --sfnn-bn-qat-freeze-stats is selected.
     #[arg(long)]
     sfnn_bn_qat: bool,
+    /// Use inference-fold QAT with frozen, already calibrated BN statistics.
+    #[arg(long)]
+    sfnn_bn_qat_freeze_stats: bool,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5376,9 +5379,12 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.sfnn_bn_qat_freeze_stats && !self.sfnn_bn_qat {
+            return Err("--sfnn-bn-qat-freeze-stats requires --sfnn-bn-qat".into());
+        }
         if self.sfnn_bn_qat {
             if !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2) {
-                return Err("--sfnn-bn-qat requires enabled BN layers and a BN-trained checkpoint".into());
+                return Err("--sfnn-bn-qat requires enabled BN layers".into());
             }
             if self.sfnn_l1_center || self.sfnn_l2_l3_center {
                 return Err("--sfnn-bn-qat cannot be combined with centering".into());
@@ -5457,7 +5463,7 @@ impl Args {
             if self.sfnn_qat_l1 && !self.sfnn_bn_qat {
                 static WARNING: std::sync::Once = std::sync::Once::new();
                 WARNING.call_once(|| eprintln!("{}", paint(
-                    "  WARNING: BN and L1-only QAT cannot be combined; continuing with effective sfnn_qat_l1=false (requested=true). BN remains enabled. For folded-weight QAT fine tuning use --sfnn-bn-qat (freezes running statistics).",
+                    "  WARNING: BN and L1-only QAT cannot be combined; continuing with effective sfnn_qat_l1=false (requested=true). BN remains enabled. Use --sfnn-bn-qat for BN-aware QAT (supports training from scratch).",
                     ConsoleColor::BoldYellow)));
             }
             if self.sfnn_l1_effective_weight_clip || self.sfnn_ft_saturation_penalty!=0.0
@@ -17754,9 +17760,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("BatchNorm",format!("FT={} L1={} L2={} gamma={} beta={} momentum={} epsilon={}; FT views shared; dense bucket-wise; inference running-stat fold",
             args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
     }
-    runner.configure_bn_qat(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows()).map_err(|e|e.to_string())?;
+    runner.configure_bn_qat_mode(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows(),args.sfnn_bn_qat_freeze_stats).map_err(|e|e.to_string())?;
     if args.sfnn_bn_qat {
-        print_startup_kv("BN QAT","on: FT/L1/L2/L3 folded weights+bias; running mean/variance FROZEN; gamma/beta trainable; identity STE (round+clip); replaces L1-only QAT");
+        print_startup_kv("BN QAT",if args.sfnn_bn_qat_freeze_stats {
+            "on: inference-fold QAT; running mean/variance FROZEN; gamma/beta trainable; identity STE (round+clip)"
+        } else {
+            "on: train-mode BN + running-scale weight QAT (pre-BN bias FP32); non-BN weights/bias QAT; statistics UPDATED every mini-batch; uninitialized channels calibrate first; gamma/beta trainable; identity STE (round+clip)"
+        });
         let shape=runner.shape;
         let n=shape.input_size*shape.ft_size+shape.ft_size+shape.l1w_len().map_err(|e|e.to_string())?+shape.num_stacks*shape.l1_out()
             +shape.num_stacks*(shape.l2_in()*shape.l2_size+shape.l2_size+shape.l2_size+1);
@@ -25552,6 +25562,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
+        format!("sfnn_bn_qat_freeze_stats={}", args.sfnn_bn_qat_freeze_stats),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
@@ -25816,6 +25827,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
+    let signature = resume_signature_without_line(&signature, "sfnn_bn_qat_freeze_stats=");
     // Centering can be explicitly changed on resume; tensors remain folded.
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
@@ -34493,9 +34505,15 @@ mod tests {
         let mut qat=base.clone();qat.sfnn_qat_l1=true;
         assert!(qat.effective_sfnn_qat_l1());
         let mut full_qat=bn.clone();full_qat.sfnn_bn_qat=true;
+        assert!(!full_qat.sfnn_bn_qat_freeze_stats);
         assert!(full_qat.validate_arch_flags().is_ok());
         assert!(resume_signature_matches(&resume_signature(&bn),&full_qat));
         assert!(resume_signature(&full_qat).contains("sfnn_bn_qat=true"));
+        let mut frozen=full_qat.clone();frozen.sfnn_bn_qat_freeze_stats=true;
+        assert!(frozen.validate_arch_flags().is_ok());
+        assert!(resume_signature_matches(&resume_signature(&full_qat),&frozen));
+        frozen.sfnn_bn_qat=false;
+        assert!(frozen.validate_arch_flags().is_err());
         let mut json_argv:Vec<std::ffi::OsString>=vec!["bulletou".into(),"--teacher".into(),"/dev/null".into()];
         bulletou_settings_json_value_to_args(Path::new("settings.json"),"sfnn_bn_qat",&serde_json::json!(true),&mut json_argv).unwrap();
         assert!(Args::try_parse_from(json_argv).unwrap().sfnn_bn_qat);

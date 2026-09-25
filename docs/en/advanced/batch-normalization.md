@@ -157,12 +157,40 @@ Other settings are inherited from the JSON. BN conditions appear in
 grid_summary.csv. Rebuild BulletOu before using BN; do not replace a running
 training executable.
 
-## BN-aware QAT fine tuning
+## BN-aware QAT from scratch or fine tuning
 
 `--sfnn-bn-qat` / JSON `"sfnn_bn_qat": true` defaults to **off**.
-Load a BN-trained `state.bin` (or full-state `weights.bin`) first. Uncalibrated
-scratch BN is rejected; each enabled layer must have at least one initialized
-running-stat channel. Unseen buckets retain their saved initial statistics.
+**Training from scratch is supported; no pre-trained BN checkpoint is required.**
+`sfnn_bn_qat_freeze_stats` defaults to `false`: BN statistics update every mini-batch.
+
+### Default: train-mode BN
+
+For an effective weight \(W\) (including shared/factorizer contributions), use export
+rounding/clipping \(Q\) with the pre-batch running scale:
+
+\[
+r=\gamma/\sqrt{v_{running}+\varepsilon},\qquad
+\widetilde W=Q(rW)/r,\qquad y=\mathrm{BN}_{batch}(\widetilde W x+b).
+\]
+
+The calibration scale is detached: do not differentiate through it. Use identity STE
+for weight rounding/clipping, and full BN backward through batch mean/variance and gamma/beta.
+Uninitialized channels bypass weight fake quantization on their first observed batch to initialize
+statistics; subsequent batches enable it. Zero-gamma channels also use raw weights to avoid division
+by zero and allow gamma to recover. There is no fixed-superbatch warmup requirement.
+
+Pre-BN biases stay raw in training: batch centering cancels them, and unscaling rounded folded biases
+by tiny gamma would destroy numerical precision. Non-BN layers (including L3) fake-quantize both
+weights and biases. Running statistics track the fake-quantized affine inputs. With BPU, each
+mini-batch updates statistics and rebuilds the proxy; gradients accumulate. Activations remain float,
+not bit-exact integer inference. Validation/export use master weights and running statistics;
+export quantizes biases as usual.
+
+### Explicit frozen-statistics mode (previous fine-tuning behavior)
+
+Add `"sfnn_bn_qat_freeze_stats": true` / `--sfnn-bn-qat-freeze-stats` to use the following mode.
+Only this mode requires a BN-trained `state.bin` or full-state `weights.bin`; each enabled layer
+must have at least one initialized channel. Unseen buckets retain saved initial statistics.
 
 This mode **freezes running means/variances** and trains raw FP32 weights,
 biases and gamma/beta. Fold FT factorization, L1 shared weights and BN, then
@@ -191,16 +219,16 @@ Centering, effective clipping and saturation penalties are unsupported with BN Q
 worker mode remains unsupported. Enable/disable it explicitly on resume, not through
 an epoch schedule. Settings files are never rewritten automatically.
 
-Use a common JSON with `initial_state` pointing to the BN checkpoint, and a new grid root:
+For a scratch comparison, use common settings with BN enabled and no `initial_state`, and a new grid root:
 
 ```powershell
 python .\grid_search.py `
-  --settings-file D:\BulletOu-snapshots\settings\bn-finetune.json `
+  --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
   --grid sfnn-bn-qat false true
 ```
 
-ON changes both quantization and statistics freezing; OFF is ordinary BN, so this
-does not isolate quantization alone. Extra proxy weights require about 522 MiB
+By default both ON and OFF update statistics. Explicit frozen mode additionally changes
+statistics behavior, so that comparison does not isolate quantization alone. Extra proxy weights require about 522 MiB
 for HalfKA2 FT1024 (printed at startup). Checkpoint/nn.bin formats are unchanged;
 no engine changes are required. Accuracy/playing-strength improvement is not guaranteed.

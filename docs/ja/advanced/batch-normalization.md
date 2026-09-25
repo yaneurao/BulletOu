@@ -140,12 +140,35 @@ L2も比較するなら `--grid sfnn-bn-l2 false true` に変更すると8条件
 BN以外の学習条件は共通JSONから引き継ぎます。BNの各条件は`grid_summary.csv`にも出力されます。
 新しいBN機能を使用する前にBulletOuを再ビルドしてください。学習中の実行ファイルは置き換えないでください。
 
-## BN用QAT（追加学習）
+## BN用QAT（ゼロからの学習・追加学習）
 
 `--sfnn-bn-qat` / JSONの `"sfnn_bn_qat": true` はデフォルトOFFです。
-BN学習済みの **state.bin（またはfull-state weights.bin）** を読み込んで使います。
-新規初期化直後の未較正BNではエラーにします。まず通常BN学習でcheckpointを保存してください。
-未出現bucketは保存時の初期統計を保持します。各有効BN層に少なくとも一つの較正済みchannelが必要です。
+**ゼロからONで学習できます。BN checkpointの事前作成は不要です。**
+`sfnn_bn_qat_freeze_stats` は既定 `false` で、BN統計をmini-batchごとに更新します。
+
+### 通常モード：BN統計も学習
+
+BN付きの層では、そのbatch開始時のrunning平均・分散とγから、推論時の量子化スケールを決めます。
+shared等を合成した有効重みを \(W\)、nn.binの丸め・clipを \(Q\) として、
+
+\[
+r=\frac{\gamma}{\sqrt{v_{running}+\varepsilon}},\qquad
+\widetilde W=\frac{Q(rW)}{r},\qquad
+y=\mathrm{BN}_{batch}(\widetilde W x+b).
+\]
+
+- \(r\) は量子化用の**微分しない較正値**です。重みへは丸め・clipのidentity STE、BNへはbatch平均・分散を含む通常の微分を使います。γ/βも学習します。
+- 未初期化channelは最初にデータが来たbatchでは重みの疑似量子化をせず、BN統計を初期化します。以降のbatchから反映します。全体を固定sb数だけwarmupする方式ではありません。
+- γ=0のchannelも除算を避けて元の重みでBNを計算し、γが再び学習できるようにします。
+- BN前biasはbatch平均で相殺されるため、このモードの学習中は疑似量子化しません。丸めたfold済みbiasを微小γで割ることによる数値崩壊も避けます。BNなしの層（L3等）は重み・biasとも疑似量子化します。
+- running統計は疑似量子化重みを用いたBN入力から更新します。BPUでも各mini-batchで更新・再量子化し、勾配のみ蓄積します。
+- activationは浮動小数点です。整数推論の完全再現ではありません。validation/exportは元のFP32重みとrunning統計を使い、nn.binではbiasも従来どおり量子化します。
+
+### 統計固定モード（従来の追加学習方式）
+
+`"sfnn_bn_qat_freeze_stats": true`（CLI: `--sfnn-bn-qat-freeze-stats`）を追加すると以下の方式になります。
+この場合だけ、BN学習済み **state.bin / full-state weights.bin** が必要です。
+各有効BN層に少なくとも一つの較正済みchannelが必要で、未出現bucketは保存済み初期統計を保持します。
 
 - running平均・分散は固定。γ/βと元の重み・biasは学習します。
 - FT factorizer、L1 shared、BNをfoldしたFT/L1/L2/L3の重み・biasをnn.binと同じ倍率・丸め・clippingで疑似量子化します。BN OFFの層も対象です。
@@ -172,15 +195,15 @@ shared/factorizerにはさらに合成のchain ruleを適用します。γで割
 中心化、effective-weight clipping、saturation penaltiesとは併用不可。workerも未対応です。
 通常BNからのresume時にON/OFFを変更できます。epochスケジュール切替は未対応です。設定ファイルは自動書換えしません。
 
-BN checkpointを`initial_state`に指定した共通設定から、新しいgrid rootで比較できます。
+ゼロからの共通設定（BN層ON、`initial_state`なし）から、新しいgrid rootで比較できます。
 
 ```powershell
 python .\grid_search.py `
-  --settings-file D:\BulletOu-snapshots\settings\bn-finetune.json `
+  --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
   --grid sfnn-bn-qat false true
 ```
 
-ONは「量子化＋統計固定」、OFFは通常BNです。量子化だけの単独効果の比較ではありません。
+既定ではON/OFFとも統計を更新します。固定モードを選ぶ場合だけ、量子化に加えて統計固定の影響も入ります。
 量子化コピーのVRAMが追加されます（HalfKA2 FT1024で約522 MiB、起動ログに表示）。
 保存形式は変更せず、やねうら王の変更も不要です。精度・棋力改善は保証しません。

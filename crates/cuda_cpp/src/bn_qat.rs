@@ -1,6 +1,5 @@
-//! Inference-fold QAT fine tuning. Running statistics are deliberately frozen.
-//! Forward uses export weight/bias quantizers; STE is identity through round AND
-//! clipping, then the exact chain rule through the fold (including gamma/beta).
+//! BN QAT: train-mode BN with running-scale weight fake quantization, or an
+//! explicitly selected frozen-running-stat inference-fold fine-tuning mode.
 use super::*;
 
 #[derive(Debug)]
@@ -8,10 +7,14 @@ pub struct State {
     proxy: SfnnForwardDeviceWeights,
     base: usize,
     virtual_rows: usize,
+    freeze_stats: bool,
 }
 
 impl SfnnTrainStepRunner {
     pub fn configure_bn_qat(&mut self, ctx: &Context, enabled: bool, base: usize, virtual_rows: usize) -> Result<()> {
+        self.configure_bn_qat_mode(ctx, enabled, base, virtual_rows, false)
+    }
+    pub fn configure_bn_qat_mode(&mut self, ctx: &Context, enabled: bool, base: usize, virtual_rows: usize, freeze_stats: bool) -> Result<()> {
         if self.pending_gradient_batches != 0 {
             return Err(CudaCppError::message("cannot switch BN QAT with pending accumulated gradients"));
         }
@@ -20,13 +23,13 @@ impl SfnnTrainStepRunner {
             return Ok(());
         }
         let bn = self.batch_norm.as_ref().ok_or_else(|| CudaCppError::message("BN QAT requires BN"))?;
-        for (l, _) in bn.layers.iter().flatten() {
+        if freeze_stats { for (l, _) in bn.layers.iter().flatten() {
             let s = l.read_state(ctx)?;
             let c = s.width * s.groups;
             if !s.running[2 * c..].iter().any(|x| *x == 1.0) {
-                return Err(CudaCppError::message("BN QAT freezes running statistics: first train BN and load its checkpoint; uncalibrated BN is not supported"));
+                return Err(CudaCppError::message("frozen BN QAT requires calibrated statistics; disable --sfnn-bn-qat-freeze-stats to train from scratch"));
             }
-        }
+        } }
         if base == 0
             || !(self.shape.input_size == base
                 || (virtual_rows > 0 && base % virtual_rows == 0 && self.shape.input_size == base + virtual_rows))
@@ -51,7 +54,7 @@ impl SfnnTrainStepRunner {
             }
         }
         self.bn_qat =
-            Some(State { proxy, base, virtual_rows: if self.shape.input_size == base { 0 } else { virtual_rows } });
+            Some(State { proxy, base, virtual_rows: if self.shape.input_size == base { 0 } else { virtual_rows }, freeze_stats });
         Ok(())
     }
 }
@@ -59,6 +62,117 @@ impl SfnnTrainStepRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bn_qat_scratch_virtual_ft_and_unseen_bucket_calibration() {
+        let ctx=Context::new(0).unwrap();
+        let original=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        let mut shape=original.shape;shape.input_size=6;
+        // Metadata exists although no axis factorizer tensors are active.
+        shape.factorizer_progress_axis=true;
+        let mut l0=original.l0w.to_vec();l0.extend([0.03;8]);
+        let initial=SfnnForwardHostWeights {shape,l0w:&l0,..original};
+        let mut r=SfnnTrainStepRunner::new(&ctx,initial,4,1).unwrap();
+        r.configure_batch_norm(&ctx,[true;3],Default::default(),&Default::default()).unwrap();
+        r.configure_bn_qat(&ctx,true,4,2).unwrap();
+        for bucket in [0,1] {
+            let buckets=[bucket;4];
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],buckets:&buckets,
+                targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
+            let state=r.read_batch_norm_state(&ctx).unwrap();
+            for s in state.0[1..].iter().flatten() {
+                let flags=&s.running[2*s.width*s.groups..];
+                assert!(flags[..s.width].iter().all(|v|*v==1.0));
+                assert!(flags[s.width..].iter().all(|v|*v==bucket as f32));
+            }
+            assert!(r.weights.l0w.download(&ctx).unwrap().iter().all(|v|v.is_finite()));
+        }
+    }
+    #[test]
+    fn bn_qat_from_scratch_updates_stats_and_accumulates_raw_gradients() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let initial=crate::tests::tiny_sfnn_weights(shape);
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],
+            buckets:&[0,0,1,1],targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        for mask in 1..8 {
+            let enabled=[mask&1!=0,mask&2!=0,mask&4!=0];
+            let mut r=SfnnTrainStepRunner::new(&ctx,initial,4,1).unwrap();
+            r.configure_batch_norm(&ctx,enabled,Default::default(),&Default::default()).unwrap();
+            r.configure_bn_qat(&ctx,true,shape.input_size,0).unwrap();
+            let before=r.read_batch_norm_state(&ctx).unwrap();
+            let mut expected=vec![0.0;shape.l1w_len().unwrap()];
+            for _ in 0..2 {
+                // Same master weights, fresh gradient buffers, same pre-batch statistics.
+                let mut reference=SfnnTrainStepRunner::new(&ctx,initial,4,1).unwrap();
+                reference.configure_batch_norm(&ctx,enabled,Default::default(),&r.read_batch_norm_state(&ctx).unwrap()).unwrap();
+                reference.configure_bn_qat(&ctx,true,shape.input_size,0).unwrap();
+                for runner in [&mut reference,&mut r] {
+                    runner.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                        ScalarLossKind::BceWithLogits,1.0,batch,true,false,Default::default()).unwrap();
+                }
+                for (sum,g) in expected.iter_mut().zip(reference.backward_workspace.l1w_gradients.download(&ctx).unwrap()) {*sum+=g;}
+                for (a,b) in expected.iter().zip(r.backward_workspace.l1w_gradients.download(&ctx).unwrap()) {close(*a,b);}
+                for (a,b) in reference.forward_workspace.output.download(&ctx).unwrap().iter().zip(r.forward_workspace.output.download(&ctx).unwrap()) {close(*a,b);}
+            }
+            let calibrated=r.read_batch_norm_state(&ctx).unwrap();
+            assert_ne!(before,calibrated);
+            for s in calibrated.0.iter().flatten() {
+                assert!(s.running[2*s.width*s.groups..].iter().all(|v|*v==1.0));
+            }
+            let original=r.weights.l1w.download(&ctx).unwrap();
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
+            assert_ne!(original,r.weights.l1w.download(&ctx).unwrap());
+            assert_eq!(r.pending_gradient_batches,0);
+            for s in r.read_batch_norm_state(&ctx).unwrap().0.iter().flatten() {s.validate().unwrap();}
+            let state=r.snapshot_device(&ctx).unwrap();
+            let saved=r.read_batch_norm_state(&ctx).unwrap();
+            r.copy_state_from_device(&ctx,&state).unwrap();
+            assert_eq!(saved,r.read_batch_norm_state(&ctx).unwrap());
+        }
+    }
+
+    #[test]
+    fn bn_qat_train_unfold_matches_fold_and_handles_zero_gamma() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+        calibrated(&mut r,&ctx);
+        r.configure_bn_qat(&ctx,true,shape.input_size,0).unwrap();
+        let q=r.bn_qat.take().unwrap();
+        // Proxy tensors include optional shapes, so use a plain destination here.
+        let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,shape).unwrap();
+        r.build_quantized_proxy(&ctx,shape.input_size,0,&proxy).unwrap();
+        let q=State {proxy,..q};
+        let saved=r.read_batch_norm_state(&ctx).unwrap();
+        let folded=q.proxy.l1w.download(&ctx).unwrap();
+        let guard=r.batch_norm.as_ref().unwrap().bind(&ctx,1,false).unwrap();
+        unfold_training(&r,&ctx,&q).unwrap();
+        let s=saved.0[1].as_ref().unwrap();let (scale,_)=s.inference_affine().unwrap();
+        for (j,w) in q.proxy.l1w.download(&ctx).unwrap().iter().enumerate() {
+            let ch=j/shape.ft_size;let u=ch%shape.l1_out();
+            let factor=if u<s.width {scale[(ch/shape.l1_out())*s.width+u]} else {1.0};
+            close(*w*factor,folded[j]);
+        }
+        drop(guard);
+        // Zero gamma must not divide by zero, and absent buckets still calibrate.
+        for (l,_) in r.batch_norm.as_ref().unwrap().layers.iter().flatten() {
+            let mut a=l.affine.download(&ctx).unwrap();a[0]=0.0;l.affine.upload(&ctx,&a).unwrap();
+        }
+        drop(q);
+        r.configure_bn_qat(&ctx,true,shape.input_size,0).unwrap();
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],buckets:&[0,0,0,0],
+            targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        let upload=Context::new(0).unwrap();
+        r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,&upload,Default::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
+        r.step_profiled_no_readback_with_update_and_lr_multipliers(&ctx,Default::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,Default::default()).unwrap();
+        assert!(r.forward_workspace.output.download(&ctx).unwrap().iter().all(|v|v.is_finite()));
+        for s in r.read_batch_norm_state(&ctx).unwrap().0.iter().flatten() {s.validate().unwrap();}
+    }
     fn calibrated(r: &mut SfnnTrainStepRunner, ctx: &Context) {
         r.configure_batch_norm(ctx, [true; 3], Default::default(), &Default::default()).unwrap();
         for (l, _) in r.batch_norm.as_ref().unwrap().layers.iter().flatten() {
@@ -79,11 +193,11 @@ mod tests {
         let initial = crate::tests::tiny_sfnn_weights(shape);
         let mut r = SfnnTrainStepRunner::new(&ctx, initial, 4, 1).unwrap();
         r.configure_batch_norm(&ctx, [true; 3], Default::default(), &Default::default()).unwrap();
-        assert!(r.configure_bn_qat(&ctx, true, shape.input_size, 0).is_err());
+        assert!(r.configure_bn_qat_mode(&ctx, true, shape.input_size, 0, true).is_err());
         calibrated(&mut r, &ctx);
         r.factorizer_alpha.ft = 0.3;
         r.factorizer_alpha.shared = 0.7;
-        r.configure_bn_qat(&ctx, true, shape.input_size, 0).unwrap();
+        r.configure_bn_qat_mode(&ctx, true, shape.input_size, 0, true).unwrap();
         let saved = r.read_batch_norm_state(&ctx).unwrap();
         let raw = r.weights.l1w.download(&ctx).unwrap();
         let batch = SfnnTrainStepHostBatch {
@@ -207,7 +321,7 @@ mod tests {
             }
             l.affine.upload(&ctx, &a).unwrap();
         }
-        r.configure_bn_qat(&ctx, true, 4, 2).unwrap();
+        r.configure_bn_qat_mode(&ctx, true, 4, 2, true).unwrap();
         // Factorized FT proxy equals the export model exactly (including zero
         // gamma), with virtual feature rows removed instead of quantized twice.
         let mut export_shape = shape;
@@ -318,6 +432,13 @@ mod tests {
 }
 
 unsafe extern "C" {
+    fn bulletou_bn_qat_unfold_training(
+        ctx: *mut ffi::BulletOuCudaCppContext,
+        w: *mut ffi::BulletOuCudaCppF32Buffer, b: *mut ffi::BulletOuCudaCppF32Buffer,
+        sw: *mut ffi::BulletOuCudaCppF32Buffer, sb: *mut ffi::BulletOuCudaCppF32Buffer,
+        qw: *mut ffi::BulletOuCudaCppF32Buffer, qb: *mut ffi::BulletOuCudaCppF32Buffer,
+        input: usize, output: usize, groups: usize, layer: i32, virtual_rows: usize, alpha: f32,
+    ) -> i32;
     fn bulletou_bn_qat_ft(
         ctx: *mut ffi::BulletOuCudaCppContext,
         src: *mut ffi::BulletOuCudaCppF32Buffer,
@@ -350,7 +471,8 @@ fn ptr(b: Option<&F32Buffer>) -> *mut ffi::BulletOuCudaCppF32Buffer {
 }
 
 /// Keep the normal optimizer/state in raw coordinates, even on a failed step.
-/// Gradients accumulate in folded coordinates until the actual BPU update.
+/// Train-mode gradients accumulate in pre-BN coordinates; frozen mode uses
+/// folded coordinates. Factorizer pullback happens at the actual BPU update.
 pub(super) fn step<T>(
     r: &mut SfnnTrainStepRunner,
     ctx: &Context,
@@ -381,8 +503,9 @@ pub(super) fn step<T>(
     }
     let mut q = r.bn_qat.take().unwrap();
     let result = (|| {
-        // Raw weights and BN affine stay unchanged throughout a BPU group.
-        if r.pending_gradient_batches == 0 {
+        // Training statistics change every microbatch, so refresh its proxy.
+        // Frozen-stat mode can reuse the proxy throughout a BPU group.
+        if !q.freeze_stats || r.pending_gradient_batches == 0 {
             let optional = (
                 q.proxy.l1fw.take(),
                 q.proxy.l1fb.take(),
@@ -391,7 +514,17 @@ pub(super) fn step<T>(
                 q.proxy.l3fw.take(),
                 q.proxy.l3fb.take(),
             );
+            // Export proxy has no axes, even when the architecture carries
+            // inactive king/progress axis metadata (factorizer none/shared).
+            let training_shape=q.proxy.shape;
+            q.proxy.shape.factorizer_king_axis_dim=0;
+            q.proxy.shape.factorizer_hand_axis_dim=0;
+            q.proxy.shape.factorizer_progress_axis=false;
+            q.proxy.shape.factorizer_king_hand_pair=false;
+            q.proxy.shape.factorizer_king_progress_pair=false;
+            q.proxy.shape.factorizer_hand_progress_pair=false;
             let built = r.build_quantized_proxy(ctx, r.shape.input_size, 0, &q.proxy);
+            q.proxy.shape=training_shape;
             (q.proxy.l1fw, q.proxy.l1fb, q.proxy.l2fw, q.proxy.l2fb, q.proxy.l3fw, q.proxy.l3fb) = optional;
             built?;
             let _bind = r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?;
@@ -406,15 +539,16 @@ pub(super) fn step<T>(
                     r.factorizer_alpha.ft,
                 )
             })?;
+            if !q.freeze_stats { unfold_training(r, ctx, &q)?; }
         }
-        let bn = r.batch_norm.take();
+        let bn = if q.freeze_stats { r.batch_norm.take() } else { None };
         let factorizer = r.factorizer;
         r.factorizer = SfnnFactorizerActive::NONE;
         std::mem::swap(&mut r.weights, &mut q.proxy);
         let result = run(r);
         std::mem::swap(&mut r.weights, &mut q.proxy);
         r.factorizer = factorizer;
-        r.batch_norm = bn;
+        if q.freeze_stats { r.batch_norm = bn; }
         let value = result?;
         if update {
             pullback(r, ctx, &q)?;
@@ -426,8 +560,26 @@ pub(super) fn step<T>(
     result
 }
 
+fn unfold_training(r: &SfnnTrainStepRunner, ctx: &Context, q: &State) -> Result<()> {
+    let w=&r.weights; let p=&q.proxy; let s=r.shape;
+    for (i, w, b, sw, sb, qw, qb, input, output, groups) in [
+        (0,&w.l0w,&w.l0b,None,None,&p.l0w,&p.l0b,q.base,s.ft_size,1),
+        (1,&w.l1w,&w.l1b,w.l1fw.as_ref(),w.l1fb.as_ref(),&p.l1w,&p.l1b,s.ft_size,s.l1_out(),s.num_stacks),
+        (2,&w.l2w,&w.l2b,None,None,&p.l2w,&p.l2b,s.l2_in(),s.l2_size,s.num_stacks),
+    ] {
+        let shared=r.factorizer.shared && i==1;
+        check(unsafe { bulletou_bn_qat_unfold_training(ctx.as_ptr(),w.as_ptr(),b.as_ptr(),
+            ptr(sw.filter(|_|shared)),ptr(sb.filter(|_|shared)),qw.as_ptr(),qb.as_ptr(),
+            input,output,groups,i,if i==0 {q.virtual_rows} else {0},
+            if i==0 {r.factorizer_alpha.ft} else {r.factorizer_alpha.shared}) })?;
+    }
+    Ok(())
+}
+
 fn pullback(r: &SfnnTrainStepRunner, ctx: &Context, q: &State) -> Result<()> {
-    let _bind = r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?;
+    // Train-mode BN already differentiated mean/variance and gamma/beta.
+    // Its raw-affine gradients need only the FT/shared factorizer chain rule.
+    let _bind = if q.freeze_stats { Some(r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?) } else { None };
     let w = &r.weights;
     let g = &r.backward_workspace;
     let s = r.shape;
