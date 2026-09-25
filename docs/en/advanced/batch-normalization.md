@@ -86,6 +86,15 @@ FT training fuses BN application, clamping and pairwise multiplication to reduce
 intermediate memory traffic, without additional VRAM. BN-disabled runs do not use these buffers. Reduction ordering can cause small
 rounding differences. Playing-strength improvements have not been established.
 
+Training also fuses L1 BN application with its normal/squared branches, and L2 BN
+application with clamping. FT backward fuses BN gradient application with bias
+gradient reduction and skips adding zero to absent feature gradients. Small-bucket
+dense L1 uses a coalesced parameter-gradient reduction; shared L1 with 8/9 outputs
+also specializes the input gradient. Other shapes retain the existing paths.
+These optimizations need no extra VRAM and do not change BN definitions, statistics
+update frequency, or gradient accumulation. Floating-point reduction order can
+change training trajectories; bitwise-identical training is not guaranteed.
+
 ## Grid search
 
 Use a new output directory. Explicitly disable unsupported options for **all**

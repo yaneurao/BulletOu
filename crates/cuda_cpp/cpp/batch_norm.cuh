@@ -170,21 +170,29 @@ __global__ void bn_finish(float* stats,float* running,float* grads,size_t rows,s
     if constexpr(Mode==2) {
         grads[ch]+=float(q);grads[c+ch]+=float(p);
         float n=stats[c+ch];
-        sums[ch]=n>0?float(p)/n:0;aux[ch]=n>0?float(q)/n:0;
+        // Forward means are dead; keep backward means outside partial buffers.
+        float* means=reinterpret_cast<float*>(mean);
+        means[ch]=n>0?float(p)/n:0;means[c+ch]=n>0?float(q)/n:0;
     }
 }
 template<bool Backward>
 __global__ void bn_apply(float* a,float* b,float* xa,float* xb,const int* ids,
-    const float* params,const float* stats,size_t rows,size_t stride,size_t width,size_t groups) {
+    const float* params,const float* stats,size_t rows,size_t stride,size_t width,size_t groups,int activation=0,float* branches=nullptr) {
     size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=rows*width)return;
     size_t row=j/width,u=j%width,g=groups>1?static_cast<size_t>(ids[row]):0,c=width*groups,ch=g*width+u,k=row*stride+u;
     const double* mean=reinterpret_cast<const double*>(stats+2*c);
     if constexpr(!Backward) {
         float x=float(double(a[k])-mean[ch])*stats[ch];xa[k]=x;a[k]=params[ch]*x+params[c+ch];
         if(b){x=float(double(b[k])-mean[ch])*stats[ch];xb[k]=x;b[k]=params[ch]*x+params[c+ch];}
+        if(activation==1) a[k]=crelu(a[k]);
+        if(branches) {
+            float v=a[k],av=fabsf(v);
+            branches[row*2*width+u]=crelu(av*av*SFNN_PAIRWISE_SCALE);
+            branches[row*2*width+width+u]=crelu(v);
+        }
     } else {
-        const double* sums=mean+c;const double* aux=sums+((rows+1023)/1024)*c;
-        float sm=float(sums[ch]),pm=float(aux[ch]),scale=params[ch]*stats[ch];
+        const float* means=reinterpret_cast<const float*>(mean);
+        float sm=means[ch],pm=means[c+ch],scale=params[ch]*stats[ch];
         a[k]=scale*(a[k]-sm-xa[k]*pm);
         if(b)b[k]=scale*(b[k]-sm-xb[k]*pm);
     }
@@ -222,7 +230,7 @@ extern "C" void bulletou_bn_reference_mode(int enabled) {bn_reference_test=enabl
 bool bn_use_reference() {return bn_reference_test || std::getenv("BULLETOU_BN_REFERENCE")!=nullptr;}
 void bn_launch_forward(BulletOuCudaCppContext* ctx,float* a,float* b,float* xa,float* xb,
     const int* ids,const float* params,float* running,float* stats,
-    size_t rows,size_t stride,size_t width,size_t groups,float epsilon,float momentum,bool training,float* ft_combined=nullptr) {
+    size_t rows,size_t stride,size_t width,size_t groups,float epsilon,float momentum,bool training,float* ft_combined=nullptr,int activation=0,float* branches=nullptr) {
     if(!training && !bn_use_reference()) {
         bn_inference_kernel<<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(
             a,b,ids,params,running,rows,stride,width,groups,epsilon);
@@ -239,13 +247,33 @@ void bn_launch_forward(BulletOuCudaCppContext* ctx,float* a,float* b,float* xa,f
         if(ft_combined) {
             bn_ft_apply_activate<<<static_cast<unsigned>((rows*(width/2)+255)/256),256,0,ctx->stream>>>(a,b,xa,xb,ft_combined,params,stats,rows,width);
         } else {
-            bn_apply<false><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(a,b,xa,xb,ids,params,stats,rows,stride,width,groups);
+            bn_apply<false><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(a,b,xa,xb,ids,params,stats,rows,stride,width,groups,activation,branches);
         }
     }
 }
+__global__ void bn_ft_backward_apply_bias(float* a,float* b,const float* xa,const float* xb,
+    const float* params,float* stats,size_t rows,size_t width) {
+    size_t lane=threadIdx.x%32,u=blockIdx.x*32+lane;
+    size_t begin=blockIdx.y*1024,end=min(rows,begin+1024);
+    const float* means=stats+2*width;
+    double* sums=reinterpret_cast<double*>(stats+2*width)+width;
+    float sm=u<width?means[u]:0,pm=u<width?means[width+u]:0;
+    float scale=u<width?params[u]*stats[u]:0;
+    double sum=0;
+    for(size_t i=begin+threadIdx.x/32;i<end;i+=8) {
+        if(u>=width)continue;
+        size_t k=i*width+u;
+        float av=scale*(a[k]-sm-xa[k]*pm),bv=scale*(b[k]-sm-xb[k]*pm);
+        a[k]=av;b[k]=bv;sum+=double(av);sum+=double(bv);
+    }
+    __shared__ double partial[256];partial[threadIdx.x]=sum;__syncthreads();
+    for(int d=128;d>=32;d/=2){if(threadIdx.x<d)partial[threadIdx.x]+=partial[threadIdx.x+d];__syncthreads();}
+    if(threadIdx.x<32 && u<width)sums[blockIdx.y*width+u]=partial[lane];
+}
+__global__ void bn_bias_finish(const float* stats,float* gb,size_t rows,size_t width);
 void bn_launch_backward(BulletOuCudaCppContext* ctx,float* da,float* db,const float* xa,const float* xb,
     const int* ids,const float* params,const float* stats,float* grads,
-    size_t rows,size_t stride,size_t width,size_t groups) {
+    size_t rows,size_t stride,size_t width,size_t groups,float* ft_bias=nullptr) {
     if(bn_use_reference()) bn_backward_kernel<<<static_cast<unsigned>(width*groups),256,0,ctx->stream>>>(
         da,db,xa,xb,ids,params,stats,grads,rows,stride,width,groups);
     else {
@@ -253,7 +281,13 @@ void bn_launch_backward(BulletOuCudaCppContext* ctx,float* da,float* db,const fl
         float* scratch=const_cast<float*>(stats);
         bn_launch_partial<2>(ctx,da,db,xa,xb,ids,scratch,rows,stride,width,groups);
         bn_finish<2><<<static_cast<unsigned>((c+255)/256),256,0,ctx->stream>>>(scratch,nullptr,grads,rows,c,0,0);
-        bn_apply<true><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(da,db,const_cast<float*>(xa),const_cast<float*>(xb),ids,params,stats,rows,stride,width,groups);
+        if(ft_bias) {
+            dim3 grid(static_cast<unsigned>((width+31)/32),static_cast<unsigned>((rows+1023)/1024));
+            bn_ft_backward_apply_bias<<<grid,256,0,ctx->stream>>>(da,db,xa,xb,params,scratch,rows,width);
+            bn_bias_finish<<<static_cast<unsigned>((width+255)/256),256,0,ctx->stream>>>(stats,ft_bias,rows,width);
+        } else {
+            bn_apply<true><<<static_cast<unsigned>((rows*width+255)/256),256,0,ctx->stream>>>(da,db,const_cast<float*>(xa),const_cast<float*>(xb),ids,params,stats,rows,stride,width,groups);
+        }
     }
 }
 
@@ -301,17 +335,17 @@ extern "C" int bulletou_bn_backward(BulletOuCudaCppContext* ctx,
 }
 
 int bn_forward_bound(BulletOuCudaCppContext* ctx,int layer,float* a,float* b,
-    const int* ids,size_t rows,size_t stride,float* ft_combined=nullptr) {
+    const int* ids,size_t rows,size_t stride,float* ft_combined=nullptr,int activation=0,float* branches=nullptr) {
     const auto c=ctx->bn[layer];if(!c.params)return 0;
     bn_launch_forward(ctx,
-        a,b,c.xa,c.xb,ids,c.params,c.running,c.stats,rows,stride,c.width,c.groups,c.epsilon,c.momentum,c.training,ft_combined);
+        a,b,c.xa,c.xb,ids,c.params,c.running,c.stats,rows,stride,c.width,c.groups,c.epsilon,c.momentum,c.training,ft_combined,activation,branches);
     return check_kernel_launch("SFNN BN forward");
 }
 int bn_backward_bound(BulletOuCudaCppContext* ctx,int layer,float* a,float* b,
-    const int* ids,size_t rows,size_t stride) {
+    const int* ids,size_t rows,size_t stride,float* ft_bias=nullptr) {
     const auto c=ctx->bn[layer];if(!c.params)return 0;
     bn_launch_backward(ctx,
-        a,b,c.xa,c.xb,ids,c.params,c.stats,c.grads,rows,stride,c.width,c.groups);
+        a,b,c.xa,c.xb,ids,c.params,c.stats,c.grads,rows,stride,c.width,c.groups,ft_bias);
     return check_kernel_launch("SFNN BN backward");
 }
 __global__ void bn_bias_finish(const float* stats,float* gb,size_t rows,size_t width) {

@@ -850,4 +850,59 @@ mod tests {
             close(*a, b, 1e-6);
         }
     }
+
+    #[test]
+    fn bn_wide_ft_and_l1_gradients_match_reference_with_accumulation() {
+        let ctx=Context::new(0).unwrap();
+        let initial=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        for (hidden,skip,stacks) in [(7,true,2),(8,false,8),(8,true,16)] {
+        let shape=SfnnForwardShape {input_size:8,ft_size:128,l1_hidden:hidden,l1_skip:skip,num_stacks:stacks,..initial.shape};
+        let values=|n:usize| (0..n).map(|i|((i*17%101) as f32-50.0)*0.003).collect::<Vec<_>>();
+        let l0w=values(shape.input_size*shape.ft_size);
+        let l0b=vec![0.1;shape.ft_size];
+        let l1w=values(shape.l1w_len().unwrap());
+        let l1fw=values(shape.ft_size*shape.l1_out());
+        let l1b=values(shape.num_stacks*shape.l1_out());
+        let l1fb=values(shape.l1_out());
+        let l2w=values(shape.num_stacks*shape.l2_size*shape.l1_hidden*2);
+        let l2fw=values(shape.l2_size*shape.l1_hidden*2);
+        let l2b=values(stacks*shape.l2_size);
+        let l3w=values(stacks*shape.l2_size);
+        let l3b=values(stacks);
+        let weights=SfnnForwardHostWeights {shape,l0w:&l0w,l0b:&l0b,l1w:&l1w,l1fw:Some(&l1fw),
+            l1b:&l1b,l1fb:Some(&l1fb),l2w:&l2w,l2fw:Some(&l2fw),l2b:&l2b,l3w:&l3w,l3b:&l3b,..initial};
+        let rows=1027;
+        let stm=(0..rows).map(|i|(i%4) as i32).collect::<Vec<_>>();
+        let nstm=(0..rows).map(|i|((i+1)%4) as i32).collect::<Vec<_>>();
+        let buckets=(0..rows).map(|i|((i/3)%(stacks-1)) as i32).collect::<Vec<_>>();
+        let targets=(0..rows).map(|i|(i%11) as f32/10.0).collect::<Vec<_>>();
+        let entries=vec![1.0;rows];
+        let batch=SfnnTrainStepHostBatch {stm_indices:&stm,nstm_indices:&nstm,buckets:&buckets,
+            targets:&targets,entry_weights:&entries,batch_size:rows,max_active:1};
+        unsafe extern "C" {fn bulletou_bn_reference_mode(enabled:i32);}
+        struct Reset;
+        impl Drop for Reset {fn drop(&mut self){unsafe{bulletou_bn_reference_mode(0);}}}
+        let _reset=Reset;
+        let mut reference=None;
+        for old in [true,false] {
+            unsafe{bulletou_bn_reference_mode(old as i32);}
+            let mut r=SfnnTrainStepRunner::new(&ctx,weights,rows,1).unwrap();
+            r.configure_batch_norm(&ctx,[true;3],Default::default(),&Default::default()).unwrap();
+            for _ in 0..2 {
+                r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,
+                    Default::default(),ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch,true,false,Default::default()).unwrap();
+            }
+            let b=&r.backward_workspace;
+            let result=[b.l0w_gradients.download(&ctx).unwrap(),b.l0b_gradients.download(&ctx).unwrap(),
+                b.l1w_gradients.download(&ctx).unwrap(),b.l1b_gradients.download(&ctx).unwrap(),
+                b.l1fw_gradients.download(&ctx).unwrap(),b.l1fb_gradients.download(&ctx).unwrap(),
+                r.forward_workspace.output.download(&ctx).unwrap()];
+            if old {reference=Some(result);} else {
+                for (a,b) in reference.take().unwrap().iter().zip(result.iter()) {
+                    for (&a,&b) in a.iter().zip(b) {close(a,b,3e-5);}
+                }
+            }
+        }
+        }
+    }
 }

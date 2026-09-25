@@ -4066,7 +4066,7 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     float* l0w_gradients,
     size_t n_features,
     size_t ft_size,
-    int add_to_existing) {
+    int add_to_existing,bool skip_empty=false) {
     size_t feature = blockIdx.x;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= n_features || row >= ft_size) {
@@ -4075,6 +4075,7 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
 
     size_t off_start = static_cast<size_t>(offsets[feature]);
     size_t off_end = static_cast<size_t>(offsets[feature + 1]);
+    if(skip_empty && add_to_existing && off_start==off_end)return;
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
@@ -5309,11 +5310,12 @@ int launch_sfnn_forward_kernels(
         }
     }
 
-    if(bn_forward_bound(ctx,1,l1,nullptr,buckets,batch,l1_out)) return -1;
+    const bool fuse_bn_branches=ctx->bn[1].params && ctx->bn[1].training && !bn_use_reference();
+    if(bn_forward_bound(ctx,1,l1,nullptr,buckets,batch,l1_out,nullptr,0,fuse_bn_branches?l2_input:nullptr)) return -1;
     if (block_count_1d(batch * l2_in, threads, &blocks, "sfnn_l2_input_kernel") != 0) {
         return -1;
     }
-    sfnn_l2_input_kernel<<<blocks, threads, 0, ctx->stream>>>(l1, l2_input, batch, l1_hidden, l1_skip);
+    if(!fuse_bn_branches)sfnn_l2_input_kernel<<<blocks, threads, 0, ctx->stream>>>(l1, l2_input, batch, l1_hidden, l1_skip);
     if (check_kernel_launch("sfnn_l2_input_kernel launch") != 0) {
         return -1;
     }
@@ -5357,8 +5359,9 @@ int launch_sfnn_forward_kernels(
     }
 
     if(ctx->bn[2].params) {
-        if(bn_forward_bound(ctx,2,l2,nullptr,buckets,batch,l2_size))return -1;
-        bn_activate<<<static_cast<unsigned>((batch*l2_size+255)/256),256,0,ctx->stream>>>(l2,batch*l2_size);
+        const bool fused=ctx->bn[2].training && !bn_use_reference();
+        if(bn_forward_bound(ctx,2,l2,nullptr,buckets,batch,l2_size,nullptr,fused?1:0))return -1;
+        if(!fused)bn_activate<<<static_cast<unsigned>((batch*l2_size+255)/256),256,0,ctx->stream>>>(l2,batch*l2_size);
         if(check_kernel_launch("BN L2 activation"))return -1;
     }
     if (block_count_1d(batch, threads, &blocks, "sfnn_stacked_l3_output_kernel") != 0) {
@@ -5507,6 +5510,57 @@ unsigned int sfnn_dense_reduce_split_count(size_t batch) {
     return static_cast<unsigned int>(splits);
 }
 
+// BN L1: contiguous input lanes, compile-time indexed bucket accumulators.
+template<int Outputs>
+__global__ void bn_l1_input_gradient(const float* dy,const float* w,const float* shared,
+    const int* buckets,float* dx,size_t batch,size_t width,size_t stacks,float alpha) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=batch*width)return;
+    size_t row=j/width,u=j%width;
+    int id=buckets[row];if(id<0 || static_cast<size_t>(id)>=stacks){dx[j]=0;return;}
+    size_t stack=static_cast<size_t>(id);float sum=0;
+    #pragma unroll
+    for(int out=0;out<Outputs;++out) {
+        float grad=dy[row*Outputs+out];
+        if(grad!=0) {
+            float weight=w[(stack*Outputs+out)*width+u];
+            if(shared)weight+=alpha*shared[u*Outputs+out];
+            sum+=grad*weight;
+        }
+    }
+    dx[j]=sum;
+}
+// No low-precision GEMM or changed gradients; accumulate across BPU as before.
+__global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
+    float* dw,float* db,float* dfw,float* dfb,size_t batch,size_t width,size_t outputs,
+    size_t stacks,float alpha,bool input_major) {
+    size_t lane=threadIdx.x%32,out=blockIdx.z*8+threadIdx.x/32,in=blockIdx.x*32+lane;
+    size_t begin=blockIdx.y*256,end=min(batch,begin+256);
+    float ws[16]={},bs[16]={};
+    for(size_t row=begin;row<end;++row) {
+        int bucket=buckets[row];
+        float grad=out<outputs?dy[row*outputs+out]:0;
+        float x=in<width?inputs[row*width+in]:0;
+        #pragma unroll
+        for(int s=0;s<16;++s) {
+            if(bucket==s && s<stacks) {
+                ws[s]+=grad*x;
+                if(in==0)bs[s]+=grad;
+            }
+        }
+    }
+    if(out>=outputs || in>=width)return;
+    float shared_w=0,shared_b=0;
+    #pragma unroll
+    for(int s=0;s<16;++s) {
+        if(s<stacks) {
+            if(ws[s]!=0)atomicAdd(dw+(s*outputs+out)*width+in,ws[s]);
+            shared_w+=ws[s];shared_b+=bs[s];
+            if(in==0 && bs[s]!=0)atomicAdd(db+s*outputs+out,bs[s]);
+        }
+    }
+    if(dfw && shared_w!=0)atomicAdd(dfw+(input_major?in*outputs+out:out*width+in),alpha*shared_w);
+    if(dfb && in==0 && shared_b!=0)atomicAdd(dfb+out,alpha*shared_b);
+}
 int launch_sfnn_dense_param_reduce_tiled(
     BulletOuCudaCppContext* ctx,
     const float* inputs,
@@ -5544,6 +5598,16 @@ int launch_sfnn_dense_param_reduce_tiled(
     const char* label) {
     if (batch == 0 || input_dim == 0 || output_dim == 0 || num_stacks == 0) {
         return 0;
+    }
+    if(ctx->bn[1].params && input_dim>=32 && output_dim>=ctx->bn[1].width && output_dim<=ctx->bn[1].width+1 && output_dim<=16 && num_stacks<=16 &&
+        has_axis==0 && use_crelu_gradient==0 && !bn_use_reference()) {
+        dim3 grid(static_cast<unsigned>((input_dim+31)/32),static_cast<unsigned>((batch+255)/256),
+            static_cast<unsigned>((output_dim+7)/8));
+        bn_l1_param_reduce<<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+            weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+            has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+            shared_alpha,shared_weight_input_major!=0);
+        return check_kernel_launch(label);
     }
     if (num_stacks <= SFNN_DENSE_REDUCE_ACCUM_MAX_STACKS) {
         const size_t input_tiles = (input_dim + SFNN_DENSE_REDUCE_TILE - 1) / SFNN_DENSE_REDUCE_TILE;
@@ -6004,6 +6068,7 @@ int launch_sfnn_inverse_index_for_perspective(
     if (launch_sfnn_build_inverse_index(ctx, indices, batch, max_active, n_features) != 0)
         return -1;
     constexpr int gather_threads = 128;
+    const bool bn_fast=ctx->bn[0].params && !bn_use_reference();
 
     dim3 gather_grid(
         static_cast<unsigned int>(n_features),
@@ -6016,7 +6081,7 @@ int launch_sfnn_inverse_index_for_perspective(
         l0w_gradients,
         n_features,
         ft_size,
-        add_to_existing);
+        add_to_existing,bn_fast);
     if (check_kernel_launch("sfnn_inverse_gather_l0w_gradients_kernel launch") != 0) {
         return -1;
     }
@@ -6096,8 +6161,9 @@ int launch_sfnn_inverse_index_l0_backward(
     }
 
     if(ctx->bn[0].params) {
-        if(bn_backward_bound(ctx,0,stm_l0_pre_gradients,nstm_l0_pre_gradients,nullptr,batch,ft_size))return -1;
-        bn_bias_sum_bound(ctx,stm_l0_pre_gradients,nstm_l0_pre_gradients,l0b_gradients,batch,ft_size);
+        const bool fused=!bn_use_reference();
+        if(bn_backward_bound(ctx,0,stm_l0_pre_gradients,nstm_l0_pre_gradients,nullptr,batch,ft_size,fused?l0b_gradients:nullptr))return -1;
+        if(!fused) bn_bias_sum_bound(ctx,stm_l0_pre_gradients,nstm_l0_pre_gradients,l0b_gradients,batch,ft_size);
         if(check_kernel_launch("BN FT bias backward"))return -1;
     }
     size_t n_features = input_size;
@@ -6671,7 +6737,13 @@ int launch_sfnn_backward_kernels(
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_factorized_l1_backward_kernel") != 0) {
             return -1;
         }
-        sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        const bool bn_input_fast=ctx->bn[1].params && !bn_use_reference() &&
+            reduce_l1_params && has_l1ax==0 &&
+            !qat_l1w && !residual_count_gates && (l1_out==8 || l1_out==9);
+        if(bn_input_fast) {
+            if(l1_out==8)bn_l1_input_gradient<8><<<blocks,threads,0,ctx->stream>>>(l1_gradients,l1w,has_l1f?l1fw:nullptr,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+            else bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,l1w,has_l1f?l1fw:nullptr,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+        } else sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,
             l1w,
