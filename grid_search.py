@@ -48,7 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
-    "sfnn_bn_ft", "sfnn_bn_l1", "sfnn_bn_l2", "sfnn_bn_gamma", "sfnn_bn_beta", "sfnn_bn_momentum", "sfnn_bn_epsilon",
+    "sfnn_bn_ft", "sfnn_bn_l1", "sfnn_bn_l2", "sfnn_bn_qat", "sfnn_bn_gamma", "sfnn_bn_beta", "sfnn_bn_momentum", "sfnn_bn_epsilon",
     "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_factorizer",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",

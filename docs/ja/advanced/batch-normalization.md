@@ -59,7 +59,7 @@ BNなしのcheckpointに新たにBNを追加すると、forwardが変わりま�
 
 - cuda-cppの通常学習と`grid_search.py`。dense SFNN、factorizer `none` / `shared`。
 - 現時点ではworker、plateau、compact/grouped L1、bucket-count gates、層のfreeze／個別LR倍率は未対応。
-- QATが同時指定された場合、黄色のWARNINGを出し、QATだけを無効化して続行します（実効値 `sfnn_qat_l1=false`）。BNは有効のままです。設定ファイルは書き換えません。
+- 従来のL1単独QATはBNと併用できません。`sfnn_bn_qat=false`で`sfnn_qat_l1=true`なら黄色のWARNINGを出し、L1単独QATだけを無効化します。BN用QATは下記の別オプションです。
 - `sfnn_l1_effective_weight_clip`、FT/weight saturation penaltyは併用不可で、引き続きエラーにします。
 - L1／L2・L3の中心化とは併用できます（中心化側の制約も適用）。
 - 各BN層は `bucket数 × unit数 <= 65536`。FTは1group。
@@ -100,3 +100,48 @@ python .\grid_search.py `
 L2も比較するなら `--grid sfnn-bn-l2 false true` に変更すると8条件になります。
 BN以外の学習条件は共通JSONから引き継ぎます。BNの各条件は`grid_summary.csv`にも出力されます。
 新しいBN機能を使用する前にBulletOuを再ビルドしてください。学習中の実行ファイルは置き換えないでください。
+
+## BN用QAT（追加学習）
+
+`--sfnn-bn-qat` / JSONの `"sfnn_bn_qat": true` はデフォルトOFFです。
+BN学習済みの **state.bin（またはfull-state weights.bin）** を読み込んで使います。
+新規初期化直後の未較正BNではエラーにします。まず通常BN学習でcheckpointを保存してください。
+未出現bucketは保存時の初期統計を保持します。各有効BN層に少なくとも一つの較正済みchannelが必要です。
+
+- running平均・分散は固定。γ/βと元の重み・biasは学習します。
+- FT factorizer、L1 shared、BNをfoldしたFT/L1/L2/L3の重み・biasをnn.binと同じ倍率・丸め・clippingで疑似量子化します。BN OFFの層も対象です。
+- 元のFP32重み・optimizer stateを保持し、量子化コピーでforward/backwardします。
+- activationは既存の浮動小数点学習経路です。整数推論の全演算を再現する機能ではなく、weight/bias QATです。
+- 丸めとclippingの両方にidentity STEを使い、foldの微分で元の重み・γ/βへ勾配を戻します。範囲外でも勾配をゼロにはしません。
+- BPUの勾配は蓄積し、optimizer更新時に一度だけ元の座標へ戻します。
+- acc/lossは量子化前のBNモデル、qacc/qlossは量子化後のままです。
+
+固定統計で \(r=\gamma/\sqrt{v+\varepsilon}\) とすると、\(W'=rW,\ b'=r(b-\mu)+\beta\) です。
+量子化コピーに対する勾配を \(G_W,G_b\) として、STE後は
+
+\[
+\frac{\partial L}{\partial W}=rG_W,\quad
+\frac{\partial L}{\partial b}=rG_b,\quad
+\frac{\partial L}{\partial\beta}=G_b,\quad
+\frac{\partial L}{\partial\gamma}
+=\frac{\langle G_W,W\rangle+G_b(b-\mu)}{\sqrt{v+\varepsilon}}.
+\]
+
+shared/factorizerにはさらに合成のchain ruleを適用します。γで割らないのでγ=0にも対応します。
+
+既存のBNオプションを維持してONにしてください。`sfnn_qat_l1=true`が残っていてもBN用QATが置き換えます。
+中心化、effective-weight clipping、saturation penaltiesとは併用不可。workerも未対応です。
+通常BNからのresume時にON/OFFを変更できます。epochスケジュール切替は未対応です。設定ファイルは自動書換えしません。
+
+BN checkpointを`initial_state`に指定した共通設定から、新しいgrid rootで比較できます。
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bn-finetune.json `
+  --output-folder D:\BulletOu-snapshots\grid-bn-qat `
+  --grid sfnn-bn-qat false true
+```
+
+ONは「量子化＋統計固定」、OFFは通常BNです。量子化だけの単独効果の比較ではありません。
+量子化コピーのVRAMが追加されます（HalfKA2 FT1024で約522 MiB、起動ログに表示）。
+保存形式は変更せず、やねうら王の変更も不要です。精度・棋力改善は保証しません。

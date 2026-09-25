@@ -5206,6 +5206,10 @@ struct Args {
     /// Bucket-wise BatchNorm before L2 clamp.
     #[arg(long)]
     sfnn_bn_l2: bool,
+    /// Fine-tune a saved BN model using folded FT/L1/L2/L3 weight/bias QAT.
+    /// Freezes BN running mean/variance; gamma/beta remain trainable.
+    #[arg(long)]
+    sfnn_bn_qat: bool,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5354,6 +5358,14 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.sfnn_bn_qat {
+            if !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2) {
+                return Err("--sfnn-bn-qat requires enabled BN layers and a BN-trained checkpoint".into());
+            }
+            if self.sfnn_l1_center || self.sfnn_l2_l3_center {
+                return Err("--sfnn-bn-qat cannot be combined with centering".into());
+            }
+        }
         if !self.sfnn_ft_saturation_penalty.is_finite() || self.sfnn_ft_saturation_penalty < 0.0
             || !self.sfnn_ft_saturation_rate.is_finite() || self.sfnn_ft_saturation_rate <= 0.0
             || self.sfnn_ft_saturation_rate > 1.0 || self.sfnn_ft_saturation_patience == 0
@@ -5410,10 +5422,10 @@ impl Args {
                 || (spec!=SfnnFactorizerSpec::NONE && spec!=SfnnFactorizerSpec::SHARED) || self.sfnn_bucket_counts.is_some() {
                 return Err("SFNN BN requires cuda-cpp, dense SFNN, factorizer none/shared and no bucket counts".into());
             }
-            if self.sfnn_qat_l1 {
+            if self.sfnn_qat_l1 && !self.sfnn_bn_qat {
                 static WARNING: std::sync::Once = std::sync::Once::new();
                 WARNING.call_once(|| eprintln!("{}", paint(
-                    "  WARNING: BN and L1 QAT cannot currently be combined; continuing with effective sfnn_qat_l1=false (requested=true). BN remains enabled.",
+                    "  WARNING: BN and L1-only QAT cannot be combined; continuing with effective sfnn_qat_l1=false (requested=true). BN remains enabled. For folded-weight QAT fine tuning use --sfnn-bn-qat (freezes running statistics).",
                     ConsoleColor::BoldYellow)));
             }
             if self.sfnn_l1_effective_weight_clip || self.sfnn_ft_saturation_penalty!=0.0
@@ -17700,6 +17712,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("BatchNorm",format!("FT={} L1={} L2={} gamma={} beta={} momentum={} epsilon={}; FT views shared; dense bucket-wise; inference running-stat fold",
             args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
     }
+    runner.configure_bn_qat(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows()).map_err(|e|e.to_string())?;
+    if args.sfnn_bn_qat {
+        print_startup_kv("BN QAT","on: FT/L1/L2/L3 folded weights+bias; running mean/variance FROZEN; gamma/beta trainable; identity STE (round+clip); replaces L1-only QAT");
+        let shape=runner.shape;
+        let n=shape.input_size*shape.ft_size+shape.ft_size+shape.l1w_len().map_err(|e|e.to_string())?+shape.num_stacks*shape.l1_out()
+            +shape.num_stacks*(shape.l2_in()*shape.l2_size+shape.l2_size+shape.l2_size+1);
+        print_startup_kv("BN QAT scratch",format!("{:.1} MiB additional GPU weights",n as f64*4.0/1048576.0));
+    }
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
 
     let loss_kind = cuda_cpp_scalar_loss_kind(args);
@@ -25463,6 +25483,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_norm_loss_strength={:.9}", args.sfnn_norm_loss_strength),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
+        format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
@@ -25722,6 +25743,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_l1_saturation_backward_alpha=");
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
+    let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
     // Centering can be explicitly changed on resume; tensors remain folded.
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
@@ -34332,6 +34354,17 @@ mod tests {
         assert_eq!(resume_signature(&invalid),resume_signature(&bn));
         let mut qat=base.clone();qat.sfnn_qat_l1=true;
         assert!(qat.effective_sfnn_qat_l1());
+        let mut full_qat=bn.clone();full_qat.sfnn_bn_qat=true;
+        assert!(full_qat.validate_arch_flags().is_ok());
+        assert!(resume_signature_matches(&resume_signature(&bn),&full_qat));
+        assert!(resume_signature(&full_qat).contains("sfnn_bn_qat=true"));
+        let mut json_argv:Vec<std::ffi::OsString>=vec!["bulletou".into(),"--teacher".into(),"/dev/null".into()];
+        bulletou_settings_json_value_to_args(Path::new("settings.json"),"sfnn_bn_qat",&serde_json::json!(true),&mut json_argv).unwrap();
+        assert!(Args::try_parse_from(json_argv).unwrap().sfnn_bn_qat);
+        let mut invalid_qat=base.clone();invalid_qat.sfnn_bn_qat=true;
+        assert!(invalid_qat.validate_arch_flags().is_err());
+        invalid_qat=full_qat.clone();invalid_qat.sfnn_l1_center=true;
+        assert!(invalid_qat.validate_arch_flags().is_err());
         invalid=bn.clone();invalid.sfnn_bn_epsilon=0.0;assert!(invalid.validate_arch_flags().is_err());
         invalid=bn.clone();invalid.sfnn_bn_momentum=1.1;assert!(invalid.validate_arch_flags().is_err());
     }

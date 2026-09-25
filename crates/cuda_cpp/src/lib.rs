@@ -1,6 +1,7 @@
 use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 
 pub mod batch_norm;
+mod bn_qat;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CudaCppError {
@@ -6105,6 +6106,7 @@ impl SfnnTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
+    bn_qat: Option<bn_qat::State>,
     pub batch_norm: Option<batch_norm::Network>,
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
     output_center_sums: Option<(F32Buffer, F32Buffer)>,
@@ -6479,6 +6481,7 @@ impl SfnnTrainStepRunner {
             l1_center_batches: 0,
             ft_saturation_guard: None,
             batch_norm: None,
+            bn_qat: None,
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7189,6 +7192,11 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        if self.bn_qat.is_some() {
+            return bn_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r|
+                r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr_multipliers,dirty_buckets));
+        }
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
@@ -7359,6 +7367,11 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        if self.bn_qat.is_some() {
+            return bn_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r|
+                r.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    ctx,upload_ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr_multipliers,dirty_buckets));
+        }
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;
@@ -7495,6 +7508,17 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<SfnnTrainStepProfile> {
+        if self.bn_qat.is_some() {
+            // Outer timing includes proxy refresh, STE pullback and optimizer.
+            let start=Event::new(ctx)?; let stop=Event::new(ctx)?; start.record(ctx)?;
+            let mut p=bn_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r|
+                r.step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+                    ctx,params,loss_kind,output_inv_scale,batch,false,lr_multipliers,dirty_buckets))?;
+            stop.record(ctx)?; stop.synchronize()?;
+            let elapsed=stop.elapsed_ms_since(&start)?;
+            p.update_ms += (elapsed-p.total_ms).max(0.0); p.total_ms=elapsed;
+            return Ok(p);
+        }
         self.validate()?;
         lr_multipliers.validate()?;
         self.prepare_l1_qat(ctx, lr_multipliers.qat_l1)?;

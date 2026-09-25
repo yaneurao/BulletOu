@@ -7404,6 +7404,8 @@ int launch_nnue_backward_kernels(
 
 } // namespace
 
+#include "bn_qat.cuh"
+
 extern "C" int bulletou_cuda_cpp_last_error(char* out, size_t out_len) {
     if (out == nullptr || out_len == 0) {
         return fail_message("last_error output buffer is null or empty");
