@@ -63,6 +63,25 @@ impl SfnnTrainStepRunner {
 mod tests {
     use super::*;
     #[test]
+    fn bn_qat_toggle_preserves_trained_state() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+        r.configure_batch_norm(&ctx,[true;3],Default::default(),&Default::default()).unwrap();
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],buckets:&[0,0,1,1],
+            targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        for enabled in [false,true,false,true] {
+            let weights=r.read_weights(&ctx).unwrap();
+            let optimizer=r.read_optimizer_states(&ctx).unwrap();
+            r.configure_bn_qat(&ctx,enabled,shape.input_size,0).unwrap();
+            assert_eq!(weights,r.read_weights(&ctx).unwrap());
+            assert_eq!(optimizer,r.read_optimizer_states(&ctx).unwrap());
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
+            assert!(r.forward_workspace.output.download(&ctx).unwrap().iter().all(|v|v.is_finite()));
+        }
+    }
+    #[test]
     fn bn_qat_fused_ft_matches_separate_quantize_unfold() {
         let ctx=Context::new(0).unwrap();
         let shape=crate::tests::tiny_sfnn_shape();

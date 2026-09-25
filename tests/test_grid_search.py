@@ -15,6 +15,17 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_bn_qat_epoch_schedule(self):
+        settings = {"sfnn_bn_qat": {"epoch1": False, "epoch6": True, "epoch8": False}}
+        for epoch in (0, 1, 5, 6, 7, 8, 10):
+            self.assertEqual(grid.resolve_epoch_settings(settings, epoch)["sfnn_bn_qat"], 6 <= epoch < 8)
+        with self.assertRaisesRegex(ValueError, "true/false"):
+            grid.resolve_epoch_settings({"sfnn_bn_qat": {"epoch1": False, "epoch6": 1}}, 1)
+        self.common["sfnn_bn_qat"] = settings["sfnn_bn_qat"]
+        grid.atomic_json(self.settings_path, self.common)
+        plan = self.plan(["--lrs", "0.0001"])
+        self.assertEqual(plan["trials"][0]["settings"]["sfnn_bn_qat"], settings["sfnn_bn_qat"])
+
     def test_nnue_bn_grid_conditions(self):
         self.common["arch"] = "NNUE_ka2_256x2_32_32"
         grid.atomic_json(self.settings_path, self.common)

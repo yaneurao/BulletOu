@@ -193,7 +193,16 @@ shared/factorizerにはさらに合成のchain ruleを適用します。γで割
 
 既存のBNオプションを維持してONにしてください。`sfnn_qat_l1=true`が残っていてもBN用QATが置き換えます。
 中心化、effective-weight clipping、saturation penaltiesとは併用不可。workerも未対応です。
-通常BNからのresume時にON/OFFを変更できます。epochスケジュール切替は未対応です。設定ファイルは自動書換えしません。
+通常BNからのresume時にON/OFFを変更できます。単体SFNN学習とgrid searchでは、次のepochスケジュールも使えます。
+
+```json
+"sfnn_bn_qat": {"epoch1": false, "epoch6": true}
+```
+
+epoch 1〜5はBNのみ、epoch 6開始時からBN＋QATになります。重み・optimizer・学習済みγ/β・BN統計は初期化しません。
+resumeは再開epochの値を使用します。warmupのepoch 0はepoch1の値を使用し、将来のQAT指定を先に適用しません。
+`sfnn_bn_ft/l1/l2`は必要な層を最初から有効にしてください。`sfnn_bn_qat_freeze_stats`は既定のfalseのまま使います。
+切替時は`[BN QAT] epoch=6 enabled=true`と表示します。true→falseも対応します。設定ファイルは自動書換えしません。
 
 ゼロからの共通設定（BN層ON、`initial_state`なし）から、新しいgrid rootで比較できます。
 

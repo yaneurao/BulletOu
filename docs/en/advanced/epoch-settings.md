@@ -24,6 +24,7 @@ Merge these fields into a complete training configuration. Values apply from the
 | `lr`, `lr_min` | LR start and lower limit |
 | `batches_per_update` | Accumulation batches per update |
 | `sfnn_qat_l1` | Enable/disable L1 QAT |
+| `sfnn_bn_qat` | Enable/disable BN QAT; enable BN layers from startup, e.g. `{"epoch1":false,"epoch6":true}` |
 | `sfnn_freeze_l1` | Freeze/unfreeze L1 |
 | `sfnn_l1_lr_mult` | L1 LR multiplier |
 | `sfnn_norm_loss_strength` | Norm regularization strength |

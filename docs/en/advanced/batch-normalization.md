@@ -216,8 +216,18 @@ quantized validation remains separate.
 
 Keep the saved BN flags enabled. BN QAT replaces `sfnn_qat_l1` if both are set.
 Centering, effective clipping and saturation penalties are unsupported with BN QAT;
-worker mode remains unsupported. Enable/disable it explicitly on resume, not through
-an epoch schedule. Settings files are never rewritten automatically.
+worker mode remains unsupported. Standalone SFNN training and grid search support:
+
+```json
+"sfnn_bn_qat": {"epoch1": false, "epoch6": true}
+```
+
+Epochs 1–5 use BN alone; BN QAT starts at the beginning of epoch 6. Master weights,
+optimizer state, learned gamma/beta and BN statistics are retained. Resume resolves
+the resumed epoch; warmup epoch 0 inherits epoch1, without applying future QAT settings.
+Enable the required BN layers from the start and leave `sfnn_bn_qat_freeze_stats` at its default false.
+Transitions print `[BN QAT] epoch=6 enabled=true`; true-to-false also works.
+Settings files are never rewritten automatically.
 
 For a scratch comparison, use common settings with BN enabled and no `initial_state`, and a new grid root:
 

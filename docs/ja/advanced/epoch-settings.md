@@ -28,6 +28,7 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 | `lr`, `lr_min` | 学習率の開始値・下限値 |
 | `batches_per_update` | 1更新あたりの累積batch数 |
 | `sfnn_qat_l1` | L1 QATの有効・無効 |
+| `sfnn_bn_qat` | BN QATの有効・無効（BN層は最初から有効化。例：`{"epoch1":false,"epoch6":true}`） |
 | `sfnn_freeze_l1` | L1の固定・解除 |
 | `sfnn_l1_lr_mult` | L1の学習率倍率 |
 | `sfnn_norm_loss_strength` | ノルム正則化係数 |
