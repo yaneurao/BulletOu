@@ -7,7 +7,7 @@ pub struct State {
     proxy: SfnnForwardDeviceWeights,
     base: usize,
     virtual_rows: usize,
-    freeze_stats: bool,
+    pub(super) freeze_stats: bool,
     l2_effective_weight_clip: bool,
 }
 
@@ -92,6 +92,36 @@ unsafe extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tiled_ft_pullback_matches_cpu_chain_rule() {
+        let ctx=Context::new(0).unwrap();let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();calibrated(&mut r,&ctx);
+        let width=shape.ft_size;let base=2057;
+        for vr in [0,7] {
+            let w:Vec<_>=(0..(base+vr)*width).map(|j|((j%53) as f32-26.0)*0.01).collect();
+            let g:Vec<_>=(0..w.len()).map(|j|((j%31) as f32-15.0)*0.003).collect();
+            let wb=F32Buffer::from_host(&ctx,&w).unwrap();let gb=F32Buffer::from_host(&ctx,&g).unwrap();
+            let bias=F32Buffer::from_host(&ctx,&vec![0.2;width]).unwrap();let db=F32Buffer::from_host(&ctx,&vec![0.03;width]).unwrap();
+            let layer=&r.batch_norm.as_ref().unwrap().layers[0].as_ref().unwrap().0;
+            layer.gradients.fill(&ctx,0.0).unwrap();let state=layer.read_state(&ctx).unwrap();
+            let _bind=r.batch_norm.as_ref().unwrap().bind(&ctx,1,false).unwrap();
+            check(unsafe {bulletou_bn_qat_pullback(ctx.as_ptr(),wb.as_ptr(),bias.as_ptr(),std::ptr::null_mut(),std::ptr::null_mut(),
+                gb.as_ptr(),db.as_ptr(),std::ptr::null_mut(),std::ptr::null_mut(),base,width,1,0,vr,0.7)}).unwrap();
+            let actual=gb.download(&ctx).unwrap();let ag=layer.gradients.download(&ctx).unwrap();
+            for u in 0..width {
+                let inv=1.0/(state.running[width+u]+state.config.epsilon).sqrt();let scale=state.affine[u]*inv;
+                let mut sum=0.0f64;
+                for k in 0..base {
+                    let j=k*width+u;let effective=w[j]+if vr>0 {0.7*w[(base+k%vr)*width+u]} else {0.0};
+                    sum+=g[j] as f64*effective as f64;
+                    assert!((actual[j]-scale*g[j]).abs()<1e-6);
+                }
+                let expected=((sum+0.03f32 as f64*(0.2-state.running[u]) as f64)*inv as f64) as f32;
+                assert!((ag[u]-expected).abs()<1e-5,"{} {}",ag[u],expected);
+                assert!((ag[width+u]-0.03).abs()<1e-6);
+            }
+        }
+    }
     #[test]
     fn bn_l2_effective_projection_preserves_other_state() {
         let ctx=Context::new(0).unwrap();

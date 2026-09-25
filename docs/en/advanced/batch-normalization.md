@@ -1,5 +1,27 @@
 # Experimental NNUE / SFNN batch normalization
 
+## One-shot L2 revival on restore
+
+`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units once, after loading a trained L2 BN checkpoint and before training. It does **not** run every epoch. Requires `sfnn_bn_l2`, `sfnn_bn_qat`, and `sfnn_bn_qat_freeze_stats`. Direct training/grid_search only; worker, ordinary NNUE, scratch initialization, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers are rejected.
+
+```json
+"sfnn_bn_l2": true,
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": true,
+"sfnn_l2_revive": true
+```
+
+Compare with `--grid sfnn-l2-revive false true` using the same `initial_state` in common settings.
+
+- Calibration independently reads 16 teacher batches from the restored position, without shuffling. The training cursor/shuffle is unchanged. Validation data and target labels are not used for calibration.
+- Only units reaching the upper clamp in **every** observed position in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. This is an empirical criterion, not proof of constant output on unseen positions.
+- Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); reset that BN scale to one and center its calibration preactivation near 0.5. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
+- Reset selected moments and synchronize Lookahead slow state. Do not reset other units or FT/L1. Always-zero units are reported, not automatically reset.
+- The saved L2 BN state uses record version 2 to remember completion, even when no units qualified. Subsequent restores skip the operation. Old checkpoints remain readable; the old executable cannot read revived version-2 states. The exported nn.bin format is unchanged.
+- `l2-revive.csv` records per-bucket/unit counts, upper/lower hits and selection. Existing audits are preserved with numbered filenames. Interruption before a new checkpoint is saved causes recalibration from the original checkpoint on restart.
+
+This intentionally changes the function slightly; it is not an exact equivalence transformation or a guarantee of improved strength. Temporary GPU proxy/workspace and CPU calibration inputs are released before training.
+
 ## Effective L2 weight bounds for BN-QAT fine tuning
 
 `--sfnn-bn-l2-effective-weight-clip` (JSON: `sfnn_bn_l2_effective_weight_clip`, default false) bounds BN-folded L2 weights to `[-2, 127/64]`. Requires `sfnn_bn_l2=true`, `sfnn_bn_qat=true`, and `sfnn_bn_qat_freeze_stats=true`. Intended for fine tuning a calibrated BN checkpoint; not ordinary NNUE.

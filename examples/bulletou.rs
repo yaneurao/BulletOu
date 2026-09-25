@@ -5218,6 +5218,9 @@ struct Args {
     /// Requires L2 BN and frozen-stat BN QAT. Default: off.
     #[arg(long)]
     sfnn_bn_l2_effective_weight_clip: bool,
+    /// On checkpoint restore, revive always-upper L2 units once using teacher calibration.
+    #[arg(long)]
+    sfnn_l2_revive: bool,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5387,6 +5390,9 @@ impl Args {
     fn validate_arch_flags(&self) -> Result<(), String> {
         if self.sfnn_bn_qat_freeze_stats && !self.sfnn_bn_qat {
             return Err("--sfnn-bn-qat-freeze-stats requires --sfnn-bn-qat".into());
+        }
+        if self.sfnn_l2_revive && !(self.sfnn_bn_l2 && self.sfnn_bn_qat && self.sfnn_bn_qat_freeze_stats) {
+            return Err("--sfnn-l2-revive requires --sfnn-bn-l2, --sfnn-bn-qat and --sfnn-bn-qat-freeze-stats; applies only on checkpoint restore".into());
         }
         if self.sfnn_bn_l2_effective_weight_clip &&
             !(self.sfnn_bn_l2 && self.sfnn_bn_qat && self.sfnn_bn_qat_freeze_stats) {
@@ -10609,6 +10615,7 @@ impl WorkerSfnnSession {
             format_count(updates_per_superbatch),
             format_count(batch_size)
         );
+        if args.sfnn_l2_revive { return Err("--sfnn-l2-revive is supported by direct training/grid_search, not worker trials".into()); }
         let initial_state = build_sfnn_initial_state_for_cuda_cpp(&args, feature_kind)?;
         let progress_state = initial_state.progress.clone();
         let progress_params = cuda_cpp_sfnn_progress_params_for_state(progress_state.as_ref())?;
@@ -17302,6 +17309,57 @@ fn run_cuda_cpp_sfnn_ka2_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
+    use bulletou_cuda_cpp::*;
+    if runner.l2_revival_done() {
+        eprintln!("  [L2 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
+    }
+    if runner.factorizer.any_axis() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+        || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
+        return Err("--sfnn-l2-revive currently requires dense L1, no axes/count gates, and no legacy L2/L3 factorizers".into());
+    }
+    let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
+    let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
+    let proxy=SfnnForwardDeviceWeights::new_dense(ctx,shape).map_err(|e|e.to_string())?;
+    runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
+    let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,cfg.batch_size)).map_err(|e|e.to_string())?;
+    let mut calibration=l2_revive::Calibration::new(shape.l2_in(),shape.l2_size,shape.num_stacks);
+    eprintln!("  [L2 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket, upper=100%; learning cursor unchanged");
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
+        let fast=teacher.batch;
+        let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
+        let stm=strip(&fast.stm);let nstm=strip(&fast.nstm);
+        let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch {stm_indices:&stm,nstm_indices:&nstm,
+            buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
+        sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
+        calibration.add(&fast.buckets,&workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,
+            &workspace.l2.download(ctx).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+    })?;
+    let candidates=calibration.candidates();
+    let mut report=String::from("bucket,unit,positions,upper_hits,lower_hits,revived\n");
+    for i in 0..calibration.upper.len() {
+        let b=i/shape.l2_size;
+        report.push_str(&format!("{b},{},{},{},{},{}\n",i%shape.l2_size,calibration.counts[b],calibration.upper[i],calibration.lower[i],candidates.contains(&i)));
+    }
+    // Persist the audit before mutating weights. Never touch the source checkpoint.
+    std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
+    let (path,mut out)=(0..10000).find_map(|i| {
+        let path=args.output_dir().join(if i==0 {"l2-revive.csv".into()} else {format!("l2-revive-{i}.csv")});
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file)=>Some(Ok((path,file))),
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>None,
+            Err(e)=>Some(Err(format!("{}: {e}",path.display())))
+        }
+    }).ok_or_else(||"too many L2 revival audit files".to_string())??;
+    std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
+    let ids=runner.revive_l2(ctx,&calibration).map_err(|e|e.to_string())?;
+    eprintln!("  [L2 REVIVE] complete: {} units; Glorot inputs, L3=+/-1/64, bias compensation, selected moments reset; audit={}",ids.len(),path.display());
+    for i in ids {eprintln!("  [L2 REVIVE] bucket={} unit={}",i/shape.l2_size,i%shape.l2_size);}
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<(), String> {
     use bulletou_cuda_cpp::{
         Context, RAdamUpdateParams, RangerUpdateParams, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
@@ -17367,6 +17425,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_sfnn_initial_state_for_cuda_cpp(args, feature_kind)?;
+    if args.sfnn_l2_revive && initial_state.weights.batch_norm.0[2].is_none() {
+        return Err("--sfnn-l2-revive requires a checkpoint containing calibrated L2 BN (not scratch training)".into());
+    }
     let sfnn_progress_train_state = initial_state.progress.clone();
     let sfnn_progress_params = cuda_cpp_sfnn_progress_params_for_state(sfnn_progress_train_state.as_ref())?;
     let frozen_progress_params = if progress_enabled {
@@ -17870,6 +17931,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
+    if args.sfnn_l2_revive {
+        run_sfnn_l2_revival(args,feature_kind,&ctx,&mut runner,&config)?;
+    }
     let validation_cache_started = std::time::Instant::now();
     let mut sfnn_resident_validation_cache = CudaCppSfnnResidentValidationCache::try_new(
         args,
@@ -34509,7 +34573,7 @@ mod tests {
         for (i,width) in [32,8,8].into_iter().enumerate() {
             let mut affine=vec![0.25;width];affine.extend(vec![0.5;width]);
             let mut running=vec![0.03;width];running.extend(vec![0.2;width]);running.extend(vec![1.0;width]);
-            bn.0[i]=Some(batch_norm::State {width,groups:1,config:Default::default(),
+            bn.0[i]=Some(batch_norm::State {revival_done:false,width,groups:1,config:Default::default(),
                 optimizer:group(&affine),affine,running});
         }
         let weights=NnueTrainWeightsReadback {batch_norm:bn.clone(),l0w:initial.l0w,l0b:initial.l0b,
@@ -34569,6 +34633,10 @@ mod tests {
         assert!(resume_signature_matches(&resume_signature(&bn),&full_qat));
         assert!(resume_signature(&full_qat).contains("sfnn_bn_qat=true"));
         let mut frozen=full_qat.clone();frozen.sfnn_bn_qat_freeze_stats=true;
+        assert!(!frozen.sfnn_l2_revive);
+        let mut revive=frozen.clone();revive.sfnn_l2_revive=true;
+        assert!(revive.validate_arch_flags().is_ok());
+        revive.sfnn_bn_qat_freeze_stats=false;assert!(revive.validate_arch_flags().is_err());
         assert!(frozen.validate_arch_flags().is_ok());
         assert!(resume_signature_matches(&resume_signature(&full_qat),&frozen));
         let mut clipped=frozen.clone();clipped.sfnn_bn_l2_effective_weight_clip=true;

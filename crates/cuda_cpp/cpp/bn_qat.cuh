@@ -131,6 +131,34 @@ __global__ void bn_qat_pullback(const float* w,const float* b,const float* sw,co
         if(gsb)atomicAdd(gsb+u,alpha*scale*d);
     }
 }
+// Split the large FT reduction across input tiles. The old kernel launched only
+// width/32 blocks (32 for FT1024), leaving most SMs idle for the whole matrix.
+__global__ void bn_qat_ft_pullback_tiles(const float* w,float* gw,double* partial,
+    size_t input,size_t output,size_t vr,float alpha,BnConfig bn) {
+    __shared__ double sums[256];
+    size_t u=blockIdx.x*32+threadIdx.x%32,lane=threadIdx.x/32;
+    double sum=0;
+    if(u<output) {
+        float inv=1.0f/sqrtf(bn.running[output+u]+bn.epsilon);
+        float scale=bn.params[u]*inv;
+        for(size_t k=blockIdx.y*1024+lane;k<input && k<(blockIdx.y+1)*1024;k+=8) {
+            size_t j=k*output+u;float effective=w[j];
+            if(vr)effective+=alpha*w[(input+k%vr)*output+u];
+            float d=gw[j];sum+=double(d)*effective;gw[j]=scale*d;
+        }
+    }
+    sums[threadIdx.x]=sum;__syncthreads();
+    for(int d=4;d;d/=2) {if(lane<size_t(d))sums[threadIdx.x]+=sums[threadIdx.x+d*32];__syncthreads();}
+    if(u<output && lane==0)partial[blockIdx.y*output+u]=sums[threadIdx.x];
+}
+__global__ void bn_qat_ft_pullback_finish(const double* partial,const float* b,float* gb,
+    size_t tiles,size_t output,BnConfig bn) {
+    size_t u=blockIdx.x*blockDim.x+threadIdx.x;if(u>=output)return;
+    double sum=0;for(size_t p=0;p<tiles;++p)sum+=partial[p*output+u];
+    float inv=1.0f/sqrtf(bn.running[output+u]+bn.epsilon),d=gb[u];
+    bn.grads[u]+=float((sum+double(d)*(b[u]-bn.running[u]))*inv);
+    bn.grads[output+u]+=d;gb[u]=bn.params[u]*inv*d;
+}
 extern "C" int bulletou_bn_qat_ft(BulletOuCudaCppContext* ctx,BulletOuCudaCppF32Buffer* src,
     BulletOuCudaCppF32Buffer* dst,size_t base,size_t vr,size_t width,float alpha) {
     if(!ctx || !base || !width || validate_buffer(ctx,src,(base+vr)*width,"BN QAT FT source") ||
@@ -164,6 +192,15 @@ extern "C" int bulletou_bn_qat_pullback(BulletOuCudaCppContext* ctx,
     // scanning the entire FT matrix only rewrites each gradient unchanged.
     // Keep the virtual-row reduction above: it is still required for FT.
     if(!bn.params && !gs && !gsb)return check_kernel_launch("BN QAT identity pullback");
+    if(layer==0 && groups==1 && input>1024 && bn.params && !sw && !sb && !gs && !gsb) {
+        size_t tiles=(input+1023)/1024;
+        if(ensure_f32_scratch(&ctx->bn_qat_partials,&ctx->bn_qat_partials_len,2*tiles*output,"BN QAT partial sums"))return -1;
+        auto partial=reinterpret_cast<double*>(ctx->bn_qat_partials);
+        bn_qat_ft_pullback_tiles<<<dim3(static_cast<unsigned>((output+31)/32),static_cast<unsigned>(tiles)),256,0,ctx->stream>>>(
+            w->ptr,gw->ptr,partial,input,output,vr,alpha,bn);
+        bn_qat_ft_pullback_finish<<<static_cast<unsigned>((output+255)/256),256,0,ctx->stream>>>(partial,b->ptr,gb->ptr,tiles,output,bn);
+        return check_kernel_launch("BN QAT tiled FT pullback");
+    }
     if(gs)cudaMemsetAsync(gs->ptr,0,input*output*sizeof(float),ctx->stream);
     if(gsb)cudaMemsetAsync(gsb->ptr,0,output*sizeof(float),ctx->stream);
     bn_qat_pullback<<<static_cast<unsigned>((groups*output+31)/32),256,0,ctx->stream>>>(w->ptr,b->ptr,sw?sw->ptr:nullptr,sb?sb->ptr:nullptr,

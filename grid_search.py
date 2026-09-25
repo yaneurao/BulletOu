@@ -48,6 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
+    "sfnn_l2_revive",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",

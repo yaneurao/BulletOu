@@ -2,6 +2,7 @@ use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 
 pub mod batch_norm;
 mod bn_qat;
+pub mod l2_revive;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CudaCppError {

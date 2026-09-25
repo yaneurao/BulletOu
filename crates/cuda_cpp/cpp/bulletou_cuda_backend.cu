@@ -99,6 +99,8 @@ struct BulletOuCudaCppContext {
     BnConfig bn[3];
     FtSaturationConfig ft_guard;
     float* norm_loss_scratch = nullptr;
+    float* bn_qat_partials = nullptr; // double partial sums, allocated in float-sized units
+    size_t bn_qat_partials_len = 0;
     int device = 0;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
@@ -7521,6 +7523,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         return -1;
     }
     if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
+    if (ctx->bn_qat_partials != nullptr) cudaFree(ctx->bn_qat_partials);
     if (ctx->blas != nullptr) {
         cublasStatus_t blas_status = cublasDestroy(ctx->blas);
         if (blas_status != CUBLAS_STATUS_SUCCESS) {

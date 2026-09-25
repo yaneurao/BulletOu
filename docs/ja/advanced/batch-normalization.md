@@ -1,5 +1,28 @@
 # NNUE / SFNNのBatch Normalization（実験用）
 
+## 復元時のL2定数unit再利用
+
+`--sfnn-l2-revive`（JSON: `"sfnn_l2_revive": true`、デフォルトfalse）は、学習済みL2 BN checkpointを復元した直後、学習開始前に一度だけ校正・再初期化します。各epoch開始時には実行しません。
+`sfnn_bn_l2`、`sfnn_bn_qat`、`sfnn_bn_qat_freeze_stats`をtrueにしてください。直接学習とgrid_searchに対応し、worker、通常NNUE、scratch開始、compact L1、axis/pair・residual count gate・旧L2/L3 factorizerは未対応で明示エラーになります。
+
+```json
+"sfnn_bn_l2": true,
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": true,
+"sfnn_l2_revive": true
+```
+
+gridのA/B比較は `--grid sfnn-l2-revive false true`。共通設定の`initial_state`に同じcheckpointを指定してください。
+
+- 復元した教師位置から16batchを別途読み、量子化推論で校正します。校正時のshuffleは0。学習側の位置・shuffle設定は進めたり変更したりしません。検証データ・正解評価値は校正に使用しません。
+- bucket内で1,024局面以上観測され、その全てで出力1のL2 unitだけが対象です。少数・未出現bucketは処理しません。「サンプル全件」であり、未知の全局面で定数という証明ではありません。
+- 定数寄与をL3 biasへ移し、入力をGlorot一様分布（seed=20260926）で再初期化。対象のBN倍率を1にし、校正入力平均で出力が約0.5になるようbetaを設定します。L3接続を元と同符号の±1/64から再学習し、その平均寄与もbias補償します。
+- 対象のmomentとLookahead slowを整合させます。他unitとFT/L1はリセットしません。上限に達しないunitや出力0のunitは自動リセットしません。
+- 校正・処理済み情報をL2 BNのstateレコード（version 2）に保存します。後続checkpointからのresumeでは、フラグがtrueでも再実行しません。対象0件でも校正済みになります。nn.bin形式は変わりません。旧stateは読み込めますが、処理済みstateを旧実行ファイルでは読めません。
+- 出力先の`l2-revive.csv`に各bucket/unitの局面数・上限/下限回数・対象判定を保存します。既存ファイルは上書きせず連番にします。校正後、checkpoint保存前に中断した場合は、元checkpointから再校正します。
+
+これは完全な等価変換ではありません。定数寄与の移動後に新しい局面依存出力を作り、量子化丸めも変わります。精度・棋力の向上は保証しません。校正時のみ推論用GPU重み/workspaceとCPU入力サンプルを一時保持し、学習前に解放します。
+
 ## BN-QAT追加学習時のL2有効重み制限
 
 `--sfnn-bn-l2-effective-weight-clip`（JSON: `sfnn_bn_l2_effective_weight_clip`、デフォルトfalse）は、BN fold後のL2重みを `[-2, 127/64]` に制限します。`sfnn_bn_l2=true`、`sfnn_bn_qat=true`、`sfnn_bn_qat_freeze_stats=true` が必要です。学習済みBN checkpointからの追加学習用で、通常NNUEには適用しません。
