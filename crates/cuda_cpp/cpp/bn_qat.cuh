@@ -109,6 +109,11 @@ extern "C" int bulletou_bn_qat_pullback(BulletOuCudaCppContext* ctx,
         validate_buffer(ctx,gs,input*output,"BN QAT shared gradient") || validate_buffer(ctx,gsb,output,"BN QAT shared bias gradient")))return -1;
     BnConfig bn=layer<3?ctx->bn[layer]:BnConfig{};
     if(vr)bn_qat_ft_virtual<<<static_cast<unsigned>((vr*output+255)/256),256,0,ctx->stream>>>(gw->ptr,input,vr,output,alpha,bn);
+    // Train-mode BN has already produced raw-coordinate gradients. With no
+    // shared factorizer, the remaining pullback is exactly the identity;
+    // scanning the entire FT matrix only rewrites each gradient unchanged.
+    // Keep the virtual-row reduction above: it is still required for FT.
+    if(!bn.params && !gs && !gsb)return check_kernel_launch("BN QAT identity pullback");
     if(gs)cudaMemsetAsync(gs->ptr,0,input*output*sizeof(float),ctx->stream);
     if(gsb)cudaMemsetAsync(gsb->ptr,0,output*sizeof(float),ctx->stream);
     bn_qat_pullback<<<static_cast<unsigned>((groups*output+31)/32),256,0,ctx->stream>>>(w->ptr,b->ptr,sw?sw->ptr:nullptr,sb?sb->ptr:nullptr,
