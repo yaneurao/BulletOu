@@ -8,6 +8,7 @@ pub struct State {
     base: usize,
     virtual_rows: usize,
     freeze_stats: bool,
+    l2_effective_weight_clip: bool,
 }
 
 impl SfnnTrainStepRunner {
@@ -54,14 +55,101 @@ impl SfnnTrainStepRunner {
             }
         }
         self.bn_qat =
-            Some(State { proxy, base, virtual_rows: if self.shape.input_size == base { 0 } else { virtual_rows }, freeze_stats });
+            Some(State { proxy, base, virtual_rows: if self.shape.input_size == base { 0 } else { virtual_rows }, freeze_stats, l2_effective_weight_clip: false });
         Ok(())
     }
+
+    /// Project L2 master/Lookahead weights in BN-folded coordinates. Moments are retained.
+    pub fn configure_bn_l2_effective_weight_clip(&mut self, ctx: &Context, enabled: bool) -> Result<()> {
+        if self.pending_gradient_batches != 0 {
+            return Err(CudaCppError::message("cannot change BN L2 clipping with accumulated gradients"));
+        }
+        if enabled && (!self.bn_qat.as_ref().is_some_and(|q| q.freeze_stats)
+            || !self.batch_norm.as_ref().is_some_and(|bn| bn.layers[2].is_some())) {
+            return Err(CudaCppError::message("BN L2 effective weight clipping requires L2 BN and frozen-stat BN QAT"));
+        }
+        if enabled && self.factorizer.shared && self.weights.l2fw.is_some() {
+            return Err(CudaCppError::message("BN L2 effective weight clipping does not support legacy L2 shared weights"));
+        }
+        if let Some(q) = self.bn_qat.as_mut() { q.l2_effective_weight_clip = enabled; }
+        if enabled { project_l2(self, ctx)?; }
+        Ok(())
+    }
+}
+
+fn project_l2(r: &SfnnTrainStepRunner, ctx: &Context) -> Result<()> {
+    let _bind = r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?;
+    check(unsafe { bulletou_bn_qat_project_l2(ctx.as_ptr(), r.weights.l2w.as_ptr(),
+        r.optimizer_states.l2w.slow_params.as_ptr(), r.shape.l2_in(), r.shape.l2_size * r.shape.num_stacks) })
+}
+
+unsafe extern "C" {
+    fn bulletou_bn_qat_project_l2(ctx: *mut ffi::BulletOuCudaCppContext,
+        w: *mut ffi::BulletOuCudaCppF32Buffer, slow: *mut ffi::BulletOuCudaCppF32Buffer,
+        input: usize, channels: usize) -> i32;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bn_l2_effective_projection_preserves_other_state() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+        assert!(r.configure_bn_l2_effective_weight_clip(&ctx,true).is_err());
+        calibrated(&mut r,&ctx);
+        let (layer,_)=r.batch_norm.as_ref().unwrap().layers[2].as_ref().unwrap();
+        let c=layer.width*layer.groups;
+        let mut params=layer.affine.download(&ctx).unwrap();
+        for (i,v) in params[..c].iter_mut().enumerate() {*v=match i%3 {0=>0.0,1=>-2.0,_=>3.0};}
+        layer.affine.upload(&ctx,&params).unwrap();
+        r.configure_bn_qat_mode(&ctx,true,shape.input_size,0,true).unwrap();
+        // Tiny legacy fixtures contain L2 shared weights; production L2 does not.
+        assert!(r.configure_bn_l2_effective_weight_clip(&ctx,true).is_err());
+        r.factorizer.shared=false;
+        r.weights.l2w.fill(&ctx,100.0).unwrap();
+        r.optimizer_states.l2w.slow_params.fill(&ctx,-100.0).unwrap();
+        r.optimizer_states.l2w.momentum.fill(&ctx,0.3).unwrap();
+        let bn=r.read_batch_norm_state(&ctx).unwrap();
+        let bias=r.weights.l2b.download(&ctx).unwrap();
+        let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,shape).unwrap();
+        r.build_quantized_proxy(&ctx,shape.input_size,0,&proxy).unwrap();
+        let quantized_before=proxy.l2w.download(&ctx).unwrap();
+        r.configure_bn_l2_effective_weight_clip(&ctx,true).unwrap();
+        r.build_quantized_proxy(&ctx,shape.input_size,0,&proxy).unwrap();
+        assert_eq!(quantized_before,proxy.l2w.download(&ctx).unwrap());
+        let w=r.weights.l2w.download(&ctx).unwrap();
+        let slow=r.optimizer_states.l2w.slow_params.download(&ctx).unwrap();
+        for i in 0..w.len() {
+            let ch=i/shape.l2_in();let scale=params[ch]/(0.21f32+1e-5).sqrt();
+            if scale==0.0 {assert_eq!(w[i],100.0);assert_eq!(slow[i],-100.0);}
+            else {assert!((-2.0..=127.0/64.0).contains(&(w[i]*scale)));assert!((-2.0..=127.0/64.0).contains(&(slow[i]*scale)));}
+        }
+        assert_eq!(bn,r.read_batch_norm_state(&ctx).unwrap());
+        assert_eq!(bias,r.weights.l2b.download(&ctx).unwrap());
+        assert!(r.optimizer_states.l2w.momentum.download(&ctx).unwrap().iter().all(|&x|x==0.3));
+        project_l2(&r,&ctx).unwrap();
+        assert_eq!(w,r.weights.l2w.download(&ctx).unwrap());
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],
+            buckets:&[0,0,1,1],targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        // BPU=2: projection must follow the real update, including Lookahead.
+        for step in 0..12 {
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,batch,true,step%2==1,Default::default()).unwrap();
+            if step%2==1 {
+                let states=r.read_batch_norm_state(&ctx).unwrap();
+                let (scale,_)=states.0[2].as_ref().unwrap().inference_affine().unwrap();
+                for values in [r.weights.l2w.download(&ctx).unwrap(),r.optimizer_states.l2w.slow_params.download(&ctx).unwrap()] {
+                    for (i,v) in values.iter().enumerate() {
+                        assert!((-2.000001..=1.984376).contains(&(v*scale[i/shape.l2_in()])));
+                    }
+                }
+            }
+        }
+        r.configure_bn_l2_effective_weight_clip(&ctx,false).unwrap();
+        assert!(!r.bn_qat.as_ref().unwrap().l2_effective_weight_clip);
+    }
     #[test]
     fn bn_qat_toggle_preserves_trained_state() {
         let ctx=Context::new(0).unwrap();
@@ -626,6 +714,8 @@ pub(super) fn step<T>(
         if update {
             pullback(r, ctx, &q)?;
             r.update_weights_with_lr_multipliers_and_dirty_buckets(ctx, params, lr, dirty)?;
+            // After both Ranger/Lookahead and BN gamma updates: use the new fold scale.
+            if q.l2_effective_weight_clip { project_l2(r, ctx)?; }
         }
         Ok(value)
     })();

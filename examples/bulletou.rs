@@ -5214,6 +5214,10 @@ struct Args {
     /// Use inference-fold QAT with frozen, already calibrated BN statistics.
     #[arg(long)]
     sfnn_bn_qat_freeze_stats: bool,
+    /// Bound BN-folded L2 master and Lookahead weights on load and after every update.
+    /// Requires L2 BN and frozen-stat BN QAT. Default: off.
+    #[arg(long)]
+    sfnn_bn_l2_effective_weight_clip: bool,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5383,6 +5387,10 @@ impl Args {
     fn validate_arch_flags(&self) -> Result<(), String> {
         if self.sfnn_bn_qat_freeze_stats && !self.sfnn_bn_qat {
             return Err("--sfnn-bn-qat-freeze-stats requires --sfnn-bn-qat".into());
+        }
+        if self.sfnn_bn_l2_effective_weight_clip &&
+            !(self.sfnn_bn_l2 && self.sfnn_bn_qat && self.sfnn_bn_qat_freeze_stats) {
+            return Err("--sfnn-bn-l2-effective-weight-clip requires --sfnn-bn-l2, --sfnn-bn-qat and --sfnn-bn-qat-freeze-stats".into());
         }
         if self.sfnn_bn_qat {
             if !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2) {
@@ -17763,6 +17771,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
     }
     runner.configure_bn_qat_mode(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows(),args.sfnn_bn_qat_freeze_stats).map_err(|e|e.to_string())?;
+    runner.configure_bn_l2_effective_weight_clip(&ctx,args.sfnn_bn_l2_effective_weight_clip).map_err(|e|e.to_string())?;
+    if args.sfnn_bn_l2_effective_weight_clip {
+        print_startup_kv("BN L2 effective weight clip", "on: folded range [-2, 127/64]; master + Lookahead slow projected on load/after each update; moments retained");
+    }
     if args.sfnn_bn_qat {
         print_startup_kv("BN QAT",if args.sfnn_bn_qat_freeze_stats {
             "on: inference-fold QAT; running mean/variance FROZEN; gamma/beta trainable; identity STE (round+clip)"
@@ -18292,6 +18304,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     runner.configure_bn_qat_mode(&ctx, next_args.sfnn_bn_qat,
                         feature_kind.base_input_size(), feature_kind.virtual_rows(),
                         next_args.sfnn_bn_qat_freeze_stats).map_err(|e| e.to_string())?;
+                    runner.configure_bn_l2_effective_weight_clip(&ctx,next_args.sfnn_bn_l2_effective_weight_clip).map_err(|e|e.to_string())?;
                     eprintln!("{}", paint(format!(
                         "  [BN QAT] epoch={} enabled={} (weights, optimizer and BN state preserved)",
                         progress.epoch, next_args.sfnn_bn_qat), ConsoleColor::Yellow));
@@ -25577,6 +25590,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
         format!("sfnn_bn_qat_freeze_stats={}", args.sfnn_bn_qat_freeze_stats),
+        format!("sfnn_bn_l2_effective_weight_clip={}", args.sfnn_bn_l2_effective_weight_clip),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
         format!("sfnn_l1_center={}", args.sfnn_l1_center),
         format!("sfnn_l1_effective_weight_clip={}", args.sfnn_l1_effective_weight_clip),
@@ -25849,6 +25863,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat_freeze_stats=");
+    let signature = resume_signature_without_line(&signature, "sfnn_bn_l2_effective_weight_clip=");
     // Centering can be explicitly changed on resume; tensors remain folded.
     let signature = resume_signature_without_line(&signature, "sfnn_l2_l3_center=");
     let signature = resume_signature_without_line(&signature, "sfnn_l1_center=");
@@ -34556,6 +34571,13 @@ mod tests {
         let mut frozen=full_qat.clone();frozen.sfnn_bn_qat_freeze_stats=true;
         assert!(frozen.validate_arch_flags().is_ok());
         assert!(resume_signature_matches(&resume_signature(&full_qat),&frozen));
+        let mut clipped=frozen.clone();clipped.sfnn_bn_l2_effective_weight_clip=true;
+        assert!(clipped.validate_arch_flags().is_ok());
+        assert!(resume_signature_matches(&resume_signature(&frozen),&clipped));
+        clipped.sfnn_bn_qat_freeze_stats=false;
+        assert!(clipped.validate_arch_flags().is_err());
+        clipped=frozen.clone();clipped.sfnn_bn_l2_effective_weight_clip=true;clipped.sfnn_bn_l2=false;
+        assert!(clipped.validate_arch_flags().is_err());
         frozen.sfnn_bn_qat=false;
         assert!(frozen.validate_arch_flags().is_err());
         let mut json_argv:Vec<std::ffi::OsString>=vec!["bulletou".into(),"--teacher".into(),"/dev/null".into()];

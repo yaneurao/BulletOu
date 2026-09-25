@@ -1,5 +1,26 @@
 # Experimental NNUE / SFNN batch normalization
 
+## Effective L2 weight bounds for BN-QAT fine tuning
+
+`--sfnn-bn-l2-effective-weight-clip` (JSON: `sfnn_bn_l2_effective_weight_clip`, default false) bounds BN-folded L2 weights to `[-2, 127/64]`. Requires `sfnn_bn_l2=true`, `sfnn_bn_qat=true`, and `sfnn_bn_qat_freeze_stats=true`. Intended for fine tuning a calibrated BN checkpoint; not ordinary NNUE.
+
+```json
+"sfnn_bn_l2": true,
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": true,
+"sfnn_bn_l2_effective_weight_clip": true,
+"lr": 0.00005,
+"lr_min": 0.00005
+```
+
+On load and after each optimizer update (including BN gamma and Ranger Lookahead updates), a GPU kernel projects `W <- clip(r*W,-2,127/64)/r`, with `r=gamma/sqrt(running_variance+epsilon)`. Lookahead slow weights receive the same projection; optimizer momentum/velocity are retained. Zero gamma leaves weights unchanged. With BPU>1 this runs after actual updates, not each microbatch. No extra VRAM is allocated.
+
+Only **L2 weights** are affected, not biases, FT, L1, or L3. This differs from raw `optimizer_weight_clip` by including the BN fold scale. Running mean/variance stay frozen while weights and gamma/beta remain trainable. The option may change on resume; disabling it does not undo previous projections. Checkpoint/export formats remain unchanged.
+
+Legacy active L2 shared weights are unsupported and rejected; current L1-only shared factorization is supported.
+
+Use `--grid sfnn-bn-l2-effective-weight-clip false true` with the required BN/QAT/frozen-stat flags in common settings. Per-epoch schedules for this option are not supported. This addresses float/quantized discrepancies; accuracy or playing-strength gains are not guaranteed.
+
 ## Ordinary NNUE
 
 The CUDA C++ trainer supports BN for ordinary HalfKP, KP, KA2, HalfKPE9 and HalfKP_vm NNUE.

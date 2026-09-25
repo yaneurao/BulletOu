@@ -1,3 +1,33 @@
+// Project using the same explicitly rounded scale as inference folding.
+__device__ float bn_project_weight(float w, float r) {
+    const float folded=__fmul_rn(r,w);
+    if(folded>=-2.0f && folded<=127.0f/64.0f)return w;
+    float v=__fdiv_rn(fminf(fmaxf(folded,-2.0f),127.0f/64.0f),r);
+    // Division rounding must not leave the projected value outside the bound.
+    if(__fmul_rn(r,v) < -2.0f || __fmul_rn(r,v) > 127.0f/64.0f)v=nextafterf(v,0.0f);
+    return v;
+}
+__global__ void bn_project_l2(float* w,float* slow,size_t input,size_t channels,BnConfig bn) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j>=input*channels)return;
+    size_t ch=j/input;
+    float r=__fdiv_rn(bn.params[ch],__fsqrt_rn(__fadd_rn(bn.running[channels+ch],bn.epsilon)));
+    // Zero gamma means zero effective weights; no division or reset is needed.
+    if(r==0.0f || !isfinite(r))return;
+    w[j]=bn_project_weight(w[j],r);
+    slow[j]=bn_project_weight(slow[j],r);
+}
+extern "C" int bulletou_bn_qat_project_l2(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* slow,size_t input,size_t channels) {
+    if(!ctx || !input || !channels || !ctx->bn[2].params ||
+        ctx->bn[2].width*ctx->bn[2].groups!=channels ||
+        validate_buffer(ctx,w,input*channels,"BN L2 projection weights") ||
+        validate_buffer(ctx,slow,input*channels,"BN L2 projection slow"))return -1;
+    bn_project_l2<<<static_cast<unsigned>((input*channels+255)/256),256,0,ctx->stream>>>(
+        w->ptr,slow->ptr,input,channels,ctx->bn[2]);
+    return check_kernel_launch("BN L2 effective weight projection");
+}
+
 // Fold QAT. Identity STE through both rounding and clipping.
 // The raw parameter tensors are never quantized in place.
 __global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha,BnConfig bn,

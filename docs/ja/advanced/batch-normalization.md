@@ -1,5 +1,28 @@
 # NNUE / SFNNのBatch Normalization（実験用）
 
+## BN-QAT追加学習時のL2有効重み制限
+
+`--sfnn-bn-l2-effective-weight-clip`（JSON: `sfnn_bn_l2_effective_weight_clip`、デフォルトfalse）は、BN fold後のL2重みを `[-2, 127/64]` に制限します。`sfnn_bn_l2=true`、`sfnn_bn_qat=true`、`sfnn_bn_qat_freeze_stats=true` が必要です。学習済みBN checkpointからの追加学習用で、通常NNUEには適用しません。
+
+```json
+"sfnn_bn_l2": true,
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": true,
+"sfnn_bn_l2_effective_weight_clip": true,
+"lr": 0.00005,
+"lr_min": 0.00005
+```
+
+開始時と各optimizer更新後（BNのγ更新・Ranger Lookaheadの後）に、`r=gamma/sqrt(running_variance+epsilon)` として `W <- clip(r*W,-2,127/64)/r` をGPUで計算します。Rangerのslow weightも同じ制限を適用し、momentum/velocityは保持します。γ=0では変更しません。BPU>1では各microbatchではなく更新時に実行します。追加VRAMは不要です。
+
+対象は **L2 weightのみ**。bias・FT・L1・L3は変更しません。通常の`optimizer_weight_clip`とは別で、BN倍率を含めた制限です。平均・分散は固定しますが、重みとγ/βは学習を続けます。再開時にON/OFFを変更できます。設定をOFFに戻しても、既に補正した重みは元に戻りません。nn.bin/state.bin形式は変わりません。
+
+古いL2 shared重みが有効な構成には未対応で、明示的にエラーにします。現在のL1のみのsharedは対応しています。
+
+grid searchでは `--grid sfnn-bn-l2-effective-weight-clip false true` で比較できます。共通設定には必要なBN/QAT/統計固定を指定してください。途中epochのON/OFFスケジュールはこのオプションでは未対応です。
+
+この制限は量子化前後の乖離を抑えるためのもので、acc・qacc・棋力の向上を保証するものではありません。
+
 ## 通常NNUE
 
 CUDA C++バックエンドの通常NNUE（HalfKP / KP / KA2 / HalfKPE9 / HalfKP_vm）にも対応しています。
