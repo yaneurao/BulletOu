@@ -35,7 +35,7 @@ validationはrunning統計をfoldした重みで計算します。`nn.bin`にも
 やねうら王側にBN層や追加ファイルは不要です。ただし量子化誤差やclipがなくなるわけではありません。
 通常NNUEの既存の検証項目を変更・追加する機能ではありません。
 `state.bin` / 完全状態の`weights.bin`には未fold重み、BN統計、γ/βとそのoptimizer stateを保存します。
-resume時は同じBNオプション・設定値を指定してください。保存済みBNをOFFにしてのresumeはエラーにし、黙って破棄しません。
+resume時は同じBNオプション・設定値を指定してください。ただし `nnue_bn_momentum` は変更できます。保存済みBNをOFFにしてのresumeはエラーにし、黙って破棄しません。
 
 ## SFNN
 
@@ -59,6 +59,35 @@ JSONでは `_`、CLIでは `-` を使います。grid searchではどちらも�
 γ=0.25、β=0.5は、標準偏差1のまま上限1のclampへ入れることを避けるための実験用初期値です。
 最適値が確認されたわけではありません。標準的なγ=1、β=0も指定できます。
 これらのオプションはepoch別切り替えには対応していません。
+
+### 統計の取り込み率を下げて追加学習する
+
+既存runの設定JSONで、次を指定して再開できます。
+
+```json
+"sfnn_bn_momentum": 0.01
+```
+
+更新式は `新しい移動統計 = (1 - momentum) × 以前の移動統計 + momentum × 今回のbatch統計` です。
+既定値は引き続き0.1。0.01では各batchの取り込み率が1%になり、0.001では0.1%になります。
+毎mini-batch更新する頻度は変わりません。SBごとの更新や16sb分の厳密な平均を意味しません。
+履歴の半減時間は0.1で約6.6、0.01で約69、0.001で約693回の統計更新です。
+bucketがそのbatchに十分出現しない場合は更新されないため、これは必ずしも経過batch数と一致しません。
+
+resumeおよび `--initial-state` では、保存済みの平均・分散、学習済みγ/β、optimizer状態を保持し、
+**再開後の取り込み率だけ**を指定値へ変更します。起動時に旧値→新値を表示し、次のcheckpointにも新値を保存します。
+epsilon・初期γ/βなど、その他のBN設定の変更を許可するものではありません。
+`sfnn_bn_qat_freeze_stats=true` のときは統計固定なので、取り込み率を変えても統計更新は起きません。
+小さい値は変動を平滑化する一方、重み変化への追従を遅らせます。最適値・棋力改善は未確認です。
+
+新規の条件比較はgrid searchでも指定できます。
+
+```powershell
+python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn-bn-momentum 0.1 0.01 0.001
+```
+
+**既存trialを続けたい場合はgrid軸を追加せず、共通設定JSONの値を変更し、元のgrid指定に `--resume` を付けます。**
+既存のBNが0.1で保存されていても再開できます。完了済みepochから1epoch追加する場合は `max_epochs` も合計epoch数へ増やしてください。
 
 ## 計算と統計の単位
 
@@ -91,7 +120,7 @@ L1のshared成分も合算してからbucketごとにfoldします。nn.binの�
 fold後の重みが量子化範囲に収まる保証はないため、acc/qacc・飽和率も確認してください。
 
 `state.bin`にはfold前の重みとBNのγ・β、移動統計、γ・βのoptimizer stateを保存します。
-BN付きcheckpointのresumeには同じBN設定が必要です。保存されたBNを無視してOFFで読み込むことはエラーにします。
+BN付きcheckpointのresumeには、取り込み率momentumを除き同じBN設定が必要です。保存されたBNを無視してOFFで読み込むことはエラーにします。
 BNなしのcheckpointに新たにBNを追加すると、forwardが変わります。単なる等価変換ではありません。
 
 ## 対応範囲と負荷

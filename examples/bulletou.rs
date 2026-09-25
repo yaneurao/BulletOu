@@ -5218,6 +5218,7 @@ struct Args {
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
     sfnn_bn_beta: f32,
+    /// New-batch EMA weight (0,1]; smaller values smooth running statistics. May change on resume.
     #[arg(long, default_value_t = 0.1)]
     sfnn_bn_momentum: f32,
     #[arg(long, default_value_t = 1e-5)]
@@ -25834,6 +25835,13 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
 
 fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_normalize_defaults(signature);
+    // The EMA update rate affects future batches, not the saved inference model.
+    // Keep all other BN fields in the compatibility check.
+    let signature = signature.lines().map(|line| {
+        if line.starts_with("sfnn_bn=") || line.starts_with("nnue_bn=") {
+            line.split(';').filter(|part| !part.starts_with("momentum=")).collect::<Vec<_>>().join(";")
+        } else { line.to_owned() }
+    }).collect::<Vec<_>>().join("\n") + "\n";
     // Retired experimental option: retain resume access to existing checkpoints,
     // but never accept it as a current CLI/JSON training option.
     let signature = resume_signature_without_line(&signature, "sfnn_l1_saturation_backward_alpha=");
@@ -34527,6 +34535,12 @@ mod tests {
         assert_eq!(bn.sfnn_bn_gamma,0.25);assert_eq!(bn.sfnn_bn_beta,0.5);
         assert!(!resume_signature(&base).contains("sfnn_bn="));
         assert!(resume_signature(&bn).contains("sfnn_bn=true,true,true"));
+        let mut slower=bn.clone();slower.sfnn_bn_momentum=0.01;
+        assert!(resume_signature_matches(&resume_signature(&bn),&slower));
+        slower.sfnn_bn_epsilon=0.001;
+        assert!(!resume_signature_matches(&resume_signature(&bn),&slower));
+        slower=bn.clone();slower.sfnn_bn_beta=0.1;
+        assert!(!resume_signature_matches(&resume_signature(&bn),&slower));
         let mut invalid=bn.clone();invalid.sfnn_qat_l1=true;
         assert!(invalid.validate_arch_flags().is_ok());
         assert!(!invalid.effective_sfnn_qat_l1());

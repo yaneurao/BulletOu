@@ -15,6 +15,11 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_bn_momentum_grid(self):
+        plan=self.plan(["--grid","sfnn-bn-momentum","0.1","0.01","0.001"])
+        self.assertEqual({t["settings"]["sfnn_bn_momentum"] for t in plan["trials"]},{0.1,0.01,0.001})
+        self.assertIn("sfnn_bn_momentum",grid.COMMON_COLUMNS)
+
     def test_bn_qat_epoch_schedule(self):
         settings = {"sfnn_bn_qat": {"epoch1": False, "epoch6": True, "epoch8": False}}
         for epoch in (0, 1, 5, 6, 7, 8, 10):

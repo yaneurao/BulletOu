@@ -35,7 +35,7 @@ Validation folds running statistics into weights. Export folds the same statisti
 `nn.bin` quantization; no engine BN support or extra file is needed. Quantization error and clipping still apply.
 This does not add/change the existing ordinary-NNUE validation metrics.
 `state.bin` / full-state `weights.bin` retain unfused weights, BN statistics, gamma/beta and their optimizer state.
-Resume with matching BN options/configuration. Disabling saved BN fails explicitly rather than discarding it.
+Resume with matching BN options/configuration, except that `nnue_bn_momentum` may change. Disabling saved BN fails explicitly rather than discarding it.
 
 ## SFNN
 
@@ -56,6 +56,37 @@ centering, BN changes the training forward pass.
 Gamma=0.25/beta=0.5 is an experimental initialization suited to the `[0,1]`
 clamp range, not an established optimum. Gamma=1/beta=0 is also supported.
 These options do not support epoch-dependent schedules.
+
+### Slower running-statistic updates on resume
+
+Set this in the existing run's common settings JSON:
+
+```json
+"sfnn_bn_momentum": 0.01
+```
+
+The update is `running = (1 - momentum) * running + momentum * batch_statistic`.
+The default remains 0.1. A value of 0.01 incorporates 1% of each new batch statistic;
+0.001 incorporates 0.1%. Updates still happen every eligible mini-batch, not once per SB.
+This is not an exact average over 16 SBs. History half-lives are approximately 6.6,
+69, and 693 statistic updates respectively. Buckets without sufficient samples do not update.
+
+Resume and `--initial-state` preserve running statistics, learned gamma/beta and
+optimizer state, replacing **only the future EMA update rate**. Startup logs show
+the old and new values; subsequent checkpoints store the new rate.
+Other BN configuration changes (epsilon, initial gamma/beta) remain incompatible.
+With `sfnn_bn_qat_freeze_stats=true`, statistics remain frozen regardless of momentum.
+Smaller values smooth fluctuations but also lag behind changing weights; strength gains are not established.
+
+For separate grid conditions:
+
+```powershell
+python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn-bn-momentum 0.1 0.01 0.001
+```
+
+To continue an existing trial, change the common settings JSON and reuse the original
+grid axes with `--resume`; do not add a new grid axis. Increase `max_epochs` to the
+desired total if the previous run has already reached its limit.
 
 ## Semantics
 
@@ -92,7 +123,7 @@ bounds; compare float/quantized metrics rather than assuming equivalence after
 rounding/clipping.
 
 state.bin retains unfused weights plus gamma/beta, running statistics, and
-their optimizer states. Resume requires the same BN configuration; silently
+their optimizer states. Resume requires the same BN configuration except momentum; silently
 discarding checkpoint BN is rejected. Adding BN to a non-BN checkpoint changes
 the function; it is not a function-preserving conversion.
 

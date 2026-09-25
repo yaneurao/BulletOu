@@ -47,6 +47,19 @@ pub struct State {
     pub optimizer: RangerParamStateReadback,
 }
 impl State {
+    /// Change only the EMA update rate when resuming; preserve all learned state.
+    fn with_resume_config(&self, config: Config) -> Result<Self> {
+        config.validate()?;
+        self.validate()?;
+        let mut state = self.clone();
+        state.config.momentum = config.momentum;
+        if state.config != config {
+            return Err(CudaCppError::message(
+                "BN configuration differs from checkpoint: only momentum may change on resume",
+            ));
+        }
+        Ok(state)
+    }
     pub fn validate(&self) -> Result<()> {
         self.config.validate()?;
         let c = channels(self.width, self.groups)?;
@@ -400,10 +413,12 @@ impl Network {
                 if s.width != width || s.groups != groups {
                     return Err(CudaCppError::message("BN checkpoint shape mismatch"));
                 }
-                if s.config != config {
-                    return Err(CudaCppError::message("BN configuration differs from checkpoint"));
+                let resumed = s.with_resume_config(config)?;
+                if s.config.momentum != config.momentum {
+                    eprintln!("  BN statistics EMA: layer={i} momentum={} -> {} (running statistics, gamma/beta and optimizer state preserved)",
+                        s.config.momentum, config.momentum);
                 }
-                Layer::from_state(ctx, s)?
+                Layer::from_state(ctx, &resumed)?
             } else {
                 Layer::new(ctx, width, groups, config)?
             };
@@ -578,6 +593,38 @@ impl SfnnTrainWeightsReadback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bn_resume_momentum_preserves_state_and_changes_ema() {
+        let ctx=Context::new(0).unwrap();
+        let mut state=Layer::new(&ctx,1,1,Config::default()).unwrap().read_state(&ctx).unwrap();
+        state.running=vec![2.0,3.0,1.0];
+        state.affine=vec![0.4,0.6];
+        state.optimizer.momentum=vec![0.2,-0.1];
+        state.optimizer.velocity=vec![0.3,0.4];
+        state.optimizer.slow_params=vec![0.35,0.55];
+        let config=Config{momentum:0.01,..state.config};
+        let resumed=state.with_resume_config(config).unwrap();
+        let mut expected=state.clone();expected.config.momentum=0.01;
+        assert_eq!(resumed,expected);
+        assert_eq!(resumed.inference_affine().unwrap(),state.inference_affine().unwrap());
+        assert!(state.with_resume_config(Config{epsilon:0.001,..config}).is_err());
+        assert!(state.with_resume_config(Config{initial_beta:0.1,..config}).is_err());
+        for invalid in [0.0,-0.1,1.1,f32::NAN] {
+            assert!(state.with_resume_config(Config{momentum:invalid,..config}).is_err());
+        }
+        let layer=Layer::from_state(&ctx,&resumed).unwrap();
+        assert_eq!(layer.read_state(&ctx).unwrap(),expected);
+        let workspace=layer.workspace(&ctx,2,1,false).unwrap();
+        let x=F32Buffer::from_host(&ctx,&[4.0,8.0]).unwrap();
+        layer.forward(&ctx,&workspace,&x,None,None,true).unwrap();
+        let after=layer.read_state(&ctx).unwrap();
+        close(after.running[0],2.0*0.99+6.0*0.01,1e-5);
+        close(after.running[1],3.0*0.99+8.0*0.01,1e-5);
+        assert_eq!(after.affine,state.affine);
+        assert_eq!(after.optimizer.momentum,state.optimizer.momentum);
+        assert_eq!(after.optimizer.velocity,state.optimizer.velocity);
+        assert_eq!(State::decode(&after.encode().unwrap()).unwrap(),after);
+    }
     #[test]
     fn nnue_bn_all_layer_masks_fold_and_backward() {
         let ctx = Context::new(0).unwrap();
