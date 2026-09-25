@@ -2204,6 +2204,17 @@ pub fn sfnn_build_quantized_proxy_device(
     residual_count_gates: Option<&F32Buffer>,
     factorizer_axis_confidences: Option<&F32Buffer>,
 ) -> Result<()> {
+    sfnn_build_quantized_proxy_device_impl(ctx, base_input_size, virtual_rows, weights, proxy_weights,
+        factorizer, factorizer_alpha, residual_count_gates, factorizer_axis_confidences, false)
+}
+
+fn sfnn_build_quantized_proxy_device_impl(
+    ctx: &Context, base_input_size: usize, virtual_rows: usize,
+    weights: &SfnnForwardDeviceWeights, proxy_weights: &SfnnForwardDeviceWeights,
+    factorizer: SfnnFactorizerActive, factorizer_alpha: SfnnFactorizerAlpha,
+    residual_count_gates: Option<&F32Buffer>, factorizer_axis_confidences: Option<&F32Buffer>,
+    skip_ft_weights: bool,
+) -> Result<()> {
     weights.validate()?;
     proxy_weights.validate()?;
     factorizer.validate_for_shape(weights.shape)?;
@@ -2372,6 +2383,7 @@ pub fn sfnn_build_quantized_proxy_device(
             proxy_weights.l2b.as_ptr(),
             proxy_weights.l3w.as_ptr(),
             proxy_weights.l3b.as_ptr(),
+            skip_ft_weights as i32,
         )
     })
 }
@@ -9766,6 +9778,7 @@ mod ffi {
             dst_l2b: *mut BulletOuCudaCppF32Buffer,
             dst_l3w: *mut BulletOuCudaCppF32Buffer,
             dst_l3b: *mut BulletOuCudaCppF32Buffer,
+            skip_ft_weights: i32,
         ) -> i32;
         pub fn bulletou_cuda_cpp_sfnn_backward_device(
             ctx: *mut BulletOuCudaCppContext,

@@ -232,3 +232,8 @@ By default both ON and OFF update statistics. Explicit frozen mode additionally 
 statistics behavior, so that comparison does not isolate quantization alone. Extra proxy weights require about 522 MiB
 for HalfKA2 FT1024 (printed at startup). Checkpoint/nn.bin formats are unchanged;
 no engine changes are required. Accuracy/playing-strength improvement is not guaranteed.
+
+BN QAT fuses FT quantization and conversion back to training coordinates, avoiding
+duplicate full-FT memory passes and identity gradient pullbacks in updating-statistics mode.
+Quantization and BN statistics still update every mini-batch. Rounding is unchanged.
+These optimizations require no additional option.

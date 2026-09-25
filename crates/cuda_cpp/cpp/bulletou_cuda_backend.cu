@@ -8624,7 +8624,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     BulletOuCudaCppF32Buffer* dst_l2w,
     BulletOuCudaCppF32Buffer* dst_l2b,
     BulletOuCudaCppF32Buffer* dst_l3w,
-    BulletOuCudaCppF32Buffer* dst_l3b) {
+    BulletOuCudaCppF32Buffer* dst_l3b, int skip_ft_weights) {
     if (set_context_device(ctx) != 0) {
         return -1;
     }
@@ -8754,6 +8754,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     constexpr float qb = 64.0f;
     constexpr float fc_bias_scale = qa * qb;
 
+    if (!skip_ft_weights) {
     if (block_count_1d(dst_l0w_len, threads, &blocks, "sfnn proxy l0w") != 0) return -1;
     sfnn_build_quantized_proxy_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(
         src_l0w->ptr,
@@ -8764,6 +8765,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         ft_size,
         qa, ft_factorizer_alpha, ctx->bn[0], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l0w_kernel launch") != 0) return -1;
+    }
 
     if (block_count_1d(ft_size, threads, &blocks, "sfnn proxy l0b") != 0) return -1;
     sfnn_build_quantized_proxy_vector_kernel<<<blocks, threads, 0, ctx->stream>>>(

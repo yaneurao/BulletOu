@@ -1,13 +1,24 @@
 // Fold QAT. Identity STE through both rounding and clipping.
 // The raw parameter tensors are never quantized in place.
-__global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha,BnConfig bn) {
+__global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha,BnConfig bn,
+    bool training=false,const float* bias=nullptr,float* out_bias=nullptr) {
     size_t j=blockIdx.x*blockDim.x+threadIdx.x;
     if(j>=(base+vr)*width)return;
     size_t f=j/width,u=j%width;
     if(f>=base) {dst[j]=0;return;}
     float v=bn_fold_weight(src[j],bn,0,u);
     if(vr) v=__fadd_rn(v,__fmul_rn(alpha,bn_fold_weight(src[(base+f%vr)*width+u],bn,0,u)));
-    dst[j]=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f,true);
+    v=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f,true);
+    if(training && bn.params) {
+        float r=bn.params[u]/sqrtf(bn.running[width+u]+bn.epsilon);
+        if(bn.running[2*width+u]!=0 && r!=0) v=v/r;
+        else {
+            v=src[j];
+            if(vr)v+=alpha*src[(base+f%vr)*width+u];
+        }
+        if(f==0)out_bias[u]=bias[u];
+    }
+    dst[j]=v;
 }
 // Return quantized folded tensors to pre-BN coordinates. Running scale is a
 // detached quantizer calibration, NOT another differentiable BN operation.
@@ -96,6 +107,15 @@ extern "C" int bulletou_bn_qat_ft(BulletOuCudaCppContext* ctx,BulletOuCudaCppF32
         validate_buffer(ctx,dst,(base+vr)*width,"BN QAT FT proxy"))return -1;
     bn_qat_ft<<<static_cast<unsigned>(((base+vr)*width+255)/256),256,0,ctx->stream>>>(src->ptr,dst->ptr,base,vr,width,alpha,ctx->bn[0]);
     return check_kernel_launch("BN QAT FT quantization");
+}
+extern "C" int bulletou_bn_qat_ft_training(BulletOuCudaCppContext* ctx,BulletOuCudaCppF32Buffer* src,
+    BulletOuCudaCppF32Buffer* dst,BulletOuCudaCppF32Buffer* bias,BulletOuCudaCppF32Buffer* out_bias,
+    size_t base,size_t vr,size_t width,float alpha) {
+    if(!ctx || !base || !width || validate_buffer(ctx,src,(base+vr)*width,"BN QAT FT source") ||
+        validate_buffer(ctx,dst,(base+vr)*width,"BN QAT FT proxy") ||
+        validate_buffer(ctx,bias,width,"BN QAT FT bias") || validate_buffer(ctx,out_bias,width,"BN QAT FT proxy bias"))return -1;
+    bn_qat_ft<<<static_cast<unsigned>(((base+vr)*width+255)/256),256,0,ctx->stream>>>(src->ptr,dst->ptr,base,vr,width,alpha,ctx->bn[0],true,bias->ptr,out_bias->ptr);
+    return check_kernel_launch("BN QAT fused FT quantization/unfold");
 }
 extern "C" int bulletou_bn_qat_pullback(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* b,BulletOuCudaCppF32Buffer* sw,BulletOuCudaCppF32Buffer* sb,

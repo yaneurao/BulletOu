@@ -63,6 +63,41 @@ impl SfnnTrainStepRunner {
 mod tests {
     use super::*;
     #[test]
+    fn bn_qat_fused_ft_matches_separate_quantize_unfold() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+        calibrated(&mut r,&ctx);
+        for enabled in [true,false] {
+        for vr in [0,2] {
+            let base=65536;let width=shape.ft_size;
+            // Exercise half-integer boundaries, adjacent f32 values, int16
+            // endpoints, both signs and out-of-range values.
+            let values:Vec<_>=(0..(base+vr)*width).map(|i| {
+                let v=((i%70000) as f32-35000.0+0.5)/127.0;
+                f32::from_bits(v.to_bits().wrapping_add((i%3) as u32).wrapping_sub(1))
+            }).collect();
+            let src=F32Buffer::from_host(&ctx,&values).unwrap();
+            let bias=F32Buffer::from_host(&ctx,&[0.1,-0.2,0.3,-0.4]).unwrap();
+            let old=F32Buffer::new(&ctx,values.len()).unwrap();
+            let new=F32Buffer::new(&ctx,values.len()).unwrap();
+            let ob=F32Buffer::from_host(&ctx,&[7.0;4]).unwrap();
+            let nb=F32Buffer::from_host(&ctx,&[7.0;4]).unwrap();
+            let l=&r.batch_norm.as_ref().unwrap().layers[0].as_ref().unwrap().0;
+            let mut a=l.affine.download(&ctx).unwrap();a[0]=0.0;a[1]=-0.75;a[2]=0.00001;l.affine.upload(&ctx,&a).unwrap();
+            let mut stats=l.running.download(&ctx).unwrap();stats[2*width+3]=0.0;l.running.upload(&ctx,&stats).unwrap();
+            let _binding=enabled.then(||r.batch_norm.as_ref().unwrap().bind(&ctx,1,false).unwrap());
+            for alpha in [0.0,0.3,1.0] {
+                check(unsafe {bulletou_bn_qat_ft(ctx.as_ptr(),src.as_ptr(),old.as_ptr(),base,vr,width,alpha)}).unwrap();
+                check(unsafe {bulletou_bn_qat_unfold_training(ctx.as_ptr(),src.as_ptr(),bias.as_ptr(),std::ptr::null_mut(),std::ptr::null_mut(),
+                    old.as_ptr(),ob.as_ptr(),base,width,1,0,vr,alpha)}).unwrap();
+                check(unsafe {bulletou_bn_qat_ft_training(ctx.as_ptr(),src.as_ptr(),new.as_ptr(),bias.as_ptr(),nb.as_ptr(),base,vr,width,alpha)}).unwrap();
+                assert_eq!(old.download(&ctx).unwrap(),new.download(&ctx).unwrap());
+                assert_eq!(ob.download(&ctx).unwrap(),nb.download(&ctx).unwrap());
+            }
+        }}
+    }
+    #[test]
     fn bn_qat_scratch_virtual_ft_and_unseen_bucket_calibration() {
         let ctx=Context::new(0).unwrap();
         let original=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
@@ -149,7 +184,7 @@ mod tests {
         let saved=r.read_batch_norm_state(&ctx).unwrap();
         let folded=q.proxy.l1w.download(&ctx).unwrap();
         let guard=r.batch_norm.as_ref().unwrap().bind(&ctx,1,false).unwrap();
-        unfold_training(&r,&ctx,&q).unwrap();
+        unfold_training(&r,&ctx,&q,true).unwrap();
         let s=saved.0[1].as_ref().unwrap();let (scale,_)=s.inference_affine().unwrap();
         for (j,w) in q.proxy.l1w.download(&ctx).unwrap().iter().enumerate() {
             let ch=j/shape.ft_size;let u=ch%shape.l1_out();
@@ -448,6 +483,12 @@ unsafe extern "C" {
         width: usize,
         alpha: f32,
     ) -> i32;
+    fn bulletou_bn_qat_ft_training(
+        ctx: *mut ffi::BulletOuCudaCppContext, src: *mut ffi::BulletOuCudaCppF32Buffer,
+        dst: *mut ffi::BulletOuCudaCppF32Buffer, bias: *mut ffi::BulletOuCudaCppF32Buffer,
+        out_bias: *mut ffi::BulletOuCudaCppF32Buffer,
+        base: usize, virtual_rows: usize, width: usize, alpha: f32,
+    ) -> i32;
     fn bulletou_bn_qat_pullback(
         ctx: *mut ffi::BulletOuCudaCppContext,
         w: *mut ffi::BulletOuCudaCppF32Buffer,
@@ -523,11 +564,20 @@ pub(super) fn step<T>(
             q.proxy.shape.factorizer_king_hand_pair=false;
             q.proxy.shape.factorizer_king_progress_pair=false;
             q.proxy.shape.factorizer_hand_progress_pair=false;
-            let built = r.build_quantized_proxy(ctx, r.shape.input_size, 0, &q.proxy);
+            // The specialized FT kernel below replaces generic FT quantization.
+            // Avoid writing the full FT matrix twice on every microbatch.
+            let built = (|| {
+                let _bind = r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?;
+                sfnn_build_quantized_proxy_device_impl(ctx, r.shape.input_size, 0, &r.weights, &q.proxy,
+                    r.factorizer, r.factorizer_alpha,
+                    r.residual_count_gates_enabled.then_some(&r.residual_count_gates_by_stack),
+                    r.factorizer_axis_confidences_enabled.then_some(&r.factorizer_axis_confidences), true)
+            })();
             q.proxy.shape=training_shape;
             (q.proxy.l1fw, q.proxy.l1fb, q.proxy.l2fw, q.proxy.l2fb, q.proxy.l3fw, q.proxy.l3fb) = optional;
             built?;
             let _bind = r.batch_norm.as_ref().unwrap().bind(ctx, 1, false)?;
+            if q.freeze_stats {
             check(unsafe {
                 bulletou_bn_qat_ft(
                     ctx.as_ptr(),
@@ -539,7 +589,11 @@ pub(super) fn step<T>(
                     r.factorizer_alpha.ft,
                 )
             })?;
-            if !q.freeze_stats { unfold_training(r, ctx, &q)?; }
+            } else {
+                check(unsafe { bulletou_bn_qat_ft_training(ctx.as_ptr(),r.weights.l0w.as_ptr(),q.proxy.l0w.as_ptr(),
+                    r.weights.l0b.as_ptr(),q.proxy.l0b.as_ptr(),q.base,q.virtual_rows,r.shape.ft_size,r.factorizer_alpha.ft) })?;
+                unfold_training(r, ctx, &q, false)?;
+            }
         }
         let bn = if q.freeze_stats { r.batch_norm.take() } else { None };
         let factorizer = r.factorizer;
@@ -560,13 +614,14 @@ pub(super) fn step<T>(
     result
 }
 
-fn unfold_training(r: &SfnnTrainStepRunner, ctx: &Context, q: &State) -> Result<()> {
+fn unfold_training(r: &SfnnTrainStepRunner, ctx: &Context, q: &State, include_ft: bool) -> Result<()> {
     let w=&r.weights; let p=&q.proxy; let s=r.shape;
     for (i, w, b, sw, sb, qw, qb, input, output, groups) in [
         (0,&w.l0w,&w.l0b,None,None,&p.l0w,&p.l0b,q.base,s.ft_size,1),
         (1,&w.l1w,&w.l1b,w.l1fw.as_ref(),w.l1fb.as_ref(),&p.l1w,&p.l1b,s.ft_size,s.l1_out(),s.num_stacks),
         (2,&w.l2w,&w.l2b,None,None,&p.l2w,&p.l2b,s.l2_in(),s.l2_size,s.num_stacks),
     ] {
+        if i==0 && !include_ft { continue; }
         let shared=r.factorizer.shared && i==1;
         check(unsafe { bulletou_bn_qat_unfold_training(ctx.as_ptr(),w.as_ptr(),b.as_ptr(),
             ptr(sw.filter(|_|shared)),ptr(sb.filter(|_|shared)),qw.as_ptr(),qb.as_ptr(),
