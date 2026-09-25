@@ -78,11 +78,12 @@ GPU qvalid folds BN and quantizes on-device without host weight readback/upload;
 CPU-exact validation still runs on the CPU. With BN enabled, quantization uses
 f64 scaling before rounding, matching the CPU nn.bin exporter at rounding boundaries.
 Training reductions use 1024-row
-chunks and coalesced 8-unit tiles, preserving double-precision accumulation,
+chunks and coalesced 32-unit tiles for widths divisible by 32 (8 otherwise), preserving double-precision accumulation,
 two-pass variance and EMA definitions. Inference applies running statistics
 directly, without batch reductions. Reduction scratch adds about 1.6 MiB for
 FT1024/L1=8/L2=64, 8 buckets, batch65536 (separate from saved activations).
-BN-disabled runs do not use these buffers. Reduction ordering can cause small
+FT training fuses BN application, clamping and pairwise multiplication to reduce
+intermediate memory traffic, without additional VRAM. BN-disabled runs do not use these buffers. Reduction ordering can cause small
 rounding differences. Playing-strength improvements have not been established.
 
 ## Grid search

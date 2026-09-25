@@ -548,7 +548,7 @@ mod tests {
     #[ignore = "explicit serial reference/optimized comparison and GPU timing"]
     fn bn_reference_parity_and_benchmark() {
         let ctx=Context::new(0).unwrap();
-        for (rows,width,groups,views) in [(257,13,3,false),(259,32,1,true),(65536,1024,1,true),(65536,8,8,false),(65536,64,8,false)] {
+        for (rows,width,groups,views) in [(257,13,3,false),(259,32,1,true),(259,64,3,false),(65536,1024,1,true),(65536,8,8,false),(65536,64,8,false)] {
             let mut reference=None;
             for old in [true,false] {
                 unsafe extern "C" {fn bulletou_bn_reference_mode(enabled:i32);}
@@ -752,6 +752,22 @@ mod tests {
                 })
                 .sum::<f32>()
         };
+        // Includes the fused FT normalize/clamp/product path, not just primitive BN.
+        let optimized_loss = evaluate();
+        let optimized_output = r.forward_workspace.output.download(&ctx).unwrap();
+        unsafe extern "C" { fn bulletou_bn_reference_mode(enabled: i32); }
+        struct ResetReference;
+        impl Drop for ResetReference {
+            fn drop(&mut self) { unsafe { bulletou_bn_reference_mode(0); } }
+        }
+        {
+            let _reset = ResetReference;
+            unsafe { bulletou_bn_reference_mode(1); }
+            close(optimized_loss, evaluate(), 2e-6);
+            for (a,b) in optimized_output.iter().zip(r.forward_workspace.output.download(&ctx).unwrap()) {
+                close(*a,b,2e-5);
+            }
+        }
         let h = 0.0005;
         for (w, g) in [(&r.weights.l0w, &g0), (&r.weights.l1w, &g1), (&r.weights.l2w, &g2)] {
             let original = w.download(&ctx).unwrap();

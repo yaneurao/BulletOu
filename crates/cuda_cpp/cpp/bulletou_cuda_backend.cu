@@ -5216,8 +5216,9 @@ int launch_sfnn_forward_kernels(
     }
 
     if(ctx->bn[0].params) {
-        if(bn_forward_bound(ctx,0,stm_l0,nstm_l0,nullptr,batch,ft_size)) return -1;
-        bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
+        const bool fused=ctx->bn[0].training && !bn_use_reference();
+        if(bn_forward_bound(ctx,0,stm_l0,nstm_l0,nullptr,batch,ft_size,fused?combined:nullptr)) return -1;
+        if(!fused) bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
         if(check_kernel_launch("BN FT activation"))return -1;
     }
     if (common_shard_l1) {
