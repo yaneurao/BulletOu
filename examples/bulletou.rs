@@ -5219,6 +5219,24 @@ struct Args {
     #[arg(long, default_value_t = 1e-5)]
     sfnn_bn_epsilon: f32,
 
+    /// Ordinary NNUE BatchNorm before FT CReLU (shared across both perspectives).
+    #[arg(long)]
+    nnue_bn_ft: bool,
+    /// Ordinary NNUE BatchNorm before the first dense hidden CReLU.
+    #[arg(long)]
+    nnue_bn_l1: bool,
+    /// Ordinary NNUE BatchNorm before the second dense hidden CReLU.
+    #[arg(long)]
+    nnue_bn_l2: bool,
+    #[arg(long, default_value_t = 0.25)]
+    nnue_bn_gamma: f32,
+    #[arg(long, default_value_t = 0.5)]
+    nnue_bn_beta: f32,
+    #[arg(long, default_value_t = 0.1)]
+    nnue_bn_momentum: f32,
+    #[arg(long, default_value_t = 1e-5)]
+    nnue_bn_epsilon: f32,
+
     /// Clip folded L1 weights (residual + alpha*shared) to [-2,127/64] after updates.
     /// Default off. Projects fast and Lookahead slow weights; preserves biases/moments.
     #[arg(long)]
@@ -5413,6 +5431,20 @@ impl Args {
             }
             if self.sfnn_l1_center && (self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()) {
                 return Err("--sfnn-l1-center requires dense L1 (no compact/grouped L1)".into());
+            }
+        }
+        if self.nnue_bn_ft || self.nnue_bn_l1 || self.nnue_bn_l2 {
+            if self.backend != BackendKind::CudaCpp || !matches!(self.eval_type(),
+                EvalType::NnueHalfkp | EvalType::NnueKp | EvalType::NnueKa2 | EvalType::NnueHalfkpe9 | EvalType::NnueHalfkpvm) {
+                return Err("NNUE BN requires the cuda-cpp ordinary NNUE trainer (not SFNN)".into());
+            }
+            if self.lr_schedule == LrScheduleKind::Plateau {
+                return Err("NNUE BN supports non-plateau training/grid_search".into());
+            }
+            if !self.nnue_bn_gamma.is_finite() || !self.nnue_bn_beta.is_finite()
+                || !self.nnue_bn_epsilon.is_finite() || self.nnue_bn_epsilon <= 0.0
+                || !self.nnue_bn_momentum.is_finite() || self.nnue_bn_momentum <= 0.0 || self.nnue_bn_momentum > 1.0 {
+                return Err("NNUE BN requires finite gamma/beta, epsilon>0 and 0<momentum<=1".into());
             }
         }
         if self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 {
@@ -14396,6 +14428,16 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     }
     .map_err(|e| e.to_string())?;
     runner.warmup(&ctx).map_err(|e| e.to_string())?;
+    runner.configure_batch_norm(&ctx, [args.nnue_bn_ft, args.nnue_bn_l1, args.nnue_bn_l2],
+        bulletou_cuda_cpp::batch_norm::Config {
+            epsilon: args.nnue_bn_epsilon, momentum: args.nnue_bn_momentum,
+            initial_gamma: args.nnue_bn_gamma, initial_beta: args.nnue_bn_beta,
+        }, &initial_state.batch_norm).map_err(|e| e.to_string())?;
+    if runner.batch_norm.is_some() {
+        print_startup_kv("NNUE BN", format!("FT={}, L1={}, L2={}, gamma={}, beta={}, momentum={}, epsilon={}; inference/export uses folded running statistics",
+            args.nnue_bn_ft, args.nnue_bn_l1, args.nnue_bn_l2, args.nnue_bn_gamma,
+            args.nnue_bn_beta, args.nnue_bn_momentum, args.nnue_bn_epsilon));
+    }
     print_startup_kv_colored("warmup", "done (NNUE dense-backward kernels)", ConsoleColor::BoldGreen);
     let upload_ctx = Context::new(device).map_err(|e| e.to_string())?;
     print_startup_kv_colored(
@@ -19842,6 +19884,12 @@ fn cuda_cpp_nnue_weights_for_cpu_validation(
     use bulletou_lib::value::{
         NnueForwardOwnedWeights as CpuNnueForwardOwnedWeights, NnueForwardShape as CpuNnueForwardShape,
     };
+    let mut folded;
+    let weights = if weights.batch_norm.0.iter().any(Option::is_some) {
+        folded = weights.clone();
+        folded.fold_batch_norm(shape).map_err(|e| e.to_string())?;
+        &folded
+    } else { weights };
 
     let base_input_size = feature_kind.base_input_size();
     let virtual_rows = feature_kind.virtual_rows();
@@ -23042,6 +23090,7 @@ fn cuda_cpp_sfnn_stacked_hidden_bias_init(
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppHalfkpInitialState {
+    batch_norm: bulletou_cuda_cpp::batch_norm::NetworkState,
     weights: bulletou_lib::value::NnueForwardOwnedWeights,
     optimizer_states: Option<CudaCppHalfkpOptimizerState>,
     completed_steps: usize,
@@ -23261,6 +23310,7 @@ fn build_nnue_initial_state_for_cuda_cpp(
     }
 
     Ok(CudaCppHalfkpInitialState {
+        batch_norm: Default::default(),
         weights: build_nnue_initial_weights_for_cuda_cpp(args, feature_kind)?,
         optimizer_states: None,
         completed_steps: 0,
@@ -23348,7 +23398,7 @@ fn load_cuda_cpp_nnue_initial_state(
     let mut sections = load_cuda_cpp_component_state_sections(
         path,
         "nnue",
-        &["weights", "momentum", "velocity", "slow", "step_ranger"],
+        &["weights", "momentum", "velocity", "slow", "step_ranger", "bn"],
         true,
     )?;
     let weights_records = sections.remove("weights").unwrap_or_default();
@@ -23378,7 +23428,14 @@ fn load_cuda_cpp_nnue_initial_state(
     let step_ranger = sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_halfkp_completed_steps_from_steps(&step_ranger)?;
 
-    Ok(CudaCppHalfkpInitialState { weights, optimizer_states, completed_steps })
+    let bn_records = sections.remove("bn").unwrap_or_default();
+    let mut batch_norm = bulletou_cuda_cpp::batch_norm::NetworkState::default();
+    for (i, key) in ["ft", "l1", "l2"].iter().enumerate() {
+        if let Some(v) = bn_records.get(*key) {
+            batch_norm.0[i] = Some(bulletou_cuda_cpp::batch_norm::State::decode(v).map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(CudaCppHalfkpInitialState { batch_norm, weights, optimizer_states, completed_steps })
 }
 
 #[cfg(all(feature = "cuda-cpp-backend", test))]
@@ -23556,6 +23613,8 @@ fn write_cuda_cpp_halfkp_weights_bin(
     optimizer_states: &bulletou_cuda_cpp::NnueRangerOptimizerStatesReadback,
     completed_steps: usize,
 ) -> Result<(), String> {
+    let bn_records = weights.batch_norm.0.iter().map(|s| s.as_ref().map(|s| s.encode()).transpose())
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
     let completed_steps = [completed_steps as f32];
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/weights/l0w", weights.l0w.as_slice()),
@@ -23567,6 +23626,9 @@ fn write_cuda_cpp_halfkp_weights_bin(
         ("nnue/weights/outw", weights.outw.as_slice()),
         ("nnue/weights/outb", weights.outb.as_slice()),
     ];
+    for (key, value) in ["nnue/bn/ft", "nnue/bn/l1", "nnue/bn/l2"].iter().zip(&bn_records) {
+        if let Some(value) = value { records.push((key, value.as_slice())); }
+    }
     macro_rules! push_group_state {
         ($id:literal, $state:expr) => {{
             let state = $state;
@@ -24200,6 +24262,12 @@ fn write_cuda_cpp_nnue_nn_bin(
     weights: &bulletou_cuda_cpp::NnueTrainWeightsReadback,
 ) -> Result<(), String> {
     use std::io::Write as _;
+    let mut folded;
+    let weights = if weights.batch_norm.0.iter().any(Option::is_some) {
+        folded = weights.clone();
+        folded.fold_batch_norm(shape).map_err(|e| e.to_string())?;
+        &folded
+    } else { weights };
 
     let feature_set = feature_kind.feature_set();
     let base_input_size = feature_kind.base_input_size();
@@ -25504,6 +25572,10 @@ fn resume_signature_values(args: &Args) -> String {
         + &if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
             format!("sfnn_bn={},{},{};gamma={};beta={};momentum={};epsilon={}\n",
                 args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon)
+        } else {String::new()}
+        + &if args.nnue_bn_ft || args.nnue_bn_l1 || args.nnue_bn_l2 {
+            format!("nnue_bn={},{},{};gamma={};beta={};momentum={};epsilon={}\n",
+                args.nnue_bn_ft,args.nnue_bn_l1,args.nnue_bn_l2,args.nnue_bn_gamma,args.nnue_bn_beta,args.nnue_bn_momentum,args.nnue_bn_epsilon)
         } else {String::new()}
 }
 
@@ -32495,6 +32567,7 @@ mod tests {
         }
 
         let weights = bulletou_cuda_cpp::NnueTrainWeightsReadback {
+            batch_norm: Default::default(),
             l0w: vec![10.0],
             l0b: vec![11.0],
             l1w: vec![12.0],
@@ -32780,6 +32853,7 @@ mod tests {
         l0w[0] = 10.0;
         l0w[virtual_rows] = 1.0;
         let weights = bulletou_cuda_cpp::NnueTrainWeightsReadback {
+            batch_norm: Default::default(),
             l0w,
             l0b: vec![0.0],
             l1w: vec![1.0, 1.0],
@@ -34330,6 +34404,70 @@ mod tests {
         assert!(!args_at_epoch(&scheduled,1).unwrap().sfnn_l2_l3_center);
         assert!(args_at_epoch(&scheduled,2).unwrap().sfnn_l2_l3_center);
         assert!(!args_at_epoch(&scheduled,3).unwrap().sfnn_l2_l3_center);
+    }
+
+    #[test]
+    fn nnue_bn_cli_json_defaults_and_constraints() {
+        let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "NNUE_ka2_32x2_8_8", "--superbatches", "1", "--max-epochs", "1"].map(Into::into).to_vec();
+        let base = Args::try_parse_from(argv.clone()).unwrap();
+        assert!(!base.nnue_bn_ft && !base.nnue_bn_l1 && !base.nnue_bn_l2);
+        for name in ["nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2"] {
+            bulletou_settings_json_value_to_args(Path::new("settings.json"), name, &serde_json::json!(true), &mut argv).unwrap();
+        }
+        let enabled = Args::try_parse_from(argv).unwrap();
+        assert!(enabled.validate_arch_flags().is_ok());
+        assert!(resume_signature(&enabled).contains("nnue_bn=true,true,true"));
+        assert_eq!(enabled.nnue_bn_gamma, 0.25);
+        assert_eq!(enabled.nnue_bn_beta, 0.5);
+        let mut invalid = enabled.clone(); invalid.nnue_bn_epsilon = 0.0;
+        assert!(invalid.validate_arch_flags().is_err());
+        invalid = enabled.clone(); invalid.sfnn_bn_ft = true;
+        assert!(invalid.validate_arch_flags().is_err());
+        invalid = enabled; invalid.lr_schedule = LrScheduleKind::Plateau;
+        assert!(invalid.validate_arch_flags().is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn nnue_bn_checkpoint_and_export_roundtrip() {
+        use bulletou_cuda_cpp::{batch_norm, RangerParamStateReadback, NnueTrainWeightsReadback, NnueRangerOptimizerStatesReadback};
+        let args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "NNUE_ka2_32x2_8_8", "--nnue-bn-ft", "--nnue-bn-l1", "--nnue-bn-l2"]).unwrap();
+        let kind = CudaCppNnueFeatureKind::Ka2;
+        let initial = build_nnue_initial_weights_for_cuda_cpp(&args,kind).unwrap();
+        let shape = bulletou_cuda_cpp::NnueForwardShape {input_size:initial.shape.input_size,l1:32,l2:8,l3:8};
+        let group = |v: &[f32]| RangerParamStateReadback {
+            momentum:vec![0.01;v.len()],velocity:vec![0.02;v.len()],slow_params:v.to_vec(),
+        };
+        let mut bn = batch_norm::NetworkState::default();
+        for (i,width) in [32,8,8].into_iter().enumerate() {
+            let mut affine=vec![0.25;width];affine.extend(vec![0.5;width]);
+            let mut running=vec![0.03;width];running.extend(vec![0.2;width]);running.extend(vec![1.0;width]);
+            bn.0[i]=Some(batch_norm::State {width,groups:1,config:Default::default(),
+                optimizer:group(&affine),affine,running});
+        }
+        let weights=NnueTrainWeightsReadback {batch_norm:bn.clone(),l0w:initial.l0w,l0b:initial.l0b,
+            l1w:initial.l1w,l1b:initial.l1b,l2w:initial.l2w,l2b:initial.l2b,outw:initial.outw,outb:initial.outb};
+        let optimizer=NnueRangerOptimizerStatesReadback {
+            l0w:group(&weights.l0w),l0b:group(&weights.l0b),l1w:group(&weights.l1w),l1b:group(&weights.l1b),
+            l2w:group(&weights.l2w),l2b:group(&weights.l2b),outw:group(&weights.outw),outb:group(&weights.outb),
+        };
+        let dir=std::env::temp_dir().join(format!("bulletou-nnue-bn-test-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_cuda_cpp_halfkp_weights_bin(&dir.join("state.bin"),&weights,&optimizer,42).unwrap();
+        let loaded=load_cuda_cpp_nnue_initial_state(&dir.join("state.bin"),&args,kind).unwrap();
+        assert_eq!(loaded.batch_norm,bn);assert_eq!(loaded.completed_steps,42);
+        assert_eq!(loaded.weights.l0w,weights.l0w);
+        assert_eq!(loaded.optimizer_states.unwrap().l1w.momentum,optimizer.l1w.momentum);
+        write_cuda_cpp_nnue_nn_bin(&dir.join("bn.bin"),kind,shape,&weights).unwrap();
+        let mut folded=weights.clone();folded.fold_batch_norm(shape).unwrap();
+        write_cuda_cpp_nnue_nn_bin(&dir.join("folded.bin"),kind,shape,&folded).unwrap();
+        assert_eq!(std::fs::read(dir.join("bn.bin")).unwrap(),std::fs::read(dir.join("folded.bin")).unwrap());
+        let validation=cuda_cpp_nnue_weights_for_cpu_validation(kind,shape,&weights).unwrap();
+        assert_eq!(validation.l0w,folded.l0w);assert_eq!(validation.l1b,folded.l1b);assert_eq!(validation.l2w,folded.l2w);
+        for name in ["state.bin","bn.bin","folded.bin"] {std::fs::remove_file(dir.join(name)).unwrap();}
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

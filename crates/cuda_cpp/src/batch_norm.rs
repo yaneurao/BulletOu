@@ -371,6 +371,20 @@ impl Network {
         config: Config,
         saved: &NetworkState,
     ) -> Result<Self> {
+        Self::with_layout(ctx, rows, enabled, config, saved, [
+            (shape.ft_size, shape.ft_size, 1),
+            (shape.l1_hidden, shape.l1_out(), shape.num_stacks),
+            (shape.l2_size, shape.l2_size, shape.num_stacks),
+        ])
+    }
+    pub fn new_nnue(ctx: &Context, shape: NnueForwardShape, rows: usize,
+        enabled: [bool; 3], config: Config, saved: &NetworkState) -> Result<Self> {
+        Self::with_layout(ctx, rows, enabled, config, saved, [
+            (shape.l1, shape.l1, 1), (shape.l2, shape.l2, 1), (shape.l3, shape.l3, 1),
+        ])
+    }
+    fn with_layout(ctx: &Context, rows: usize, enabled: [bool; 3], config: Config,
+        saved: &NetworkState, layout: [(usize, usize, usize); 3]) -> Result<Self> {
         let mut layers = [None, None, None];
         for i in 0..3 {
             if !enabled[i] {
@@ -381,11 +395,7 @@ impl Network {
                 }
                 continue;
             }
-            let (width, stride, groups) = match i {
-                0 => (shape.ft_size, shape.ft_size, 1),
-                1 => (shape.l1_hidden, shape.l1_out(), shape.num_stacks),
-                _ => (shape.l2_size, shape.l2_size, shape.num_stacks),
-            };
+            let (width, stride, groups) = layout[i];
             let l = if let Some(s) = &saved.0[i] {
                 if s.width != width || s.groups != groups {
                     return Err(CudaCppError::message("BN checkpoint shape mismatch"));
@@ -479,6 +489,30 @@ impl Drop for Binding<'_> {
     }
 }
 
+impl NnueTrainWeightsReadback {
+    /// NNUE affine tensors are input-major, including the sparse FT.
+    pub fn fold_batch_norm(&mut self, shape: NnueForwardShape) -> Result<()> {
+        for (i, state) in self.batch_norm.0.iter().enumerate() {
+            let Some(state) = state else { continue };
+            let (w, b, width) = match i {
+                0 => (&mut self.l0w, &mut self.l0b, shape.l1),
+                1 => (&mut self.l1w, &mut self.l1b, shape.l2),
+                _ => (&mut self.l2w, &mut self.l2b, shape.l3),
+            };
+            if state.width != width || state.groups != 1 {
+                return Err(CudaCppError::message("NNUE BN fold shape mismatch"));
+            }
+            let (scale, shift) = state.inference_affine()?;
+            for row in w.chunks_exact_mut(width) {
+                for (u, value) in row.iter_mut().enumerate() { *value *= scale[u]; }
+            }
+            for (u, value) in b.iter_mut().enumerate() { *value = *value * scale[u] + shift[u]; }
+        }
+        self.batch_norm = NetworkState::default();
+        Ok(())
+    }
+}
+
 impl SfnnTrainWeightsReadback {
     /// Fold inference BN after all active L1 shared terms. Keep zero shared
     /// tensors so existing exporter/shape contracts remain unchanged.
@@ -544,6 +578,103 @@ impl SfnnTrainWeightsReadback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nnue_bn_all_layer_masks_fold_and_backward() {
+        let ctx = Context::new(0).unwrap();
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let host = crate::tests::tiny_nnue_weights(shape);
+        let batch = NnueForwardDeviceBatch::from_host(&ctx, NnueForwardHostBatch {
+            stm_indices: &[0, 1, 2, 3, 0, 2], nstm_indices: &[3, 2, 1, 0, 2, 1],
+            batch_size: 6, max_active: 1,
+        }).unwrap();
+        for mask in 0..8 {
+            let mut runner = NnueTrainStepRunner::new(&ctx, host, 6, 1).unwrap();
+            runner.configure_batch_norm(&ctx, [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0],
+                Config { initial_gamma: 0.1, ..Default::default() }, &NetworkState::default()).unwrap();
+            // Train-mode end-to-end derivative, through every enabled BN and clamp.
+            let guard = runner.batch_norm.as_ref().map(|b| b.bind(&ctx, 6, true)).transpose().unwrap();
+            nnue_forward_device(&ctx, &batch, &runner.weights, &runner.forward_workspace).unwrap();
+            let dy = [0.2, -0.3, 0.1, 0.4, -0.2, 0.5];
+            runner.loss_workspace.mean_output_gradients.upload(&ctx, &dy).unwrap();
+            nnue_backward_device(&ctx, &batch, &runner.weights, &runner.forward_workspace,
+                &runner.loss_workspace, &runner.backward_workspace).unwrap();
+            for (weight, grad, values) in [
+                (&runner.weights.l0w, &runner.backward_workspace.l0w_gradients, host.l0w),
+                (&runner.weights.l1w, &runner.backward_workspace.l1w_gradients, host.l1w),
+                (&runner.weights.l2w, &runner.backward_workspace.l2w_gradients, host.l2w),
+            ] {
+                let expected = grad.download(&ctx).unwrap();
+                for j in 0..values.len() {
+                    let mut objective = [0.0; 2];
+                    for (k, sign) in [-1.0, 1.0].iter().enumerate() {
+                        let mut v = values.to_vec(); v[j] += sign * 0.0001;
+                        weight.upload(&ctx, &v).unwrap();
+                        nnue_forward_device(&ctx, &batch, &runner.weights, &runner.forward_workspace).unwrap();
+                        objective[k] = runner.forward_workspace.output.download(&ctx).unwrap().iter()
+                            .zip(dy).map(|(a,b)| a*b).sum::<f32>();
+                    }
+                    weight.upload(&ctx, values).unwrap();
+                    close(expected[j], (objective[1]-objective[0])/0.0002, 0.006);
+                }
+            }
+            drop(guard);
+            let saved = runner.read_weights(&ctx).unwrap();
+            for s in saved.batch_norm.0.iter().flatten() {
+                assert_eq!(State::decode(&s.encode().unwrap()).unwrap(), *s);
+            }
+            let guard = runner.batch_norm.as_ref().map(|b| b.bind(&ctx,6,false)).transpose().unwrap();
+            nnue_forward_device(&ctx,&batch,&runner.weights,&runner.forward_workspace).unwrap();
+            let expected = runner.forward_workspace.output.download(&ctx).unwrap();
+            drop(guard);
+            let mut folded = saved;
+            folded.fold_batch_norm(shape).unwrap();
+            let weights = NnueForwardDeviceWeights::from_host(&ctx, NnueForwardHostWeights {
+                shape, l0w: &folded.l0w, l0b: &folded.l0b, l1w: &folded.l1w, l1b: &folded.l1b,
+                l2w: &folded.l2w, l2b: &folded.l2b, outw: &folded.outw, outb: &folded.outb,
+            }).unwrap();
+            nnue_forward_device(&ctx,&batch,&weights,&runner.forward_workspace).unwrap();
+            for (a,b) in expected.iter().zip(runner.forward_workspace.output.download(&ctx).unwrap()) {
+                close(*a,b,2e-5);
+            }
+        }
+    }
+    #[test]
+    fn nnue_bn_step_paths_update_and_restore() {
+        let ctx = Context::new(0).unwrap();
+        let upload = Context::new(0).unwrap();
+        let shape = NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 };
+        let host = crate::tests::tiny_nnue_weights(shape);
+        let batch = NnueTrainStepHostBatch {
+            stm_indices: &[0,1,2,3,0,2], nstm_indices: &[3,2,1,0,2,1],
+            targets: &[0.1,0.3,0.7,0.9,0.2,0.8], entry_weights: &[1.0;6], batch_size:6,max_active:1,
+        };
+        let mut reference: Option<NnueTrainWeightsReadback> = None;
+        for path in 0..3 {
+            let mut runner = NnueTrainStepRunner::new(&ctx,host,6,1).unwrap();
+            runner.warmup(&ctx).unwrap();
+            runner.configure_batch_norm(&ctx,[true;3],Config::default(),&NetworkState::default()).unwrap();
+            for step in 1..=2 {
+                let mut p = RangerUpdateParams::default(); p.radam.step=step;
+                match path {
+                    0 => runner.step_no_readback(&ctx,p,ScalarLossKind::BceWithLogits,1.0,batch).unwrap(),
+                    1 => runner.step_pipelined_no_readback(&ctx,&upload,p,ScalarLossKind::BceWithLogits,1.0,batch).unwrap(),
+                    _ => { runner.step_profiled_no_readback(&ctx,p,ScalarLossKind::BceWithLogits,1.0,batch).unwrap(); },
+                }
+            }
+            let result = runner.read_weights(&ctx).unwrap();
+            for state in result.batch_norm.0.iter().flatten() {
+                assert!(state.optimizer.momentum.iter().any(|v| *v!=0.0));
+                assert!(state.running[2*state.width..].iter().all(|v| *v==1.0));
+            }
+            if let Some(r) = &reference {
+                for (a,b) in r.l0w.iter().zip(&result.l0w) {close(*a,*b,1e-6);}
+                assert_eq!(r.batch_norm,result.batch_norm);
+            } else {reference=Some(result.clone());}
+            runner.configure_batch_norm(&ctx,[true;3],Config::default(),&result.batch_norm).unwrap();
+            assert_eq!(runner.read_weights(&ctx).unwrap().batch_norm,result.batch_norm);
+            assert!(runner.configure_batch_norm(&ctx,[false;3],Config::default(),&result.batch_norm).is_err());
+        }
+    }
     #[test]
     #[ignore = "explicit serial reference/optimized comparison and GPU timing"]
     fn bn_reference_parity_and_benchmark() {

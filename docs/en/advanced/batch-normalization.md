@@ -1,4 +1,43 @@
-# Experimental SFNN batch normalization
+# Experimental NNUE / SFNN batch normalization
+
+## Ordinary NNUE
+
+The CUDA C++ trainer supports BN for ordinary HalfKP, KP, KA2, HalfKPE9 and HalfKP_vm NNUE.
+BN precedes each selected CReLU. FT perspectives remain **concatenated**, not SFNN product pooling.
+
+| JSON key | Default | Meaning |
+|---|---:|---|
+| `nnue_bn_ft` | `false` | FT before CReLU; both perspectives share statistics and affine parameters |
+| `nnue_bn_l1` | `false` | First dense hidden layer before CReLU |
+| `nnue_bn_l2` | `false` | Second dense hidden layer before CReLU |
+| `nnue_bn_gamma` | `0.25` | Initial trainable gamma |
+| `nnue_bn_beta` | `0.5` | Initial trainable beta |
+| `nnue_bn_momentum` | `0.1` | New-batch weight in running-statistic EMA, `(0,1]` |
+| `nnue_bn_epsilon` | `0.00001` | Positive variance stabilizer |
+
+Hidden layers use per-unit statistics without buckets. Equations, statistics and gamma/beta updates follow
+the SFNN description below. Existing ordinary-NNUE training supports only `batches_per_update=1`.
+Ordinary NNUE BN supports standalone/grid search, not plateau, worker mode, epoch-dependent BN settings or BN QAT.
+Do not use `sfnn_bn_*` for ordinary NNUE.
+
+Grid example (use an ordinary NNUE architecture in `settings.json`):
+
+```powershell
+python .\grid_search.py `
+  --settings-file .\settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
+  --grid nnue-bn-ft false true `
+  --grid nnue-bn-l1 true `
+  --grid nnue-bn-l2 true
+```
+
+Validation folds running statistics into weights. Export folds the same statistics before conventional
+`nn.bin` quantization; no engine BN support or extra file is needed. Quantization error and clipping still apply.
+This does not add/change the existing ordinary-NNUE validation metrics.
+`state.bin` / full-state `weights.bin` retain unfused weights, BN statistics, gamma/beta and their optimizer state.
+Resume with matching BN options/configuration. Disabling saved BN fails explicitly rather than discarding it.
+
+## SFNN
 
 Independent BN switches are available after the FT, L1, and L2 affine operations,
 **before** their activations. All default to off. Unlike optimizer-coordinate

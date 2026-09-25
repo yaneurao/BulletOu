@@ -15,6 +15,19 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_nnue_bn_grid_conditions(self):
+        self.common["arch"] = "NNUE_ka2_256x2_32_32"
+        grid.atomic_json(self.settings_path, self.common)
+        plan = self.plan(["--lrs", "0.0001", "--grid", "nnue-bn-ft", "false", "true",
+                          "--grid", "nnue-bn-l1", "true", "--grid", "nnue-bn-l2", "true"])
+        self.assertEqual(len(plan["trials"]), 2)
+        self.assertEqual({t["settings"]["nnue_bn_ft"] for t in plan["trials"]}, {False, True})
+        for trial in plan["trials"]:
+            self.assertTrue(trial["settings"]["nnue_bn_l1"])
+            self.assertTrue(trial["settings"]["nnue_bn_l2"])
+        for name in ("ft", "l1", "l2", "gamma", "beta", "momentum", "epsilon"):
+            self.assertIn("nnue_bn_" + name, grid.COMMON_COLUMNS)
+
     def test_ft_saturation_guard_grid_and_epoch(self):
         plan = self.plan(["--grid", "sfnn-ft-saturation-penalty", "0", "0.0001", "0.001"])
         self.assertEqual({t["settings"]["sfnn_ft_saturation_penalty"] for t in plan["trials"]}, {0, 0.0001, 0.001})

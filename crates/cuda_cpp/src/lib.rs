@@ -5411,6 +5411,7 @@ impl<'a> NnueTrainStepHostBatch<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NnueTrainWeightsReadback {
+    pub batch_norm: batch_norm::NetworkState,
     pub l0w: Vec<f32>,
     pub l0b: Vec<f32>,
     pub l1w: Vec<f32>,
@@ -5547,6 +5548,7 @@ impl NnueTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct NnueTrainStepRunner {
+    pub batch_norm: Option<batch_norm::Network>,
     pub shape: NnueForwardShape,
     pub batch_size: usize,
     pub max_active: usize,
@@ -5563,6 +5565,12 @@ pub struct NnueTrainStepRunner {
 }
 
 impl NnueTrainStepRunner {
+    pub fn configure_batch_norm(&mut self, ctx: &Context, enabled: [bool; 3],
+        config: batch_norm::Config, saved: &batch_norm::NetworkState) -> Result<()> {
+        let network = batch_norm::Network::new_nnue(ctx, self.shape, self.batch_size, enabled, config, saved)?;
+        self.batch_norm = enabled.iter().any(|v| *v).then_some(network);
+        Ok(())
+    }
     pub fn new(
         ctx: &Context,
         initial_weights: NnueForwardHostWeights<'_>,
@@ -5609,6 +5617,7 @@ impl NnueTrainStepRunner {
             upload_slots.push(NnueTrainStepUploadSlot::new(ctx, batch_size, max_active)?);
         }
         Ok(Self {
+            batch_norm: None,
             shape,
             batch_size,
             max_active,
@@ -5677,6 +5686,7 @@ impl NnueTrainStepRunner {
         finalize_loss: bool,
     ) -> Result<()> {
         self.validate()?;
+        let _bn = self.batch_norm.as_ref().map(|b| b.bind(ctx, self.batch_size, true)).transpose()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5744,6 +5754,7 @@ impl NnueTrainStepRunner {
         finalize_loss: bool,
     ) -> Result<()> {
         self.validate()?;
+        let _bn = self.batch_norm.as_ref().map(|b| b.bind(ctx, self.batch_size, true)).transpose()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5798,6 +5809,7 @@ impl NnueTrainStepRunner {
         batch: NnueTrainStepHostBatch<'_>,
     ) -> Result<NnueTrainStepProfile> {
         self.validate()?;
+        let _bn = self.batch_norm.as_ref().map(|b| b.bind(ctx, self.batch_size, true)).transpose()?;
         batch.validate()?;
         if batch.batch_size != self.batch_size || batch.max_active != self.max_active {
             return Err(CudaCppError::message(format!(
@@ -5862,6 +5874,7 @@ impl NnueTrainStepRunner {
 
     pub fn read_weights(&self, ctx: &Context) -> Result<NnueTrainWeightsReadback> {
         Ok(NnueTrainWeightsReadback {
+            batch_norm: self.batch_norm.as_ref().map(|b| b.read_state(ctx)).transpose()?.unwrap_or_default(),
             l0w: self.weights.l0w.download(ctx)?,
             l0b: self.weights.l0b.download(ctx)?,
             l1w: self.weights.l1w.download(ctx)?,
@@ -5949,7 +5962,9 @@ impl NnueTrainStepRunner {
             &self.backward_workspace.outb_gradients,
             &self.weights.outb,
             &self.optimizer_states.outb,
-        )
+        )?;
+        if let Some(bn) = &self.batch_norm { bn.update(ctx, params)?; }
+        Ok(())
     }
 }
 
@@ -11714,7 +11729,7 @@ mod tests {
         assert_eq!(staged_i.download(&ctx).unwrap(), vec![3, 4, 5]);
     }
 
-    fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
+    pub(super) fn tiny_nnue_weights(shape: NnueForwardShape) -> NnueForwardHostWeights<'static> {
         assert_eq!(shape, NnueForwardShape { input_size: 4, l1: 2, l2: 2, l3: 1 });
         NnueForwardHostWeights {
             shape,

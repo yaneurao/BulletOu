@@ -1,4 +1,43 @@
-# SFNNのBatch Normalization（実験用）
+# NNUE / SFNNのBatch Normalization（実験用）
+
+## 通常NNUE
+
+CUDA C++バックエンドの通常NNUE（HalfKP / KP / KA2 / HalfKPE9 / HalfKP_vm）にも対応しています。
+FT・L1・L2のactivation前へ個別にBNを入れます。FTの2視点は従来どおり**連結**し、SFNNの積や二乗枝へ変更しません。
+
+| JSONキー | デフォルト | 意味 |
+|---|---:|---|
+| `nnue_bn_ft` | `false` | FT加算後、CReLU前。両視点で統計・γ・βを共有 |
+| `nnue_bn_l1` | `false` | 第1全結合隠れ層のCReLU前 |
+| `nnue_bn_l2` | `false` | 第2全結合隠れ層のCReLU前 |
+| `nnue_bn_gamma` | `0.25` | γの初期値（以降は学習） |
+| `nnue_bn_beta` | `0.5` | βの初期値（以降は学習） |
+| `nnue_bn_momentum` | `0.1` | running統計のEMAで新しいbatch側の係数。`(0,1]` |
+| `nnue_bn_epsilon` | `0.00001` | 分散へ加える正の定数 |
+
+L1/L2はbucketなしでunitごとに統計を持ちます。計算式・統計更新・γ/βの扱いは下記SFNNと同じです。
+通常NNUEは既存の制限どおり `batches_per_update=1` のみです。
+通常NNUE BNはstandalone/grid search用で、plateau、worker、epoch別BN切り替え、BN QATは未対応です。
+`sfnn_bn_*` は通常NNUEには使用しません。
+
+grid searchの例（`settings.json` のarchには通常NNUEを指定）：
+
+```powershell
+python .\grid_search.py `
+  --settings-file .\settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
+  --grid nnue-bn-ft false true `
+  --grid nnue-bn-l1 true `
+  --grid nnue-bn-l2 true
+```
+
+validationはrunning統計をfoldした重みで計算します。`nn.bin`にもfoldしてから従来どおり量子化するため、
+やねうら王側にBN層や追加ファイルは不要です。ただし量子化誤差やclipがなくなるわけではありません。
+通常NNUEの既存の検証項目を変更・追加する機能ではありません。
+`state.bin` / 完全状態の`weights.bin`には未fold重み、BN統計、γ/βとそのoptimizer stateを保存します。
+resume時は同じBNオプション・設定値を指定してください。保存済みBNをOFFにしてのresumeはエラーにし、黙って破棄しません。
+
+## SFNN
 
 FT・L1・L2の線形出力に、activation前のBatchNorm（BN）を個別に追加できます。
 デフォルトはすべてOFFです。中心化とは別の処理で、学習中のforwardも変わります。

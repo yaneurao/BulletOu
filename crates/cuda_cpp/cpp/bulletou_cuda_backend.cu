@@ -902,7 +902,7 @@ __global__ void nnue_sparse_l0_crelu_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t rows) {
+    size_t rows, bool activate = true) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * rows;
     if (tid >= total) {
@@ -926,7 +926,7 @@ __global__ void nnue_sparse_l0_crelu_kernel(
             }
         }
     }
-    output[tid] = crelu(sum);
+    output[tid] = activate ? crelu(sum) : sum;
 }
 
 __global__ void crelu_inplace_kernel(float* values, size_t len) {
@@ -963,7 +963,7 @@ __global__ void nnue_dense_crelu_kernel(
     float* output,
     size_t batch,
     size_t input_dim,
-    size_t output_dim) {
+    size_t output_dim, bool activate = true) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
@@ -977,7 +977,7 @@ __global__ void nnue_dense_crelu_kernel(
     for (size_t in_col = 0; in_col < input_dim; ++in_col) {
         sum += input[input_base + in_col] * weights[in_col * output_dim + out_col];
     }
-    output[tid] = crelu(sum);
+    output[tid] = activate ? crelu(sum) : sum;
 }
 
 __global__ void nnue_dense_output_kernel(
@@ -4335,6 +4335,8 @@ __global__ void l0_crelu_backward_inplace_kernel(
     gradients[tid] = crelu_pre_gradient_from_value(activations[tid], gradients[tid]);
 }
 
+int bn_backward_bound(BulletOuCudaCppContext*, int, float*, float*, const int*, size_t, size_t, float*);
+
 int launch_dense_crelu_backward_gemm(
     BulletOuCudaCppContext* ctx,
     const char* label,
@@ -4347,7 +4349,7 @@ int launch_dense_crelu_backward_gemm(
     float* bias_gradients,
     size_t batch,
     size_t input_dim,
-    size_t output_dim) {
+    size_t output_dim, int bn_layer = -1) {
     constexpr int threads = 256;
     int blocks = 0;
 
@@ -4358,6 +4360,8 @@ int launch_dense_crelu_backward_gemm(
     if (check_kernel_launch("dense_crelu_pre_gradient_kernel launch") != 0) {
         return -1;
     }
+    if (bn_layer >= 0 && ctx->bn[bn_layer].params &&
+        bn_backward_bound(ctx, bn_layer, output_gradients, nullptr, nullptr, batch, output_dim, nullptr) != 0) return -1;
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
@@ -5000,6 +5004,8 @@ int launch_dense_forward_gemm(
     return 0;
 }
 
+#include "batch_norm.cuh"
+
 int launch_nnue_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -5038,14 +5044,20 @@ int launch_nnue_forward_kernels(
         return -1;
     }
     nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        stm_indices, l0w, l0b, stm_l0, batch, max_active, input_size, l1);
+        stm_indices, l0w, l0b, stm_l0, batch, max_active, input_size, l1, !ctx->bn[0].params);
     if (check_kernel_launch("nnue_sparse_l0_crelu_kernel stm launch") != 0) {
         return -1;
     }
     nnue_sparse_l0_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        nstm_indices, l0w, l0b, nstm_l0, batch, max_active, input_size, l1);
+        nstm_indices, l0w, l0b, nstm_l0, batch, max_active, input_size, l1, !ctx->bn[0].params);
     if (check_kernel_launch("nnue_sparse_l0_crelu_kernel nstm launch") != 0) {
         return -1;
+    }
+    if (ctx->bn[0].params) {
+        if (bn_forward_bound(ctx, 0, stm_l0, nstm_l0, nullptr, batch, l1) != 0) return -1;
+        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_l0, batch * l1);
+        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_l0, batch * l1);
+        if (check_kernel_launch("NNUE FT BN activation") != 0) return -1;
     }
 
     if (block_count_1d(batch * l1 * 2, threads, &blocks, "nnue_concat_l0_kernel") != 0) {
@@ -5059,17 +5071,27 @@ int launch_nnue_forward_kernels(
     if (block_count_1d(batch * l2, threads, &blocks, "nnue_dense_l1_crelu_kernel") != 0) {
         return -1;
     }
-    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(combined, l1w, l1b, hidden1, batch, l1 * 2, l2);
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(combined, l1w, l1b, hidden1, batch, l1 * 2, l2, !ctx->bn[1].params);
     if (check_kernel_launch("nnue_dense_l1_crelu_kernel launch") != 0) {
         return -1;
+    }
+    if (ctx->bn[1].params) {
+        if (bn_forward_bound(ctx, 1, hidden1, nullptr, nullptr, batch, l2) != 0) return -1;
+        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, batch * l2);
+        if (check_kernel_launch("NNUE L1 BN activation") != 0) return -1;
     }
 
     if (block_count_1d(batch * l3, threads, &blocks, "nnue_dense_l2_crelu_kernel") != 0) {
         return -1;
     }
-    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l2w, l2b, hidden2, batch, l2, l3);
+    nnue_dense_crelu_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden1, l2w, l2b, hidden2, batch, l2, l3, !ctx->bn[2].params);
     if (check_kernel_launch("nnue_dense_l2_crelu_kernel launch") != 0) {
         return -1;
+    }
+    if (ctx->bn[2].params) {
+        if (bn_forward_bound(ctx, 2, hidden2, nullptr, nullptr, batch, l3) != 0) return -1;
+        crelu_inplace_kernel<<<blocks, threads, 0, ctx->stream>>>(hidden2, batch * l3);
+        if (check_kernel_launch("NNUE L2 BN activation") != 0) return -1;
     }
 
     if (block_count_1d(batch, threads, &blocks, "nnue_dense_output_kernel") != 0) {
@@ -5082,8 +5104,6 @@ int launch_nnue_forward_kernels(
 
     return 0;
 }
-
-#include "batch_norm.cuh"
 
 int launch_sfnn_forward_kernels(
     BulletOuCudaCppContext* ctx,
@@ -7327,7 +7347,7 @@ int launch_nnue_backward_kernels(
         l2b_gradients,
         batch,
         l2,
-            l3) != 0) {
+            l3, 2) != 0) {
         return -1;
     }
 
@@ -7344,7 +7364,7 @@ int launch_nnue_backward_kernels(
             l1b_gradients,
             batch,
             l1_input_dim,
-            l2) != 0) {
+            l2, 1) != 0) {
         return -1;
     }
 
@@ -7362,6 +7382,8 @@ int launch_nnue_backward_kernels(
     if (check_kernel_launch("nnue_l0_crelu_backward_kernel launch") != 0) {
         return -1;
     }
+    if (ctx->bn[0].params && bn_backward_bound(ctx, 0, stm_l0_gradients, nstm_l0_gradients,
+        nullptr, batch, l1) != 0) return -1;
 
     if (zero_l0_gradients != 0) {
         size_t l0_zero_threads = std::max(nnue_l0w_len_for_shape(input_size, l1), l1);
