@@ -44,6 +44,20 @@ class GridSearchTests(unittest.TestCase):
         plan = self.plan(["--lrs", "0.0001"])
         self.assertEqual(plan["trials"][0]["settings"]["sfnn_bn_qat"], settings["sfnn_bn_qat"])
 
+    def test_bn_freeze_stats_epoch_schedule(self):
+        schedule = {"epoch1": False, "epoch2": True, "epoch4": False}
+        settings = {"sfnn_bn_qat": True, "sfnn_bn_qat_freeze_stats": schedule}
+        for epoch in (0, 1, 2, 3, 4, 10):
+            resolved = grid.resolve_epoch_settings(settings, epoch)
+            self.assertEqual(resolved["sfnn_bn_qat_freeze_stats"], 2 <= epoch < 4)
+            self.assertTrue(resolved["sfnn_bn_qat"])
+        with self.assertRaisesRegex(ValueError, "true/false"):
+            grid.resolve_epoch_settings({"sfnn_bn_qat_freeze_stats": {"epoch1": False, "epoch2": 1}}, 1)
+        self.common.update(settings)
+        grid.atomic_json(self.settings_path, self.common)
+        plan = self.plan(["--lrs", "0.0001"])
+        self.assertEqual(plan["trials"][0]["settings"]["sfnn_bn_qat_freeze_stats"], schedule)
+
     def test_nnue_bn_grid_conditions(self):
         self.common["arch"] = "NNUE_ka2_256x2_32_32"
         grid.atomic_json(self.settings_path, self.common)

@@ -37,6 +37,15 @@ impl SfnnTrainStepRunner {
         {
             return Err(CudaCppError::message("invalid BN QAT FT factorizer layout"));
         }
+        let virtual_rows=if self.shape.input_size == base {0} else {virtual_rows};
+        // A statistics-mode transition needs no second full-size QAT proxy.
+        if let Some(q)=self.bn_qat.as_mut() {
+            if q.base==base && q.virtual_rows==virtual_rows {
+                q.freeze_stats=freeze_stats;
+                q.l2_effective_weight_clip=false; // caller reapplies the configured policy
+                return Ok(());
+            }
+        }
         let mut proxy = SfnnForwardDeviceWeights::new_dense(ctx, self.shape)?;
         // Preserve optional tensor shapes for runner/optimizer validation. They
         // are inactive during the proxy pass and never optimized.
@@ -197,6 +206,34 @@ mod tests {
             r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
                 ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
             assert!(r.forward_workspace.output.download(&ctx).unwrap().iter().all(|v|v.is_finite()));
+        }
+    }
+    #[test]
+    fn bn_qat_freeze_toggle_preserves_state_and_controls_statistics() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+        calibrated(&mut r,&ctx);
+        r.configure_bn_qat(&ctx,true,shape.input_size,0).unwrap();
+        let ptr=r.bn_qat.as_ref().unwrap().proxy.l0w.as_ptr();
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],buckets:&[0,0,1,1],
+            targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        for freeze in [false,true,false,true] {
+            let weights=r.read_weights(&ctx).unwrap();
+            let optimizer=r.read_optimizer_states(&ctx).unwrap();
+            let before=r.read_batch_norm_state(&ctx).unwrap();
+            r.configure_bn_qat_mode(&ctx,true,shape.input_size,0,freeze).unwrap();
+            assert_eq!(ptr,r.bn_qat.as_ref().unwrap().proxy.l0w.as_ptr());
+            assert_eq!(weights,r.read_weights(&ctx).unwrap());
+            assert_eq!(optimizer,r.read_optimizer_states(&ctx).unwrap());
+            assert_eq!(before,r.read_batch_norm_state(&ctx).unwrap());
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,Default::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,true,Default::default()).unwrap();
+            let after=r.read_batch_norm_state(&ctx).unwrap();
+            for (a,b) in before.0.iter().zip(&after.0) {
+                let (a,b)=(a.as_ref().unwrap(),b.as_ref().unwrap());
+                if freeze {assert_eq!(a.running,b.running);} else {assert_ne!(a.running,b.running);}
+            }
         }
     }
     #[test]

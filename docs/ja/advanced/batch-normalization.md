@@ -290,6 +290,17 @@ resumeは再開epochの値を使用します。warmupのepoch 0はepoch1の値�
 `sfnn_bn_ft/l1/l2`は必要な層を最初から有効にしてください。`sfnn_bn_qat_freeze_stats`は既定のfalseのまま使います。
 切替時は`[BN QAT] epoch=6 enabled=true`と表示します。true→falseも対応します。設定ファイルは自動書換えしません。
 
+`sfnn_bn_qat_freeze_stats`もepoch別指定に対応します。QATは最初からON、epoch1でBN統計を更新し、epoch2開始時に固定する例:
+
+```json
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": {"epoch1": false, "epoch2": true}
+```
+
+切替はepochの最初のbatchより前に行い、直前までの平均・分散をそのまま固定します。重み・γ/β・optimizer状態は初期化しません。γ/βと重みの学習は継続します。統計固定の切替だけなら既存のQAT用VRAMを再利用します。
+`[BN QAT] epoch=2 enabled=true freeze_stats=true`と表示します。後のepochでfalseへ戻して統計更新を再開することもできます。resumeは再開epochの値を使用し、warmupのepoch0ではepoch1の値を使用します。将来のtrueは、それ以前のepochには影響しません。grid_searchでもこのJSONをそのまま使用できます（workerはepoch設定未対応）。
+固定開始には校正済みBN統計が必要です。`sfnn_bn_l2_effective_weight_clip`や復元時L2リセットは統計固定を要求するため、統計更新中の学習で同時に有効にはできません。既存の設定ファイルは自動変更しません。
+
 ゼロからの共通設定（BN層ON、`initial_state`なし）から、新しいgrid rootで比較できます。
 
 ```powershell

@@ -1,5 +1,18 @@
 # Experimental NNUE / SFNN batch normalization
 
+## Epoch-wise running-statistics freezing
+
+Standalone SFNN training and grid_search accept:
+
+```json
+"sfnn_bn_qat": true,
+"sfnn_bn_qat_freeze_stats": {"epoch1": false, "epoch2": true}
+```
+
+QAT is active from the start. Epoch1 updates BN statistics; before the first batch of epoch2, the latest running mean/variance are frozen. Weights, gamma/beta and optimizer state are preserved and remain trainable. Switching statistics mode reuses the existing QAT GPU proxy. The log reports `[BN QAT] epoch=2 enabled=true freeze_stats=true`.
+
+Later false values resume statistics updates. Resume resolves the resumed epoch; warmup epoch0 uses epoch1. Future settings do not affect earlier epochs. Frozen mode requires calibrated statistics and QAT enabled. BN L2 effective clipping and restore-time L2 revival require frozen mode and cannot remain enabled during statistics-updating training. Worker mode does not support epoch schedules. User settings files are not automatically rewritten.
+
 ## One-shot L2 revival on restore
 
 For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_l2_revive_zero": true`, default false). It can be combined with upper revival:

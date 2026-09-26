@@ -4072,7 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "sfnn_bn_qat",
+    "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
@@ -4093,7 +4093,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "sfnn_bn_qat" | "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = matches!(key, "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4123,7 +4123,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(sfnn_bn_qat, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -18367,7 +18367,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
                 ctx.synchronize().map_err(|e| e.to_string())?;
                 let next_args = args_at_epoch(base_args, progress.epoch)?;
-                if next_args.sfnn_bn_qat != epoch_args.sfnn_bn_qat {
+                if next_args.sfnn_bn_qat != epoch_args.sfnn_bn_qat
+                    || next_args.sfnn_bn_qat_freeze_stats != epoch_args.sfnn_bn_qat_freeze_stats {
                     // Only the QAT proxy changes; keep master weights, optimizer,
                     // BN affine parameters/running statistics and data position.
                     // configure checks that the previous BPU group is complete.
@@ -18376,8 +18377,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         next_args.sfnn_bn_qat_freeze_stats).map_err(|e| e.to_string())?;
                     runner.configure_bn_l2_effective_weight_clip(&ctx,next_args.sfnn_bn_l2_effective_weight_clip).map_err(|e|e.to_string())?;
                     eprintln!("{}", paint(format!(
-                        "  [BN QAT] epoch={} enabled={} (weights, optimizer and BN state preserved)",
-                        progress.epoch, next_args.sfnn_bn_qat), ConsoleColor::Yellow));
+                        "  [BN QAT] epoch={} enabled={} freeze_stats={} (weights, optimizer and BN state preserved)",
+                        progress.epoch, next_args.sfnn_bn_qat, next_args.sfnn_bn_qat_freeze_stats), ConsoleColor::Yellow));
                 }
                 epoch_args = next_args;
                 schedule.batches_per_superbatch = progress.batches_per_superbatch;
@@ -27721,6 +27722,22 @@ mod tests {
         assert!(resumed.sfnn_bn_qat);
         assert!(resume_signature_matches(&resume_signature(&args_at_epoch(&args,5).unwrap()),&resumed));
         assert!(validate_epoch_setting("sfnn_bn_qat",&serde_json::json!({"epoch1":false,"epoch6":1})).is_err());
+        args.sfnn_bn_qat=true;
+        args.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_bn_qat_freeze_stats":{"epoch1":false,"epoch2":true,"epoch4":false}
+        }).to_string());
+        for epoch in [0,1,2,3,4,9] {
+            let resolved=args_at_epoch(&args,epoch).unwrap();
+            assert!(resolved.sfnn_bn_qat);
+            assert_eq!(resolved.sfnn_bn_qat_freeze_stats,(2..4).contains(&epoch));
+        }
+        let resumed=args_at_epoch(&args_at_epoch(&args,2).unwrap(),3).unwrap();
+        assert!(resumed.sfnn_bn_qat_freeze_stats);
+        assert!(resume_signature_matches(&resume_signature(&args_at_epoch(&args,1).unwrap()),&resumed));
+        assert!(validate_epoch_setting("sfnn_bn_qat_freeze_stats",&serde_json::json!({"epoch1":false,"epoch2":1})).is_err());
+        args.sfnn_bn_qat=false;
+        assert!(args_at_epoch(&args,1).is_ok());
+        assert!(args_at_epoch(&args,2).is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
