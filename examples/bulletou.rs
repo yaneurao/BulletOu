@@ -4072,6 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
@@ -4156,6 +4157,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
@@ -4561,6 +4563,18 @@ struct Args {
     /// quantized accuracy.
     #[arg(long, default_value = "1.0")]
     sfnn_l1_lr_mult: f32,
+
+    /// SFNN FT master weights/biases LR multiplier; does not scale BN gamma/beta.
+    #[arg(long, default_value = "1.0")]
+    sfnn_ft_lr_mult: f32,
+
+    /// SFNN L2 master weights/biases LR multiplier; does not scale BN gamma/beta.
+    #[arg(long, default_value = "1.0")]
+    sfnn_l2_lr_mult: f32,
+
+    /// SFNN L3 master weights/biases LR multiplier.
+    #[arg(long, default_value = "1.0")]
+    sfnn_l3_lr_mult: f32,
 
     /// Freeze SFNN L1 updates for the whole run. Frozen groups keep weights
     /// and Ranger state unchanged; their gradients are cleared after backward.
@@ -5532,8 +5546,8 @@ impl Args {
             if self.lr_schedule==LrScheduleKind::Plateau {
                 return Err("BN currently supports standalone non-plateau training/grid_search".into());
             }
-            if self.sfnn_freeze_l1 || self.sfnn_l1_lr_mult!=1.0 {
-                return Err("BN currently requires sfnn_freeze_l1=false and sfnn_l1_lr_mult=1".into());
+            if self.sfnn_freeze_l1 || self.sfnn_l1_lr_mult<=0.0 {
+                return Err("BN requires sfnn_freeze_l1=false and sfnn_l1_lr_mult>0; positive layer LR multipliers are supported".into());
             }
             if !self.sfnn_bn_gamma.is_finite() || !self.sfnn_bn_beta.is_finite()
                 || !self.sfnn_bn_epsilon.is_finite() || self.sfnn_bn_epsilon<=0.0
@@ -5739,6 +5753,15 @@ impl Args {
         }
         if !(self.sfnn_l1_lr_mult.is_finite() && self.sfnn_l1_lr_mult >= 0.0) {
             return Err(format!("--sfnn-l1-lr-mult must be finite and non-negative (got {})", self.sfnn_l1_lr_mult));
+        }
+        for (name, value) in [("sfnn-ft-lr-mult", self.sfnn_ft_lr_mult),
+            ("sfnn-l2-lr-mult", self.sfnn_l2_lr_mult), ("sfnn-l3-lr-mult", self.sfnn_l3_lr_mult)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("--{name} must be finite and positive (got {value})"));
+            }
+            if value != 1.0 && !eval_type.uses_layerstack() {
+                return Err(format!("--{name} applies to SFNN / LayerStack eval types only"));
+            }
         }
         if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1) && !eval_type.uses_layerstack() {
             return Err("--sfnn-l1-lr-mult / --sfnn-freeze-l1 apply to SFNN / LayerStack eval types only".to_string());
@@ -17800,7 +17823,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
-    if args.sfnn_l1_lr_mult != 1.0
+    if args.sfnn_ft_lr_mult != 1.0 || args.sfnn_l2_lr_mult != 1.0 || args.sfnn_l3_lr_mult != 1.0
+        || args.sfnn_l1_lr_mult != 1.0
         || args.sfnn_freeze_l1
         || progress_enabled
         || args.sfnn_update_scope != SfnnUpdateScopeArg::All
@@ -17818,7 +17842,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "SFNN layer LR",
             format!(
-                "L1 multiplier={} freeze={freeze}, progress={}, update_scope={}",
+                "FT={} L2={} L3={} L1 multiplier={} freeze={freeze}, progress={}, update_scope={}",
+                args.sfnn_ft_lr_mult, args.sfnn_l2_lr_mult, args.sfnn_l3_lr_mult,
                 paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow),
                 progress_freeze,
                 paint(args.sfnn_update_scope.cli_name(), ConsoleColor::BoldYellow)
@@ -24987,6 +25012,9 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     _progress: Option<CudaCppScheduleProgress>,
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
+        l0: args.sfnn_ft_lr_mult,
+        l2: args.sfnn_l2_lr_mult,
+        l3: args.sfnn_l3_lr_mult,
         bn_affine: args.sfnn_bn_affine_lr_multiplier,
         l2_l3_center: args.sfnn_l2_l3_center,
         l1_center: args.sfnn_l1_center,
@@ -25688,6 +25716,9 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
         format!("sfnn_bn_affine_lr_multiplier={}", args.sfnn_bn_affine_lr_multiplier),
+        format!("sfnn_ft_lr_mult={}", args.sfnn_ft_lr_mult),
+        format!("sfnn_l2_lr_mult={}", args.sfnn_l2_lr_mult),
+        format!("sfnn_l3_lr_mult={}", args.sfnn_l3_lr_mult),
         format!("sfnn_bn_qat_freeze_stats={}", args.sfnn_bn_qat_freeze_stats),
         format!("sfnn_bn_l2_effective_weight_clip={}", args.sfnn_bn_l2_effective_weight_clip),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
@@ -25962,6 +25993,9 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_affine_lr_multiplier=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_lr_mult=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l2_lr_mult=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l3_lr_mult=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat_freeze_stats=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_l2_effective_weight_clip=");
     // Centering can be explicitly changed on resume; tensors remain folded.
@@ -34701,6 +34735,17 @@ mod tests {
             bulletou_settings_json_value_to_args(Path::new("settings.json"),name,&serde_json::json!(true),&mut argv).unwrap();
         }
         let bn=Args::try_parse_from(argv).unwrap();assert!(bn.validate_arch_flags().is_ok());
+        let mut layer=bn.clone();
+        layer.sfnn_ft_lr_mult=0.25; layer.sfnn_l1_lr_mult=0.25;
+        layer.sfnn_l2_lr_mult=0.25; layer.sfnn_l3_lr_mult=0.25;
+        assert!(layer.validate_arch_flags().is_ok());
+        let m=cuda_cpp_sfnn_layer_lr_multipliers(&layer,None);
+        assert_eq!([m.l0,m.l1,m.l2,m.l3],[0.25;4]);
+        layer.epoch_settings_json=Some(serde_json::json!({"sfnn_ft_lr_mult":{"epoch1":1.0,"epoch2":0.25},
+            "sfnn_l2_lr_mult":{"epoch1":1.0,"epoch2":0.5},"sfnn_l3_lr_mult":{"epoch1":1.0,"epoch2":0.75}}).to_string());
+        assert_eq!(args_at_epoch(&layer,1).unwrap().sfnn_ft_lr_mult,1.0);
+        let later=args_at_epoch(&layer,2).unwrap();
+        assert_eq!([later.sfnn_ft_lr_mult,later.sfnn_l2_lr_mult,later.sfnn_l3_lr_mult],[0.25,0.5,0.75]);
         assert!(bn.sfnn_bn_ft && bn.sfnn_bn_l1 && bn.sfnn_bn_l2);
         assert_eq!(bn.sfnn_bn_gamma,0.25);assert_eq!(bn.sfnn_bn_beta,0.5);
         assert_eq!(bn.sfnn_bn_affine_lr_multiplier,1.0);

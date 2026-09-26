@@ -396,6 +396,40 @@ mod tests {
         assert!((a - b).abs() < 2e-5 * (1.0 + a.abs() + b.abs()), "{a} != {b}");
     }
     #[test]
+    fn bn_qat_positive_layer_lr_multipliers_scale_master_updates() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let run=|multipliers:SfnnLayerLrMultipliers| {
+            let mut r=SfnnTrainStepRunner::new(&ctx,crate::tests::tiny_sfnn_weights(shape),4,1).unwrap();
+            calibrated(&mut r,&ctx);
+            r.configure_bn_qat_mode(&ctx,true,shape.input_size,0,true).unwrap();
+            let read=|r:&SfnnTrainStepRunner| [&r.weights.l0w,&r.weights.l1w,&r.weights.l2w,&r.weights.l3w]
+                .iter().map(|w|w.download(&ctx).unwrap()).collect::<Vec<_>>();
+            let before=read(&r);
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],
+                buckets:&[0,0,1,1],targets:&[0.1,0.3,0.7,0.9],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+            let mut p=RangerUpdateParams::default();
+            p.radam.learning_rate=0.01;
+            p.radam.gradient_factor=0.5;
+            p.radam.step=1;
+            for update in [false,true] {
+                r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
+                    ScalarLossKind::BceWithLogits,1.0,batch,true,update,multipliers).unwrap();
+            }
+            (before,read(&r))
+        };
+        let (before,normal)=run(Default::default());
+        let (_,scaled)=run(SfnnLayerLrMultipliers {l0:0.25,l1:0.5,l2:0.75,l3:1.5,..Default::default()});
+        let mut total=0.0f32;
+        for (layer,m) in [0.25,0.5,0.75,1.5].into_iter().enumerate() {
+            for ((&a,&b),&c) in before[layer].iter().zip(&normal[layer]).zip(&scaled[layer]) {
+                total+=(b-a).abs();
+                assert!((c-a-m*(b-a)).abs()<2e-6,"layer={layer}: {a} -> {b} / {c}");
+            }
+        }
+        assert!(total>1e-7,"test must exercise nonzero updates");
+    }
+    #[test]
     fn bn_qat_forward_export_accumulation_update_and_resume() {
         let ctx = Context::new(0).unwrap();
         let shape = crate::tests::tiny_sfnn_shape();
@@ -707,13 +741,10 @@ pub(super) fn step<T>(
         || lr.saturation_penalty != 0.0
         || lr.ft_saturation_penalty != 0.0
         || lr.update_scope != SfnnUpdateScope::All
-        || lr.l0 != 1.0
-        || lr.l1 != 1.0
-        || lr.l2 != 1.0
-        || lr.l3 != 1.0
+        || [lr.l0, lr.l1, lr.l2, lr.l3].iter().any(|v| !v.is_finite() || *v <= 0.0)
     {
         return Err(CudaCppError::message(
-            "BN QAT requires no centering, L1-only QAT, penalties, effective clipping or layer freezing/LR multipliers",
+            "BN QAT requires no centering, L1-only QAT, penalties, effective clipping or layer freezing; layer LR multipliers must be finite and positive",
         ));
     }
     let mut q = r.bn_qat.take().unwrap();

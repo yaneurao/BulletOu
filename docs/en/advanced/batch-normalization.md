@@ -1,5 +1,28 @@
 # Experimental NNUE / SFNN batch normalization
 
+## SFNN layer learning rates (including BN / BN QAT)
+
+`sfnn_ft_lr_mult`, `sfnn_l1_lr_mult`, `sfnn_l2_lr_mult`, and `sfnn_l3_lr_mult`
+scale the optimizer learning rate of each layer's master weights and biases
+(including active L1 factorizer tensors). All default to 1.0. With BN, use finite,
+positive values. The new FT/L2/L3 options require positive values without BN too.
+They do not scale BN gamma/beta: use `sfnn_bn_affine_lr_multiplier` independently.
+Gamma/beta can still change the folded effective weights of a slowed layer.
+Existing Ranger state, clipping rules, QAT and forward equations remain unchanged.
+Lookahead and projection mean the actual parameter displacement need not scale exactly.
+
+CLI, JSON, epoch schedules and grid search are supported:
+
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn-ft-lr-mult 1.0 0.25
+```
+
+```json
+"sfnn_l2_lr_mult": {"epoch1": 1.0, "epoch13": 0.25}
+```
+
+These are experimental controls, not a guarantee of improved playing strength.
+
 ## Epoch-wise running-statistics freezing
 
 Standalone SFNN training and grid_search accept:
@@ -229,7 +252,7 @@ the function; it is not a function-preserving conversion.
 Supported: cuda-cpp standalone training/grid search, dense SFNN, none/shared
 factorizers, gradient accumulation, and optional existing centering.
 Not supported yet: worker, plateau, compact/grouped L1, count gates, layer
-freezing/individual LR multipliers, L1-only QAT, L1 effective weight clipping, or FT/weight
+freezing, L1-only QAT, L1 effective weight clipping, or FT/weight
 saturation penalties. If L1-only QAT is requested without `sfnn_bn_qat`, a yellow WARNING is printed
 and training continues with L1-only QAT disabled (effective `sfnn_qat_l1=false`), leaving
 BN enabled and settings files unchanged. Other unsupported combinations still fail.

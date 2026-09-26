@@ -1,5 +1,27 @@
 # NNUE / SFNNのBatch Normalization（実験用）
 
+## SFNNの層別学習率（BN / BN QAT対応）
+
+`sfnn_ft_lr_mult`、`sfnn_l1_lr_mult`、`sfnn_l2_lr_mult`、`sfnn_l3_lr_mult`で、
+各層のmaster重み・bias（L1は有効なfactorizerも含む）のoptimizer学習率を倍率指定できます。
+デフォルトはすべて1.0。BN使用時は有限の正数を指定します。FT/L2/L3の新オプションはBNなしでも正数のみです。
+BNのγ/βの倍率は変えません。そちらは `sfnn_bn_affine_lr_multiplier` で独立に指定します。
+層を遅くしてもγ/βによってfold後の実効重みは変わるため、完全な凍結とは異なります。
+既存のRanger状態を維持してLRに倍率を掛け、clip規則・QAT・forwardの式は変更しません。
+Lookaheadやclipがあるため、実際の重み変化量が毎回厳密にその倍率になるとは限りません。
+
+CLI、JSON、epoch指定、grid searchに対応します。例:
+
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn-ft-lr-mult 1.0 0.25
+```
+
+```json
+"sfnn_l2_lr_mult": {"epoch1": 1.0, "epoch13": 0.25}
+```
+
+これは実験機能であり、最適な倍率や棋力向上を保証するものではありません。
+
 ## 復元時のL2定数unit再利用
 
 常時出力0のunitには、独立した `--sfnn-l2-revive-zero`（JSON: `"sfnn_l2_revive_zero": true`、既定false）を使います。上限側の `sfnn_l2_revive` と同時指定できます。
@@ -215,7 +237,7 @@ BNなしのcheckpointに新たにBNを追加すると、forwardが変わりま�
 ## 対応範囲と負荷
 
 - cuda-cppの通常学習と`grid_search.py`。dense SFNN、factorizer `none` / `shared`。
-- 現時点ではworker、plateau、compact/grouped L1、bucket-count gates、層のfreeze／個別LR倍率は未対応。
+- 現時点ではworker、plateau、compact/grouped L1、bucket-count gates、層のfreezeは未対応。正数の層別LR倍率は対応。
 - 従来のL1単独QATはBNと併用できません。`sfnn_bn_qat=false`で`sfnn_qat_l1=true`なら黄色のWARNINGを出し、L1単独QATだけを無効化します。BN用QATは下記の別オプションです。
 - `sfnn_l1_effective_weight_clip`、FT/weight saturation penaltyは併用不可で、引き続きエラーにします。
 - L1／L2・L3の中心化とは併用できます（中心化側の制約も適用）。
