@@ -9,6 +9,11 @@ Standalone SFNN training and grid_search accept:
 "sfnn_bn_qat_freeze_stats": {"epoch1": false, "epoch2": true}
 ```
 
+On `--resume`, startup compatibility checks use the actual epoch determined from
+the saved checkpoint, not the historical epoch1 values. Resuming after epoch6
+therefore uses epoch7's `true` for revive/L2 effective clipping requirements.
+Fresh runs still validate epoch1 (warmup epoch0 inherits epoch1 settings).
+
 QAT is active from the start. Epoch1 updates BN statistics; before the first batch of epoch2, the latest running mean/variance are frozen. Weights, gamma/beta and optimizer state are preserved and remain trainable. Switching statistics mode reuses the existing QAT GPU proxy. The log reports `[BN QAT] epoch=2 enabled=true freeze_stats=true`.
 
 Later false values resume statistics updates. Resume resolves the resumed epoch; warmup epoch0 uses epoch1. Future settings do not affect earlier epochs. Frozen mode requires calibrated statistics and QAT enabled. BN L2 effective clipping and restore-time L2 revival require frozen mode and cannot remain enabled during statistics-updating training. Worker mode does not support epoch schedules. User settings files are not automatically rewritten.

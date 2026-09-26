@@ -4109,6 +4109,36 @@ fn epoch_setting_value(value: &serde_json::Value, epoch: usize) -> Result<&serde
         .ok_or_else(|| format!("epoch schedule has no value at epoch {epoch}"))
 }
 
+/// Shared by startup validation and schedule construction; inspect saved progress,
+/// never rows from an interrupted, unsaved epoch in the top-level summary.
+fn production_resume_start(args: &Args) -> (usize, usize, bool) {
+    let output = args.output_dir();
+    let resume = resume_enabled(args, &output);
+    let progress = if resume { latest_checkpoint_epoch_superbatch(&output) } else { None };
+    let Some((epoch, sb)) = progress else {
+        return (if args.warmup_sb > 0 { 0 } else { 1 }, 1, false);
+    };
+    let teacher_changed = read_latest_saved_teacher(&output)
+        .is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
+    let epoch_sbs = if epoch == 0 { args.warmup_sb } else { args.superbatches.unwrap_or(1) };
+    if !teacher_changed && sb < epoch_sbs {
+        (epoch, sb + 1, true)
+    } else {
+        (epoch.saturating_add(1).max(1), 1, false)
+    }
+}
+
+fn starting_epoch_settings(args: &Args) -> Result<Args, String> {
+    if args.epoch_settings_json.is_some() && args.backend == BackendKind::CudaCpp
+        && args.cuda_cpp_train_steps.is_none() && args.eval_type().uses_layerstack()
+        && args.lr_schedule != LrScheduleKind::Plateau {
+        let epoch = production_resume_start(args).0;
+        args_at_epoch(args, epoch).map_err(|e| format!("starting epoch {epoch}: {e}"))
+    } else {
+        Ok(args.clone())
+    }
+}
+
 fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
     let epoch = epoch.max(1); // Independent warmup epoch uses epoch 1 settings.
     let mut resolved = args.clone();
@@ -12533,6 +12563,12 @@ fn main() {
             }
         }
     }
+    // Resolve the actual resume epoch before validating dependent settings.
+    // JSON parsing installs epoch1 values only as placeholders.
+    let args = starting_epoch_settings(&args).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
     let batches_per_superbatch = effective_batches_per_superbatch(&args).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2);
@@ -25094,6 +25130,8 @@ fn append_cuda_cpp_progress_log(
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
+    let starting_args = starting_epoch_settings(args)?;
+    let args = &starting_args;
     if args.warmup_sb > 0 {
         args.validate_arch_flags()?;
         print_startup_kv("LR warmup", format!(
@@ -25165,30 +25203,7 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
     let output_dir = args.output_dir();
     let top_level_log = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let resume_enabled = resume_enabled(args, &output_dir);
-    let latest_checkpoint_progress =
-        if resume_enabled { latest_checkpoint_epoch_superbatch(&output_dir) } else { None };
-    let latest_checkpoint_epoch = latest_checkpoint_progress.map(|(epoch, _)| epoch).unwrap_or(0);
-    let latest_checkpoint_superbatch = latest_checkpoint_progress.map(|(_, superbatch)| superbatch);
-    let prev_teacher = if resume_enabled { read_latest_saved_teacher(&output_dir) } else { None };
-    let teacher_changed =
-        prev_teacher.as_deref().is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
-    let previous_epoch_sbs = if latest_checkpoint_epoch == 0 { args.warmup_sb } else { superbatches };
-    let prev_run_completed_epoch = latest_checkpoint_superbatch.map(|last_sb| last_sb >= previous_epoch_sbs).unwrap_or(false);
-    let mid_epoch_resume = !teacher_changed && !prev_run_completed_epoch && latest_checkpoint_progress.is_some();
-    let start_epoch = if latest_checkpoint_progress.is_none() {
-        if args.warmup_sb > 0 { 0 } else { 1 }
-    } else if mid_epoch_resume {
-        latest_checkpoint_epoch
-    } else if resume_enabled {
-        latest_checkpoint_epoch.saturating_add(1).max(1)
-    } else {
-        1
-    };
-    let first_epoch_start_superbatch = if mid_epoch_resume {
-        latest_checkpoint_superbatch.map(|last_sb| last_sb + 1).unwrap_or(1)
-    } else {
-        1usize
-    };
+    let (start_epoch, first_epoch_start_superbatch, mid_epoch_resume) = production_resume_start(args);
     let lr_position_offset = if mid_epoch_resume {
         first_epoch_start_superbatch
             .saturating_sub(1)
@@ -27833,6 +27848,45 @@ mod tests {
         assert_eq!(updates, vec![10]); // Not global step 8.
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn resume_bn_schedule_validates_saved_epoch_not_epoch1() {
+        let tmp=std::env::temp_dir().join(format!("bulletou-bn-start-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_halfka2_1024_8_64_progress8","--superbatches","324","--max-epochs","7",
+            "--sfnn-bn-l2","--sfnn-bn-qat","--sfnn-l2-revive","--sfnn-l2-revive-zero",
+            "--sfnn-bn-l2-effective-weight-clip","--resume","--output",tmp.to_str().unwrap()]).unwrap();
+        args.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_bn_qat_freeze_stats":{"epoch1":false,"epoch2":true},
+            "sfnn_bn_affine_lr_multiplier":{"epoch1":1.0,"epoch7":0.1}
+        }).to_string());
+        // A new run really would be invalid in epoch1; do not bypass validation.
+        assert!(starting_epoch_settings(&args).unwrap_err().contains("starting epoch 1"));
+        std::fs::create_dir_all(tmp.join("0006")).unwrap();
+        std::fs::write(tmp.join("0006/state.bin"),b"state").unwrap();
+        std::fs::write(tmp.join("0006/dataloader_pos.txt"),"1024,0\n").unwrap();
+        let write_progress=|sb|std::fs::write(tmp.join("0006/learn.log"),format!(
+            "{LEARN_LOG_HEADER}\nSFNN_HALFKA2-SFNN_halfka2_1024_8_64_progress8,6,{sb},1,-,-,-,-,0.0001,0.0001,1.0,1024,/dev/null\n")).unwrap();
+        write_progress(324);
+        assert_eq!(production_resume_start(&args),(7,1,false));
+        let active=starting_epoch_settings(&args).unwrap();
+        assert!(active.sfnn_bn_qat_freeze_stats);
+        assert_eq!(active.sfnn_bn_affine_lr_multiplier,0.1);
+        assert_eq!(cuda_cpp_run_schedule(&args).unwrap().chunks[0].epoch,7);
+        // An unsaved top-level epoch must not change the resume anchor.
+        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME),format!(
+            "{LEARN_LOG_HEADER}\nSFNN_HALFKA2-SFNN_halfka2_1024_8_64_progress8,99,1,1,-,-,-,-,0.0001,0.0001,1.0,1024,/dev/null\n")).unwrap();
+        write_progress(100);
+        assert_eq!(production_resume_start(&args),(6,101,true));
+        assert_eq!(starting_epoch_settings(&args).unwrap().sfnn_bn_affine_lr_multiplier,1.0);
+        assert_eq!(cuda_cpp_run_schedule(&args).unwrap().chunks[0].epoch,6);
+        args.warmup_sb=32;
+        assert_eq!(cuda_cpp_run_schedule(&args).unwrap().chunks[0].epoch,6);
+        args.no_resume=true;
+        assert!(starting_epoch_settings(&args).unwrap_err().contains("starting epoch 0"));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn scheduled_bpu_resume_uses_resumed_epoch_geometry_and_lr() {

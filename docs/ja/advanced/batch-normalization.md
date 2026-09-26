@@ -329,6 +329,11 @@ resumeは再開epochの値を使用します。warmupのepoch 0はepoch1の値�
 "sfnn_bn_qat_freeze_stats": {"epoch1": false, "epoch2": true}
 ```
 
+`--resume`では、保存済みcheckpointから実際の再開epochを決め、そのepochの設定で
+起動時の組み合わせ検証を行います。epoch6末からの再開ならepoch7の`true`を使い、
+過去のepoch1の`false`を使ってreviveやL2 effective clipとの併用を拒否しません。
+新規学習ではepoch1（warmup中はepoch0＝epoch1設定）の条件を検証します。
+
 切替はepochの最初のbatchより前に行い、直前までの平均・分散をそのまま固定します。重み・γ/β・optimizer状態は初期化しません。γ/βと重みの学習は継続します。統計固定の切替だけなら既存のQAT用VRAMを再利用します。
 `[BN QAT] epoch=2 enabled=true freeze_stats=true`と表示します。後のepochでfalseへ戻して統計更新を再開することもできます。resumeは再開epochの値を使用し、warmupのepoch0ではepoch1の値を使用します。将来のtrueは、それ以前のepochには影響しません。grid_searchでもこのJSONをそのまま使用できます（workerはepoch設定未対応）。
 固定開始には校正済みBN統計が必要です。`sfnn_bn_l2_effective_weight_clip`や復元時L2リセットは統計固定を要求するため、統計更新中の学習で同時に有効にはできません。既存の設定ファイルは自動変更しません。
