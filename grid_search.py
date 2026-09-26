@@ -32,7 +32,7 @@ METRICS = (
     "test_value_accuracy", "test_value_loss",
     "quantized_value_accuracy", "quantized_value_loss",
 )
-EXTREMA = ("max_acc", "min_loss", "max_qacc", "min_qloss")
+LAST8_METRICS = ("last8_acc", "last8_loss", "last8_qacc", "last8_qloss")
 PLURAL_OPTIONS = {
     "lrs": "lr", "lr_mins": "lr_min",
     "wrm_target_scalings": "wrm_target_scaling",
@@ -602,8 +602,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     parameter_columns = list(dict.fromkeys([*parameter_columns,
         *(key for settings in all_settings for key, value in settings.items() if isinstance(value, dict))]))
-    fields = ["trial", "epoch", "superbatch", *METRICS, *EXTREMA,
-              *[name + "_sb" for name in EXTREMA], "positions",
+    fields = ["trial", "epoch", "superbatch", *METRICS, *LAST8_METRICS, "positions",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]
     # Generic grid keys must not duplicate metric/status columns.
     fields = list(dict.fromkeys(fields))
@@ -643,12 +642,13 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
             for key in (*METRICS, "positions"):
                 value = last.get(key, "")
                 row[key] = value if numeric(value) is not None else ""
-            for metric, name in zip(METRICS, EXTREMA):
-                measured = [r for r in group if numeric(r.get(metric)) is not None]
+            # Last eight SB numbers, not the last eight validation events.
+            window = [r for r in group
+                      if int(last["superbatch"]) - 8 < int(r["superbatch"]) <= int(last["superbatch"])]
+            for metric, name in zip(METRICS, LAST8_METRICS):
+                measured = [v for r in window if (v := numeric(r.get(metric))) is not None]
                 if measured:
-                    choose = min if "loss" in metric else max
-                    best = choose(measured, key=lambda r: numeric(r[metric]))
-                    row[name], row[name + "_sb"] = best[metric], best["superbatch"]
+                    row[name] = format(math.fsum(v / len(measured) for v in measured), ".12g")
             result.append(row)
     return fields, result
 

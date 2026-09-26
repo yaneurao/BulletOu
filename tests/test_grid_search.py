@@ -505,7 +505,7 @@ class GridSearchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "--lr"):
                 grid.preflight_exe(plan)
 
-    def test_csv_metric_order_extrema_and_missing_final_not_carried(self):
+    def test_csv_metric_order_last8_and_missing_final_not_carried(self):
         plan = self.plan()
         trial = plan["trials"][0]
         directory = grid.trial_dir(self.output, trial)
@@ -520,12 +520,49 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(fields[-1], "checkpoint")
         self.assertEqual(row["quantized_value_accuracy"], "")
         self.assertEqual(row["test_value_loss"], "")
-        self.assertEqual(row["max_qacc"], "0.70")
-        self.assertEqual(row["max_qacc_sb"], "2")
+        self.assertEqual(fields[7:11], list(grid.LAST8_METRICS))
+        self.assertFalse(any(k.startswith(("max_", "min_")) for k in fields))
+        self.assertEqual(row["last8_qacc"], "0.66")
+        self.assertEqual(row["last8_loss"], "0.12")
         self.assertEqual(row["checkpoint"], str(directory / "0001"))
         self.assertEqual(result[1]["status"], "done")
         self.assertEqual(len(result), 4)
         self.assertEqual(rows[-1]["quantized_value_accuracy"], "-")
+
+    def test_last8_uses_sb_window_not_validation_count(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        trial["settings"]["superbatches"] = 16
+        directory = grid.trial_dir(self.output, trial)
+        rows = [{**self.metrics(sb=sb), "test_value_accuracy": str(sb / 100)}
+                for sb in (1, 4, 8, 9, 12, 16)]
+        # Missing/nonfinite values are excluded independently for each metric.
+        for r in rows[-3:]:
+            r["quantized_value_accuracy"] = "-"
+        rows[-3]["test_value_loss"] = "inf"
+        rows[-2]["test_value_loss"] = "nan"
+        rows[-1]["test_value_loss"] = "0"
+        self.summary(directory, [self.metrics(epoch=0, sb=16), *rows,
+                                 self.metrics(epoch=2, sb=4)])
+        result = grid.summarize(self.output, plan)[1]
+        self.assertAlmostEqual(float(result[0]["last8_acc"]), (0.09 + 0.12 + 0.16) / 3)
+        self.assertEqual(result[0]["last8_loss"], "0")
+        self.assertEqual(result[0].get("last8_qacc", ""), "")
+        self.assertTrue(all(result[1].get(k, "") == "" for k in grid.LAST8_METRICS))
+
+    def test_last8_warmup_epoch_is_independent(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        trial["settings"]["warmup_sb"] = 12
+        directory = grid.trial_dir(self.output, trial)
+        self.summary(directory, [
+            {**self.metrics(epoch=0, sb=4), "test_value_accuracy": "0.99"},
+            {**self.metrics(epoch=0, sb=5), "test_value_accuracy": "0.2"},
+            {**self.metrics(epoch=0, sb=12), "test_value_accuracy": "0.4"},
+            self.metrics(epoch=1, sb=4)])
+        rows = grid.summarize(self.output, plan)[1]
+        self.assertEqual(rows[0]["last8_acc"], "0.3")
+        self.assertEqual(rows[1]["last8_acc"], "0.63")
 
     def test_summary_omits_final_sb_lr_but_keeps_configured_lr(self):
         plan = self.plan()
@@ -550,7 +587,7 @@ class GridSearchTests(unittest.TestCase):
         grid.atomic_json(directory / "grid-state.json", {"status": "done"})
         row = grid.summarize(self.output, plan)[1][0]
         self.assertEqual(row["checkpoint"], "")
-        self.assertEqual(row["max_qacc"], "0.62")
+        self.assertEqual(row["last8_qacc"], "0.62")
 
     def test_empty_and_zero_metrics(self):
         plan = self.plan()
@@ -560,7 +597,7 @@ class GridSearchTests(unittest.TestCase):
         self.summary(directory, [row, self.metrics(epoch=2)])
         grid.atomic_json(directory / "grid-state.json", {"status": "done"})
         result = grid.summarize(self.output, plan)[1]
-        self.assertEqual(result[0]["min_qloss"], "0")
+        self.assertEqual(result[0]["last8_qloss"], "0")
         self.assertEqual(result[0]["test_value_accuracy"], "0")
         self.assertEqual(len(result), 4)
 
@@ -591,7 +628,7 @@ class GridSearchTests(unittest.TestCase):
                     for row in reader:
                         if row["trial"] == "1" and row["epoch"] == "1":
                             continue
-                        for key in (*grid.METRICS, *grid.EXTREMA, "checkpoint", "superbatch", "positions"):
+                    for key in (*grid.METRICS, *grid.LAST8_METRICS, "checkpoint", "superbatch", "positions"):
                             self.assertEqual(row[key], "")
         self.assertEqual((directory / grid.SUMMARY_CSV_NAME).read_bytes(), source)
 

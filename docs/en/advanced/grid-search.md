@@ -160,7 +160,7 @@ grid-target-scale/
 
 The short hash covers the complete condition; full settings are kept in the per-trial JSON and manifest. Resuming also writes `bulletou-resume-settings.json`, omitting the common initial-state arguments so BulletOu resumes the trial itself.
 
-Like YOSC, the aggregate CSV includes condition rows before training starts, with settings, target epoch, output directory and status. It is rebuilt at trial start/end/interruption. **Measurements are populated per epoch when its final sb is recorded**, even if the overall trial remains unfinished. Only unfinished epochs have blank metrics, extrema, measured sb and checkpoint. Inspect `summary-learn.csv` or `stdout.log` for intermediate measurements. Aggregation never modifies source logs.
+Like YOSC, the aggregate CSV includes condition rows before training starts, with settings, target epoch, output directory and status. It is rebuilt at trial start/end/interruption. **Measurements are populated per epoch when its final sb is recorded**, even if the overall trial remains unfinished. Only unfinished epochs have blank metrics, last-eight-SB averages, measured sb and checkpoint. Inspect `summary-learn.csv` or `stdout.log` for intermediate measurements. Aggregation never modifies source logs.
 
 Example: after extending a completed epoch 1 to max_epochs=3, while epoch 2 is running, epoch 1 retains its measurements and epochs 2–3 show conditions only. Completed epochs remain visible even if the trial is interrupted or fails. Existing aggregate CSVs adopt these rules on the next run or with `--summary-only`.
 
@@ -170,8 +170,7 @@ One row represents **one condition × one reported epoch**:
 | --- | --- |
 | `trial`, `epoch`, `superbatch` | Condition ID, epoch, last recorded sb |
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc, loss, qacc, qloss**, in that order, from the last row in the epoch. Accuracy is a 0–1 fraction |
-| `max_acc`, `min_loss`, `max_qacc`, `min_qloss` | Independently measured epoch extrema, possibly from different sb |
-| Corresponding `*_sb` columns | Location of each extremum; first sb on ties |
+| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | Arithmetic means of finite validation values within the final eight SB of each epoch, immediately after the final-SB metrics. Replace the eight extrema/value-location columns |
 | `positions` | Cumulative position count from the last native row. Final-sb `lr_start` / `lr_end` are omitted; configured `lr` / `lr_min` remain in the condition columns |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
 | `status` | `done` for a completed epoch; otherwise `pending`, `running`, `interrupted`, `failed` or `incomplete`. This may differ from the overall `trial_status` |
@@ -179,7 +178,9 @@ One row represents **one condition × one reported epoch**:
 | `output_dir` | Condition directory |
 | `checkpoint` | **Last column**: saved checkpoint corresponding to the last row, blank if unsaved or removed |
 
-Missing/non-finite metrics remain blank. Older measured values are never substituted into an unmeasured final row. No checkpoint path is invented for an unsaved peak. At completion, stdout lists the best epoch-end condition independently for all four metrics; no overall score/winner is silently chosen.
+Missing/non-finite metrics remain blank. Older measured values are never substituted into an unmeasured final row. `last8_*` uses SB numbers N−7 through N, where N is the final SB, **not the last eight validation events**. Epochs shorter than eight SB use the whole epoch; the window never crosses epochs (warmup epoch 0 is independent). Missing/non-finite values are excluded separately for each metric; no valid values means blank. Averages for unfinished epochs remain blank. At completion, stdout lists the best epoch-end condition independently for all four metrics; no overall score/winner is silently chosen.
+
+On the next launch or `--summary-only`, existing aggregate CSVs are rebuilt from source logs with the new columns. No executable rebuild is needed; an already running runner is unaffected. Native `summary-learn.csv` and `summary-epoch-last.csv` are not modified.
 
 Native save frequency and epoch-end saves are unchanged. **The runner neither deletes checkpoints nor makes best-checkpoint copies.** Budget disk space for all conditions' saves.
 

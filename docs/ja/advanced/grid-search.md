@@ -162,7 +162,7 @@ grid-target-scale/
 
 短いhashは条件全体から作ります。フォルダ名では省略された条件も `bulletou-settings.json` とmanifestに残ります。再開時だけ、開始state指定を外した `bulletou-resume-settings.json` も作ります。
 
-`grid_summary.csv` は、YOSCと同様に学習開始前から全条件の行を作ります。各行には実験条件・対象epoch・保存先・状態を記録し、条件開始・終了・中断時に再集計します。**測定結果はepoch単位で、末尾sbまで記録されたepochに記入します。** trial全体が未完了でも、完了済みepochの結果は表示します。未完了epochのacc/loss/qacc/qloss・最大最小値・実測sb・checkpointだけを空欄にします。途中経過は本体の `summary-learn.csv` や条件ごとの `stdout.log` で確認してください。元ログは変更しません。
+`grid_summary.csv` は、YOSCと同様に学習開始前から全条件の行を作ります。各行には実験条件・対象epoch・保存先・状態を記録し、条件開始・終了・中断時に再集計します。**測定結果はepoch単位で、末尾sbまで記録されたepochに記入します。** trial全体が未完了でも、完了済みepochの結果は表示します。未完了epochのacc/loss/qacc/qloss・末尾8SB平均・実測sb・checkpointだけを空欄にします。途中経過は本体の `summary-learn.csv` や条件ごとの `stdout.log` で確認してください。元ログは変更しません。
 
 例：epoch 1完了後にmax_epochsを3へ延長し、epoch 2の途中なら、epoch 1の測定結果は表示し、epoch 2・3は条件だけ表示します。trialが中断・失敗しても完了済みepochは掲載します。既存CSVも `--summary-only` または次回起動で、この規則に従って再集計されます。
 
@@ -172,8 +172,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | --- | --- |
 | `trial`, `epoch`, `superbatch` | 条件番号、epoch、実際に記録された最後のsb |
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc → loss → qacc → qloss**。そのepochの最後の行の値。accuracyは0～1 |
-| `max_acc`, `min_loss`, `max_qacc`, `min_qloss` | そのepochで実際に計測された値の最大／最小。4指標は別々のsbで達成していてもよい |
-| `max_acc_sb`, `min_loss_sb`, `max_qacc_sb`, `min_qloss_sb` | 各最大／最小のsb。同値なら最初のsb |
+| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | 各epoch末尾8SB内の有限な検証値の算術平均。最終SBの4指標の直後に出力。最大／最小値とそのSB番号の8列は廃止 |
 | `positions` | 本体の最後の行の累積局面数。最終sbの `lr_start` / `lr_end` は集計に出しません。設定値の `lr` / `lr_min` は条件列に残します |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
 | `status` | epoch完了は `done`。未完了は `pending` / `running` / `interrupted` / `failed` / `incomplete`。`trial_status`はtrial全体の状態なので異なる場合があります |
@@ -181,7 +180,9 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | `output_dir` | 条件の保存先 |
 | `checkpoint` | **末尾列**。その最後の行に対応する保存checkpointのフォルダ。未保存・削除済みなら空欄 |
 
-未計測、`nan`、`inf` は空欄です。最後のsbで未計測なら、以前のsbの値で埋めません。最大／最小を達成したsbが未保存なら、そのnn.binがあるかのようなpathは作りません。各指標のepoch末best条件も完了時にstdoutへ表示します。単一の総合点や勝者は勝手に決めません。
+未計測、`nan`、`inf` は空欄です。最後のsbで未計測なら、最終SBの指標を以前のsbの値で埋めません。`last8_*` は「最後の8回の検証」ではなく、末尾SB番号をNとしてN−7〜NのSB内だけを対象にします。8SB未満のepochはそのepoch全体を対象とし、epochをまたぎません（warmupのepoch 0も独立）。未計測・非有限値は指標ごとに除外し、有効値がなければ空欄です。未完了epochの平均も空欄です。各指標のepoch末best条件は完了時にstdoutへ表示します。単一の総合点や勝者は勝手に決めません。
+
+既存のCSVは次回起動または `--summary-only` で元ログから新しい列へ再集計されます。本体の再ビルドは不要です。起動中のrunnerには反映されません。元の `summary-learn.csv` と `summary-epoch-last.csv` は変更しません。
 
 本体の `save_rate`、epoch末保存の挙動はそのままです。**runnerはcheckpointを削除せず、bestの自動コピーも作りません。** 各条件の全保存分のディスク容量を見込んでください。
 
