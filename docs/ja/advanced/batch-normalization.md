@@ -111,6 +111,7 @@ JSONでは `_`、CLIでは `-` を使います。grid searchではどちらも�
 | `sfnn_bn_gamma` | `0.25` | 有効なBN各層のγの**初期値**。γはその後学習される |
 | `sfnn_bn_beta` | `0.5` | 有効なBN各層のβの**初期値**。βはその後学習される |
 | `sfnn_bn_momentum` | `0.1` | 推論用統計のEMAで、**新しいbatch側**に掛ける係数。範囲 `(0,1]` |
+| `sfnn_bn_affine_lr_multiplier` | `1.0` | SFNN BNのγ/β専用の学習率倍率。有限の0以上。0はγ/βとそのoptimizer状態の更新を停止 |
 | `sfnn_bn_epsilon` | `0.00001` | 分散の分母へ足す正の定数 |
 
 γ=0.25、β=0.5は、標準偏差1のまま上限1のclampへ入れることを避けるための実験用初期値です。
@@ -135,6 +136,37 @@ resumeおよび `--initial-state` では、保存済みの平均・分散、学�
 **再開後の取り込み率だけ**を指定値へ変更します。起動時に旧値→新値を表示し、次のcheckpointにも新値を保存します。
 epsilon・初期γ/βなど、その他のBN設定の変更を許可するものではありません。
 `sfnn_bn_qat_freeze_stats=true` のときは統計固定なので、取り込み率を変えても統計更新は起きません。
+
+### γ/βだけの学習率を変更する
+
+`sfnn_bn_qat_freeze_stats` は平均・分散を固定する設定であり、γ/βは学習を続けます。
+`sfnn_bn_affine_lr_multiplier` を使うと、すべての有効なSFNN BN層のγ/βだけを
+`その時点の本体lr × 倍率` で更新します。重み・biasのLRや統計のEMAには影響しません。
+BNのみ／BN+QAT、BPUによる勾配蓄積に対応します。通常NNUE用ではありません。
+
+```json
+"sfnn_bn_affine_lr_multiplier": 0.1
+```
+
+本体lrが0.0004ならγ/βのlrは0.00004です。デフォルト1.0は従来動作。
+0はγ/βとそのmomentum/velocity/Lookahead slowを更新せず、勾配だけクリアします。
+再有効化時は既存のoptimizer状態を保持します（optimizerのstep番号は本体と共通）。
+統計を固定していなければ、倍率0でも平均・分散は更新されます。
+resume時に変更でき、checkpoint形式やnn.bin形式は変わりません。
+
+epoch指定も可能です。未来の設定は現在epochに適用されません。
+
+```json
+"sfnn_bn_affine_lr_multiplier": {"epoch1": 1.0, "epoch3": 0.1}
+```
+
+grid_searchの既存コマンドに追加して比較できます:
+
+```powershell
+--grid sfnn-bn-affine-lr-multiplier 1.0 0.1 0
+```
+
+起動ログの `BN affine LR` に倍率、grid_summary.csvに設定値を出力します。
 小さい値は変動を平滑化する一方、重み変化への追従を遅らせます。最適値・棋力改善は未確認です。
 
 新規の条件比較はgrid searchでも指定できます。

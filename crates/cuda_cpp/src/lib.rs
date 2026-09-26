@@ -6227,6 +6227,8 @@ impl SfnnUpdateScope {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SfnnLayerLrMultipliers {
+    /// LR multiplier for BN gamma/beta only; zero freezes affine optimizer state too.
+    pub bn_affine: f32,
     /// Input-centered optimizer coordinates for L2/L3 over all accumulated batches.
     pub l2_l3_center: bool,
     /// Input-centered optimizer coordinates for dense L1 residual/shared weights.
@@ -6255,6 +6257,7 @@ pub struct SfnnLayerLrMultipliers {
 impl Default for SfnnLayerLrMultipliers {
     fn default() -> Self {
         Self {
+            bn_affine: 1.0,
             l2_l3_center: false,
             l1_center: false,
             l1_effective_weight_clip: false,
@@ -6289,7 +6292,7 @@ impl SfnnLayerLrMultipliers {
         if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
             return Err(CudaCppError::message("SFNN norm loss strength must be finite and non-negative"));
         }
-        for (name, value) in [("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l3", self.l3)] {
+        for (name, value) in [("bn_affine", self.bn_affine), ("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l3", self.l3)] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(CudaCppError::message(format!(
                     "SFNN {name} learning-rate multiplier must be finite and non-negative"
@@ -8439,7 +8442,7 @@ impl SfnnTrainStepRunner {
         if lr_multipliers.l1_effective_weight_clip && lr_multipliers.l1 > 0.0 {
             l1_center::clip_effective_weights(self, ctx)?;
         }
-        if let Some(bn)=&self.batch_norm {bn.update(ctx,params)?;}
+        if let Some(bn)=&self.batch_norm {bn.update_with_lr_multiplier(ctx,params,lr_multipliers.bn_affine)?;}
         self.pending_gradient_batches = 0;
         Ok(())
     }

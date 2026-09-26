@@ -479,13 +479,16 @@ impl Network {
         }
         Ok(guard)
     }
-    pub(super) fn update(&self, ctx: &Context, mut p: RangerUpdateParams) -> Result<()> {
+    pub(super) fn update(&self, ctx: &Context, p: RangerUpdateParams) -> Result<()> {
+        self.update_with_lr_multiplier(ctx, p, 1.0)
+    }
+    pub(super) fn update_with_lr_multiplier(&self, ctx: &Context, mut p: RangerUpdateParams, multiplier: f32) -> Result<()> {
         // Gamma/beta are affine normalization parameters, not quantized weights.
         p.radam.min_weight = -f32::MAX;
         p.radam.max_weight = f32::MAX;
         p.radam.decay = 0.0;
         for (l, _) in self.layers.iter().flatten() {
-            update_param_group(ctx, p, &l.gradients, &l.affine, &l.optimizer)?;
+            update_param_group_with_lr_multiplier(ctx, p, &l.gradients, &l.affine, &l.optimizer, multiplier)?;
         }
         Ok(())
     }
@@ -637,6 +640,33 @@ mod tests {
         assert_eq!(after.optimizer.momentum,state.optimizer.momentum);
         assert_eq!(after.optimizer.velocity,state.optimizer.velocity);
         assert_eq!(State::decode(&after.encode().unwrap()).unwrap(),after);
+    }
+    #[test]
+    fn bn_affine_lr_multiplier_scales_and_freezes_optimizer() {
+        let ctx=Context::new(0).unwrap();
+        let shape=NnueForwardShape {input_size:4,l1:2,l2:2,l3:1};
+        let mut results=Vec::new();
+        for m in [1.0,0.1,0.0] {
+            let bn=Network::new_nnue(&ctx,shape,2,[true,false,false],Config::default(),&NetworkState::default()).unwrap();
+            let l=&bn.layers[0].as_ref().unwrap().0;
+            l.gradients.fill(&ctx,0.25).unwrap();
+            let before=l.read_state(&ctx).unwrap();
+            let p=RangerUpdateParams {radam:RAdamUpdateParams {step:1,learning_rate:0.01,..Default::default()},..Default::default()};
+            bn.update_with_lr_multiplier(&ctx,p,m).unwrap();
+            let after=l.read_state(&ctx).unwrap();
+            if m==0.0 {
+                assert_eq!(before,after);
+                assert!(l.gradients.download(&ctx).unwrap().iter().all(|&v|v==0.0));
+                // Also skip Lookahead: a stale slow copy must not move a frozen affine parameter.
+                l.optimizer.slow_params.fill(&ctx,10.0).unwrap();
+                let saved=l.read_state(&ctx).unwrap();
+                bn.update_with_lr_multiplier(&ctx,RangerUpdateParams {radam:RAdamUpdateParams {step:6,..p.radam},..p},0.0).unwrap();
+                assert_eq!(saved,l.read_state(&ctx).unwrap());
+            }
+            results.push(after.affine.iter().zip(&before.affine).map(|(a,b)|a-b).collect::<Vec<_>>());
+        }
+        for (full,small) in results[0].iter().zip(&results[1]) { assert!(full.abs()>0.0);close(*small,*full*0.1,1e-7); }
+        assert!(SfnnLayerLrMultipliers {bn_affine:-1.0,..Default::default()}.validate().is_err());
     }
     #[test]
     fn nnue_bn_all_layer_masks_fold_and_backward() {

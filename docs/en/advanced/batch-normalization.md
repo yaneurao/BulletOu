@@ -118,6 +118,7 @@ centering, BN changes the training forward pass.
 | `sfnn_bn_gamma` | `0.25` | Initial trainable gamma for enabled layers |
 | `sfnn_bn_beta` | `0.5` | Initial trainable beta for enabled layers |
 | `sfnn_bn_momentum` | `0.1` | New-batch EMA coefficient, in `(0,1]` |
+| `sfnn_bn_affine_lr_multiplier` | `1.0` | SFNN BN gamma/beta LR multiplier; finite and nonnegative. Zero freezes affine parameters and their optimizer state |
 | `sfnn_bn_epsilon` | `0.00001` | Positive variance stabilizer |
 
 Gamma=0.25/beta=0.5 is an experimental initialization suited to the `[0,1]`
@@ -143,6 +144,30 @@ optimizer state, replacing **only the future EMA update rate**. Startup logs sho
 the old and new values; subsequent checkpoints store the new rate.
 Other BN configuration changes (epsilon, initial gamma/beta) remain incompatible.
 With `sfnn_bn_qat_freeze_stats=true`, statistics remain frozen regardless of momentum.
+
+### Independent gamma/beta learning rate
+
+Freezing running statistics does **not** freeze gamma/beta. Set
+`"sfnn_bn_affine_lr_multiplier": 0.1` (CLI `--sfnn-bn-affine-lr-multiplier 0.1`)
+to update gamma/beta in every enabled SFNN BN layer at `current main LR * 0.1`.
+For example, main LR 0.0004 gives affine LR 0.00004. The default 1.0 preserves previous behavior.
+This applies to BN and BN+QAT, including accumulated gradients; ordinary NNUE is not covered.
+Weight/bias learning rates and running-stat EMA are unchanged.
+
+Zero clears affine gradients but skips the entire affine optimizer update, including
+momentum, velocity and Lookahead slow weights. Re-enabling retains these states;
+the optimizer step counter remains shared with the main network. Statistics still
+update unless separately frozen. Resume can change the multiplier; checkpoint and nn.bin formats are unchanged.
+
+Epoch schedules are supported, e.g.:
+
+```json
+"sfnn_bn_affine_lr_multiplier": {"epoch1": 1.0, "epoch3": 0.1}
+```
+
+Future values do not affect the current epoch. Add
+`--grid sfnn-bn-affine-lr-multiplier 1.0 0.1 0` to a grid_search command to compare.
+The startup `BN affine LR` line and grid_summary.csv record the multiplier.
 Smaller values smooth fluctuations but also lag behind changing weights; strength gains are not established.
 
 For separate grid conditions:

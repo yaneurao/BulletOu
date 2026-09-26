@@ -4072,6 +4072,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
@@ -4123,7 +4124,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -5231,6 +5232,9 @@ struct Args {
     /// New-batch EMA weight (0,1]; smaller values smooth running statistics. May change on resume.
     #[arg(long, default_value_t = 0.1)]
     sfnn_bn_momentum: f32,
+    /// BN gamma/beta LR = current LR times this multiplier. Zero freezes their optimizer too.
+    #[arg(long, default_value_t = 1.0)]
+    sfnn_bn_affine_lr_multiplier: f32,
     #[arg(long, default_value_t = 1e-5)]
     sfnn_bn_epsilon: f32,
 
@@ -5391,6 +5395,12 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if !self.sfnn_bn_affine_lr_multiplier.is_finite() || self.sfnn_bn_affine_lr_multiplier < 0.0 {
+            return Err("--sfnn-bn-affine-lr-multiplier must be finite and non-negative".into());
+        }
+        if self.sfnn_bn_affine_lr_multiplier != 1.0 && !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2) {
+            return Err("--sfnn-bn-affine-lr-multiplier requires SFNN BN".into());
+        }
         if self.sfnn_bn_qat_freeze_stats && !self.sfnn_bn_qat {
             return Err("--sfnn-bn-qat-freeze-stats requires --sfnn-bn-qat".into());
         }
@@ -17836,6 +17846,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     if runner.batch_norm.is_some() {
         print_startup_kv("BatchNorm",format!("FT={} L1={} L2={} gamma={} beta={} momentum={} epsilon={}; FT views shared; dense bucket-wise; inference running-stat fold",
             args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
+        print_startup_kv("BN affine LR", format!("current LR x {}; gamma/beta only, 0 freezes affine optimizer; independent of running-stat freeze", args.sfnn_bn_affine_lr_multiplier));
     }
     runner.configure_bn_qat_mode(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows(),args.sfnn_bn_qat_freeze_stats).map_err(|e|e.to_string())?;
     runner.configure_bn_l2_effective_weight_clip(&ctx,args.sfnn_bn_l2_effective_weight_clip).map_err(|e|e.to_string())?;
@@ -24940,6 +24951,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     _progress: Option<CudaCppScheduleProgress>,
 ) -> bulletou_cuda_cpp::SfnnLayerLrMultipliers {
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
+        bn_affine: args.sfnn_bn_affine_lr_multiplier,
         l2_l3_center: args.sfnn_l2_l3_center,
         l1_center: args.sfnn_l1_center,
         l1_effective_weight_clip: args.sfnn_l1_effective_weight_clip,
@@ -25660,6 +25672,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
+        format!("sfnn_bn_affine_lr_multiplier={}", args.sfnn_bn_affine_lr_multiplier),
         format!("sfnn_bn_qat_freeze_stats={}", args.sfnn_bn_qat_freeze_stats),
         format!("sfnn_bn_l2_effective_weight_clip={}", args.sfnn_bn_l2_effective_weight_clip),
         format!("sfnn_l2_l3_center={}", args.sfnn_l2_l3_center),
@@ -25933,6 +25946,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
+    let signature = resume_signature_without_line(&signature, "sfnn_bn_affine_lr_multiplier=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat_freeze_stats=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_l2_effective_weight_clip=");
     // Centering can be explicitly changed on resume; tensors remain folded.
@@ -34635,6 +34649,19 @@ mod tests {
         let bn=Args::try_parse_from(argv).unwrap();assert!(bn.validate_arch_flags().is_ok());
         assert!(bn.sfnn_bn_ft && bn.sfnn_bn_l1 && bn.sfnn_bn_l2);
         assert_eq!(bn.sfnn_bn_gamma,0.25);assert_eq!(bn.sfnn_bn_beta,0.5);
+        assert_eq!(bn.sfnn_bn_affine_lr_multiplier,1.0);
+        let mut affine=bn.clone();affine.sfnn_bn_affine_lr_multiplier=0.1;
+        assert!(affine.validate_arch_flags().is_ok());
+        assert!(resume_signature_matches(&resume_signature(&bn),&affine));
+        let legacy=resume_signature_without_line(&resume_signature(&bn),"sfnn_bn_affine_lr_multiplier=");
+        assert!(resume_signature_matches(&legacy,&affine));
+        affine.epoch_settings_json=Some(serde_json::json!({"sfnn_bn_affine_lr_multiplier":{"epoch1":1.0,"epoch2":0.0}}).to_string());
+        assert_eq!(args_at_epoch(&affine,1).unwrap().sfnn_bn_affine_lr_multiplier,1.0);
+        assert_eq!(args_at_epoch(&affine,2).unwrap().sfnn_bn_affine_lr_multiplier,0.0);
+        for v in [-0.1,f32::NAN,f32::INFINITY] {
+            let mut invalid=bn.clone();invalid.sfnn_bn_affine_lr_multiplier=v;
+            assert!(invalid.validate_arch_flags().is_err());
+        }
         assert!(!resume_signature(&base).contains("sfnn_bn="));
         assert!(resume_signature(&bn).contains("sfnn_bn=true,true,true"));
         let mut slower=bn.clone();slower.sfnn_bn_momentum=0.01;

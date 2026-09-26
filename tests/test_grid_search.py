@@ -15,6 +15,14 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_bn_affine_lr_multiplier_grid_and_epoch(self):
+        key="sfnn_bn_affine_lr_multiplier"
+        plan=self.plan(["--grid","sfnn-bn-affine-lr-multiplier","1","0.1","0"])
+        self.assertEqual({t["settings"][key] for t in plan["trials"]},{1,0.1,0})
+        self.assertIn(key,grid.COMMON_COLUMNS)
+        settings={key:{"epoch1":1.0,"epoch3":0.1}}
+        self.assertEqual(grid.resolve_epoch_settings(settings,2)[key],1.0)
+        self.assertEqual(grid.resolve_epoch_settings(settings,3)[key],0.1)
     def test_l2_revive_grid(self):
         plan=self.plan(["--grid","sfnn-l2-revive","false","true"])
         self.assertEqual({t["settings"]["sfnn_l2_revive"] for t in plan["trials"]},{False,True})

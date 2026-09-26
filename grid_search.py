@@ -48,6 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
+    "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
     "sfnn_l2_revive_zero",
     "sfnn_bn_qat_freeze_stats",
@@ -170,6 +171,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
+    "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
