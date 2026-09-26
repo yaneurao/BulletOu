@@ -172,7 +172,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 | --- | --- |
 | `trial`, `epoch`, `superbatch` | 条件番号、epoch、実際に記録された最後のsb |
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc → loss → qacc → qloss**。そのepochの最後の行の値。accuracyは0～1 |
-| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | 各epoch末尾8SB内の有限な検証値の算術平均。最終SBの4指標の直後に出力。最大／最小値とそのSB番号の8列は廃止 |
+| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | 各epoch末尾8SB内の有限な検証値の算術平均。小数点以下10桁固定（例：`0.6349000000`）。最終SBの4指標の直後に出力。最大／最小値とそのSB番号の8列は廃止 |
 | `positions` | 本体の最後の行の累積局面数。最終sbの `lr_start` / `lr_end` は集計に出しません。設定値の `lr` / `lr_min` は条件列に残します |
 | `lr`, `lr_min`, `wrm_target_scaling` 等 | 指定した学習条件。grid軸は個別列になる。JSONにない既定値を推測で埋めない |
 | `status` | epoch完了は `done`。未完了は `pending` / `running` / `interrupted` / `failed` / `incomplete`。`trial_status`はtrial全体の状態なので異なる場合があります |

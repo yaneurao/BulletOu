@@ -522,8 +522,8 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(row["test_value_loss"], "")
         self.assertEqual(fields[7:11], list(grid.LAST8_METRICS))
         self.assertFalse(any(k.startswith(("max_", "min_")) for k in fields))
-        self.assertEqual(row["last8_qacc"], "0.66")
-        self.assertEqual(row["last8_loss"], "0.12")
+        self.assertEqual(row["last8_qacc"], "0.6600000000")
+        self.assertEqual(row["last8_loss"], "0.1200000000")
         self.assertEqual(row["checkpoint"], str(directory / "0001"))
         self.assertEqual(result[1]["status"], "done")
         self.assertEqual(len(result), 4)
@@ -546,7 +546,7 @@ class GridSearchTests(unittest.TestCase):
                                  self.metrics(epoch=2, sb=4)])
         result = grid.summarize(self.output, plan)[1]
         self.assertAlmostEqual(float(result[0]["last8_acc"]), (0.09 + 0.12 + 0.16) / 3)
-        self.assertEqual(result[0]["last8_loss"], "0")
+        self.assertEqual(result[0]["last8_loss"], "0.0000000000")
         self.assertEqual(result[0].get("last8_qacc", ""), "")
         self.assertTrue(all(result[1].get(k, "") == "" for k in grid.LAST8_METRICS))
 
@@ -561,8 +561,21 @@ class GridSearchTests(unittest.TestCase):
             {**self.metrics(epoch=0, sb=12), "test_value_accuracy": "0.4"},
             self.metrics(epoch=1, sb=4)])
         rows = grid.summarize(self.output, plan)[1]
-        self.assertEqual(rows[0]["last8_acc"], "0.3")
-        self.assertEqual(rows[1]["last8_acc"], "0.63")
+        self.assertEqual(rows[0]["last8_acc"], "0.3000000000")
+        self.assertEqual(rows[1]["last8_acc"], "0.6300000000")
+
+    def test_last8_csv_fixed_ten_decimal_places(self):
+        plan = self.plan()
+        directory = grid.trial_dir(self.output, plan["trials"][0])
+        values = ("0.6349", "0.000000123456", "0", "1.23456789016")
+        self.summary(directory, [{**self.metrics(), **dict(zip(grid.METRICS, values))}])
+        path = self.output / "grid_summary.csv"
+        grid.write_summary(self.output, plan, path)
+        row = self.csv_rows(path)[0]
+        self.assertEqual([row[k] for k in grid.LAST8_METRICS],
+                         ["0.6349000000", "0.0000001235", "0.0000000000", "1.2345678902"])
+        for key in grid.LAST8_METRICS:
+            self.assertRegex(row[key], r"^\d+\.\d{10}$")
 
     def test_summary_omits_final_sb_lr_but_keeps_configured_lr(self):
         plan = self.plan()
@@ -587,7 +600,7 @@ class GridSearchTests(unittest.TestCase):
         grid.atomic_json(directory / "grid-state.json", {"status": "done"})
         row = grid.summarize(self.output, plan)[1][0]
         self.assertEqual(row["checkpoint"], "")
-        self.assertEqual(row["last8_qacc"], "0.62")
+        self.assertEqual(row["last8_qacc"], "0.6200000000")
 
     def test_empty_and_zero_metrics(self):
         plan = self.plan()
@@ -597,7 +610,7 @@ class GridSearchTests(unittest.TestCase):
         self.summary(directory, [row, self.metrics(epoch=2)])
         grid.atomic_json(directory / "grid-state.json", {"status": "done"})
         result = grid.summarize(self.output, plan)[1]
-        self.assertEqual(result[0]["last8_qloss"], "0")
+        self.assertEqual(result[0]["last8_qloss"], "0.0000000000")
         self.assertEqual(result[0]["test_value_accuracy"], "0")
         self.assertEqual(len(result), 4)
 

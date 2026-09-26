@@ -648,7 +648,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
             for metric, name in zip(METRICS, LAST8_METRICS):
                 measured = [v for r in window if (v := numeric(r.get(metric))) is not None]
                 if measured:
-                    row[name] = format(math.fsum(v / len(measured) for v in measured), ".12g")
+                    row[name] = format(math.fsum(v / len(measured) for v in measured), ".10f")
             result.append(row)
     return fields, result
 

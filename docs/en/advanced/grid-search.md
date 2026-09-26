@@ -170,7 +170,7 @@ One row represents **one condition × one reported epoch**:
 | --- | --- |
 | `trial`, `epoch`, `superbatch` | Condition ID, epoch, last recorded sb |
 | `test_value_accuracy`, `test_value_loss`, `quantized_value_accuracy`, `quantized_value_loss` | **acc, loss, qacc, qloss**, in that order, from the last row in the epoch. Accuracy is a 0–1 fraction |
-| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | Arithmetic means of finite validation values within the final eight SB of each epoch, immediately after the final-SB metrics. Replace the eight extrema/value-location columns |
+| `last8_acc`, `last8_loss`, `last8_qacc`, `last8_qloss` | Arithmetic means of finite validation values within the final eight SB of each epoch, formatted with exactly ten decimal places (e.g. `0.6349000000`), immediately after the final-SB metrics. Replace the eight extrema/value-location columns |
 | `positions` | Cumulative position count from the last native row. Final-sb `lr_start` / `lr_end` are omitted; configured `lr` / `lr_min` remain in the condition columns |
 | `lr`, `lr_min`, `wrm_target_scaling`, etc. | Settings, including individual grid-axis columns. Unspecified executable defaults are not guessed |
 | `status` | `done` for a completed epoch; otherwise `pending`, `running`, `interrupted`, `failed` or `incomplete`. This may differ from the overall `trial_status` |
