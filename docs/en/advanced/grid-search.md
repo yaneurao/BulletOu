@@ -151,7 +151,9 @@ python .\grid_search.py `
   --epochs 1 2
 ```
 
-This runs four conditions. As in BulletOu JSON, `true` passes a flag and `false` omits it; **false does not necessarily disable the underlying feature**. Numbers and strings are supported. Lifecycle/initial-state options, including output paths, resume, and max_epochs, cannot be grid axes.
+This runs four conditions. As in BulletOu JSON, `true` passes a flag and `false` omits it; **false does not necessarily disable the underlying feature**. Numbers and strings are supported. Lifecycle/initial-state options, including output paths, and resume, cannot be grid axes.
+
+Use `--grid max-epochs 1 2` (`max_epochs` also works) to train independent one-epoch and two-epoch conditions. Combining it with `--grid superbatches 16 32` produces four conditions. The grid axis overrides common JSON and `--max-epochs`. Reports stop at each condition's endpoint; `--epochs` optionally selects reported epochs within that range. On resume, a different epoch-budget grid value is a separate condition, not an extension of an existing condition.
 
 ## Outputs
 

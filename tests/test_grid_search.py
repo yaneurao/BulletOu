@@ -442,6 +442,30 @@ class GridSearchTests(unittest.TestCase):
         plan = self.plan(["--superbatches", "32", "--grid", "superbatches", "8", "16"])
         self.assertEqual({t["settings"]["superbatches"] for t in plan["trials"]}, {8, 16})
 
+    def test_max_epochs_grid_has_independent_budgets_and_report_rows(self):
+        before = self.settings_path.read_bytes()
+        plan = self.plan(["--max-epochs", "10", "--grid", "max-epochs", "1", "3"])
+        self.assertEqual(plan["report_epochs"], [1, 2, 3])
+        self.assertEqual(len(plan["trials"]), 4)
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertIn("max_epochs", fields)
+        for trial in plan["trials"]:
+            budget = trial["parameters"]["max_epochs"]
+            self.assertEqual(trial["settings"]["max_epochs"], budget)
+            self.assertEqual([r["epoch"] for r in rows if r["trial"] == trial["id"]],
+                             list(range(1, budget + 1)))
+        merged, selected = grid.plan_resume(self.output, plan, self.plan(
+            ["--grid", "max_epochs", "1", "3"]))
+        self.assertEqual(len(selected), 4)
+        self.assertEqual([t["settings"]["output"] for t in merged["trials"]],
+                         [t["settings"]["output"] for t in plan["trials"]])
+        self.assertEqual(self.settings_path.read_bytes(), before)
+
+    def test_max_epochs_grid_rejects_invalid_budgets(self):
+        for value in ("0", "-1", "1.5", "true"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.plan(["--grid", "max_epochs", value])
+
     def test_resume_accepts_common_schedule_cli_overrides(self):
         old = self.plan()
         requested = self.plan(["--max-epochs", "3", "--superbatches", "32"])

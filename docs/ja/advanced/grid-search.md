@@ -153,7 +153,9 @@ python .\grid_search.py `
   --epochs 1 2
 ```
 
-これも2×2の4条件です。JSONと同様に、`true` はフラグを指定、`false` はフラグを省略します（**falseが必ず「機能OFF」を意味するわけではありません**）。数値や文字列も指定できます。出力先・開始state・resume・max_epochsなどの実行管理項目はgrid軸にはできません。
+これも2×2の4条件です。JSONと同様に、`true` はフラグを指定、`false` はフラグを省略します（**falseが必ず「機能OFF」を意味するわけではありません**）。数値や文字列も指定できます。出力先・開始state・resumeなどの実行管理項目はgrid軸にはできません。
+
+`--grid max-epochs 1 2`（`max_epochs`表記も可）で、1epochと2epochを独立した条件として学習できます。`--grid superbatches 16 32`と併用すれば4条件です。grid指定は共通JSONや `--max-epochs` より優先します。集計は各条件の終了epochまでで、`--epochs`を併用するとその範囲内の指定epochだけを表示します。再開時もepoch数が異なるgrid値は別条件です。既存条件の延長ではありません。
 
 ## 出力と集計
 

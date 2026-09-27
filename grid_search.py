@@ -44,7 +44,7 @@ PLURAL_OPTIONS = {
 }
 OUTPUT_KEYS = {"output", "output_folder", "tag", "resume", "no_resume"}
 FORBIDDEN_GRID = OUTPUT_KEYS | {
-    "settings_file", "initial_state", "initial_dataloader_pos", "max_epochs",
+    "settings_file", "initial_state", "initial_dataloader_pos",
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
@@ -129,7 +129,8 @@ def parse_args(argv=None):
     for key in ("max_epochs", "superbatches"):
         if getattr(a, key) is not None and getattr(a, key) < 1:
             p.error(f"--{key.replace('_', '-')} must be a positive integer")
-    if a.max_epochs is not None and a.epochs and max(a.epochs) > a.max_epochs:
+    epoch_grid = any(entry and key_name(entry[0]) == "max_epochs" for entry in a.grid)
+    if not epoch_grid and a.max_epochs is not None and a.epochs and max(a.epochs) > a.max_epochs:
         p.error("--epochs cannot exceed --max-epochs")
     if not a.summary_only and a.settings_file is None:
         p.error("--settings-file is required unless --summary-only is used")
@@ -295,9 +296,15 @@ def make_plan(args) -> dict:
         template["max_epochs"] = max(args.epochs)
     if args.superbatches is not None:
         template["superbatches"] = args.superbatches
+    axes = collect_axes(args)
+    if "max_epochs" in axes:
+        for value in axes["max_epochs"]:
+            positive_int({"max_epochs": value}, "max_epochs")
+        template["max_epochs"] = max(axes["max_epochs"])
+        if args.epochs and max(args.epochs) > template["max_epochs"]:
+            raise ValueError("--epochs cannot exceed the largest --grid max_epochs value")
     check_settings(template)
     epochs = sorted(set(args.epochs or range(1, template["max_epochs"] + 1)))
-    axes = collect_axes(args)
     root = args.output_folder.resolve()
     count = math.prod(len(values) for values in axes.values())
     if count > 10000:
