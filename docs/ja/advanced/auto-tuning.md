@@ -114,7 +114,7 @@ population search 実行時は runner が候補ごとに次の値を決めます
 | `output`, `output_folder`, `tag` | 候補ごとに出力先を分ける |
 | `superbatches`, `max_epochs` | 候補 trial の長さを runner が決める |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | 候補評価用に runner が指定する |
-| `sfnn_factorizer_alpha` | population search の `parameters` から候補ごとに作る |
+| `sfnn_l1_factorizer_alpha` | population search の `parameters` から候補ごとに作る |
 | `sfnn_*_count_confidence` | population search の `parameters` から候補ごとに作る |
 | `lr`, `lr_min` | 任意。`tuning-settings.json` の `parameters` に書いた場合、runner が `--lr` / `--lr-min` として渡す。探索中の採用値は `runner-state.json` に保存する |
 
@@ -252,7 +252,7 @@ alpha は factorizer 成分の強さです。
 
 `shared` を動かすと全体の土台が動くので、最初は `shared = 1.0` で固定したほうが結果を読みやすいです。
 
-`bulletou.exe` の `--sfnn-factorizer-alpha pair=...` は、3 つの pair alpha に同じ値を入れる短縮指定です。population search では `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
+`bulletou.exe` の `--sfnn-l1-factorizer-alpha pair=...` は、3 つの pair alpha に同じ値を入れる短縮指定です。population search では `king_hand_pair`、`king_progress_pair`、`hand_progress_pair` を個別に調整します。
 
 ## count confidence パラメーター
 
@@ -288,7 +288,7 @@ population search で調整済みの `parameters.current` だけを使い、popu
 python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
-この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
+この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-l1-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。
 
 このモードでは、`superbatches` は `trial_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` / `lr_min` は `parameters` に書いていれば runner が現在値として渡し、書いていなければ `bulletou-settings.json` の値を使います。`save_rate` は `accepted-checkpoints/` に公開 checkpoint を何 epoch ごとに残すかを表します。
 

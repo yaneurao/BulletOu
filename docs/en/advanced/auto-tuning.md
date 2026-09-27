@@ -114,7 +114,7 @@ During population search, the runner owns these candidate-specific values, so do
 | `output`, `output_folder`, `tag` | Each candidate needs a separate output directory |
 | `superbatches`, `max_epochs` | The runner sets the candidate trial length |
 | `save_rate`, `validation_rate`, `quantized_validation_rate` | The runner sets candidate evaluation cadence |
-| `sfnn_factorizer_alpha` | Built from `parameters` for each candidate |
+| `sfnn_l1_factorizer_alpha` | Built from `parameters` for each candidate |
 | `sfnn_*_count_confidence` | Built from `parameters` for each candidate |
 | `lr`, `lr_min` | Optional. If these are written in `tuning-settings.json` `parameters`, the runner passes them as `--lr` / `--lr-min`. Accepted values during search are stored in `runner-state.json` |
 
@@ -249,7 +249,7 @@ Alpha values are multipliers for factorizer terms.
 
 Changing `shared` moves the global base term, so keeping `shared = 1.0` fixed is often easier to interpret.
 
-In `bulletou.exe`, `--sfnn-factorizer-alpha pair=...` is a shortcut that sets all three pair alpha values to the same value. In population search settings, tune `king_hand_pair`, `king_progress_pair`, and `hand_progress_pair` separately.
+In `bulletou.exe`, `--sfnn-l1-factorizer-alpha pair=...` is a shortcut that sets all three pair alpha values to the same value. In population search settings, tune `king_hand_pair`, `king_progress_pair`, and `hand_progress_pair` separately.
 
 ## Count-confidence parameters
 
@@ -285,7 +285,7 @@ Then launch the runner once:
 python .\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
-With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
+With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-l1-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.
 
 In this mode, the runner fills `superbatches` from `trial_sbs` and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. If `lr` / `lr_min` are written in `parameters`, the runner passes those current values; otherwise it uses the learning rates from `bulletou-settings.json`. `save_rate` controls how often public checkpoints are copied under `accepted-checkpoints/`.
 

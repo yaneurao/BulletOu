@@ -57,7 +57,7 @@ Here, one sb is `65536 x 610 = 39,976,960` positions. One epoch is 36 sb, or abo
 | Set StepLR decay | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | Change the loss exponent | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | Change SFNN factorizer | `--sfnn-factorizer` | `--sfnn-factorizer none` |
-| Change SFNN factorizer strength | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
+| Change SFNN factorizer strength | `--sfnn-l1-factorizer-alpha` | `--sfnn-l1-factorizer-alpha king=0.90` |
 | Dampen SFNN quantization saturation | `--sfnn-saturation-penalty` | `--sfnn-saturation-penalty 1e-7` |
 
 Fuller option table:
@@ -99,7 +99,7 @@ Fuller option table:
 | `--quantized-validation-rate` | How often to run post-quantization accuracy/loss during training. Uses the GPU proxy by default | saved checkpoints only |
 | `--quantized-validation-exact` | Use exact CPU integer forward for quantized validation. Slow; use only when needed | off |
 | `--sfnn-factorizer` | How SFNN shares common components between buckets | `shared` |
-| `--sfnn-factorizer-alpha` | How strongly factorizer components contribute | 1.0 |
+| `--sfnn-l1-factorizer-alpha` | How strongly factorizer components contribute | 1.0 |
 | `--sfnn-saturation-penalty` | Extra penalty for folded L1/L2/L3 weights that reach the i8 edge | 0.0 |
 | `--sfnn-saturation-threshold` | Quantized i8 value where the saturation penalty starts | 127.0 |
 | `--optimizer` | Optimizer | `ranger` |
@@ -292,7 +292,7 @@ Run it with:
 ./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
-Use `--sfnn-factorizer-alpha` when you want to change how strongly factorizer terms contribute.
+Use `--sfnn-l1-factorizer-alpha` when you want to change how strongly factorizer terms contribute.
 
 ```text
 W_effective = W_base
@@ -307,49 +307,49 @@ For example, to use only 90% of the king-axis factorizer:
 
 ```bash
 --sfnn-factorizer king=axis
---sfnn-factorizer-alpha king=0.90
+--sfnn-l1-factorizer-alpha king=0.90
 ```
 
 To set king and hand separately:
 
 ```bash
 --sfnn-factorizer king=axis,hand=axis
---sfnn-factorizer-alpha king=0.90,hand=0.80
+--sfnn-l1-factorizer-alpha king=0.90,hand=0.80
 ```
 
 To strengthen all single-axis terms and all two-axis terms:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha axis=4.0,pair=4.0
+--sfnn-l1-factorizer-alpha axis=4.0,pair=4.0
 ```
 
 To strengthen only the progress-axis term:
 
 ```bash
 --sfnn-factorizer progress=axis
---sfnn-factorizer-alpha progress=4.0
+--sfnn-l1-factorizer-alpha progress=4.0
 ```
 
 To set every factorizer term to the same strength:
 
 ```bash
 --sfnn-factorizer axis
---sfnn-factorizer-alpha 0.90
+--sfnn-l1-factorizer-alpha 0.90
 ```
 
 You can write the same idea explicitly with `all=`, which is often easier to read in experiment notes.
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0
+--sfnn-l1-factorizer-alpha all=3.0
 ```
 
 Later keys override earlier ones, so you can set a common value first and then adjust one group.
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0,pair=4.0
+--sfnn-l1-factorizer-alpha all=3.0,pair=4.0
 ```
 
 In this example, `shared` and `axis` use 3.0, while `pair` uses 4.0.
@@ -367,7 +367,7 @@ This enables `shared`, `king-axis`, `hand-axis`, `progress-axis`, `king-hand`, `
 
 `alpha` can also be larger than `1.0`. The accepted range is `0.0` to `10.0`. For example, `king=2.0` adds the king-axis contribution at twice its stored value in forward, and the gradient into king-axis tensors is also doubled. Very large values can destabilize training, so treat this as an experimental tuning knob.
 
-When BulletOu writes `nn.bin`, it folds weights using the `W_effective` formula above. So an `nn.bin` saved with `--sfnn-factorizer-alpha king=0.90` contains the king-axis contribution at 90% strength.
+When BulletOu writes `nn.bin`, it folds weights using the `W_effective` formula above. So an `nn.bin` saved with `--sfnn-l1-factorizer-alpha king=0.90` contains the king-axis contribution at 90% strength.
 
 ### 7.1 Dampen quantization saturation
 
@@ -416,7 +416,7 @@ Then pass it during training:
 
 ```powershell
 --sfnn-factorizer pair `
---sfnn-factorizer-alpha all=1.0 `
+--sfnn-l1-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
 --sfnn-progress-bin C:\path\to\same-progress\progress.bin
 ```

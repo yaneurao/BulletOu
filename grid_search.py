@@ -88,7 +88,8 @@ def key_name(key: str) -> str:
     normalized = key.replace("-", "_")
     # Keep persisted grid identities stable while accepting the layer-specific name.
     return {"sfnn_ft_factorizer": "ft_factorizer",
-            "sfnn_l1_factorizer": "sfnn_factorizer"}.get(normalized, normalized)
+            "sfnn_l1_factorizer": "sfnn_factorizer",
+            "sfnn_l1_factorizer_alpha": "sfnn_factorizer_alpha"}.get(normalized, normalized)
 
 
 def scalar(value):
@@ -120,7 +121,7 @@ def parse_args(argv=None):
         p.add_argument("--" + option.replace("_", "-"), nargs="+", metavar="VALUE",
                        help=f"Grid values for BulletOu {PLURAL_OPTIONS[option]} (Cartesian product)")
     p.add_argument("--grid", action="append", nargs="+", default=[], metavar="KEY_OR_VALUE",
-                   help="Repeatable generic axis: --grid sfnn_factorizer_alpha shared=0.5 shared=1.0")
+                   help="Repeatable generic axis: --grid sfnn_l1_factorizer_alpha shared=0.5 shared=1.0")
     p.add_argument("--summary-csv", type=Path)
     p.add_argument("--summary-only", action="store_true", help="Rebuild CSV from the manifest and existing logs; no trainer needed")
     p.add_argument("--dry-run", action="store_true", help="Validate and display the plan without writing files or training")

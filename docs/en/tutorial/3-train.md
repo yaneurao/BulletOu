@@ -180,7 +180,7 @@ python .\tuning_parameters.py `
   --resume
 ```
 
-In this mode, the runner launches `bulletou.exe` once. It does not create candidates, worker caches, or snapshots. It only converts `parameters.current` into `--sfnn-factorizer-alpha` and count-confidence options, so memory overhead is roughly the same as running `bulletou.exe` directly.
+In this mode, the runner launches `bulletou.exe` once. It does not create candidates, worker caches, or snapshots. It only converts `parameters.current` into `--sfnn-l1-factorizer-alpha` and count-confidence options, so memory overhead is roughly the same as running `bulletou.exe` directly.
 
 The runner fills `superbatches` from `trial_sbs` and `max_epochs` from `generations`. It uses `validation_rate` and `quantized_validation_rate` from the `tuning` section of `tuning-settings.json`. Put ordinary training settings such as `lr` and `save_rate` in `bulletou-settings.json`.
 
@@ -192,7 +192,7 @@ Next: [4. Enable validation](4-validation.md)
 
 HalfKA2 / HalfKP FT (first-layer) weight sharing is enabled by default. Disable it with `"ft_factorizer": false` in JSON or `--ft-factorizer false` on the CLI. This is separate from `"sfnn_factorizer": "none"`, which disables L1 sharing. L2/L3 do not use sharing. Resume with the same FT ON/OFF setting as the saved checkpoint.
 
-For `SFNN_halfka2`, `"ft_factorizer_alpha": 0.5` also controls FT sharing strength (default 1.0). L1 shared strength is set separately with `"sfnn_factorizer_alpha": "shared=0.5"`. When resuming with changed alpha from a checkpoint that records its coefficients, rebase preserves the immediate effective weights. See [settings and rebase caveats](../advanced/sfnn-factorizer.md).
+For `SFNN_halfka2`, `"ft_factorizer_alpha": 0.5` also controls FT sharing strength (default 1.0). L1 shared strength is set separately with `"sfnn_l1_factorizer_alpha": "shared=0.5"`. When resuming with changed alpha from a checkpoint that records its coefficients, rebase preserves the immediate effective weights. See [settings and rebase caveats](../advanced/sfnn-factorizer.md).
 
 SFNN enables tatara-style weight clipping by default: L1/L2 weights and biases, plus L3 weights, are limited to ±1.984375; FT and the output bias are unbounded. Disable it with `--optimizer-weight-clip 0` (JSON: `"optimizer_weight_clip": 0`). See [what this controls and its limitations](../advanced/tuning.md#weight-clipping-during-training).
 

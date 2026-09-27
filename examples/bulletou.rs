@@ -1463,7 +1463,7 @@ struct CompareSfnnQuantizationArgs {
     sfnn_factorizer: String,
 
     /// Factorizer alpha used while forwarding the fp32 state.
-    #[arg(long = "sfnn-factorizer-alpha", default_value = "1.0")]
+    #[arg(long = "sfnn-l1-factorizer-alpha", visible_alias = "sfnn-factorizer-alpha", default_value = "1.0")]
     sfnn_factorizer_alpha: String,
 
     /// Quantized forward path. `gpu` matches live qvalid; `cpu-exact`
@@ -1852,7 +1852,7 @@ impl CompareSfnnQuantizationArgs {
         let _ = self.sfnn_factorizer.parse::<SfnnFactorizerSpec>()?;
         let factorizer_alpha = self.sfnn_factorizer_alpha.parse::<SfnnFactorizerAlphaSpec>()?;
         if self.sfnn_factorizer.eq_ignore_ascii_case("none") && !factorizer_alpha.is_default() {
-            return Err("--sfnn-factorizer-alpha is meaningful only when --sfnn-factorizer is active".to_string());
+            return Err("--sfnn-l1-factorizer-alpha is meaningful only when --sfnn-factorizer is active".to_string());
         }
         if self.win_rate_model && self.loss_sigmoid_mse {
             return Err("--win-rate-model and --loss-sigmoid-mse are mutually exclusive".to_string());
@@ -1892,7 +1892,7 @@ impl CompareSfnnQuantizationArgs {
             self.arch.cli_name(),
             "--sfnn-factorizer".to_string(),
             self.sfnn_factorizer.clone(),
-            "--sfnn-factorizer-alpha".to_string(),
+            "--sfnn-l1-factorizer-alpha".to_string(),
             self.sfnn_factorizer_alpha.clone(),
             "--fv-scale".to_string(),
             self.fv_scale.to_string(),
@@ -4025,6 +4025,7 @@ fn bulletou_settings_json_value_to_args(
     let normalized = match normalized.as_str() {
         "sfnn-ft-factorizer" => "ft-factorizer",
         "sfnn-factorizer" => "sfnn-l1-factorizer",
+        "sfnn-factorizer-alpha" => "sfnn-l1-factorizer-alpha",
         _ => &normalized,
     };
     let flag = format!("--{normalized}");
@@ -5162,7 +5163,7 @@ struct Args {
     /// `0.95`, `all=0.95`, `shared=0.95`, `king=0.90`,
     /// `hand=0.90`, or comma-separated forms such as
     /// `shared=0.95,king=1.50,hand=0.90`. Values must be in [0, 10].
-    #[arg(long = "sfnn-factorizer-alpha")]
+    #[arg(long = "sfnn-l1-factorizer-alpha", visible_alias = "sfnn-factorizer-alpha")]
     sfnn_factorizer_alpha: Option<SfnnFactorizerAlphaSpec>,
 
     /// Extra Ranger weight decay applied only to SFNN base stack tensors
@@ -5693,7 +5694,7 @@ impl Args {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
         }
         if self.sfnn_factorizer_alpha.is_some() && !eval_type.uses_layerstack() {
-            return Err("--sfnn-factorizer-alpha currently applies to SFNN / LayerStack eval types only".to_string());
+            return Err("--sfnn-l1-factorizer-alpha currently applies to SFNN / LayerStack eval types only".to_string());
         }
         if !(self.sfnn_factorizer_residual_decay.is_finite() && self.sfnn_factorizer_residual_decay >= 0.0) {
             return Err(format!(
@@ -5899,7 +5900,7 @@ impl Args {
             && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
             && !effective_sfnn_factorizer_alpha(self).is_default()
         {
-            return Err("--sfnn-factorizer-alpha has no effect when --sfnn-factorizer none is active".to_string());
+            return Err("--sfnn-l1-factorizer-alpha has no effect when --sfnn-factorizer none is active".to_string());
         }
         if self.sfnn_factorizer_residual_decay != 0.0
             && effective_sfnn_factorizer_spec(self) == SfnnFactorizerSpec::NONE
@@ -29429,7 +29430,7 @@ mod tests {
             "cuda-cpp",
             "--sfnn-factorizer",
             "pair",
-            "--sfnn-factorizer-alpha",
+            "--sfnn-l1-factorizer-alpha",
             "shared=4.0,axis=4.0,pair=4.0",
         ])
         .unwrap();
@@ -30297,6 +30298,20 @@ mod tests {
     }
 
     #[test]
+    fn l1_factorizer_alpha_cli_json_aliases() {
+        let base = ["bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_8_64_progress8"];
+        let old = Args::try_parse_from(base.into_iter().chain(["--sfnn-factorizer-alpha", "shared=0.5"])).unwrap();
+        let new = Args::try_parse_from(base.into_iter().chain(["--sfnn-l1-factorizer-alpha", "shared=0.5"])).unwrap();
+        assert_eq!(resume_signature(&old), resume_signature(&new));
+        for key in ["sfnn_factorizer_alpha", "sfnn_l1_factorizer_alpha", "sfnn-l1-factorizer-alpha"] {
+            let mut argv: Vec<std::ffi::OsString> = base.into_iter().map(Into::into).collect();
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), key,
+                &serde_json::json!("shared=0.5"), &mut argv).unwrap();
+            assert_eq!(resume_signature(&Args::try_parse_from(argv).unwrap()), resume_signature(&new));
+        }
+    }
+
+    #[test]
     fn sfnn_l1_factorizer_cli_json_and_resume_alias() {
         for value in ["none", "shared", "axis", "pair"] {
             let base = ["bulletou", "--teacher", "teacher.psv", "--arch", "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4"];
@@ -30345,12 +30360,12 @@ mod tests {
             "1",
             "--sfnn-factorizer",
             "none",
-            "--sfnn-factorizer-alpha",
+            "--sfnn-l1-factorizer-alpha",
             "0.5",
         ])
         .unwrap();
         let err = args.validate_backend_flags().unwrap_err();
-        assert!(err.contains("--sfnn-factorizer-alpha has no effect"), "{err}");
+        assert!(err.contains("--sfnn-l1-factorizer-alpha has no effect"), "{err}");
     }
 
     #[test]
@@ -31839,7 +31854,7 @@ mod tests {
             "/dev/null",
             "--ft-factorizer-alpha",
             "0.5",
-            "--sfnn-factorizer-alpha",
+            "--sfnn-l1-factorizer-alpha",
             "all=0.25",
         ])
         .unwrap();
@@ -33745,7 +33760,7 @@ mod tests {
             "test.hcpe",
             "--sfnn-factorizer",
             "pair",
-            "--sfnn-factorizer-alpha",
+            "--sfnn-l1-factorizer-alpha",
             "all=3.0",
             "--wrm-in-offset",
             "0",

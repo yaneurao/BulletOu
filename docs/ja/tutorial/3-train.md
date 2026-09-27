@@ -173,7 +173,7 @@ python .\tuning_parameters.py `
   --resume
 ```
 
-このモードでは、runner は `bulletou.exe` を1回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
+このモードでは、runner は `bulletou.exe` を1回だけ起動します。candidate 生成、worker cache、snapshot 保持は行いません。`parameters.current` を `--sfnn-l1-factorizer-alpha` と count confidence オプションに変換して渡すだけなので、メモリ面のオーバーヘッドは `bulletou.exe` を単体で動かす場合とほぼ同じです。
 
 このモードでは、`superbatches` は `trial_sbs`、`max_epochs` は `generations` から runner が補います。`validation_rate` と `quantized_validation_rate` は `tuning-settings.json` の `tuning` に書いた値を使います。`lr` や `save_rate` などは `bulletou-settings.json` に書きます。
 
@@ -185,7 +185,7 @@ python .\tuning_parameters.py `
 
 HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"ft_factorizer": false`、CLIなら `--ft-factorizer false` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。再開時は保存元と同じFTのON/OFF設定にしてください。
 
-`SFNN_halfka2` では `"ft_factorizer_alpha": 0.5` のようにFT共有の強さも指定できます（デフォルト1.0）。L1共有の強さは `"sfnn_factorizer_alpha": "shared=0.5"` で別に指定します。係数を記録したcheckpointからαを変更して再開すると、開始直後の実効重みを保つrebaseを行います。[設定例とrebaseの注意点](../advanced/sfnn-factorizer.md)
+`SFNN_halfka2` では `"ft_factorizer_alpha": 0.5` のようにFT共有の強さも指定できます（デフォルト1.0）。L1共有の強さは `"sfnn_l1_factorizer_alpha": "shared=0.5"` で別に指定します。係数を記録したcheckpointからαを変更して再開すると、開始直後の実効重みを保つrebaseを行います。[設定例とrebaseの注意点](../advanced/sfnn-factorizer.md)
 
 SFNNでは、学習中の重み制限がデフォルトで有効です。tataraと同じくL1・L2の重みとbias、L3の重みを±1.984375に収め、FTと出力biasは制限しません。無効にする場合は `--optimizer-weight-clip 0`（JSONでは `"optimizer_weight_clip": 0`）を指定します。[設定の意味と注意点](../advanced/tuning.md#学習中の重み制限)
 

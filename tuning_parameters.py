@@ -1356,7 +1356,7 @@ def train_args(
         )
     alpha_values = {k: v for k, v in params.items() if k in tuner.ALPHA_PARAMETERS}
     if alpha_values:
-        cmd.extend(["--sfnn-factorizer-alpha", tuner.alpha_arg(alpha_values)])
+        cmd.extend(["--sfnn-l1-factorizer-alpha", tuner.alpha_arg(alpha_values)])
     for name, flag in tuner.CONFIDENCE_FLAGS.items():
         if name in params and abs(params[name]) > 0.0:
             cmd.extend([flag, f"{params[name]:.12g}"])
@@ -1833,7 +1833,7 @@ def bulletou_override_preview(params: dict[str, float]) -> dict[str, Any]:
     preview: dict[str, Any] = {}
     alpha_values = {k: v for k, v in params.items() if k in tuner.ALPHA_PARAMETERS}
     if alpha_values:
-        preview["sfnn_factorizer_alpha"] = tuner.alpha_arg(alpha_values)
+        preview["sfnn_l1_factorizer_alpha"] = tuner.alpha_arg(alpha_values)
     for name, flag in tuner.CONFIDENCE_FLAGS.items():
         if name in params and abs(params[name]) > 0.0:
             preview[flag.removeprefix("--").replace("-", "_")] = params[name]

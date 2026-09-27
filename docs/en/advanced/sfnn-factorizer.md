@@ -1,4 +1,6 @@
-﻿# SFNN factorizer
+# SFNN factorizer
+
+Use `--sfnn-l1-factorizer-alpha` (JSON: `sfnn_l1_factorizer_alpha`) for L1 coefficients, e.g. `"sfnn_l1_factorizer_alpha": "shared=0.5"`. The old `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` names remain aliases. Grid search accepts `--grid sfnn-l1-factorizer-alpha shared=0.5 shared=1.0`. Persisted grid settings, CSV columns and checkpoint compatibility signatures retain the internal name `sfnn_factorizer_alpha` to preserve existing run identities and resume behavior. Computation and defaults are unchanged.
 
 <a href="../../ja/advanced/sfnn-factorizer.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
@@ -47,7 +49,7 @@ To compare fresh training with all this sharing disabled, add these fields to `b
 ```
 
 To enable FT factorization, omit `ft_factorizer` or set it to `true`. Startup prints `FT factorizer = on/off`.
-`sfnn_factorizer_alpha` does not scale the shared FT weights.
+`sfnn_l1_factorizer_alpha` does not scale the shared FT weights.
 
 Loading `state.bin` through `--resume` or `--initial-state` requires the same FT setting as the saved checkpoint.
 Changing ON/OFF changes weight and optimizer-state array sizes and produces an explicit error; there is no automatic conversion.
@@ -61,12 +63,12 @@ Resume from a checkpoint without L2/L3 factorizers or start a fresh run. Existin
 
 For `SFNN_halfka2`, `--ft-factorizer-alpha` controls the shared FT coefficient.
 Its default is 1.0 and its range is 0–100. L1 shared uses the independent
-`--sfnn-factorizer-alpha shared=...` option.
+`--sfnn-l1-factorizer-alpha shared=...` option.
 
 ```powershell
 --ft-factorizer-alpha 0.5 `
 --sfnn-factorizer shared `
---sfnn-factorizer-alpha shared=0.5
+--sfnn-l1-factorizer-alpha shared=0.5
 ```
 
 Equivalent fields in `bulletou-settings.json`:
@@ -75,7 +77,7 @@ Equivalent fields in `bulletou-settings.json`:
 {
   "ft_factorizer_alpha": 0.5,
   "sfnn_factorizer": "shared",
-  "sfnn_factorizer_alpha": "shared=0.5"
+  "sfnn_l1_factorizer_alpha": "shared=0.5"
 }
 ```
 
@@ -85,7 +87,7 @@ gets multiplied by 0.5. With L1 count gating, the individual term is
 `c(count) * individual_weight`. Export folding and both GPU/CPU quantized
 validation use the same coefficient. FT biases are not shared terms and are not scaled.
 
-`sfnn_factorizer_alpha: "all=0.5"` controls L1 shared/axis/pair, not the FT.
+`sfnn_l1_factorizer_alpha: "all=0.5"` controls L1 shared/axis/pair, not the FT.
 FT alpha 0 keeps the shared array allocated with zero contribution;
 `ft_factorizer: false` removes the array entirely. These are different settings.
 Non-default FT alpha is supported only for `SFNN_halfka2` with FT sharing enabled.
@@ -336,9 +338,9 @@ king-progress
 hand-progress
 ```
 
-## 7. `--sfnn-factorizer-alpha`
+## 7. `--sfnn-l1-factorizer-alpha`
 
-`--sfnn-factorizer-alpha` controls how strongly factorizer terms are added during forward propagation.
+`--sfnn-l1-factorizer-alpha` controls how strongly factorizer terms are added during forward propagation.
 
 ```text
 W_effective = W_base + alpha * W_factorizer
@@ -350,28 +352,28 @@ Set every term to the same strength:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0
+--sfnn-l1-factorizer-alpha all=3.0
 ```
 
 Set all single-axis terms and all pair terms:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha axis=4.0,pair=4.0
+--sfnn-l1-factorizer-alpha axis=4.0,pair=4.0
 ```
 
 Weaken only the hand-axis term:
 
 ```bash
 --sfnn-factorizer axis
---sfnn-factorizer-alpha hand=0.80
+--sfnn-l1-factorizer-alpha hand=0.80
 ```
 
 `hand=` changes only the hand-axis strength. Pair terms such as `hand-progress` and `king-hand` are controlled by `pair=`.
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha hand=0.80,pair=2.0
+--sfnn-l1-factorizer-alpha hand=0.80,pair=2.0
 ```
 
 In this example, hand-axis uses 0.8 and pair terms use 2.0.
@@ -380,7 +382,7 @@ You can combine `all=` with more specific keys. Later keys win.
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0,pair=4.0
+--sfnn-l1-factorizer-alpha all=3.0,pair=4.0
 ```
 
 Here, `shared` and `axis` use 3.0, while `pair` uses 4.0.
@@ -488,7 +490,7 @@ Then pass it during training:
 
 ```powershell
 --sfnn-factorizer pair `
---sfnn-factorizer-alpha all=1.0 `
+--sfnn-l1-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 

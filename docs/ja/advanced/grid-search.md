@@ -148,7 +148,7 @@ python .\grid_search.py `
   --settings-file .\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-shared `
   --checkpoint C:\path\to\0033 `
-  --grid sfnn_factorizer_alpha "shared=0.5" "shared=1.0" `
+  --grid sfnn_l1_factorizer_alpha "shared=0.5" "shared=1.0" `
   --grid ft_factorizer false true `
   --epochs 1 2
 ```

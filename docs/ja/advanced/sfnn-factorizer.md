@@ -1,4 +1,6 @@
-﻿# SFNN factorizer
+# SFNN factorizer
+
+L1の係数は `--sfnn-l1-factorizer-alpha`（JSON: `sfnn_l1_factorizer_alpha`）で指定します。例: `"sfnn_l1_factorizer_alpha": "shared=0.5"`。旧名 `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` はaliasです。`--grid sfnn-l1-factorizer-alpha shared=0.5 shared=1.0` も使えます。既存gridの再開・条件IDを維持するため、保存設定・CSV列・checkpoint互換性判定の内部名は `sfnn_factorizer_alpha` のままです。係数の計算・デフォルト値は変更していません。
 
 <a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
@@ -47,7 +49,7 @@ compact L1のarchitectureでは、このL1共有も無効です。
 ```
 
 FTを有効にするには `ft_factorizer` を省略するか `true` にします。起動時の `FT factorizer = on/off` でも確認できます。
-`sfnn_factorizer_alpha` はFTの共通重みには掛かりません。
+`sfnn_l1_factorizer_alpha` はFTの共通重みには掛かりません。
 
 `--resume` または `--initial-state` で `state.bin` を読み込むときは、保存元と同じFT設定が必要です。
 ON/OFFを変えると重みとoptimizer stateの配列サイズが異なるため、明示的なエラーになります。自動変換は行いません。
@@ -60,12 +62,12 @@ L2・L3のfactorizerを含まないcheckpointから再開するか、新規学�
 ### FTとL1 sharedの強さ
 
 `SFNN_halfka2` では `--ft-factorizer-alpha` でFTの共通重みに掛ける係数を指定します。
-デフォルトは1.0、指定範囲は0～100です。L1 sharedは `--sfnn-factorizer-alpha shared=...` で独立に指定します。
+デフォルトは1.0、指定範囲は0～100です。L1 sharedは `--sfnn-l1-factorizer-alpha shared=...` で独立に指定します。
 
 ```powershell
 --ft-factorizer-alpha 0.5 `
 --sfnn-factorizer shared `
---sfnn-factorizer-alpha shared=0.5
+--sfnn-l1-factorizer-alpha shared=0.5
 ```
 
 同じ指定を `bulletou-settings.json` に書く場合：
@@ -74,7 +76,7 @@ L2・L3のfactorizerを含まないcheckpointから再開するか、新規学�
 {
   "ft_factorizer_alpha": 0.5,
   "sfnn_factorizer": "shared",
-  "sfnn_factorizer_alpha": "shared=0.5"
+  "sfnn_l1_factorizer_alpha": "shared=0.5"
 }
 ```
 
@@ -84,7 +86,7 @@ L1のcount補正を使う場合は、個別項が `c(count) * 個別重み` に�
 `nn.bin` への足し込みとGPU/CPUの量子化後検証にも同じ係数を使います。
 FTのbiasは共有項ではないため、この係数は掛かりません。
 
-`sfnn_factorizer_alpha: "all=0.5"` はL1のshared・axis・pairを指定するもので、FTには影響しません。
+`sfnn_l1_factorizer_alpha: "all=0.5"` はL1のshared・axis・pairを指定するもので、FTには影響しません。
 FTの係数0は、共通重みの配列を残したまま寄与を0にします。
 `ft_factorizer: false` はその配列自体を作らない指定で、同じ意味ではありません。
 非デフォルトのFT係数はFT共有が有効な `SFNN_halfka2` 専用です。
@@ -330,9 +332,9 @@ king-progress
 hand-progress
 ```
 
-## 7. `--sfnn-factorizer-alpha`
+## 7. `--sfnn-l1-factorizer-alpha`
 
-`--sfnn-factorizer-alpha` は、factorizer 成分を forward でどれだけ足すかを変える係数です。
+`--sfnn-l1-factorizer-alpha` は、factorizer 成分を forward でどれだけ足すかを変える係数です。
 
 ```text
 W_effective = W_base + alpha * W_factorizer
@@ -344,28 +346,28 @@ W_effective = W_base + alpha * W_factorizer
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0
+--sfnn-l1-factorizer-alpha all=3.0
 ```
 
 単独軸と2軸を同じ強さにする場合:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha axis=4.0,pair=4.0
+--sfnn-l1-factorizer-alpha axis=4.0,pair=4.0
 ```
 
 hand axis だけを弱める場合:
 
 ```bash
 --sfnn-factorizer axis
---sfnn-factorizer-alpha hand=0.80
+--sfnn-l1-factorizer-alpha hand=0.80
 ```
 
 `hand=` は hand-axis の強さを変えます。`hand-progress` や `king-hand` のような pair 成分の強さは `pair=` で変えます。
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha hand=0.80,pair=2.0
+--sfnn-l1-factorizer-alpha hand=0.80,pair=2.0
 ```
 
 この例では、hand-axis は0.8倍、pair 成分は2.0倍です。
@@ -374,7 +376,7 @@ hand axis だけを弱める場合:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0,pair=4.0
+--sfnn-l1-factorizer-alpha all=3.0,pair=4.0
 ```
 
 この例では、`shared` と `axis` は3.0、`pair` は4.0です。
@@ -482,7 +484,7 @@ count-aware な追加学習では、count.bin を作ったときと同じ分類�
 
 ```powershell
 --sfnn-factorizer pair `
---sfnn-factorizer-alpha all=1.0 `
+--sfnn-l1-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\hand1024-k3k3-progress4-count.bin
 ```
 

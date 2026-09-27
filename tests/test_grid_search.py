@@ -15,6 +15,11 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_l1_alpha_alias_preserves_grid_identity(self):
+        old = self.plan(["--grid", "sfnn-factorizer-alpha", "shared=0.5", "shared=1"])
+        new = self.plan(["--grid", "sfnn-l1-factorizer-alpha", "shared=0.5", "shared=1"])
+        self.assertEqual(old, new)
+
     def test_independent_l1_initialization_grid(self):
         keys = ["sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero", "sfnn_init_l2_l3_glorot"]
         args = []

@@ -1,4 +1,4 @@
-﻿# 学習設定を調整する
+# 学習設定を調整する
 
 <a href="../../en/advanced/tuning.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
@@ -57,7 +57,7 @@ WRM教師勝率を0/1から内側へ圧縮する `--wrm-target-epsilon`（既定
 | StepLR の減衰率を指定する | `--lr-step-gamma` | `--lr-step-gamma 0.992` |
 | loss の指数を変える | `--loss-pow-exp` | `--loss-pow-exp 2.5` |
 | SFNN の factorizer を変える | `--sfnn-factorizer` | `--sfnn-factorizer none` |
-| SFNN の factorizer の効き具合を変える | `--sfnn-factorizer-alpha` | `--sfnn-factorizer-alpha king=0.90` |
+| SFNN の factorizer の効き具合を変える | `--sfnn-l1-factorizer-alpha` | `--sfnn-l1-factorizer-alpha king=0.90` |
 | SFNN の量子化飽和を抑える | `--sfnn-saturation-penalty` | `--sfnn-saturation-penalty 1e-7` |
 
 主なオプション一覧:
@@ -99,7 +99,7 @@ WRM教師勝率を0/1から内側へ圧縮する `--wrm-target-epsilon`（既定
 | `--quantized-validation-rate` | 学習中に量子化後のaccuracy/lossを何sbごとに見るか。デフォルトはGPU近似 | 保存時のみ |
 | `--quantized-validation-exact` | 量子化後検証をCPU整数forwardで正確に測る。遅いので必要なときだけ使う | off |
 | `--sfnn-factorizer` | SFNNのbucket間で共通成分を共有する方法 | `shared` |
-| `--sfnn-factorizer-alpha` | factorizer成分をどれだけ効かせるか | 1.0 |
+| `--sfnn-l1-factorizer-alpha` | factorizer成分をどれだけ効かせるか | 1.0 |
 | `--sfnn-saturation-penalty` | fold後のL1/L2/L3重みがi8の端に張り付くのを抑える追加ペナルティ | 0.0 |
 | `--sfnn-saturation-threshold` | 飽和ペナルティをかけ始めるi8量子化値 | 127.0 |
 | `--optimizer` | optimizer | `ranger` |
@@ -278,7 +278,7 @@ W_effective = W_base + W_shared + W_axis + W_pair
 ./target/release/examples/bulletou --settings-file ./bulletou-settings.json
 ```
 
-factorizerの効き具合を変えたい場合は `--sfnn-factorizer-alpha` を使います。
+factorizerの効き具合を変えたい場合は `--sfnn-l1-factorizer-alpha` を使います。
 
 ```text
 W_effective = W_base
@@ -293,49 +293,49 @@ W_effective = W_base
 
 ```bash
 --sfnn-factorizer king=axis
---sfnn-factorizer-alpha king=0.90
+--sfnn-l1-factorizer-alpha king=0.90
 ```
 
 king と hand を別々に弱める場合:
 
 ```bash
 --sfnn-factorizer king=axis,hand=axis
---sfnn-factorizer-alpha king=0.90,hand=0.80
+--sfnn-l1-factorizer-alpha king=0.90,hand=0.80
 ```
 
 axis成分全体と2軸成分全体を強める場合:
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha axis=4.0,pair=4.0
+--sfnn-l1-factorizer-alpha axis=4.0,pair=4.0
 ```
 
 progress axis だけを強める場合:
 
 ```bash
 --sfnn-factorizer progress=axis
---sfnn-factorizer-alpha progress=4.0
+--sfnn-l1-factorizer-alpha progress=4.0
 ```
 
 全factorizer成分を同じ強さにする場合:
 
 ```bash
 --sfnn-factorizer axis
---sfnn-factorizer-alpha 0.90
+--sfnn-l1-factorizer-alpha 0.90
 ```
 
 同じ意味を、明示的に `all=` で書くこともできます。実験メモとして残すなら、こちらのほうが意図が読み取りやすいです。
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0
+--sfnn-l1-factorizer-alpha all=3.0
 ```
 
 `all=` のあとに個別指定を書くと、その成分だけ上書きされます。
 
 ```bash
 --sfnn-factorizer pair
---sfnn-factorizer-alpha all=3.0,pair=4.0
+--sfnn-l1-factorizer-alpha all=3.0,pair=4.0
 ```
 
 この例では `shared` と `axis` は3.0、`pair` は4.0になります。
@@ -353,7 +353,7 @@ progress axis だけを強める場合:
 
 `alpha` は `1.0` より大きくすることもできます。指定可能範囲は `0.0` から `10.0` です。たとえば `king=2.0` は king-axis 成分を forward で2倍して足し、同時に king-axis tensor への勾配も2倍します。大きすぎる値は学習を不安定にする可能性があるため、実験用途として扱ってください。
 
-`nn.bin` を書き出すときは、上の `W_effective` の形に畳み込まれます。そのため `--sfnn-factorizer-alpha king=0.90` で保存した `nn.bin` には、king axis成分が90%で反映されます。
+`nn.bin` を書き出すときは、上の `W_effective` の形に畳み込まれます。そのため `--sfnn-l1-factorizer-alpha king=0.90` で保存した `nn.bin` には、king axis成分が90%で反映されます。
 
 ### 6.1 量子化飽和を抑える
 
@@ -402,7 +402,7 @@ bucket 数が多い arch では、出現回数の少ない stack の個別成分
 
 ```powershell
 --sfnn-factorizer pair `
---sfnn-factorizer-alpha all=1.0 `
+--sfnn-l1-factorizer-alpha all=1.0 `
 --sfnn-bucket-counts D:\BulletOu-snapshots\counts\count.bin `
 --sfnn-progress-bin C:\path\to\same-progress\progress.bin
 ```

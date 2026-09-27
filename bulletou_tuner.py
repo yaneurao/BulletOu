@@ -128,6 +128,8 @@ RUNNER_CONTROLLED_BULLETOU_SETTINGS = {
     "quantized_validation_rate",
     "quantized-validation-rate",
     "sfnn_factorizer_alpha",
+    "sfnn_l1_factorizer_alpha",
+    "sfnn-l1-factorizer-alpha",
     "sfnn-factorizer-alpha",
     "cuda_cpp_skip_final_output",
     "cuda-cpp-skip-final-output",
@@ -598,7 +600,7 @@ def alpha_arg(params: dict[str, float]) -> str:
 
 
 def parameter_args(params: dict[str, float]) -> list[str]:
-    out = ["--sfnn-factorizer-alpha", alpha_arg(params)]
+    out = ["--sfnn-l1-factorizer-alpha", alpha_arg(params)]
     for name, flag in CONFIDENCE_FLAGS.items():
         value = params.get(name)
         if value is not None and abs(value) > 0.0:
