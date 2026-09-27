@@ -45,6 +45,9 @@ Later false values resume statistics updates. Resume resolves the resumed epoch;
 
 For non-BN L1, see the separate [L1 revival feature](l1-revive.md).
 
+**L2 revival also supports non-BN training.** Neither BN nor QAT is required in that mode: the ordinary L2 bias supplies the new activation shift. Per-layer QAT is supported too.
+When enabling both non-BN L1 and L2 revival, L1 runs first; L2 is calibrated using the resulting network.
+
 For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_l2_revive_zero": true`, default false). It can be combined with upper revival:
 
 ```json
@@ -52,11 +55,11 @@ For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_
 "sfnn_l2_revive_zero": true
 ```
 
-The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, all with output zero. Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, BN reset, outgoing ±1/64 and selected optimizer reset are the same as upper revival. The old contribution is zero, so only subtract the new mean contribution from L3 bias. This is not exact function preservation.
+The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, all with output zero. Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. The old contribution is zero, so only subtract the new mean contribution from L3 bias. This is not exact function preservation.
 
 Compare with `--grid sfnn-l2-revive-zero false true`. Upper/zero completion markers are independent, allowing zero revival after an earlier upper revival. Each is performed once, including calibration with no candidates. Enabling both shares one calibration pass. BN state headers are 1=neither, 2=upper only, 3=zero only, 4=both. Old 1/2 remain readable; older executables cannot read 3/4. nn.bin is unchanged.
 
-`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units once, after loading a trained L2 BN checkpoint and before training. It does **not** run every epoch. Requires `sfnn_bn_l2`, `sfnn_bn_qat`, and `sfnn_bn_qat_freeze_stats`. Direct training/grid_search only; worker, ordinary NNUE, scratch initialization, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers are rejected.
+`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units once after restoring a checkpoint, before training. It does **not** run every epoch. **Only when BN is enabled**, it requires `sfnn_bn_l2`, `sfnn_bn_qat`, `sfnn_bn_qat_freeze_stats` and a calibrated L2 BN checkpoint. Do not enable BN just for non-BN revival. Direct training/grid_search only; worker, ordinary NNUE, scratch initialization, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers are rejected.
 
 ```json
 "sfnn_bn_l2": true,
@@ -69,9 +72,9 @@ Compare with `--grid sfnn-l2-revive false true` using the same `initial_state` i
 
 - Calibration independently reads 16 teacher batches from the restored position, without shuffling. The training cursor/shuffle is unchanged. Validation data and target labels are not used for calibration.
 - Only units reaching the upper clamp in **every** observed position in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. This is an empirical criterion, not proof of constant output on unseen positions.
-- Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); reset that BN scale to one and center its calibration preactivation near 0.5. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
+- Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); center the mean calibration preactivation at 0.5 using L2 bias without BN, or BN beta with scale one when BN is enabled. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
 - Reset selected moments and synchronize Lookahead slow state. Do not reset other units or FT/L1. `sfnn_l2_revive` alone does not reset always-zero units.
-- The saved L2 BN state uses record version 2 to remember completion, even when no units qualified. Subsequent restores skip the operation. Old checkpoints remain readable; the old executable cannot read revived version-2 states. The exported nn.bin format is unchanged.
+- Completion is persisted in the `l2_revival_flags` record in state.bin/weights.bin, even when no units qualify. Legacy completion flags inside L2 BN are still read and written. Subsequent restores skip completed kinds. Old checkpoints remain readable. The exported nn.bin format is unchanged.
 - `l2-revive.csv` records per-bucket/unit counts, upper/lower hits and selection. Existing audits are preserved with numbered filenames. Interruption before a new checkpoint is saved causes recalibration from the original checkpoint on restart.
 
 This intentionally changes the function slightly; it is not an exact equivalence transformation or a guarantee of improved strength. Temporary GPU proxy/workspace and CPU calibration inputs are released before training.

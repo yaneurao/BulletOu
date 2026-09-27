@@ -26,6 +26,9 @@ python .\grid_search.py --settings-file settings.json --output-folder results --
 
 BNなしのL1用は別機能です。[L1定数unitの再初期化](l1-revive.md)を参照してください。
 
+**L2もBNなしで使用できます。** BNなしではBNオプションやQATは必須ではなく、通常のL2 biasで再初期化後の出力位置を調整します。層別QATとの併用も可能です。
+BNなしでL1/L2両方を指定した場合は、L1を処理してから、変更後のネットワークでL2を校正・処理します。
+
 常時出力0のunitには、独立した `--sfnn-l2-revive-zero`（JSON: `"sfnn_l2_revive_zero": true`、既定false）を使います。上限側の `sfnn_l2_revive` と同時指定できます。
 
 ```json
@@ -33,12 +36,12 @@ BNなしのL1用は別機能です。[L1定数unitの再初期化](l1-revive.md)
 "sfnn_l2_revive_zero": true
 ```
 
-ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ全出力0の場合だけ処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・BN再設定・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与は0なのでbiasに加算せず、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
+ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ全出力0の場合だけ処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・bias調整（BNありではBN再設定）・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与は0なのでbiasに加算せず、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
 
 grid比較は `--grid sfnn-l2-revive-zero false true`。上限/ゼロの処理済み情報は独立して保存するため、上限側を実施したcheckpointへ後からゼロ側を指定できます。各種類は一度だけで、対象0件でも校正済みになります。両方指定すると校正は1回です。BN stateのヘッダ1=未実施、2=上限のみ、3=ゼロのみ、4=両方。古い1/2は読み込めますが、3/4は今回より古い実行ファイルでは読めません。nn.bin形式は不変です。
 
-`--sfnn-l2-revive`（JSON: `"sfnn_l2_revive": true`、デフォルトfalse）は、学習済みL2 BN checkpointを復元した直後、学習開始前に一度だけ校正・再初期化します。各epoch開始時には実行しません。
-`sfnn_bn_l2`、`sfnn_bn_qat`、`sfnn_bn_qat_freeze_stats`をtrueにしてください。直接学習とgrid_searchに対応し、worker、通常NNUE、scratch開始、compact L1、axis/pair・residual count gate・旧L2/L3 factorizerは未対応で明示エラーになります。
+`--sfnn-l2-revive`（JSON: `"sfnn_l2_revive": true`、デフォルトfalse）は、checkpointを復元した直後、学習開始前に一度だけ校正・再初期化します。各epoch開始時には実行しません。
+**BNを使用している場合だけ**、`sfnn_bn_l2`、`sfnn_bn_qat`、`sfnn_bn_qat_freeze_stats`をtrueにし、校正済みL2 BN checkpointを使用してください。BNなしの学習へ、これらを追加する必要はありません。直接学習とgrid_searchに対応し、worker、通常NNUE、scratch開始、compact L1、axis/pair・residual count gate・旧L2/L3 factorizerは未対応で明示エラーになります。
 
 ```json
 "sfnn_bn_l2": true,
@@ -51,9 +54,9 @@ gridのA/B比較は `--grid sfnn-l2-revive false true`。共通設定の`initial
 
 - 復元した教師位置から16batchを別途読み、量子化推論で校正します。校正時のshuffleは0。学習側の位置・shuffle設定は進めたり変更したりしません。検証データ・正解評価値は校正に使用しません。
 - bucket内で1,024局面以上観測され、その全てで出力1のL2 unitだけが対象です。少数・未出現bucketは処理しません。「サンプル全件」であり、未知の全局面で定数という証明ではありません。
-- 定数寄与をL3 biasへ移し、入力をGlorot一様分布（seed=20260926）で再初期化。対象のBN倍率を1にし、校正入力平均で出力が約0.5になるようbetaを設定します。L3接続を元と同符号の±1/64から再学習し、その平均寄与もbias補償します。
+- 定数寄与をL3 biasへ移し、入力をGlorot一様分布（seed=20260926）で再初期化。BNなしではL2 bias、BNありでは倍率1のBN betaを設定し、校正入力で平均preactivationを0.5にします。L3接続を元と同符号の±1/64から再学習し、その平均寄与もbias補償します。
 - 対象のmomentとLookahead slowを整合させます。他unitとFT/L1はリセットしません。`sfnn_l2_revive` 単独では出力0のunitはリセットしません。
-- 校正・処理済み情報をL2 BNのstateレコード（version 2）に保存します。後続checkpointからのresumeでは、フラグがtrueでも再実行しません。対象0件でも校正済みになります。nn.bin形式は変わりません。旧stateは読み込めますが、処理済みstateを旧実行ファイルでは読めません。
+- 校正・処理済み情報をstate.bin/weights.binの`l2_revival_flags`へ保存します。従来のL2 BN内の処理済み情報も引き続き読み書きします。後続checkpointからのresumeでは、フラグがtrueでも再実行しません。対象0件でも校正済みになります。nn.bin形式は変わりません。
 - 出力先の`l2-revive.csv`に各bucket/unitの局面数・上限/下限回数・対象判定を保存します。既存ファイルは上書きせず連番にします。校正後、checkpoint保存前に中断した場合は、元checkpointから再校正します。
 
 これは完全な等価変換ではありません。定数寄与の移動後に新しい局面依存出力を作り、量子化丸めも変わります。精度・棋力の向上は保証しません。校正時のみ推論用GPU重み/workspaceとCPU入力サンプルを一時保持し、学習前に解放します。

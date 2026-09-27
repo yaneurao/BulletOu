@@ -41,3 +41,5 @@ or unseen-position parity. Revival may saturate again and is not guaranteed to i
 Supported: dense L1, factorizer none/shared, non-BN training including per-layer QAT, standalone/grid search.
 BN, axis/pair, residual count gates, compact L1, legacy L2/L3 factorizers and worker trials are rejected explicitly.
 The nn.bin inference format is unchanged; old checkpoints without completion flags are treated as unprocessed.
+
+[L2 upper/zero revival](batch-normalization.md) also supports non-BN training. When all four flags are true, L1 revival runs before L2 calibration and revival.

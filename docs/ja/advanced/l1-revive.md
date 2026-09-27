@@ -45,3 +45,5 @@ L2 reviveの微小な非ゼロ接続とは異なり、L1では新unitによる�
 対応範囲: dense L1、L1 factorizer none/shared、BNなし、通常学習または層別QAT、standalone/grid search。
 BN、axis/pair、residual count gate、compact L1、旧L2/L3 factorizer、worker trialは未対応でエラーにします。
 nn.binの推論形式は変更しません。既存checkpointに処理済み情報がなければ未処理として読み込みます。
+
+[L2の上限・ゼロrevive](batch-normalization.md)もBNなしに対応しています。4項目を同時にtrueにした場合は、L1を処理した後のネットワークでL2を校正・処理します。

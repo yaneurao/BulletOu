@@ -6015,6 +6015,7 @@ impl<'a> SfnnTrainStepHostBatch<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SfnnTrainWeightsReadback {
     pub l1_revival_flags: u8,
+    pub l2_revival_flags: u8,
     pub batch_norm: batch_norm::NetworkState,
     pub l0w: Vec<f32>,
     pub l0b: Vec<f32>,
@@ -6138,6 +6139,7 @@ impl SfnnTrainStepUploadSlot {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
     pub l1_revival_flags: u8,
+    pub l2_revival_flags: u8,
     layer_qat: layer_qat::State,
     bn_qat: Option<bn_qat::State>,
     pub batch_norm: Option<batch_norm::Network>,
@@ -6176,6 +6178,7 @@ pub struct SfnnTrainStepRunner {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunnerSnapshot {
     pub l1_revival_flags: u8,
+    pub l2_revival_flags: u8,
     pub batch_norm: batch_norm::NetworkState,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
@@ -6533,6 +6536,7 @@ impl SfnnTrainStepRunner {
             bn_qat: None,
             layer_qat: Default::default(),
             l1_revival_flags: 0,
+            l2_revival_flags: 0,
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7084,6 +7088,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
             l1_revival_flags: self.l1_revival_flags,
+            l2_revival_flags: self.l2_revival_flags,
             batch_norm: self.read_batch_norm_state(ctx)?,
             weights: self.weights.try_clone_device(ctx)?,
             optimizer_states: self.optimizer_states.try_clone_device(ctx, self.shape)?,
@@ -7094,6 +7099,7 @@ impl SfnnTrainStepRunner {
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
         self.l1_revival_flags = src.l1_revival_flags;
+        self.l2_revival_flags = src.l2_revival_flags;
         self.restore_batch_norm(ctx,&src.batch_norm)?;
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
@@ -7709,6 +7715,7 @@ impl SfnnTrainStepRunner {
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
         Ok(SfnnTrainWeightsReadback {
             l1_revival_flags: self.l1_revival_flags,
+            l2_revival_flags: self.l2_revival_flags,
             batch_norm: self.read_batch_norm_state(ctx)?,
             l0w: self.weights.l0w.download(ctx)?,
             l0b: self.weights.l0b.download(ctx)?,
