@@ -18,6 +18,20 @@ This page covers two commands for inspecting an exported `nn.bin` directly. Thes
 
 ## Test quantized accuracy / loss
 
+### Per-layer FT/L2/L3 QAT without BN
+
+CUDA SFNN supports independent `sfnn_qat_ft`, `sfnn_qat_l2`, and `sfnn_qat_l3` booleans, all **off by default**. They can be combined with `sfnn_qat_l1`.
+
+- FT weights/biases use scale 127 and int16 bounds. FT factorizer contributions are folded before rounding.
+- L2/L3 weights use scale 64 and int8 bounds; biases use scale 8128 and int32 bounds.
+- Forward/backward use fake-quantized weights; FP32 masters receive identity-STE updates. Integer activation arithmetic is not fully emulated.
+- Direct, worker, profiling and gradient accumulation paths are supported. Checkpoints retain FP32 masters and optimizer state; export format is unchanged. Toggle on resume or use an epoch schedule such as `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}`.
+- With BN enabled, a warning is printed and these three flags are disabled. Use `sfnn_bn_qat` instead.
+- Each selected layer needs a GPU FP32 weight/bias copy. FT1024 HalfKA2 with factorization costs about 512 MiB extra; L2/L3-only QAT does not allocate an FT copy. Rounding adds runtime overhead.
+- Legacy L2/L3 factorizer tensors are unsupported.
+
+For an eight-condition grid use `--grid sfnn-qat-ft false true --grid sfnn-qat-l2 false true --grid sfnn-qat-l3 false true`. Use only `true` per flag to enable all three in a single condition. The L1 flag is independent.
+
 ### Compare L1 QAT on/off
 
 SFNN dense L1 supports optional quantization-aware training with `--sfnn-qat-l1`.
@@ -28,7 +42,7 @@ It is **off by default**. In the top level of `bulletou-settings.json`, use:
 ```
 
 `false` or omission preserves ordinary training. The normal, worker and profiling paths support it;
-grouped/common-shard L1 is rejected. Only **L1 weights and biases** are fake-quantized, not FT/L2/L3 or activations.
+grouped/common-shard L1 is rejected. This flag fake-quantizes **L1 weights and biases** only. Other layers have separate flags below; activation integer arithmetic is not emulated.
 Factorizers and count gates are folded before quantization:
 
 ```text

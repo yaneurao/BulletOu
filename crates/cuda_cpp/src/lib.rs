@@ -2,6 +2,7 @@ use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 
 pub mod batch_norm;
 mod bn_qat;
+mod layer_qat;
 pub mod l2_revive;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -6134,6 +6135,7 @@ impl SfnnTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
+    layer_qat: layer_qat::State,
     bn_qat: Option<bn_qat::State>,
     pub batch_norm: Option<batch_norm::Network>,
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
@@ -6252,6 +6254,10 @@ pub struct SfnnLayerLrMultipliers {
     pub tatara_weight_clip: bool,
     /// Training-only L1 fake quantization; FP32 master parameters use identity STE.
     pub qat_l1: bool,
+    pub qat_ft: bool,
+    pub qat_l2: bool,
+    pub qat_l3: bool,
+    pub qat_ft_virtual_rows: usize,
 }
 
 impl Default for SfnnLayerLrMultipliers {
@@ -6275,6 +6281,10 @@ impl Default for SfnnLayerLrMultipliers {
             saturation_threshold: 127.0,
             tatara_weight_clip: false,
             qat_l1: false,
+            qat_ft: false,
+            qat_l2: false,
+            qat_l3: false,
+            qat_ft_virtual_rows: 0,
         }
     }
 }
@@ -6365,6 +6375,10 @@ impl SfnnTrainStepRunner {
             self.factorizer_axis_confidences_enabled.then_some(&self.factorizer_axis_confidences))
     }
     fn prepare_l1_qat(&mut self, ctx: &Context, enabled: bool) -> Result<()> {
+        // The selected-layer wrapper temporarily owns its buffers during a
+        // step. Reaching here with cached buffers means all its flags are off.
+        // Release them when an epoch schedule disables selected-layer QAT.
+        self.layer_qat = Default::default();
         if !enabled {
             self.forward_workspace.qat_l1 = None;
             self.forward_workspace.qat_l1_active.set(false);
@@ -6513,6 +6527,7 @@ impl SfnnTrainStepRunner {
             ft_saturation_guard: None,
             batch_norm: None,
             bn_qat: None,
+            layer_qat: Default::default(),
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7223,6 +7238,11 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        if layer_qat::enabled(lr_multipliers) {
+            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
+                r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr,dirty_buckets));
+        }
         if self.bn_qat.is_some() {
             return bn_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r|
                 r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
@@ -7398,6 +7418,11 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
+        if layer_qat::enabled(lr_multipliers) {
+            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
+                r.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                    ctx,upload_ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr,dirty_buckets));
+        }
         if self.bn_qat.is_some() {
             return bn_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r|
                 r.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
@@ -7539,6 +7564,16 @@ impl SfnnTrainStepRunner {
         lr_multipliers: SfnnLayerLrMultipliers,
         dirty_buckets: Option<&[i32]>,
     ) -> Result<SfnnTrainStepProfile> {
+        if layer_qat::enabled(lr_multipliers) {
+            let start=Event::new(ctx)?; let stop=Event::new(ctx)?; start.record(ctx)?;
+            let mut p=layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
+                r.step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
+                    ctx,params,loss_kind,output_inv_scale,batch,false,lr,dirty_buckets))?;
+            stop.record(ctx)?; stop.synchronize()?;
+            let elapsed=stop.elapsed_ms_since(&start)?;
+            p.update_ms+=(elapsed-p.total_ms).max(0.0); p.total_ms=elapsed;
+            return Ok(p);
+        }
         if self.bn_qat.is_some() {
             // Outer timing includes proxy refresh, STE pullback and optimizer.
             let start=Event::new(ctx)?; let stop=Event::new(ctx)?; start.record(ctx)?;

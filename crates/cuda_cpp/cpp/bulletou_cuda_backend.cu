@@ -7430,6 +7430,27 @@ int launch_nnue_backward_kernels(
 
 #include "bn_qat.cuh"
 
+__global__ void layer_qat_kernel(const float* src,float* dst,size_t n,float scale,float lo,float hi,
+    size_t base,size_t vr,size_t width,float alpha) {
+    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    if(j>=n)return;
+    float v=src[j];
+    if(vr) {
+        size_t f=j/width,u=j%width;
+        if(f>=base){dst[j]=0.0f;return;}
+        v+=alpha*src[(base+f%vr)*width+u];
+    }
+    dst[j]=sfnn_quantize_dequant_clamped(v,scale,lo,hi);
+}
+extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,
+    float scale,float lo,float hi,size_t base,size_t vr,size_t width,float alpha) {
+    if(!ctx || !src || !dst || validate_buffer(ctx,dst,src->len,"layer QAT output"))return -1;
+    layer_qat_kernel<<<static_cast<unsigned>((src->len+255)/256),256,0,ctx->stream>>>(
+        src->ptr,dst->ptr,src->len,scale,lo,hi,base,vr,width,alpha);
+    return check_kernel_launch("layer QAT");
+}
+
 extern "C" int bulletou_cuda_cpp_last_error(char* out, size_t out_len) {
     if (out == nullptr || out_len == 0) {
         return fail_message("last_error output buffer is null or empty");

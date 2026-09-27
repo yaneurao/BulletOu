@@ -31,7 +31,7 @@ JSON設定なら、既存の `bulletou-settings.json` のトップレベルに�
 `false` または省略で従来の学習です。通常学習・worker・profilingの各経路で有効です。
 grouped/common-shard L1（`g...` / `c..._s...`）は対象外で、指定するとエラーになります。
 
-今回のQATは **L1のweightとbiasだけ**です。FT・L2・L3の丸めや、活性値の整数演算は模擬しません。
+`sfnn_qat_l1` の対象は **L1のweightとbiasだけ**です。ほかの層も以下の個別指定で有効化できます。活性値の整数演算は模擬しません。
 shared / axis / pair / count gateを使っている場合は、それらを足し合わせた実効重み `W` に対して、次の計算をします。
 
 ```text
@@ -60,6 +60,28 @@ A/Bでは、同一の `state.bin` と `dataloader_pos.txt` から、教師局面
 追加処理はGPU内だけです。丸めたL1を重み更新まで再利用し、復元やfactorizer設定変更でも再計算します。
 追加VRAMは `4 * stacks * L1出力数 * (FT幅 + 1)` byteです。`1024_8_64_progress8` なら約0.25 MiBですが、大量bucketのarchでは比例して増えます。
 OFFではこの作業領域を確保しません。学習速度への影響は未測定で、ON/OFFの同条件比較が必要です。
+
+### FT・L2・L3の層別QAT（BNなし）
+
+CUDA SFNNでは次を個別に指定できます。すべてデフォルトOFFです。
+
+```json
+"sfnn_qat_ft": true,
+"sfnn_qat_l1": true,
+"sfnn_qat_l2": true,
+"sfnn_qat_l3": true
+```
+
+- FT: weight/biasを127倍してint16範囲で丸めます。FT factorizer使用時はfold後の実効重みが対象です。
+- L2/L3: weightを64倍してint8範囲、biasを8128倍してint32範囲で丸めます。
+- forward/backwardは丸めた重みを使い、FP32の学習用重みにはidentity STEで更新します。活性値の整数演算を完全再現する機能ではありません。
+- 通常学習・worker・profiling・batches_per_updateに対応します。checkpointはFP32重みとoptimizer stateを保持し、既存checkpointからの再開時にも切り替えられます。
+- `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}` のようなepoch別指定にも対応します。
+- BNとは併用しません。BNが有効なら警告を出してこれら3項目を無効化します。BN用は `sfnn_bn_qat` を使ってください。
+- GPU上に指定層のFP32コピーを追加します。FTは大きく、HalfKA2/FT1024では約512 MiB増えます（factorizerありの場合）。L2/L3のみならFTコピーは作りません。丸め処理の速度負担もあります。
+- 旧形式のL2/L3 factorizerテンソルを残した状態は対象外です。
+
+grid searchでは、例えば `--grid sfnn-qat-ft false true --grid sfnn-qat-l2 false true --grid sfnn-qat-l3 false true` で8条件を比較できます。全層を一度にONにするなら各値を `true` だけにします。既存のL1指定は独立です。
 
 ### 保存済みのnn.binを計測する
 

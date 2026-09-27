@@ -4100,7 +4100,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4119,7 +4119,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = matches!(key, "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4180,7 +4180,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             }};
         }
         assign!(sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
-            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -5249,6 +5249,16 @@ struct Args {
     #[arg(long = "sfnn-qat-l1")]
     sfnn_qat_l1: bool,
 
+    /// Non-BN FT weight/bias QAT (int16, scale 127), identity STE. Default off.
+    #[arg(long)]
+    sfnn_qat_ft: bool,
+    /// Non-BN L2 weight/bias QAT (int8 weights, scale 64), identity STE. Default off.
+    #[arg(long)]
+    sfnn_qat_l2: bool,
+    /// Non-BN L3 weight/bias QAT (int8 weights, scale 64), identity STE. Default off.
+    #[arg(long)]
+    sfnn_qat_l3: bool,
+
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
     /// term before each update and does not change the reported value loss.
@@ -5395,6 +5405,10 @@ struct Args {
 impl Args {
     fn effective_sfnn_qat_l1(&self) -> bool {
         self.sfnn_qat_l1 && !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2)
+    }
+
+    fn non_bn_layer_qat(&self) -> bool {
+        !(self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2)
     }
     /// Resolve the checkpoint output directory.
     ///
@@ -5595,6 +5609,14 @@ impl Args {
             }
             if self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some() {
                 return Err("--sfnn-qat-l1 supports dense L1 only (not grouped/common-shard L1)".to_string());
+            }
+        }
+        if self.sfnn_qat_ft || self.sfnn_qat_l2 || self.sfnn_qat_l3 {
+            if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
+                return Err("--sfnn-qat-ft/l2/l3 require cuda-cpp SFNN".into());
+            }
+            if !self.non_bn_layer_qat() {
+                eprintln!("{}", paint("  WARNING: BN disables requested sfnn_qat_ft/l2/l3; use --sfnn-bn-qat for BN-aware QAT.", ConsoleColor::BoldYellow));
             }
         }
         if self.ft_factorizer_alpha != 1.0
@@ -17870,6 +17892,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 paint(args.sfnn_update_scope.cli_name(), ConsoleColor::BoldYellow)
             ),
         );
+        print_startup_kv("SFNN layer QAT", format!("FT={} L1={} L2={} L3={} (non-BN; FP32 masters)",
+            args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
+            args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
     }
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
@@ -25056,6 +25081,12 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         saturation_threshold: args.sfnn_saturation_threshold,
         tatara_weight_clip: uses_tatara_weight_clip(args),
         qat_l1: args.effective_sfnn_qat_l1(),
+        qat_ft: args.sfnn_qat_ft && args.non_bn_layer_qat(),
+        qat_l2: args.sfnn_qat_l2 && args.non_bn_layer_qat(),
+        qat_l3: args.sfnn_qat_l3 && args.non_bn_layer_qat(),
+        qat_ft_virtual_rows: if args.ft_factorizer && args.eval_type() == EvalType::SfnnHalfka2 {
+            bulletou_lib::game::inputs::PIECE_INPUTS
+        } else { 0 },
         ..Default::default()
     };
     if args.sfnn_freeze_l1 {
@@ -25742,6 +25773,9 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_norm_loss_strength={:.9}", args.sfnn_norm_loss_strength),
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
+        format!("sfnn_qat_ft={}", args.sfnn_qat_ft && args.non_bn_layer_qat()),
+        format!("sfnn_qat_l2={}", args.sfnn_qat_l2 && args.non_bn_layer_qat()),
+        format!("sfnn_qat_l3={}", args.sfnn_qat_l3 && args.non_bn_layer_qat()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
         format!("sfnn_bn_affine_lr_multiplier={}", args.sfnn_bn_affine_lr_multiplier),
         format!("sfnn_ft_lr_mult={}", args.sfnn_ft_lr_mult),
@@ -26028,6 +26062,9 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_l1_saturation_backward_alpha=");
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
+    let signature = resume_signature_without_line(&signature, "sfnn_qat_ft=");
+    let signature = resume_signature_without_line(&signature, "sfnn_qat_l2=");
+    let signature = resume_signature_without_line(&signature, "sfnn_qat_l3=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_affine_lr_multiplier=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_lr_mult=");
@@ -34157,6 +34194,37 @@ mod tests {
         bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),
             "sfnn_l1_saturation_backward_alpha", &serde_json::json!(0), &mut argv).unwrap();
         assert!(Args::try_parse_from(argv).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "cuda-cpp-backend")]
+    fn selected_layer_qat_cli_json_schedule_resume() {
+        let base = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_8_64_progress8"];
+        let off=Args::try_parse_from(base).unwrap();
+        let mut argv: Vec<std::ffi::OsString>=base.into_iter().map(Into::into).collect();
+        for key in ["sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3"] {
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),key,&serde_json::json!(true),&mut argv).unwrap();
+        }
+        let on=Args::try_parse_from(argv).unwrap();
+        assert!(on.sfnn_qat_ft && on.sfnn_qat_l2 && on.sfnn_qat_l3);
+        assert!(on.validate_arch_flags().is_ok());
+        assert!(resume_signature_matches(&resume_signature(&off), &on));
+        let m=cuda_cpp_sfnn_layer_lr_multipliers(&on,None);
+        assert!(m.qat_ft && m.qat_l2 && m.qat_l3 && !m.qat_l1);
+        assert_eq!(m.qat_ft_virtual_rows, bulletou_lib::game::inputs::PIECE_INPUTS);
+        let mut scheduled=on.clone();
+        scheduled.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_qat_ft":{"epoch1":false,"epoch2":true},
+            "sfnn_qat_l2":{"epoch1":false,"epoch2":true},
+            "sfnn_qat_l3":{"epoch1":false,"epoch2":true}
+        }).to_string());
+        let first=args_at_epoch(&scheduled,1).unwrap();
+        let second=args_at_epoch(&scheduled,2).unwrap();
+        assert!(!first.sfnn_qat_ft && !first.sfnn_qat_l2 && !first.sfnn_qat_l3);
+        assert!(second.sfnn_qat_ft && second.sfnn_qat_l2 && second.sfnn_qat_l3);
+        scheduled.sfnn_bn_ft=true;
+        let bn=cuda_cpp_sfnn_layer_lr_multipliers(&scheduled,None);
+        assert!(!bn.qat_ft && !bn.qat_l2 && !bn.qat_l3);
     }
 
     #[test]
