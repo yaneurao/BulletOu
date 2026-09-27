@@ -338,6 +338,10 @@ def preflight_exe(plan: dict) -> None:
     if result.returncode:
         raise ValueError(f"bulletou --help failed: {result.stderr or result.stdout}")
     options = set(re.findall(r"(?m)^\s+(?:-[A-Za-z],\s+)?--([a-z][a-z0-9-]*)", result.stdout))
+    # Clap lists visible aliases separately from the canonical option heading.
+    # Do not scan prose: documentation can mention unsupported flags as well.
+    for aliases in re.findall(r"\[aliases?:\s*([^\]]+)\]", result.stdout):
+        options.update(re.findall(r"--([a-z][a-z0-9-]*)", aliases))
     needed = {key.replace("_", "-") for trial in plan["trials"] for key in trial["settings"]}
     missing = sorted((needed | {"settings-file", "resume"}) - options)
     if missing:

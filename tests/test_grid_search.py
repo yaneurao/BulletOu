@@ -569,6 +569,20 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(run.call_count, 0)
         self.assertFalse(self.output.exists())
 
+    def test_preflight_accepts_visible_alias_but_not_prose(self):
+        plan = {"exe": sys.executable, "cwd": str(Path.cwd()),
+                "trials": [{"settings": {"sfnn_factorizer": "none"}}]}
+        help_text = ('  --settings-file <PATH>\n  --resume\n'
+                     '  --sfnn-l1-factorizer <MODE>\n'
+                     '      [aliases: --sfnn-factorizer]\n'
+                     '      Do not use --made-up-option\n')
+        result = subprocess.CompletedProcess([], 0, help_text, '')
+        with patch.object(grid.subprocess, "run", return_value=result):
+            grid.preflight_exe(plan)
+            plan["trials"][0]["settings"]["made_up_option"] = True
+            with self.assertRaisesRegex(ValueError, "made-up-option"):
+                grid.preflight_exe(plan)
+
     def test_preflight_rejects_unknown_flag_before_training(self):
         plan = self.plan()
         plan["exe"] = sys.executable
