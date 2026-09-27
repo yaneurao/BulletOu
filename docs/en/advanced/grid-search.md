@@ -2,6 +2,18 @@
 
 For independent FT/L1/L2 BatchNorm switches, defaults, limitations and grid examples, see [Batch normalization](batch-normalization.md).
 
+## Short experiments without editing common settings
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-short `
+  --max-epochs 1 --superbatches 32 `
+  --lrs 0.0001 0.0002
+```
+
+Each condition trains for one epoch of 32 SB. The source JSON is not modified. Precedence is common JSON < CLI overrides < explicit `--grid superbatches ...`. With both `--max-epochs` and `--epochs`, the former sets the training endpoint and the latter selects report epochs; report epochs beyond the endpoint are rejected. Without `--max-epochs`, `--epochs` retains its existing train-through-maximum behavior. Overrides also apply on `--resume`, but cannot reduce the total epoch budget. Repeat the arguments on resume to retain the overrides.
+
 ## Verbose saturation diagnostics
 
 Training hides `[qstats]` / `[qstats-unit]` console lines by default. Use `python .\grid_search.py ... --verbose` to pass `--verbose` to BulletOu. Direct training also accepts `--verbose`, or `"verbose": true` in its settings JSON.
@@ -101,6 +113,8 @@ Lists form a Cartesian product, not zipped pairs. Invalid combinations such as `
 | `--exe PATH` | Defaults to `target/release/examples/bulletou.exe` next to the script. Supply the appropriate executable on Ubuntu |
 | `--checkpoint DIR` | Common starting checkpoint directory with nonempty `state.bin` and `dataloader_pos.txt` |
 | `--epochs 1 2 5` | Train each condition once through epoch 5 and report epochs 1, 2, 5. Omitted: use JSON `max_epochs`, reporting every epoch |
+| `--max-epochs N` | Override common JSON `max_epochs`; total epoch count, not additional epochs |
+| `--superbatches N` | Override common JSON `superbatches` (SB per epoch) |
 | `--summary-only` | Rebuild aggregate CSV from the manifest and logs; no training, executable, or original settings needed |
 | `--summary-csv PATH` | Defaults to `<grid root>/grid_summary.csv`. Must be a `.csv` outside all trial directories (including legacy `trials/`) to protect source logs |
 | `--dry-run` | Plan only; no writes or training |

@@ -4,6 +4,18 @@ FT・L1・L2のBNは `--grid sfnn-bn-ft false true`、`--grid sfnn-bn-l1 false t
 `--grid sfnn-bn-l2 false true` で比較できます。全指定で8条件です。
 初期値・併用制限・保存仕様は [Batch Normalization](batch-normalization.md) を参照してください。
 
+## 共通設定を編集せずに短い実験を行う
+
+```powershell
+python .\grid_search.py `
+  --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
+  --output-folder D:\BulletOu-snapshots\grid-short `
+  --max-epochs 1 --superbatches 32 `
+  --lrs 0.0001 0.0002
+```
+
+各条件を1epoch・32SBで学習します。元のJSONは変更しません。優先順位は共通JSON < 上記のCLI上書き < 明示的な `--grid superbatches ...` です。`--max-epochs` と `--epochs` の併用時、前者が学習終了epoch、後者が集計対象です（終了epochを超える指定はエラー）。`--max-epochs` 未指定時の `--epochs` は従来通り最大値まで学習します。`--resume` にも適用されますが、通算epoch数を減らすことはできません。再開時の上書きを維持するには同じ引数を指定してください。
+
 ## 飽和率の詳細表示
 
 通常は学習中の `[qstats]` / `[qstats-unit]` をコンソールに表示しません。表示したいときは `python .\grid_search.py ... --verbose` を指定してください。子プロセスのBulletOuに `--verbose` を渡します。本体を直接起動するときも `--verbose`、学習JSONでは `"verbose": true` を指定できます。
@@ -103,6 +115,8 @@ LR 2通り × 教師側scaling 2通り = **4条件**です。`--dry-run` は実�
 | `--exe PATH` | 学習実行ファイル。既定はスクリプト隣の `target/release/examples/bulletou.exe`。Ubuntuでは対応する実行ファイルを指定 |
 | `--checkpoint DIR` | 全条件の共通開始checkpoint。非空の `state.bin` と `dataloader_pos.txt` が必要 |
 | `--epochs 1 2 5` | 集計したいepoch番号。各条件を一度だけ最大値5まで学習し、1・2・5の結果を出す。省略時はJSONの `max_epochs` まで学習し全epochを集計 |
+| `--max-epochs N` | 共通JSONの `max_epochs` を上書き。追加数ではなく学習の通算epoch数。未指定なら従来通り |
+| `--superbatches N` | 共通JSONの `superbatches`（1epochのSB数）を上書き |
 | `--summary-only` | 保存済みmanifestと各条件のログからCSVだけ再生成する。学習・実行ファイル・共通設定JSONは不要 |
 | `--summary-csv PATH` | 集計CSVの出力先。既定はgrid rootの `grid_summary.csv`。元ログ保護のため各trialフォルダ内（旧 `trials/` 内も含む）は指定不可 |
 | `--dry-run` | 計画表示のみ。学習・ファイル作成なし |

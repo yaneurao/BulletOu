@@ -110,6 +110,8 @@ def parse_args(argv=None):
     p.add_argument("--exe", type=Path, default=Path(__file__).resolve().parent / "target/release/examples/bulletou.exe")
     p.add_argument("--checkpoint", type=Path, help="Common initial checkpoint DIRECTORY (state.bin + dataloader_pos.txt)")
     p.add_argument("--epochs", type=int, nargs="+", help="Epochs to report, e.g. 1 2 5; train each condition once through max=5")
+    p.add_argument("--max-epochs", type=int, help="Override common max_epochs (total epochs, not additional epochs)")
+    p.add_argument("--superbatches", type=int, help="Override common superbatches (SB per epoch)")
     for option in PLURAL_OPTIONS:
         p.add_argument("--" + option.replace("_", "-"), nargs="+", metavar="VALUE",
                        help=f"Grid values for BulletOu {PLURAL_OPTIONS[option]} (Cartesian product)")
@@ -124,9 +126,15 @@ def parse_args(argv=None):
     a = p.parse_args(argv)
     if a.epochs is not None and (not a.epochs or min(a.epochs) < 1):
         p.error("--epochs must contain positive integers")
+    for key in ("max_epochs", "superbatches"):
+        if getattr(a, key) is not None and getattr(a, key) < 1:
+            p.error(f"--{key.replace('_', '-')} must be a positive integer")
+    if a.max_epochs is not None and a.epochs and max(a.epochs) > a.max_epochs:
+        p.error("--epochs cannot exceed --max-epochs")
     if not a.summary_only and a.settings_file is None:
         p.error("--settings-file is required unless --summary-only is used")
     if a.summary_only and (a.dry_run or a.resume or a.checkpoint or a.grid
+                           or a.max_epochs is not None or a.superbatches is not None
                            or any(getattr(a, key) for key in PLURAL_OPTIONS)):
         p.error("--summary-only cannot be combined with execution/grid options")
     return a
@@ -281,8 +289,12 @@ def make_plan(args) -> dict:
                 raise ValueError(f"common checkpoint requires a nonempty {checkpoint / name}")
         template["initial_state"] = str(checkpoint / "state.bin")
         template["initial_dataloader_pos"] = str(checkpoint / "dataloader_pos.txt")
-    if args.epochs:
+    if args.max_epochs is not None:
+        template["max_epochs"] = args.max_epochs
+    elif args.epochs:
         template["max_epochs"] = max(args.epochs)
+    if args.superbatches is not None:
+        template["superbatches"] = args.superbatches
     check_settings(template)
     epochs = sorted(set(args.epochs or range(1, template["max_epochs"] + 1)))
     axes = collect_axes(args)

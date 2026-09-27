@@ -425,6 +425,40 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(plan["report_epochs"], [1, 2, 5])
         self.assertEqual(plan["trials"][0]["settings"]["max_epochs"], 5)
 
+    def test_common_schedule_cli_overrides_without_writeback(self):
+        before = self.settings_path.read_bytes()
+        plan = self.plan(["--max-epochs", "3", "--superbatches", "32"])
+        self.assertEqual(plan["report_epochs"], [1, 2, 3])
+        for trial in plan["trials"]:
+            self.assertEqual(trial["settings"]["max_epochs"], 3)
+            self.assertEqual(trial["settings"]["superbatches"], 32)
+            self.assertNotIn("superbatches", trial["parameters"])
+        self.assertEqual(self.settings_path.read_bytes(), before)
+        selected = self.plan(["--max-epochs", "5", "--epochs", "1", "3"])
+        self.assertEqual(selected["report_epochs"], [1, 3])
+        self.assertEqual(selected["trials"][0]["settings"]["max_epochs"], 5)
+
+    def test_explicit_sb_grid_overrides_common_sb_override(self):
+        plan = self.plan(["--superbatches", "32", "--grid", "superbatches", "8", "16"])
+        self.assertEqual({t["settings"]["superbatches"] for t in plan["trials"]}, {8, 16})
+
+    def test_resume_accepts_common_schedule_cli_overrides(self):
+        old = self.plan()
+        requested = self.plan(["--max-epochs", "3", "--superbatches", "32"])
+        merged, _ = grid.plan_resume(self.output, old, requested)
+        for previous, trial in zip(old["trials"], merged["trials"]):
+            self.assertEqual(trial["settings"]["max_epochs"], 3)
+            self.assertEqual(trial["settings"]["superbatches"], 32)
+            self.assertEqual(trial["settings"]["output"], previous["settings"]["output"])
+
+    def test_schedule_overrides_reject_invalid_values(self):
+        for options in (["--max-epochs", "0"], ["--superbatches", "-1"],
+                        ["--max-epochs", "2", "--epochs", "3"],
+                        ["--summary-only", "--max-epochs", "2"],
+                        ["--summary-only", "--superbatches", "8"]):
+            with self.subTest(options=options), self.assertRaises(SystemExit):
+                grid.parse_args([*self.argv, *options])
+
     def test_generic_grid_string_boolean_and_zero(self):
         plan = self.plan(["--grid", "sfnn-factorizer-alpha", "shared=0.5", "shared=1.0",
                           "--grid", "no-ft-factorize", "false", "true",
