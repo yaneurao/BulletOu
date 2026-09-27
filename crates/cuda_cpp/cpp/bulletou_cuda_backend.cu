@@ -7430,24 +7430,37 @@ int launch_nnue_backward_kernels(
 
 #include "bn_qat.cuh"
 
-__global__ void layer_qat_kernel(const float* src,float* dst,size_t n,float scale,float lo,float hi,
-    size_t base,size_t vr,size_t width,float alpha) {
+template<int KIND> __global__ void layer_qat_vector_kernel(const float* src,float* dst,size_t n) {
     size_t j=blockIdx.x*blockDim.x+threadIdx.x;
     if(j>=n)return;
-    float v=src[j];
-    if(vr) {
-        size_t f=j/width,u=j%width;
-        if(f>=base){dst[j]=0.0f;return;}
-        v+=alpha*src[(base+f%vr)*width+u];
+    constexpr float scale=KIND==0?127.0f:KIND==1?64.0f:8128.0f;
+    constexpr float lo=KIND==0?-32768.0f:KIND==1?-128.0f:-2147483648.0f;
+    constexpr float hi=KIND==0?32767.0f:KIND==1?127.0f:2147483647.0f;
+    dst[j]=sfnn_quantize_dequant_clamped(src[j],scale,lo,hi);
+}
+__global__ void layer_qat_ft_fold_kernel(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha) {
+    const size_t f=blockIdx.x;
+    // One feature per block: no per-weight 64-bit division/modulo.
+    const size_t vrow=base+f%vr;
+    for(size_t u=threadIdx.x;u<width;u+=blockDim.x) {
+        const size_t j=f*width+u;
+        if(f>=base) {dst[j]=0.0f;continue;}
+        float v=src[j]+alpha*src[vrow*width+u];
+        dst[j]=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f);
     }
-    dst[j]=sfnn_quantize_dequant_clamped(v,scale,lo,hi);
 }
 extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,
     float scale,float lo,float hi,size_t base,size_t vr,size_t width,float alpha) {
     if(!ctx || !src || !dst || validate_buffer(ctx,dst,src->len,"layer QAT output"))return -1;
-    layer_qat_kernel<<<static_cast<unsigned>((src->len+255)/256),256,0,ctx->stream>>>(
-        src->ptr,dst->ptr,src->len,scale,lo,hi,base,vr,width,alpha);
+    const unsigned blocks=static_cast<unsigned>((src->len+255)/256);
+    if(vr) {
+        if(!width || src->len!=(base+vr)*width) return fail_message("invalid layer QAT FT layout");
+        layer_qat_ft_fold_kernel<<<static_cast<unsigned>(base+vr),256,0,ctx->stream>>>(src->ptr,dst->ptr,base,vr,width,alpha);
+    } else if(scale==127.0f) layer_qat_vector_kernel<0><<<blocks,256,0,ctx->stream>>>(src->ptr,dst->ptr,src->len);
+    else if(scale==64.0f) layer_qat_vector_kernel<1><<<blocks,256,0,ctx->stream>>>(src->ptr,dst->ptr,src->len);
+    else if(scale==8128.0f) layer_qat_vector_kernel<2><<<blocks,256,0,ctx->stream>>>(src->ptr,dst->ptr,src->len);
+    else return fail_message("unsupported layer QAT scale");
     return check_kernel_launch("layer QAT");
 }
 

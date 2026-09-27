@@ -28,6 +28,7 @@ CUDA SFNN supports independent `sfnn_qat_ft`, `sfnn_qat_l2`, and `sfnn_qat_l3` b
 - Direct, worker, profiling and gradient accumulation paths are supported. Checkpoints retain FP32 masters and optimizer state; export format is unchanged. Toggle on resume or use an epoch schedule such as `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}`.
 - With BN enabled, a warning is printed and these three flags are disabled. Use `sfnn_bn_qat` instead.
 - Each selected layer needs a GPU FP32 weight/bias copy. FT1024 HalfKA2 with factorization costs about 512 MiB extra; L2/L3-only QAT does not allocate an FT copy. Rounding adds runtime overhead.
+- During gradient accumulation, rounded copies are reused until a weight update. Updates, restores and selected-layer configuration changes trigger a refresh.
 - Legacy L2/L3 factorizer tensors are unsupported.
 
 For an eight-condition grid use `--grid sfnn-qat-ft false true --grid sfnn-qat-l2 false true --grid sfnn-qat-l3 false true`. Use only `true` per flag to enable all three in a single condition. The L1 flag is independent.

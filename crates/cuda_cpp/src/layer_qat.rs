@@ -6,6 +6,7 @@ pub(crate) struct State {
     ft: Option<(F32Buffer, F32Buffer)>,
     l2: Option<(F32Buffer, F32Buffer)>,
     l3: Option<(F32Buffer, F32Buffer)>,
+    signature: Option<(bool, bool, bool, usize, u32)>,
 }
 
 pub(crate) fn enabled(lr: SfnnLayerLrMultipliers) -> bool {
@@ -327,20 +328,27 @@ pub(crate) fn step<T>(
     }
     let mut q = std::mem::take(&mut r.layer_qat);
     let result = (|| {
-        prepare(
-            ctx,
-            &mut q.ft,
-            &r.weights.l0w,
-            &r.weights.l0b,
-            lr.qat_ft,
-            true,
-            base,
-            vr,
-            r.shape.ft_size,
-            r.factorizer_alpha.ft,
-        )?;
-        prepare(ctx, &mut q.l2, &r.weights.l2w, &r.weights.l2b, lr.qat_l2, false, 0, 0, 1, 1.0)?;
-        prepare(ctx, &mut q.l3, &r.weights.l3w, &r.weights.l3b, lr.qat_l3, false, 0, 0, 1, 1.0)?;
+        let signature = (lr.qat_ft, lr.qat_l2, lr.qat_l3, vr, r.factorizer_alpha.ft.to_bits());
+        // Masters are unchanged within a gradient-accumulation group. Never
+        // reuse across an update or restore (both reset pending batches).
+        let refresh = r.pending_gradient_batches == 0 || q.signature != Some(signature);
+        if refresh {
+            prepare(
+                ctx,
+                &mut q.ft,
+                &r.weights.l0w,
+                &r.weights.l0b,
+                lr.qat_ft,
+                true,
+                base,
+                vr,
+                r.shape.ft_size,
+                r.factorizer_alpha.ft,
+            )?;
+            prepare(ctx, &mut q.l2, &r.weights.l2w, &r.weights.l2b, lr.qat_l2, false, 0, 0, 1, 1.0)?;
+            prepare(ctx, &mut q.l3, &r.weights.l3w, &r.weights.l3b, lr.qat_l3, false, 0, 0, 1, 1.0)?;
+            q.signature = Some(signature);
+        }
         q.swap(&mut r.weights);
         let inner = SfnnLayerLrMultipliers { qat_ft: false, qat_l2: false, qat_l3: false, ..lr };
         let value = run(r, inner);

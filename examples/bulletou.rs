@@ -19019,6 +19019,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             profile_update_ms / denom,
             profile_total_ms / denom
         );
+        eprintln!("  cuda-cpp SFNN teacher timing: batches={} queue_wait={:.3}s load_sum={:.3}s prepare_sum={:.3}s (producer sums overlap GPU work)",
+            sfnn_diagnostics.batches, sfnn_diagnostics.teacher_queue_wait_sec,
+            sfnn_diagnostics.teacher_load_sec, sfnn_diagnostics.teacher_prepare_sec);
         eprintln!(
             "  cuda-cpp SFNN backward profile avg: zero={:.3}ms l3={:.3}ms l2={:.3}ms l2_input={:.3}ms \
              l1={:.3}ms l0={:.3}ms total={:.3}ms",
@@ -25050,7 +25053,7 @@ fn print_sfnn_qat_mode(args: &Args) {
     print_startup_kv(
         "L1 QAT",
         if args.effective_sfnn_qat_l1() {
-            "on: folded weight round(64*w)/64, bias round(8128*b)/8128; identity STE; FT/L2/L3 unchanged"
+            "on: folded weight round(64*w)/64, bias round(8128*b)/8128; identity STE; FT/L2/L3 use their separate QAT flags"
         } else {
             "off"
         },
