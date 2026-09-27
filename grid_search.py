@@ -571,14 +571,25 @@ def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
 def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[int]]:
     """Read-only reconciliation. Preserve IDs, folders and unselected conditions."""
     if (stored.get("version") != 1 or any(stored.get(k) != requested.get(k) for k in ("exe", "cwd"))
-            or set(stored.get("axes", {})) != set(requested["axes"])):
-        raise ValueError("existing grid manifest differs: resume requires the same executable path, cwd and grid axis names")
+            or not set(requested["axes"]).issubset(stored.get("axes", {}))):
+        raise ValueError("existing grid manifest differs: resume requires the same executable path and cwd; adding grid axis names is not supported")
+    removed_axes = set(stored["axes"]) - set(requested["axes"])
+    # Keep original parameters/axes as persistent identities. Removed axes
+    # no longer override candidate settings; epoch history retains old values.
     merged = copy.deepcopy(stored)
     merged["changed_setting_columns"] = changed_setting_columns(stored)
     selected = set()
+    ordered_ids = []
     report_epochs = set(stored["report_epochs"]) | set(requested["report_epochs"])
     for candidate in requested["trials"]:
-        matches = [t for t in merged["trials"] if t["parameters"] == candidate["parameters"]]
+        matches = [t for t in merged["trials"]
+                   if {k: v for k, v in t["parameters"].items() if k not in removed_axes} == candidate["parameters"]]
+        if removed_axes and len(matches) != 1:
+            raise ValueError(
+                f"cannot resume after removing grid axes {', '.join(sorted(removed_axes))}: "
+                f"remaining condition {candidate['parameters']} matches {len(matches)} existing trials "
+                f"(ids={[t['id'] for t in matches]}). Keep the removed --grid options to select one existing trial; "
+                "nothing was overwritten.")
         if not matches:
             trial = copy.deepcopy(candidate)
             trial["id"] = max(t["id"] for t in merged["trials"]) + 1
@@ -592,6 +603,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
                 if value not in merged["axes"][key]:
                     merged["axes"][key].append(value)
             selected.add(trial["id"])
+            ordered_ids.append(trial["id"])
             continue
         if len(matches) != 1:
             raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
@@ -621,10 +633,10 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         if new > old:
             report_epochs.update(range(old + 1, new + 1))
         selected.add(trial["id"])
+        ordered_ids.append(trial["id"])
     merged["report_epochs"] = sorted(report_epochs)
     # IDs identify persistent outputs; list order follows this invocation's CLI.
-    ordered = [next(t for t in merged["trials"] if t["parameters"] == c["parameters"])
-               for c in requested["trials"]]
+    ordered = [next(t for t in merged["trials"] if t["id"] == trial_id) for trial_id in ordered_ids]
     merged["trials"] = ordered + [t for t in merged["trials"] if t["id"] not in selected]
     return merged, selected
 

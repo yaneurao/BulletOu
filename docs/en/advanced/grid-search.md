@@ -1,5 +1,11 @@
 # Compare training conditions with grid search
 
+### Removing a grid axis on resume
+
+With `--resume`, you can remove e.g. `--grid lr 0.0004` and use the settings-file LR or epoch schedule instead, provided the remaining axes uniquely identify an existing trial. Its directory/checkpoint identity and completed-epoch settings/results are preserved. Original parameters retain the old LR as historical identity; `[SETTINGS CHANGED]` and per-epoch CSV settings show the effective changes.
+
+If removing an axis makes multiple existing trials match, the runner refuses to choose silently. Retained grid-axis values continue to identify conditions. Check with `--resume --dry-run` without modifying files or starting training.
+
 For independent FT/L1/L2 BatchNorm switches, defaults, limitations and grid examples, see [Batch normalization](batch-normalization.md).
 
 ## Short experiments without editing common settings

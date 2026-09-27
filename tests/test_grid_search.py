@@ -15,6 +15,28 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_resume_removed_lr_axis_preserves_epoch_history(self):
+        self.argv = self.argv[:-3]
+        self.argv += ["--grid", "loss_bce_with_logits", "true"]
+        old = self.plan(["--grid", "lr", "0.0004"])
+        self.complete_plan(old)
+        grid.atomic_json(self.settings_path, {**self.common, "lr": {"epoch1": 0.0004, "epoch3": 0.0007}, "max_epochs": 3})
+        requested = self.plan()
+        merged, selected = grid.plan_resume(self.output, old, requested)
+        self.assertEqual(selected, {1})
+        self.assertEqual(merged["trials"][0]["name"], old["trials"][0]["name"])
+        _, rows = grid.summarize(self.output, merged)
+        self.assertEqual([r["lr"] for r in rows], [0.0004, 0.0004, 0.0007])
+        again, _ = grid.plan_resume(self.output, merged, requested)
+        self.assertEqual(len(again["trials"]), 1)
+
+    def test_resume_removed_lr_axis_rejects_ambiguous_trials(self):
+        old = self.plan(["--grid", "loss_bce_with_logits", "true"])
+        self.argv = self.argv[:-3]
+        self.argv += ["--grid", "loss_bce_with_logits", "true"]
+        with self.assertRaisesRegex(ValueError, "matches 2 existing trials"):
+            grid.plan_resume(self.output, old, self.plan())
+
     def test_l1_alpha_alias_preserves_grid_identity(self):
         old = self.plan(["--grid", "sfnn-factorizer-alpha", "shared=0.5", "shared=1"])
         new = self.plan(["--grid", "sfnn-l1-factorizer-alpha", "shared=0.5", "shared=1"])

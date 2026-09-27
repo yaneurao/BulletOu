@@ -1,5 +1,11 @@
 # Grid searchで学習条件を比較する
 
+### 再開時にgrid軸を外す
+
+`--resume` 時に、たとえば `--grid lr 0.0004` を外してsettings.jsonのlr（epoch別スケジュールも可）へ切り替えられます。残したgrid条件で既存trialが一意に決まる場合に限り、同じフォルダ・checkpointから継続します。完了済みepochの設定・集計値は保持します。trialの元の条件ID・parametersには旧lrが残りますが、実際に次回使う値は`[SETTINGS CHANGED]`およびepoch別のCSVに反映されます。
+
+以前lrを複数値で試していて、外すと複数trialに一致する場合は、勝手に選ばずエラーにします。明示して残したgrid軸の値は従来どおり条件の識別に使います。`--resume --dry-run`で、ファイル変更・学習起動なしに確認できます。
+
 FT・L1・L2のBNは `--grid sfnn-bn-ft false true`、`--grid sfnn-bn-l1 false true`、
 `--grid sfnn-bn-l2 false true` で比較できます。全指定で8条件です。
 初期値・併用制限・保存仕様は [Batch Normalization](batch-normalization.md) を参照してください。
