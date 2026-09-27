@@ -8,6 +8,12 @@ You do not need this page for a first training run. Read it when you want to com
 
 ## Configure FT sharing separately from later-layer sharing
 
+### Convert a trained FT factorizer to OFF
+
+For non-BN `SFNN_halfka2` checkpoints, run `python convert_ft_factorizer_off.py --checkpoint <checkpoint-directory> --output <new-directory>` (requires NumPy). The source is unchanged. Master and Lookahead slow FT weights are folded separately. Individual FT momentum/velocity and step counters are retained; virtual-row momentum/velocity is discarded. This does not preserve the factorized optimizer update. Other layers are unchanged, and every output record is verified.
+
+Continue training into a separate output directory with `--initial-state <new-directory>/state.bin --initial-dataloader-pos <new-directory>/dataloader_pos.txt --ft-factorizer false`. Use the copied `progress.bin` when applicable. No `nn.bin` is copied. Effective weights are preserved at conversion, so switching off does not instantly reduce saturation.
+
 `SFNN_halfka2` architectures also share weights in the feature transformer (FT), the first layer that turns input features into neuron activations.
 For king position `k` and piece feature `p` (piece type, ownership, square, etc.), each FT neuron's weight is:
 
