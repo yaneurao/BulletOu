@@ -819,6 +819,22 @@ class GridSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outside trials"):
             self.run_grid(["--summary-csv", str(self.output / "trials" / "a" / "summary-learn.csv")])
 
+    def test_flat_trial_layout_and_summary_protection(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        self.assertEqual(directory, self.output / trial["name"])
+        with self.assertRaisesRegex(ValueError, "outside trials"):
+            self.run_grid(["--summary-csv", str(directory / "summary-learn.csv")])
+
+    def test_legacy_nested_manifest_retains_location_on_resume(self):
+        old = self.plan()
+        for trial in old["trials"]:
+            trial["settings"]["output"] = str(self.output / "trials" / trial["name"])
+        merged, _ = grid.plan_resume(self.output, old, self.plan())
+        for trial in merged["trials"]:
+            self.assertEqual(grid.trial_dir(self.output, trial), self.output / "trials" / trial["name"])
+
     def saved_scale_grid(self):
         argv = [*self.argv[:-3], "--wrm-target-scalings", "600", "1200", "1800"]
         plan = grid.make_plan(grid.parse_args(argv))
@@ -893,7 +909,8 @@ class GridSearchTests(unittest.TestCase):
 
     def test_resume_adds_conditions_without_changing_existing_results(self):
         argv, old = self.saved_scale_grid()
-        before = {p: p.read_bytes() for p in (self.output / "trials").rglob("*") if p.is_file()}
+        before = {p: p.read_bytes() for t in old["trials"]
+                  for p in grid.trial_dir(self.output, t).rglob("*") if p.is_file()}
         requested = [*argv[:-3], "2400", "600", "3000", "--resume"]
         seen = []
         def child(command, directory, cwd, trial_id):

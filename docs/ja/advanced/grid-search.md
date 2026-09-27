@@ -99,12 +99,12 @@ LR 2通り × 教師側scaling 2通り = **4条件**です。`--dry-run` は実�
 | 引数 | 意味 |
 | --- | --- |
 | `--settings-file PATH` | 共通のBulletOu設定JSON。集計だけの場合は不要 |
-| `--output-folder DIR` | **このgrid専用**の保存先。直下に `grid_summary.csv`、`trials/` を作る。必須 |
+| `--output-folder DIR` | **このgrid専用**の保存先。直下に `grid_summary.csv` と各 `trial0001-…/` を作る。必須 |
 | `--exe PATH` | 学習実行ファイル。既定はスクリプト隣の `target/release/examples/bulletou.exe`。Ubuntuでは対応する実行ファイルを指定 |
 | `--checkpoint DIR` | 全条件の共通開始checkpoint。非空の `state.bin` と `dataloader_pos.txt` が必要 |
 | `--epochs 1 2 5` | 集計したいepoch番号。各条件を一度だけ最大値5まで学習し、1・2・5の結果を出す。省略時はJSONの `max_epochs` まで学習し全epochを集計 |
 | `--summary-only` | 保存済みmanifestと各条件のログからCSVだけ再生成する。学習・実行ファイル・共通設定JSONは不要 |
-| `--summary-csv PATH` | 集計CSVの出力先。既定はgrid rootの `grid_summary.csv`。元ログ保護のため `trials/` 内は指定不可 |
+| `--summary-csv PATH` | 集計CSVの出力先。既定はgrid rootの `grid_summary.csv`。元ログ保護のため各trialフォルダ内（旧 `trials/` 内も含む）は指定不可 |
 | `--dry-run` | 計画表示のみ。学習・ファイル作成なし |
 | `--resume` | 未完了条件を最新保存checkpointから再開する。checkpointがなければ途中ログを退避して元の初期状態から再実行 |
 | `--continue-on-error` | ある条件が学習エラーになっても残りを実行する。エラーがあればrunnerの終了コードは非0 |
@@ -143,21 +143,22 @@ python .\grid_search.py `
 
 ## 出力と集計
 
+新規trialはgrid root直下に配置します。既存manifestの `trials/` 配下にあるtrialは移動せず、`--resume` で従来の場所から再開します。追加条件の新規trialは直下に作ります。
+
 ```text
 grid-target-scale/
   grid-manifest.json
   grid_summary.csv
   grid.lock
-  trials/
-    trial0001-lr=...-<hash>/
-      bulletou-settings.json
-      grid-state.json
-      stdout.log
-      summary-learn.csv
-      summary-epoch-last.csv
-      0001/state.bin, nn.bin, dataloader_pos.txt, ...
-    trial0002-.../
-      ...
+  trial0001-lr=...-<hash>/
+    bulletou-settings.json
+    grid-state.json
+    stdout.log
+    summary-learn.csv
+    summary-epoch-last.csv
+    0001/state.bin, nn.bin, dataloader_pos.txt, ...
+  trial0002-.../
+    ...
 ```
 
 短いhashは条件全体から作ります。フォルダ名では省略された条件も `bulletou-settings.json` とmanifestに残ります。再開時だけ、開始state指定を外した `bulletou-resume-settings.json` も作ります。

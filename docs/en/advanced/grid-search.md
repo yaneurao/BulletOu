@@ -97,12 +97,12 @@ Lists form a Cartesian product, not zipped pairs. Invalid combinations such as `
 | Argument | Meaning |
 | --- | --- |
 | `--settings-file PATH` | Common BulletOu JSON; unnecessary for summary-only |
-| `--output-folder DIR` | Required, dedicated grid root for `grid_summary.csv` and `trials/` |
+| `--output-folder DIR` | Required, dedicated grid root containing `grid_summary.csv` and each `trial0001-…/` directly |
 | `--exe PATH` | Defaults to `target/release/examples/bulletou.exe` next to the script. Supply the appropriate executable on Ubuntu |
 | `--checkpoint DIR` | Common starting checkpoint directory with nonempty `state.bin` and `dataloader_pos.txt` |
 | `--epochs 1 2 5` | Train each condition once through epoch 5 and report epochs 1, 2, 5. Omitted: use JSON `max_epochs`, reporting every epoch |
 | `--summary-only` | Rebuild aggregate CSV from the manifest and logs; no training, executable, or original settings needed |
-| `--summary-csv PATH` | Defaults to `<grid root>/grid_summary.csv`. Must be a `.csv` outside `trials/` to protect source logs |
+| `--summary-csv PATH` | Defaults to `<grid root>/grid_summary.csv`. Must be a `.csv` outside all trial directories (including legacy `trials/`) to protect source logs |
 | `--dry-run` | Plan only; no writes or training |
 | `--resume` | Resume unfinished conditions from their latest checkpoints; archive unsaved attempts and restart from the original initial state if no checkpoint exists |
 | `--continue-on-error` | Continue remaining conditions after a child training failure. Runner still exits nonzero if any failed |
@@ -146,17 +146,18 @@ grid-target-scale/
   grid-manifest.json
   grid_summary.csv
   grid.lock
-  trials/
-    trial0001-lr=...-<hash>/
-      bulletou-settings.json
-      grid-state.json
-      stdout.log
-      summary-learn.csv
-      summary-epoch-last.csv
-      0001/state.bin, nn.bin, dataloader_pos.txt, ...
-    trial0002-.../
-      ...
+  trial0001-lr=...-<hash>/
+    bulletou-settings.json
+    grid-state.json
+    stdout.log
+    summary-learn.csv
+    summary-epoch-last.csv
+    0001/state.bin, nn.bin, dataloader_pos.txt, ...
+  trial0002-.../
+    ...
 ```
+
+New trials are created directly under the grid root. Existing manifests retain their nested `trials/` paths on `--resume`; existing folders are not moved. Newly added conditions use the flat layout.
 
 The short hash covers the complete condition; full settings are kept in the per-trial JSON and manifest. Resuming also writes `bulletou-resume-settings.json`, omitting the common initial-state arguments so BulletOu resumes the trial itself.
 

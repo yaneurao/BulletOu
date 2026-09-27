@@ -106,7 +106,7 @@ def parse_value(text: str):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0], allow_abbrev=False)
     p.add_argument("--settings-file", type=Path, help="Common bulletou-settings.json; not tuning-settings.json")
-    p.add_argument("--output-folder", type=Path, required=True, help="Dedicated grid root containing trials/ and grid_summary.csv")
+    p.add_argument("--output-folder", type=Path, required=True, help="Dedicated grid root containing trial directories and grid_summary.csv")
     p.add_argument("--exe", type=Path, default=Path(__file__).resolve().parent / "target/release/examples/bulletou.exe")
     p.add_argument("--checkpoint", type=Path, help="Common initial checkpoint DIRECTORY (state.bin + dataloader_pos.txt)")
     p.add_argument("--epochs", type=int, nargs="+", help="Epochs to report, e.g. 1 2 5; train each condition once through max=5")
@@ -299,7 +299,7 @@ def make_plan(args) -> dict:
         label = "_".join(f"{k}={v}" for k, v in params.items())
         label = re.sub(r"[^A-Za-z0-9_.=+-]", "-", label)[:64].rstrip(".")
         name = f"trial{index:04}-{label}-{digest}"
-        settings["output"] = str(root / "trials" / name)
+        settings["output"] = str(root / name)
         # Explicit --output preserves this exact folder; tag is metadata only.
         settings["tag"] = name
         trials.append({"id": index, "name": name, "parameters": params, "settings": settings})
@@ -355,7 +355,16 @@ def trial_dir(root: Path, trial: dict) -> Path:
     name = trial["name"]
     if Path(name).name != name or name in (".", "..") or "/" in name or "\\" in name:
         raise ValueError("invalid trial directory in manifest")
-    return root / "trials" / name
+    # Existing manifests retain their original nested location on resume.
+    output = Path(trial["settings"]["output"]).resolve()
+    if output not in ((root / name).resolve(), (root / "trials" / name).resolve()):
+        raise ValueError("invalid trial output directory in manifest")
+    return output
+
+
+def validate_summary_path(root: Path, plan: dict, path: Path) -> None:
+    if any(path.is_relative_to(trial_dir(root, trial)) for trial in plan["trials"]):
+        raise ValueError("--summary-csv must be outside trials' directories (source logs are never overwritten)")
 
 
 def log_rows(directory: Path, *, live=False) -> list[dict]:
@@ -546,7 +555,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             trial = copy.deepcopy(candidate)
             trial["id"] = max(t["id"] for t in merged["trials"]) + 1
             trial["name"] = f"trial{trial['id']:04}-" + candidate["name"].split("-", 1)[1]
-            trial["settings"]["output"] = str(root / "trials" / trial["name"])
+            trial["settings"]["output"] = str(root / trial["name"])
             trial["settings"]["tag"] = trial["name"]
             if trial_dir(root, trial).exists():
                 raise ValueError(f"new condition output already exists: {trial_dir(root, trial)}")
@@ -804,6 +813,7 @@ def main(argv=None) -> int:
         plan = read_json(manifest_path)
         if plan.get("version") != 1:
             raise ValueError("unsupported grid manifest version")
+        validate_summary_path(root, plan, summary_path)
         with grid_lock(root):
             rows = write_summary(root, plan, summary_path, sorted(set(args.epochs)) if args.epochs else None)
         print_leaders(rows)
@@ -817,6 +827,7 @@ def main(argv=None) -> int:
         plan, selected = plan_resume(root, stored, plan)
     elif stored is not None and stored != plan:
         raise ValueError("existing grid manifest differs from this plan; restore the original settings/grid or choose a different --output-folder (nothing was overwritten)")
+    validate_summary_path(root, plan, summary_path)
     execution_plan = {**plan, "trials": [t for t in plan["trials"] if t["id"] in selected]}
     preflight_exe(execution_plan)
     print(f"[CONFIG] conditions={len(selected)} total_conditions={len(plan['trials'])} report_epochs={plan['report_epochs']} sequential=true", flush=True)
@@ -857,8 +868,8 @@ def main(argv=None) -> int:
             if stored != plan:
                 atomic_json(manifest_path, plan)
         else:
-            if (root / "trials").exists() or summary_path.exists():
-                raise ValueError("output contains trials/ or a summary but no manifest; use an empty grid root")
+            if (root / "trials").exists() or any(root.glob("trial*")) or summary_path.exists():
+                raise ValueError("output contains trial directories or a summary but no manifest; use an empty grid root")
             atomic_json(manifest_path, plan)
         if args.resume:
             restart_unsaved_trials(root, plan, selected)
