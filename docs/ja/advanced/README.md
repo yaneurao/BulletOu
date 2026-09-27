@@ -16,6 +16,7 @@
 | [population search による自動調整](auto-tuning.md) | 採用したcheckpointから次の候補へ進む方式の自動調整 |
 | [loss の scale と `FV_SCALE`](scale-and-fv-scale.md) | WRM loss、sigmoid loss、量子化後の出力 scale |
 | [追加学習](additional-training.md) | 完了済み checkpoint からさらに学習する方法 |
+| [L1定数unitの再初期化](l1-revive.md) | BNなしで常時1／常時0のunitを復元時に再初期化 |
 | [LayerStack](layerstack.md) | SFNN の hand / king / progress bucket |
 | [対局棋譜から進行度分類器を作る](progress-training.md) | `.pack` の対局内位置から `progress.bin` を学習する |
 | [SFNN factorizer](sfnn-factorizer.md) | shared / axis / pair factorizer と alpha |

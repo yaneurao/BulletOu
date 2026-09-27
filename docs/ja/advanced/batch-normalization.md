@@ -24,6 +24,8 @@ python .\grid_search.py --settings-file settings.json --output-folder results --
 
 ## 復元時のL2定数unit再利用
 
+BNなしのL1用は別機能です。[L1定数unitの再初期化](l1-revive.md)を参照してください。
+
 常時出力0のunitには、独立した `--sfnn-l2-revive-zero`（JSON: `"sfnn_l2_revive_zero": true`、既定false）を使います。上限側の `sfnn_l2_revive` と同時指定できます。
 
 ```json

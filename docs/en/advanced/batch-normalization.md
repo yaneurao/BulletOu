@@ -43,6 +43,8 @@ Later false values resume statistics updates. Resume resolves the resumed epoch;
 
 ## One-shot L2 revival on restore
 
+For non-BN L1, see the separate [L1 revival feature](l1-revive.md).
+
 For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_l2_revive_zero": true`, default false). It can be combined with upper revival:
 
 ```json

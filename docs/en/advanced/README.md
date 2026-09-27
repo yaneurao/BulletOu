@@ -16,6 +16,7 @@ If you only want to run your first training job, start with the [Tutorial](../tu
 | [Automatic population search tuning](auto-tuning.md) | Tuning that continues from accepted checkpoints |
 | [Loss scale and `FV_SCALE`](scale-and-fv-scale.md) | WRM loss, plain sigmoid loss, and quantized output scale |
 | [Continued training](additional-training.md) | Add epochs after a finished run, or continue with a new teacher or LR |
+| [Revive constant L1 units](l1-revive.md) | Restore-time revival of always-one/zero non-BN L1 units |
 | [LayerStack](layerstack.md) | SFNN hand / king / progress buckets |
 | [Train a progress classifier](progress-training.md) | Learn `progress.bin` from relative positions inside complete `.pack` games |
 | [SFNN factorizer](sfnn-factorizer.md) | Shared components between buckets, axis/pair, and alpha |

@@ -15,6 +15,12 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_l1_revival_grid_flags(self):
+        for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero"):
+            plan = self.plan(["--grid", key.replace("_", "-"), "false", "true"])
+            self.assertEqual({t["settings"][key] for t in plan["trials"]}, {False, True})
+            self.assertIn(key, grid.COMMON_COLUMNS)
+
     def test_selected_layer_qat_grid_and_schedule(self):
         for key in ("sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3"):
             plan = self.plan(["--grid", key.replace("_", "-"), "false", "true"])

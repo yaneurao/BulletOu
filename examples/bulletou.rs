@@ -5307,6 +5307,12 @@ struct Args {
     /// On checkpoint restore, revive always-zero L2 units once using teacher calibration.
     #[arg(long)]
     sfnn_l2_revive_zero: bool,
+    /// Restore only: revive L1 units whose normal AND squared branches are always upper.
+    #[arg(long)]
+    sfnn_l1_revive: bool,
+    /// Restore only: revive L1 units whose normal AND squared branches are always zero.
+    #[arg(long)]
+    sfnn_l1_revive_zero: bool,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5486,6 +5492,18 @@ impl Args {
         }
         if (self.sfnn_l2_revive || self.sfnn_l2_revive_zero) && !(self.sfnn_bn_l2 && self.sfnn_bn_qat && self.sfnn_bn_qat_freeze_stats) {
             return Err("--sfnn-l2-revive / --sfnn-l2-revive-zero require --sfnn-bn-l2, --sfnn-bn-qat and --sfnn-bn-qat-freeze-stats; apply only on checkpoint restore".into());
+        }
+        if (self.sfnn_l1_revive || self.sfnn_l1_revive_zero) &&
+            (self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2) {
+            return Err("L1 revival currently supports non-BN SFNN only".into());
+        }
+        if self.sfnn_l1_revive || self.sfnn_l1_revive_zero {
+            let spec=effective_sfnn_factorizer_spec(self);
+            if self.backend!=BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
+                || self.arch().sfnn_l1_group_count()!=1 || self.arch().sfnn_l1_common_size.is_some()
+                || (spec!=SfnnFactorizerSpec::NONE && spec!=SfnnFactorizerSpec::SHARED) {
+                return Err("L1 revival requires cuda-cpp dense SFNN with L1 factorizer none/shared".into());
+            }
         }
         if self.sfnn_bn_l2_effective_weight_clip &&
             !(self.sfnn_bn_l2 && self.sfnn_bn_qat && self.sfnn_bn_qat_freeze_stats) {
@@ -8661,6 +8679,7 @@ fn sfnn_initial_weights_into_readback(
 ) -> bulletou_cuda_cpp::SfnnTrainWeightsReadback {
     bulletou_cuda_cpp::SfnnTrainWeightsReadback {
         batch_norm: weights.batch_norm,
+        l1_revival_flags: weights.l1_revival_flags,
         l0w: weights.l0w,
         l0b: weights.l0b,
         l1w: weights.l1w,
@@ -9508,6 +9527,7 @@ fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
     let qb = f32::from(SFNN_QB);
     let fc_bias_scale = qa * qb;
     let proxy = CudaCppSfnnInitialWeights {
+        l1_revival_flags: 0,
         batch_norm: Default::default(),
         shape: proxy_shape,
         l0w: sfnn_quantize_dequant_i16(l0w_for_proxy, qa),
@@ -9636,6 +9656,7 @@ fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Res
     }
 
     let proxy = CudaCppSfnnInitialWeights {
+        l1_revival_flags: 0,
         batch_norm: Default::default(),
         shape,
         l0w,
@@ -10723,6 +10744,7 @@ impl WorkerSfnnSession {
             format_count(batch_size)
         );
         if args.sfnn_l2_revive || args.sfnn_l2_revive_zero { return Err("L2 revival is supported by direct training/grid_search, not worker trials".into()); }
+        if args.sfnn_l1_revive || args.sfnn_l1_revive_zero { return Err("L1 revival is supported by direct training/grid_search, not worker trials".into()); }
         let initial_state = build_sfnn_initial_state_for_cuda_cpp(&args, feature_kind)?;
         let progress_state = initial_state.progress.clone();
         let progress_params = cuda_cpp_sfnn_progress_params_for_state(progress_state.as_ref())?;
@@ -10758,6 +10780,7 @@ impl WorkerSfnnSession {
         }
         .map_err(|e| e.to_string())?;
         let count_settings = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
+        runner.l1_revival_flags = initial_weights.l1_revival_flags;
         let dataloader_pos =
             cuda_cpp_auto_resume_dataloader_pos(&args, batch_size, initial_state.completed_steps, "nnue")?;
         let validation_cache =
@@ -17422,6 +17445,60 @@ fn run_cuda_cpp_sfnn_ka2_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
+    use bulletou_cuda_cpp::*;
+    let upper=args.sfnn_l1_revive && !runner.l1_revival_done();
+    let zero=args.sfnn_l1_revive_zero && !runner.l1_zero_revival_done();
+    if !upper && !zero {
+        eprintln!("  [L1 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
+    }
+    if runner.batch_norm.is_some() || runner.factorizer.any_axis() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+        || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
+        return Err("--sfnn-l1-revive currently requires non-BN dense L1, no axes/count gates, and no legacy L2/L3 factorizers".into());
+    }
+    let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
+    let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
+    let proxy=SfnnForwardDeviceWeights::new_dense(ctx,shape).map_err(|e|e.to_string())?;
+    runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
+    let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,cfg.batch_size)).map_err(|e|e.to_string())?;
+    let mut calibration=l1_revive::Calibration::new(shape.ft_size,shape.l1_hidden,shape.num_stacks);
+    eprintln!("  [L1 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket, upper={upper} zero={zero} (100% required); learning cursor unchanged");
+    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
+        let fast=teacher.batch;
+        let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
+        let stm=strip(&fast.stm);let nstm=strip(&fast.nstm);
+        let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch {stm_indices:&stm,nstm_indices:&nstm,
+            buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
+        sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
+        calibration.add_masked(&fast.buckets,&workspace.combined.download(ctx).map_err(|e|e.to_string())?,
+            &workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,Some(&fast.weights)).map_err(|e|e.to_string())
+    })?;
+    let candidates=calibration.candidates_for(upper,zero);
+    let mut report=String::from("bucket,unit,positions,both_upper_hits,both_zero_hits,selected\n");
+    for i in 0..calibration.upper.len() {
+        let b=i/shape.l1_hidden;
+        report.push_str(&format!("{b},{},{},{},{},{}\n",i%shape.l1_hidden,calibration.counts[b],calibration.upper[i],calibration.lower[i],candidates.contains(&i)));
+    }
+    // Persist the audit before mutating weights. Never touch the source checkpoint.
+    std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
+    let (path,mut out)=(0..10000).find_map(|i| {
+        let path=args.output_dir().join(if i==0 {"l1-revive.csv".into()} else {format!("l1-revive-{i}.csv")});
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file)=>Some(Ok((path,file))),
+            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>None,
+            Err(e)=>Some(Err(format!("{}: {e}",path.display())))
+        }
+    }).ok_or_else(||"too many L1 revival audit files".to_string())??;
+    std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
+    let ids=runner.revive_l1_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
+    eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, zero outgoing L2 columns, L2 bias compensation, selected moments reset; audit={}",ids.len(),path.display());
+    for i in ids {eprintln!("  [L1 REVIVE] bucket={} unit={} kind={}",i/shape.l1_hidden,i%shape.l1_hidden,
+        if calibration.lower[i]==calibration.counts[i/shape.l1_hidden] {"zero"} else {"upper"});}
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
@@ -17541,6 +17618,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_sfnn_initial_state_for_cuda_cpp(args, feature_kind)?;
+    if (args.sfnn_l1_revive || args.sfnn_l1_revive_zero)
+        && args.initial_state.is_none() && auto_resume_state_bin.is_none() {
+        return Err("L1 revival requires a restored checkpoint, not scratch training".into());
+    }
     if (args.sfnn_l2_revive || args.sfnn_l2_revive_zero) && initial_state.weights.batch_norm.0[2].is_none() {
         return Err("L2 revival requires a checkpoint containing calibrated L2 BN (not scratch training)".into());
     }
@@ -17950,6 +18031,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     runner.configure_batch_norm(&ctx,[args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2],
         bulletou_cuda_cpp::batch_norm::Config {epsilon:args.sfnn_bn_epsilon,momentum:args.sfnn_bn_momentum,
             initial_gamma:args.sfnn_bn_gamma,initial_beta:args.sfnn_bn_beta},&initial_weights.batch_norm).map_err(|e|e.to_string())?;
+    runner.l1_revival_flags = initial_weights.l1_revival_flags;
     if runner.batch_norm.is_some() {
         print_startup_kv("BatchNorm",format!("FT={} L1={} L2={} gamma={} beta={} momentum={} epsilon={}; FT views shared; dense bucket-wise; inference running-stat fold",
             args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon));
@@ -18057,6 +18139,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
 
     if args.sfnn_l2_revive || args.sfnn_l2_revive_zero {
         run_sfnn_l2_revival(args,feature_kind,&ctx,&mut runner,&config)?;
+    }
+    if args.sfnn_l1_revive || args.sfnn_l1_revive_zero {
+        run_sfnn_l1_revival(args,feature_kind,&ctx,&mut runner,&config)?;
     }
     let validation_cache_started = std::time::Instant::now();
     let mut sfnn_resident_validation_cache = CudaCppSfnnResidentValidationCache::try_new(
@@ -21105,6 +21190,7 @@ fn build_sfnn_validation_fast_batch(
 #[cfg(feature = "cuda-cpp-backend")]
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppSfnnInitialWeights {
+    l1_revival_flags: u8,
     batch_norm: bulletou_cuda_cpp::batch_norm::NetworkState,
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     l0w: Vec<f32>,
@@ -21588,6 +21674,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
 
     let weights = CudaCppSfnnInitialWeights {
         batch_norm: Default::default(),
+        l1_revival_flags: 0,
         shape,
         l0w,
         l0b,
@@ -22993,6 +23080,11 @@ fn load_cuda_cpp_sfnn_weights_from_records(
 
     let weights = CudaCppSfnnInitialWeights {
         batch_norm,
+        l1_revival_flags: match records.get("l1_revival_flags").map(Vec::as_slice) {
+            None => 0,
+            Some([v]) if [0.0, 1.0, 2.0, 3.0].contains(v) => *v as u8,
+            _ => return Err("invalid L1 revival flags in checkpoint".into()),
+        },
         shape,
         l0w,
         l0b: load_cuda_cpp_weight_record(records, "l0b")?,
@@ -23952,6 +24044,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
 ) -> Result<(), String> {
     let bn_records=weights.batch_norm.0.iter().map(|s|s.as_ref().map(|s|s.encode()).transpose())
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let l1_revival_record = [weights.l1_revival_flags as f32];
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
     let mut records: Vec<(&str, &[f32])> = vec![
@@ -23969,6 +24062,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
     for (i,key) in ["nnue/weights/bn_ft","nnue/weights/bn_l1","nnue/weights/bn_l2"].into_iter().enumerate() {
         if let Some(v)=&bn_records[i] {records.push((key,v.as_slice()));}
     }
+    records.push(("nnue/weights/l1_revival_flags", &l1_revival_record));
     if let Some(progress_state) = progress_state {
         records.push(("nnue/weights/progress", progress_state.params.as_slice()));
     }
@@ -27495,6 +27589,34 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn l1_revival_flags_load_legacy_and_validate() {
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_8_32","--sfnn-l1-factorizer","none",
+            "--sfnn-l1-revive","--sfnn-l1-revive-zero"]).unwrap();
+        args.validate_arch_flags().unwrap();
+        let kind=CudaCppSfnnFeatureKind::Ka2;
+        let initial=build_sfnn_initial_weights_for_cuda_cpp(&args,kind).unwrap();
+        let mut records=BTreeMap::from([
+            ("l0w".into(),initial.l0w.clone()),("l0b".into(),initial.l0b.clone()),
+            ("l1w".into(),initial.l1w.clone()),("l1b".into(),initial.l1b.clone()),
+            ("l2w".into(),initial.l2w.clone()),("l2b".into(),initial.l2b.clone()),
+            ("l3w".into(),initial.l3w.clone()),("l3b".into(),initial.l3b.clone())]);
+        assert_eq!(load_cuda_cpp_sfnn_weights_from_records(kind,initial.shape,&records).unwrap().0.l1_revival_flags,0);
+        for flags in 0..=3 {
+            records.insert("l1_revival_flags".into(),vec![flags as f32]);
+            let loaded=load_cuda_cpp_sfnn_weights_from_records(kind,initial.shape,&records).unwrap().0;
+            assert_eq!(loaded.l1_revival_flags,flags);
+            assert_eq!(sfnn_initial_weights_into_readback(loaded).l1_revival_flags,flags);
+        }
+        for invalid in [vec![],vec![4.0],vec![1.5],vec![f32::NAN],vec![1.0,2.0]] {
+            records.insert("l1_revival_flags".into(),invalid);
+            assert!(load_cuda_cpp_sfnn_weights_from_records(kind,initial.shape,&records).is_err());
+        }
+        let mut bad=args.clone();bad.sfnn_bn_l1=true;
+        assert!(bad.validate_arch_flags().unwrap_err().contains("non-BN"));
+    }
     use super::*;
     use std::ffi::OsString;
     use std::str::FromStr;
@@ -32470,6 +32592,7 @@ mod tests {
         assert_eq!(cuda_cpp_sfnn_dense_l1w_len_for_shape(shape).unwrap(), 32);
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+            l1_revival_flags: 0,
             batch_norm: Default::default(),
             l0w: vec![0.0; shape.input_size * shape.ft_size],
             l0b: vec![0.0; shape.ft_size],
@@ -32714,6 +32837,7 @@ mod tests {
         }
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
+            l1_revival_flags: 3,
             batch_norm: Default::default(),
             l0w: vec![10.0],
             l0b: vec![11.0],
@@ -32770,6 +32894,7 @@ mod tests {
         let records = parse_model_weights_bin(&bytes).unwrap();
 
         assert_eq!(records["nnue/train/shared_coefficients"], vec![0.5, 0.75]);
+        assert_eq!(records["nnue/weights/l1_revival_flags"], vec![3.0]);
         assert_eq!(records["nnue/weights/l1fw"], vec![14.0]);
         assert_eq!(records["nnue/weights/l2fw"], vec![18.0]);
         assert_eq!(records["nnue/weights/l3fb"], vec![23.0]);
@@ -32834,6 +32959,7 @@ mod tests {
             factorizer_hand_progress_pair: false,
         };
         let weights = CudaCppSfnnInitialWeights {
+            l1_revival_flags: 0,
             batch_norm: Default::default(),
             shape,
             l0w: vec![0.0; shape.input_size * shape.ft_size],
@@ -33267,6 +33393,7 @@ mod tests {
         let l1_out = shape.l1_out();
         let l2_in = shape.l2_in();
         let weights = CudaCppSfnnInitialWeights {
+            l1_revival_flags: 0,
             batch_norm: Default::default(),
             shape,
             l0w: seq(shape.input_size * shape.ft_size, 0.0),
@@ -33432,6 +33559,7 @@ mod tests {
         };
 
         let mut expected_weights = CudaCppSfnnInitialWeights {
+            l1_revival_flags: 0,
             batch_norm: Default::default(),
             shape,
             l0w: optimizer.l0w.momentum.clone(),
@@ -33516,6 +33644,7 @@ mod tests {
         let l1_out = shape.l1_out();
         let l2_in = shape.l2_in();
         let original = CudaCppSfnnInitialWeights {
+            l1_revival_flags: 0,
             batch_norm: Default::default(),
             shape,
             l0w: seq(shape.input_size * shape.ft_size, 0.0),
