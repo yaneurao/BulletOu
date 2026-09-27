@@ -19,7 +19,7 @@ Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI for a one-SB epoch 0.
 - Epoch 0 is additional to `max_epochs`; regular epoch lengths and decay schedules are unchanged. Warmup uses epoch 1 settings, including LR and BPU.
 - Regular decay begins at epoch 1. Explicit `lr_step_gamma: 1.0` keeps LR constant during regular epochs.
 - Resume continues at the saved epoch/SB, without repeating warmup. A completed epoch 0 resumes at epoch 1. Separate initial-state runs and independent grid/worker trials start a new epoch 0.
-- Epoch 0 follows the normal save/validation intervals and epoch-end save controls. It is recorded in `summary-learn.csv`, `summary-epoch-last.csv`, and `grid_summary.csv`. This differs from the old within-epoch-1 warmup semantics: start comparisons in a new output folder.
+- Epoch 0 follows the normal save/validation intervals and epoch-end save controls. It is recorded in `summary-learn.csv` and `grid_summary.csv`. This differs from the old within-epoch-1 warmup semantics: start comparisons in a new output folder.
 - `warmup_sb` is run-wide, not an epoch-mapped setting. It is recorded in checkpoint metadata and grid CSV.
 
 With common settings configured for 16 SB and one epoch, compare three conditions:
@@ -151,7 +151,6 @@ grid-target-scale/
     grid-state.json
     stdout.log
     summary-learn.csv
-    summary-epoch-last.csv
     0001/state.bin, nn.bin, dataloader_pos.txt, ...
   trial0002-.../
     ...
@@ -181,7 +180,7 @@ One row represents **one condition × one reported epoch**:
 
 Missing/non-finite metrics remain blank. Older measured values are never substituted into an unmeasured final row. `last8_*` uses SB numbers N−7 through N, where N is the final SB, **not the last eight validation events**. Epochs shorter than eight SB use the whole epoch; the window never crosses epochs (warmup epoch 0 is independent). Missing/non-finite values are excluded separately for each metric; no valid values means blank. Averages for unfinished epochs remain blank. At completion, stdout lists the best epoch-end condition independently for all four metrics; no overall score/winner is silently chosen.
 
-On the next launch or `--summary-only`, existing aggregate CSVs are rebuilt from source logs with the new columns. No executable rebuild is needed; an already running runner is unaffected. Native `summary-learn.csv` and `summary-epoch-last.csv` are not modified.
+On the next launch or `--summary-only`, existing aggregate CSVs are rebuilt from source logs with the new columns. No executable rebuild is needed; an already running runner is unaffected. Native `summary-learn.csv` is not modified.
 
 Native save frequency and epoch-end saves are unchanged. **The runner neither deletes checkpoints nor makes best-checkpoint copies.** Budget disk space for all conditions' saves.
 

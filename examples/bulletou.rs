@@ -9130,11 +9130,6 @@ fn update_summary_log_quantized_metrics_and_diagnostics(
     let mut out = lines.join("\n");
     out.push('\n');
     std::fs::write(&top, out).map_err(|err| format!("failed to write {}: {err}", top.display()))?;
-    // qvalid can finish after the ordinary-validation/save row was appended.
-    // Refresh only completed epochs; never add a column for a mid-epoch qvalid.
-    let refresh = existing_epoch_summary_end(output_dir)
-        .and_then(|end| if epoch <= end { refresh_epoch_last_summary(output_dir, end) } else { Ok(()) });
-    warn_epoch_summary_error(output_dir, refresh);
     Ok(())
 }
 
@@ -19999,7 +19994,6 @@ fn append_cuda_cpp_direct_summary_log_row(
     file.write_all(cuda_cpp_direct_summary_log_row(args, log).as_bytes())
         .map_err(|err| format!("failed to write {}: {err}", top.display()))?;
     drop(file);
-    maybe_update_epoch_last_summary(output_dir, args, log.epoch, log.superbatch);
     Ok(())
 }
 
@@ -20009,9 +20003,6 @@ fn ensure_cuda_cpp_summary_log_header(output_dir: &std::path::Path) -> Result<()
 
     migrate_summary_log_filename(output_dir).map_err(|err| err.to_string())?;
     std::fs::create_dir_all(output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    if !output_dir.join(EPOCH_LAST_SUMMARY_NAME).exists() {
-        warn_epoch_summary_error(output_dir, initialize_epoch_last_summary(output_dir));
-    }
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed =
         ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
@@ -26151,23 +26142,9 @@ fn truncate_summary_log_after_checkpoint(
         }
     }
     if removed > 0 {
-        let retained_epoch_end = existing_epoch_summary_end(output_dir).and_then(|end| {
-            let rows = read_epoch_last_summary_rows(output_dir)?;
-            let (epoch, sb) = checkpoint_epoch_superbatch;
-            let limit = if rows.get(&epoch).is_some_and(|row| row.superbatch > sb) {
-                epoch.saturating_sub(1)
-            } else {
-                epoch
-            };
-            Ok(end.min(limit))
-        });
         let mut output = kept.join("\n");
         output.push('\n');
         std::fs::write(top, output)?;
-        warn_epoch_summary_error(
-            output_dir,
-            retained_epoch_end.and_then(|end| refresh_epoch_last_summary(output_dir, end)),
-        );
     }
     Ok(removed)
 }
@@ -26178,9 +26155,6 @@ fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
             let marker = dir.join(PLATEAU_EPOCH_DONE_NAME);
             if let Err(e) = std::fs::write(&marker, b"1\n") {
                 eprintln!("  WARN: failed to write {}: {e}", marker.display());
-            }
-            if let Some((epoch, _)) = read_checkpoint_epoch_superbatch(&dir) {
-                warn_epoch_summary_error(output_dir, refresh_epoch_last_summary(output_dir, epoch));
             }
         }
         None => {
@@ -26205,7 +26179,7 @@ fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
 #[cfg(feature = "cuda-cpp-backend")]
 fn remove_non_resume_cuda_cpp_top_level_logs(output_dir: &std::path::Path) {
     for name in
-        [SUMMARY_LEARN_LOG_NAME, EPOCH_LAST_SUMMARY_NAME, CUDA_CPP_PROGRESS_LOG_NAME, CUDA_CPP_DIAGNOSTICS_LOG_NAME]
+        [SUMMARY_LEARN_LOG_NAME, CUDA_CPP_PROGRESS_LOG_NAME, CUDA_CPP_DIAGNOSTICS_LOG_NAME]
     {
         let path = output_dir.join(name);
         match std::fs::remove_file(&path) {
@@ -26286,7 +26260,6 @@ fn prepare_resume_config_or_exit(args: &Args) {
         remove_non_resume_cuda_cpp_top_level_logs(&output_dir);
     }
 
-    warn_epoch_summary_error(&output_dir, initialize_epoch_last_summary(&output_dir));
     if let Err(e) = write_resume_config(&output_dir, args) {
         eprintln!("warning: failed to write {}: {e}", output_dir.join(RESUME_CONFIG_NAME).display());
     }
@@ -26393,286 +26366,6 @@ fn migrate_summary_log_filename(output_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Transposed final-sb metrics and measured epoch extrema next to summary-learn.csv.
-const EPOCH_LAST_SUMMARY_NAME: &str = "summary-epoch-last.csv";
-const EPOCH_LAST_METRICS: [(&str, Option<&str>); 12] = [
-    ("acc", Some("test_value_accuracy")),
-    ("loss", Some("test_value_loss")),
-    ("qacc", Some("quantized_value_accuracy")),
-    ("qloss", Some("quantized_value_loss")),
-    ("max-acc", None),
-    ("min-loss", None),
-    ("max-qacc", None),
-    ("min-qloss", None),
-    ("lr", Some("lr_start")),
-    ("lr-min", Some("lr_end")),
-    ("sb", Some("superbatch")),
-    ("bpu", Some("batches_per_update")),
-];
-const EPOCH_LAST_LR_INDEX: usize = 8;
-
-#[derive(Debug, Clone)]
-struct EpochLastSummaryRow {
-    superbatch: usize,
-    metrics: [String; EPOCH_LAST_METRICS.len()],
-}
-
-fn read_epoch_last_summary_rows(
-    output_dir: &Path,
-) -> std::io::Result<std::collections::BTreeMap<usize, EpochLastSummaryRow>> {
-    use std::io::BufRead as _;
-    let mut rows = std::collections::BTreeMap::new();
-    let path = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let file = match std::fs::File::open(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
-        Err(err) => return Err(err),
-    };
-    let mut lines = std::io::BufReader::new(file).lines();
-    let Some(header) = lines.next().transpose()? else { return Ok(rows) };
-    let names = split_log_csv_row(header.trim_start_matches('\u{feff}'));
-    let column = |name: &str| names.iter().position(|item| *item == name);
-    let (Some(epoch_index), Some(sb_index)) = (column("epoch"), column("superbatch")) else {
-        return Err(std::io::Error::other("epoch summary requires epoch and superbatch columns"));
-    };
-    let metrics = EPOCH_LAST_METRICS.map(|(_, name)| name.and_then(column));
-    // Last record wins for duplicate (epoch, sb), just as for final-sb values.
-    // Retain only the four measured fields so replaced rows cannot leave a
-    // stale maximum/minimum behind. No weights or validation data are loaded.
-    let mut observations = std::collections::BTreeMap::<(usize, usize), [String; 4]>::new();
-    let mut eval_name = None;
-    for (index, line) in lines.enumerate() {
-        let line = line?;
-        if line.trim().is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let fields = split_log_csv_row(&line);
-        let invalid = || std::io::Error::other(format!("{}:{}: invalid summary row", path.display(), index + 2));
-        if fields.len() != names.len() {
-            return Err(invalid());
-        }
-        let epoch = fields[epoch_index].parse::<usize>().map_err(|_| invalid())?;
-        let sb = fields[sb_index].parse::<usize>().map_err(|_| invalid())?;
-        if sb == 0 {
-            return Err(invalid());
-        }
-        if let Some(i) = column("eval") {
-            if eval_name.as_deref().is_some_and(|value| value != fields[i]) {
-                return Err(std::io::Error::other("epoch summary requires a single eval series"));
-            }
-            eval_name = Some(fields[i].to_string());
-        }
-        let mut values = metrics.map(|index| {
-            let value = index.map(|i| fields[i].trim()).unwrap_or("");
-            if value == "-" { String::new() } else { value.to_string() }
-        });
-        observations.insert((epoch, sb), std::array::from_fn(|i| values[i].clone()));
-        // Epoch-start LR is known only from sb 1, not from the first remaining
-        // save row of a truncated log. Do not substitute a mid-epoch LR.
-        if sb != 1 {
-            values[EPOCH_LAST_LR_INDEX] = rows
-                .get(&epoch)
-                .map(|row: &EpochLastSummaryRow| row.metrics[EPOCH_LAST_LR_INDEX].clone())
-                .unwrap_or_default();
-        }
-        // Highest sb, not highest accuracy. For duplicate (epoch, sb), use the last row.
-        if rows.get(&epoch).is_none_or(|row: &EpochLastSummaryRow| sb >= row.superbatch) {
-            rows.insert(epoch, EpochLastSummaryRow { superbatch: sb, metrics: values });
-        } else if sb == 1 {
-            // Also works for summary files whose rows are not epoch/sb-sorted.
-            rows.get_mut(&epoch).unwrap().metrics[EPOCH_LAST_LR_INDEX] =
-                std::mem::take(&mut values[EPOCH_LAST_LR_INDEX]);
-        }
-    }
-    for ((epoch, _), values) in observations {
-        let row = rows.get_mut(&epoch).unwrap();
-        for (index, text) in values.into_iter().enumerate() {
-            let Ok(value) = text.parse::<f64>() else { continue };
-            if !value.is_finite() {
-                continue;
-            }
-            let best = &mut row.metrics[index + 4];
-            let previous = best.parse::<f64>().ok();
-            let maximize = matches!(index, 0 | 2); // acc and qacc
-            if previous.is_none_or(|old| if maximize { value > old } else { value < old }) {
-                // Preserve the precision/format recorded by validation.
-                *best = text;
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn read_existing_epoch_summary_rows(
-    output_dir: &Path,
-) -> std::io::Result<std::collections::BTreeMap<usize, EpochLastSummaryRow>> {
-    use std::io::BufRead as _;
-    let mut rows = std::collections::BTreeMap::new();
-    let path = output_dir.join(EPOCH_LAST_SUMMARY_NAME);
-    let file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(rows),
-        Err(err) => return Err(err),
-    };
-    let mut lines = std::io::BufReader::new(file).lines();
-    let Some(header) = lines.next().transpose()? else { return Ok(rows) };
-    let mut columns = header.trim_start_matches('\u{feff}').trim_end().split(',');
-    if columns.next() != Some("metric") {
-        return Err(std::io::Error::other("invalid summary-epoch-last.csv header"));
-    }
-    let mut epochs = Vec::new();
-    for column in columns {
-        let epoch = column
-            .strip_prefix("epoch ")
-            .and_then(|value| value.parse::<usize>().ok())
-            .ok_or_else(|| std::io::Error::other("invalid epoch summary column"))?;
-        if rows.contains_key(&epoch) {
-            return Err(std::io::Error::other("invalid or duplicate epoch summary column"));
-        }
-        epochs.push(epoch);
-        rows.insert(epoch, EpochLastSummaryRow { superbatch: 0, metrics: std::array::from_fn(|_| String::new()) });
-    }
-    for line in lines {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields = split_log_csv_row(&line);
-        if fields.len() != epochs.len() + 1 {
-            return Err(std::io::Error::other("invalid epoch summary row length"));
-        }
-        let Some(index) = EPOCH_LAST_METRICS.iter().position(|(name, _)| *name == fields[0]) else { continue };
-        for (&epoch, value) in epochs.iter().zip(&fields[1..]) {
-            let value = value.trim();
-            let row = rows.get_mut(&epoch).unwrap();
-            row.metrics[index] = if value == "-" { String::new() } else { value.to_string() };
-            if EPOCH_LAST_METRICS[index].0 == "sb" && !row.metrics[index].is_empty() {
-                row.superbatch = row.metrics[index]
-                    .parse::<usize>()
-                    .map_err(|_| std::io::Error::other("invalid epoch summary sb value"))?;
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn existing_epoch_summary_end(output_dir: &Path) -> std::io::Result<usize> {
-    Ok(read_existing_epoch_summary_rows(output_dir)?.last_key_value().map(|(&epoch, _)| epoch).unwrap_or(0))
-}
-
-fn write_epoch_last_summary(
-    output_dir: &Path,
-    rows: &std::collections::BTreeMap<usize, EpochLastSummaryRow>,
-    completed_epoch: usize,
-    update_recorded_extrema: bool,
-) -> std::io::Result<()> {
-    // The CSV is also a persistent record. Missing source logs/checkpoints must
-    // never erase already measured values. A caller explicitly rolling back
-    // training still limits the retained epochs through completed_epoch.
-    let mut merged = read_existing_epoch_summary_rows(output_dir)?;
-    merged.retain(|epoch, _| *epoch <= completed_epoch);
-    for (&epoch, incoming) in rows.range(..=completed_epoch) {
-        let Some(stored) = merged.get_mut(&epoch) else {
-            merged.insert(epoch, incoming.clone());
-            continue;
-        };
-        for (index, value) in incoming.metrics.iter().enumerate() {
-            if value.is_empty() {
-                continue;
-            }
-            if (4..8).contains(&index) {
-                if !update_recorded_extrema && !stored.metrics[index].is_empty() {
-                    continue;
-                }
-                let previous = stored.metrics[index].parse::<f64>().ok().filter(|v| v.is_finite());
-                let current = value.parse::<f64>().ok().filter(|v| v.is_finite());
-                let maximize = matches!(index, 4 | 6);
-                if current.is_some_and(|new| previous.is_none_or(|old| if maximize { new > old } else { new < old })) {
-                    stored.metrics[index] = value.clone();
-                }
-            } else if stored.metrics[index].is_empty()
-                && (incoming.superbatch >= stored.superbatch || index == EPOCH_LAST_LR_INDEX)
-            {
-                // An earlier remaining sb is not a substitute for the final sb.
-                // Nonempty cells, including values entered by the user, win.
-                stored.metrics[index] = value.clone();
-            }
-        }
-        stored.superbatch = stored.superbatch.max(incoming.superbatch);
-    }
-    let rows = merged.iter().collect::<Vec<_>>();
-    let mut csv = String::from("metric");
-    for (epoch, _) in &rows {
-        csv.push_str(&format!(",epoch {epoch}"));
-    }
-    csv.push('\n');
-    if !rows.is_empty() {
-        for (index, (label, _)) in EPOCH_LAST_METRICS.iter().enumerate() {
-            csv.push_str(label);
-            for (_, row) in &rows {
-                csv.push(',');
-                csv.push_str(&csv_escape(&row.metrics[index]));
-            }
-            csv.push('\n');
-        }
-    }
-    std::fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(EPOCH_LAST_SUMMARY_NAME);
-    let tmp = output_dir.join(format!("{EPOCH_LAST_SUMMARY_NAME}.{}.tmp", std::process::id()));
-    // Replace the small transposed table; do not remove the previous file first.
-    let result = std::fs::write(&tmp, csv).and_then(|_| std::fs::rename(&tmp, &path));
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
-fn refresh_epoch_last_summary(output_dir: &Path, completed_epoch: usize) -> std::io::Result<()> {
-    write_epoch_last_summary(output_dir, &read_epoch_last_summary_rows(output_dir)?, completed_epoch, true)
-}
-
-fn warn_epoch_summary_error(output_dir: &Path, result: std::io::Result<()>) {
-    if let Err(err) = result {
-        eprintln!("  WARN: failed to update {}: {err}", output_dir.join(EPOCH_LAST_SUMMARY_NAME).display());
-    }
-}
-
-fn maybe_update_epoch_last_summary(output_dir: &Path, args: &Args, epoch: usize, sb: usize) {
-    if (if epoch == 0 { Some(args.warmup_sb) } else { args.superbatches }) == Some(sb) {
-        warn_epoch_summary_error(output_dir, refresh_epoch_last_summary(output_dir, epoch));
-    }
-}
-
-/// Called before overwriting resume-config.txt with the new run's controls.
-fn initialize_epoch_last_summary(output_dir: &Path) -> std::io::Result<()> {
-    let mut rows = read_epoch_last_summary_rows(output_dir)?;
-    let stored_warmup = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME)).ok()
-        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("warmup_sb=")?.parse::<usize>().ok()));
-    if rows.get(&0).is_some_and(|row| stored_warmup != Some(row.superbatch)) {
-        rows.remove(&0); // Do not publish an interrupted warmup as a completed epoch.
-    }
-    let stored_sbs = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME))
-        .ok()
-        .and_then(|text| text.lines().find_map(|line| line.strip_prefix("superbatches=")?.parse::<usize>().ok()));
-    let known_end = existing_epoch_summary_end(output_dir)?;
-    let plateau_end = latest_checkpoint_dir(output_dir).and_then(|dir| {
-        dir.join(PLATEAU_EPOCH_DONE_NAME).is_file().then(|| read_checkpoint_epoch_superbatch(&dir)).flatten()
-    });
-    let completed = match rows.last_key_value() {
-        Some((&epoch, row))
-            if stored_sbs == Some(row.superbatch)
-                || known_end >= epoch
-                || plateau_end == Some((epoch, row.superbatch)) =>
-        {
-            epoch
-        }
-        Some((&epoch, _)) => epoch.saturating_sub(1),
-        None => 0,
-    };
-    // A missing source is not evidence that a recorded epoch became incomplete.
-    // Explicit resume rollback has already trimmed the CSV separately.
-    write_epoch_last_summary(output_dir, &rows, completed.max(known_end), false)
-}
 
 /// Optional fine-grained cuda-cpp minibatch loss progress. Disabled by
 /// default; enabling it synchronises the GPU stream every configured interval.
@@ -27306,7 +26999,6 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
     }
     let test_teacher_csv = csv_escape(&resolve_test_teacher_for_summary(args));
     let bpu = args.map(|args| args.batches_per_update.to_string()).unwrap_or_else(|| "-".to_string());
-    let mut completed_epoch = None;
     for (index, fields) in rows.iter().enumerate() {
         // Keep the last batch of each (eval, epoch, superbatch).
         if rows.get(index + 1).is_some_and(|next| next[..3] == fields[..3]) {
@@ -27319,18 +27011,8 @@ fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: 
         summary.extend([""; 5]);
         summary.push(&checkpoint_name);
         writeln!(file, "{}", summary.join(","))?;
-        if let Some(args) = args {
-            if let (Ok(epoch), Ok(sb)) = (fields[1].parse::<usize>(), fields[2].parse::<usize>()) {
-                if args.superbatches == Some(sb) {
-                    completed_epoch = Some(completed_epoch.map_or(epoch, |previous: usize| previous.max(epoch)));
-                }
-            }
-        }
     }
     drop(file);
-    if let Some(epoch) = completed_epoch {
-        warn_epoch_summary_error(output_dir, refresh_epoch_last_summary(output_dir, epoch));
-    }
     Ok(())
 }
 
@@ -35678,9 +35360,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    fn epoch_summary_test_dir(label: &str) -> std::path::PathBuf {
+    fn summary_test_dir(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "bulletou-epoch-summary-{label}-{}-{}",
+            "bulletou-summary-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
         ));
@@ -35690,7 +35372,7 @@ mod tests {
 
     #[test]
     fn summary_filename_migration_preserves_history_and_conflicts() {
-        let tmp = epoch_summary_test_dir("csv-name");
+        let tmp = summary_test_dir("csv-name");
         let source = tmp.join("summary-learn.log");
         let destination = tmp.join(SUMMARY_LEARN_LOG_NAME);
         migrate_summary_log_filename(&tmp).unwrap();
@@ -35714,8 +35396,8 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn summary_filename_migration_precedes_backfill_and_resume_trim() {
-        let tmp = epoch_summary_test_dir("csv-resume");
+    fn summary_filename_migration_precedes_resume_trim() {
+        let tmp = summary_test_dir("csv-resume");
         let original = format!(
             "{SUMMARY_LEARN_LOG_HEADER}\n\
              NNUE,1,1,0.64,0.12,0.63,0.13,0.001,0.001,1,64,teacher.psv,test.hcpe,4,,,,,,-\n\
@@ -35726,311 +35408,28 @@ mod tests {
         std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=2\n").unwrap();
         ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
         assert!(!tmp.join("summary-learn.log").exists());
-        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 1);
+        assert!(!tmp.join("summary-epoch-last.csv").exists());
         assert_eq!(truncate_summary_log_after_checkpoint(&tmp, (1, 2)).unwrap(), 1);
         assert_eq!(read_prior_positions(&tmp.join(SUMMARY_LEARN_LOG_NAME))["nnue"], 128);
         assert_eq!(worker_last_summary_row(&tmp).unwrap().unwrap()["row"]["superbatch"], "2");
         update_summary_log_quantized_metrics(&tmp, 1, 2, TestMetrics { accuracy: 0.645, loss: 0.115 }).unwrap();
-        assert!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap().contains("qloss,0.11500000\n"));
+        assert!(std::fs::read_to_string(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap().contains("0.11500000"));
+        assert!(!tmp.join("summary-epoch-last.csv").exists());
         assert!(!tmp.join("summary-learn.log").exists());
         std::fs::remove_dir_all(tmp).unwrap();
     }
 
-    #[test]
-    fn epoch_summary_startup_header_and_backfill_completed_only() {
-        let tmp = epoch_summary_test_dir("backfill");
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), "metric\n");
-        std::fs::remove_file(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        // Column order is irrelevant; qloss is intentionally absent. Epoch 10 is unfinished.
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=8\n").unwrap();
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            "teacher,superbatch,epoch,test_value_loss,test_value_accuracy,quantized_value_accuracy\n\
-             \"a,b.psv\",8,2,0.12,0.62000001,0.61\n\
-             a.psv,8,1,0.13,0.60,0.59\n\
-             a.psv,3,1,0.01,0.99,0.98\n\
-             a.psv,1,10,0.10,0.63,0.62\n",
-        )
-        .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(),
-            "metric,epoch 1,epoch 2\nacc,0.60,0.62000001\nloss,0.13,0.12\nqacc,0.59,0.61\nqloss,,\nmax-acc,0.99,0.62000001\nmin-loss,0.01,0.12\nmax-qacc,0.98,0.61\nmin-qloss,,\nlr,,\nlr-min,,\nsb,8,8\nbpu,,\n"
-        );
-        // Rebuild a missing file when the last epoch has really completed.
-        std::fs::remove_file(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=1\n").unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME))
-                .unwrap()
-                .starts_with("metric,epoch 1,epoch 2,epoch 10\n")
-        );
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn epoch_summary_extrema_replace_duplicate_sb_and_ignore_missing_or_nonfinite_values() {
-        let tmp = epoch_summary_test_dir("extrema");
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=5\n").unwrap();
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            "epoch,superbatch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss\n\
-             1,3,0.99,0.01,0.99,0.01\n\
-             1,1,0.7000001,0.20,-,0.12\n\
-             1,4,NaN,inf,-inf,NaN\n\
-             1,2,0.60,0.10,0.80,-\n\
-             1,3,0.61,0.11,0.62,0.13\n\
-             1,5,,,,\n\
-             2,5,-,-,-,-\n",
-        )
-        .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        let expected = "metric,epoch 1,epoch 2\nacc,,\nloss,,\nqacc,,\nqloss,,\nmax-acc,0.7000001,\nmin-loss,0.10,\nmax-qacc,0.80,\nmin-qloss,0.12,\nlr,,\nlr-min,,\nsb,5,5\nbpu,,\n";
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), expected);
-        // Startup also upgrades an existing eight-row table without extra inference.
-        std::fs::write(
-            tmp.join(EPOCH_LAST_SUMMARY_NAME),
-            "metric,epoch 1,epoch 2\nacc,,\nloss,,\nqacc,,\nqloss,,\nlr,,\nlr-min,,\nsb,5,5\nbpu,,\n",
-        )
-        .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), expected);
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn epoch_summary_extrema_recomputed_after_quantized_backfill_and_rollback() {
-        let tmp = epoch_summary_test_dir("extrema-backfill");
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=2\n").unwrap();
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            format!(
-                "{SUMMARY_LEARN_LOG_HEADER}\n\
-             E,1,1,0.60,0.13,-,-,0.001,0.001,1,100,a.psv,a.hcpe,1,,,,,,-\n\
-             E,1,2,0.61,0.12,0.60,0.13,0.001,0.001,1,200,a.psv,a.hcpe,1,,,,,,0001\n\
-             E,2,2,0.99,0.01,0.98,0.02,0.001,0.001,1,300,a.psv,a.hcpe,1,,,,,,0002\n"
-            ),
-        )
-        .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        update_summary_log_quantized_metrics(&tmp, 1, 1, TestMetrics { accuracy: 0.9, loss: 0.05 }).unwrap();
-        assert!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME))
-                .unwrap()
-                .contains("max-qacc,0.900000,0.98\nmin-qloss,0.05000000,0.02\n")
-        );
-        truncate_summary_log_after_checkpoint(&tmp, (1, 2)).unwrap();
-        let result = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert_eq!(result.lines().next(), Some("metric,epoch 1"));
-        assert!(result.contains("max-acc,0.61\nmin-loss,0.12\nmax-qacc,0.900000\nmin-qloss,0.05000000\n"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[cfg(feature = "cuda-cpp-backend")]
-    #[test]
-    fn epoch_summary_training_controls_use_each_epochs_actual_rows() {
-        let tmp = epoch_summary_test_dir("controls");
-        // Deliberately out of order, with different BPU and LR in each epoch.
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            format!(
-                "{SUMMARY_LEARN_LOG_HEADER}\n\
-             E,2,8,0.62,0.11,0.61,0.12,0.00006,0.00005,1,300,a.psv,a.hcpe,4,,,,,,-\n\
-             E,1,4,0.60,0.13,0.59,0.14,0.0002,0.0001,1,100,a.psv,a.hcpe,1,,,,,,-\n\
-             E,1,1,0.50,0.15,0.49,0.16,0.001,0.0008,1,10,a.psv,a.hcpe,1,,,,,,-\n\
-             E,2,1,0.60,0.13,0.59,0.14,0.0005,0.0004,1,150,a.psv,a.hcpe,2,,,,,,-\n\
-             E,3,8,0.63,0.10,0.62,0.11,0.00001,0.000005,1,500,a.psv,a.hcpe,-,,,,,,-\n"
-            ),
-        )
-        .unwrap();
-        // A later invocation's settings must never fill in unknown historical fields.
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=8\nbatches_per_update=64\nlr=0.2\nlr_min=0.1\n")
-            .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        let text = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert!(text.contains("lr,0.001,0.0005,\nlr-min,0.0001,0.00005,0.000005\nsb,4,8,8\nbpu,1,4,\n"));
-        // Reconstruct all twelve rows from the sb log after deleting the table.
-        std::fs::remove_file(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), text);
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn epoch_summary_preserves_manual_cells_without_source_logs_or_checkpoints() {
-        let tmp = epoch_summary_test_dir("manual-values");
-        // bpu=4 was supplied by the user. The remaining source says bpu=1;
-        // neither startup nor a later epoch update may undo the user's value.
-        let recorded = "metric,epoch 1\nacc,0.70\nloss,0.10\nqacc,0.69\nqloss,0.11\nmax-acc,0.75\nmin-loss,0.08\nmax-qacc,0.74\nmin-qloss,0.09\nlr,0.001\nlr-min,0.0001\nsb,8\nbpu,4\n";
-        std::fs::write(tmp.join(EPOCH_LAST_SUMMARY_NAME), recorded).unwrap();
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=8\n").unwrap();
-        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), "epoch,superbatch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,batches_per_update\n1,8,0.60,0.12,0.59,0.13,1\n").unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), recorded);
-        refresh_epoch_last_summary(&tmp, 1).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), recorded);
-        // Even the epoch's final sb is gone; do not replace it with an earlier sb.
-        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), "epoch,superbatch,batches_per_update\n1,1,2\n").unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), recorded);
-        std::fs::remove_file(tmp.join(SUMMARY_LEARN_LOG_NAME)).unwrap();
-        std::fs::remove_file(tmp.join(RESUME_CONFIG_NAME)).unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), recorded);
-        // New epochs are appended while absent historical source rows stay intact.
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            "epoch,superbatch,test_value_accuracy,batches_per_update\n2,8,0.80,16\n",
-        )
-        .unwrap();
-        refresh_epoch_last_summary(&tmp, 2).unwrap();
-        let text = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert_eq!(text.lines().next(), Some("metric,epoch 1,epoch 2"));
-        assert!(text.contains("acc,0.70,0.80\n"));
-        assert!(text.contains("max-acc,0.75,0.80\n"));
-        assert!(text.ends_with("bpu,4,16\n"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn epoch_summary_backfill_adds_best_rows_without_overwriting_manual_bpu() {
-        let tmp = epoch_summary_test_dir("manual-bpu-backfill");
-        std::fs::write(
-            tmp.join(EPOCH_LAST_SUMMARY_NAME),
-            "metric,epoch 1\nacc,0.70\nloss,0.10\nqacc,0.69\nqloss,0.11\nlr,0.001\nlr-min,0.0001\nsb,8\nbpu,4\n",
-        )
-        .unwrap();
-        std::fs::write(tmp.join(SUMMARY_LEARN_LOG_NAME), "epoch,superbatch,test_value_accuracy,test_value_loss,quantized_value_accuracy,quantized_value_loss,batches_per_update\n1,1,0.75,0.08,0.74,0.09,\n1,8,0.70,0.10,0.69,0.11,\n").unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        let text = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert!(text.contains("max-acc,0.75\nmin-loss,0.08\nmax-qacc,0.74\nmin-qloss,0.09\n"));
-        assert!(text.ends_with("bpu,4\n"));
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[cfg(feature = "cuda-cpp-backend")]
-    #[test]
-    fn epoch_summary_live_updates_without_extra_validation_or_save() {
-        use clap::Parser as _;
-        let tmp = epoch_summary_test_dir("live");
-        let args = Args::try_parse_from([
-            "bulletou",
-            "--teacher",
-            "teacher.psv",
-            "--arch",
-            "SFNN_halfka2_128_8_32_k3k3",
-            "--backend",
-            "cuda-cpp",
-            "--superbatches",
-            "2",
-            "--max-epochs",
-            "2",
-            "--output",
-            tmp.to_str().unwrap(),
-        ])
-        .unwrap();
-        ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
-        let log = |epoch, superbatch, test_metrics| CudaCppCheckpointLog {
-            epoch,
-            superbatch,
-            curr_batch: 1,
-            prior_positions: 0,
-            train_steps: superbatch,
-            test_metrics,
-            lr_start: 0.001,
-            lr_end: 0.001,
-            dataloader_pos: bulletou_lib::value::TeacherDataloaderPos { byte_offset: 0, plies: 0 },
-        };
-        append_cuda_cpp_direct_summary_log_row(&tmp, &args, log(1, 1, Some(TestMetrics { accuracy: 0.9, loss: 0.1 })))
-            .unwrap();
-        update_summary_log_quantized_metrics(&tmp, 1, 1, TestMetrics { accuracy: 0.8, loss: 0.2 }).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), "metric\n");
-        append_cuda_cpp_direct_summary_log_row(&tmp, &args, log(1, 2, Some(TestMetrics { accuracy: 0.6, loss: 0.3 })))
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(),
-            "metric,epoch 1\nacc,0.600000\nloss,0.300000\nqacc,\nqloss,\nmax-acc,0.900000\nmin-loss,0.100000\nmax-qacc,0.800000\nmin-qloss,0.20000000\nlr,0.001000\nlr-min,0.001000\nsb,2\nbpu,1\n"
-        );
-        update_summary_log_quantized_metrics(&tmp, 1, 2, TestMetrics { accuracy: 0.59, loss: 0.31 }).unwrap();
-        let first = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert!(first.contains("qacc,0.590000\nqloss,0.31000000\n"));
-        // Repeating the endpoint replaces its column instead of adding a duplicate.
-        append_cuda_cpp_direct_summary_log_row(
-            &tmp,
-            &args,
-            log(1, 2, Some(TestMetrics { accuracy: 0.61, loss: 0.29 })),
-        )
-        .unwrap();
-        let repeated = std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        assert_eq!(repeated.lines().next(), Some("metric,epoch 1"));
-        // Already recorded final values are preserved, even if a duplicate
-        // source row changes them. This also protects user edits in the CSV.
-        assert!(repeated.contains("acc,0.600000\n"));
-        append_cuda_cpp_direct_summary_log_row(&tmp, &args, log(2, 2, None)).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(),
-            "metric,epoch 1,epoch 2\nacc,0.600000,\nloss,0.300000,\nqacc,0.590000,\nqloss,0.31000000,\nmax-acc,0.900000,\nmin-loss,0.100000,\nmax-qacc,0.800000,\nmin-qloss,0.20000000,\nlr,0.001000,\nlr-min,0.001000,0.001000\nsb,2,2\nbpu,1,1\n"
-        );
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[cfg(feature = "cuda-cpp-backend")]
-    #[test]
-    fn epoch_summary_saved_checkpoint_updates_final_column() {
-        use clap::Parser as _;
-        let tmp = epoch_summary_test_dir("save");
-        let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv", "--superbatches", "8"]).unwrap();
-        std::fs::create_dir(tmp.join("0001")).unwrap();
-        std::fs::write(
-            tmp.join("0001/learn.log"),
-            format!("{LEARN_LOG_HEADER}\nE,1,8,610,0.61,0.12,0.60,0.13,0.001,0.001,1,100,teacher.psv\n"),
-        )
-        .unwrap();
-        append_to_top_level_log(&tmp, 1, Some(&args)).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(),
-            "metric,epoch 1\nacc,0.61\nloss,0.12\nqacc,0.60\nqloss,0.13\nmax-acc,0.61\nmin-loss,0.12\nmax-qacc,0.60\nmin-qloss,0.13\nlr,\nlr-min,0.001\nsb,8\nbpu,1\n"
-        );
-        let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[cfg(feature = "cuda-cpp-backend")]
-    #[test]
-    fn epoch_summary_resume_discards_rolled_back_epochs() {
-        let tmp = epoch_summary_test_dir("rollback");
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=8\n").unwrap();
-        std::fs::write(
-            tmp.join(SUMMARY_LEARN_LOG_NAME),
-            format!(
-                "{SUMMARY_LEARN_LOG_HEADER}\n\
-             E,1,8,0.60,0.13,0.59,0.14,0,0,1,100,a.psv,a.hcpe,1,,,,,,-\n\
-             E,2,4,0.61,0.12,0.60,0.13,0,0,1,200,a.psv,a.hcpe,1,,,,,,-\n\
-             E,2,8,0.62,0.11,0.61,0.12,0,0,1,300,a.psv,a.hcpe,1,,,,,,-\n\
-             E,3,1,0.63,0.10,0.62,0.11,0,0,1,400,a.psv,a.hcpe,1,,,,,,-\n"
-            ),
-        )
-        .unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 2);
-        truncate_summary_log_after_checkpoint(&tmp, (2, 4)).unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 1);
-        // The csv can be deleted and reconstructed, without calling the unfinished epoch complete.
-        std::fs::remove_file(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 1);
-        // Previously completed columns survive changes to the next run's epoch length.
-        truncate_summary_log_after_checkpoint(&tmp, (1, 8)).unwrap();
-        std::fs::write(tmp.join(RESUME_CONFIG_NAME), "superbatches=32\n").unwrap();
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(existing_epoch_summary_end(&tmp).unwrap(), 1);
+    fn retired_epoch_summary_is_left_untouched() {
+        let tmp = summary_test_dir("retired-epoch-summary");
+        let path = tmp.join("summary-epoch-last.csv");
+        let recorded = "metric,epoch 1\nbpu,4\n";
+        std::fs::write(&path, recorded).unwrap();
         remove_non_resume_cuda_cpp_top_level_logs(&tmp);
-        initialize_epoch_last_summary(&tmp).unwrap();
-        assert_eq!(std::fs::read_to_string(tmp.join(EPOCH_LAST_SUMMARY_NAME)).unwrap(), "metric\n");
-        let _ = std::fs::remove_dir_all(tmp);
+        ensure_cuda_cpp_summary_log_header(&tmp).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), recorded);
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

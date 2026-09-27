@@ -140,43 +140,9 @@ CLIでは `--save-rate none --no-save-epoch-end` です。これで学習中の�
 
 ---
 
-## 4.7 epochごとの結果をCSVで見る
+## 4.7 学習結果のCSV
 
-学習フォルダの `summary-epoch-last.csv` に、各epochの最終sbの結果と、epoch内で記録された各指標のベスト値が自動で集計されます。追加のオプションやスクリプト実行は不要です。
-
-```csv
-metric,epoch 1,epoch 2
-acc,0.620000,0.630000
-loss,0.130000,0.120000
-qacc,0.619000,0.629000
-qloss,0.131000,0.121000
-max-acc,0.622000,0.632000
-min-loss,0.129000,0.119000
-max-qacc,0.621000,0.631000
-min-qloss,0.130000,0.120000
-lr,0.000875,0.000500
-lr-min,0.000030,0.000020
-sb,324,324
-bpu,1,4
-```
-
-新規学習では、開始時にヘッダ行 `metric` だけのファイルを作ります。epochが完了すると、右にそのepochの列が追加されます。行は `acc`、`loss`、`qacc`、`qloss`、`max-acc`、`min-loss`、`max-qacc`、`min-qloss`、`lr`、`lr-min`、`sb`、`bpu` の順です。accuracyは百分率ではなく0～1の値です。
-
-`lr` はそのepochのsb 1開始時のlr、`lr-min` は最終sb終了時に実際に使ったlrです。後者は設定上の下限値とは限りません。`sb` は最終sb番号（そのepochのsb数）、`bpu` は最終sbで使った `batches_per_update` です。epoch途中でbpuを変えた場合も、終了時の値を記録します。
-
-再開時は、既存の `summary-epoch-last.csv` の記録済みセルを優先します。`summary-learn.csv` と保存されている学習設定から再集計するのは、新しいepoch・追加行・空欄を補完するためです。手入力した `bpu` も保持し、元ログの値や空欄で上書きしません。checkpointフォルダや元ログを削除しても、このCSVに記録済みの値は消しません。CSV自体を削除した場合、元ログにない手入力値は復元できないので、このCSVは残してください。
-
-学習途中のepochは追加しません。学習再開で明示的に巻き戻すepochの除去は別扱いです。既存CSVにない最新epochの完了を確認できる記録がない場合、そのepochは追加しません。
-
-先頭の `acc`、`loss`、`qacc`、`qloss` は最終sbの値です。そのsbで検証していない項目は空欄です。
-
-`max-acc`・`max-qacc` はそのepoch内の最大値、`min-loss`・`min-qloss` は最小値です。4項目はそれぞれ独立に集計するので、ベスト値を記録したsbが同じとは限りません。集計対象は `summary-learn.csv` に記録された有限の検証値だけです。検証間隔が8sbならその間隔で得た値のベストであり、未計測sbの値は推定しません。そのepochで一度も有効な値が記録されていない項目は空欄です。
-
-epoch完了処理や量子化後の検証値の追記で新しい値が得られた場合、ベスト値の4行は記録済みのベストより改善したときだけ更新します。元ログが一部消えても、記録済みのベストを悪い値や空欄に戻しません。
-
-sb 1の記録がないepochの `lr` や、bpuの記録がない過去epochの `bpu` も空欄にし、現在の設定からは推定しません。
-
-`batches_per_update` は `summary-learn.csv` にも記録されるため、このCSVを消しても再開時に再集計できます。集計のための追加推論はありません。
+学習結果は `summary-learn.csv` に記録します。grid searchのepoch別集計は `grid_summary.csv` を参照してください。旧 `summary-epoch-last.csv` は生成・更新しません。既存ファイルも変更・削除しません。
 
 ## 4.8 qvalid時の飽和率と出力の大きさ
 

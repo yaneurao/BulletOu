@@ -21,7 +21,7 @@ JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、epoch 0を1sb実行し�
 - `max_epochs`にepoch 0は含みません。通常epochのsb数や減衰スケジュールは変えません。epoch 0にはepoch 1の設定（LR、bpuなど）を使います。
 - epoch 1から通常の減衰を行います。明示的な`lr_step_gamma: 1.0`なら通常epochは固定LRです。
 - resumeは保存済みepoch/sbから続行し、warmupをやり直しません。epoch 0完了checkpointならepoch 1から再開します。別runへの`initial_state`による追加学習と独立したgrid/worker trialでは、新たにepoch 0から適用します。
-- epoch 0も通常の保存・検証間隔とepoch末尾保存の設定に従います。`summary-learn.csv`、`summary-epoch-last.csv`、`grid_summary.csv`にepoch 0として記録します。旧仕様のepoch 1内warmupとは意味が異なるため、比較実験は新しい出力フォルダで開始してください。
+- epoch 0も通常の保存・検証間隔とepoch末尾保存の設定に従います。`summary-learn.csv`、`grid_summary.csv`にepoch 0として記録します。旧仕様のepoch 1内warmupとは意味が異なるため、比較実験は新しい出力フォルダで開始してください。
 - epoch別の値変更には対応せず、run全体で一つの整数です。`warmup_sb`は保存情報とgrid CSVに記録します。
 
 比較例（共通設定で`superbatches: 16`、`max_epochs: 1`を確認してください）：
@@ -155,7 +155,6 @@ grid-target-scale/
     grid-state.json
     stdout.log
     summary-learn.csv
-    summary-epoch-last.csv
     0001/state.bin, nn.bin, dataloader_pos.txt, ...
   trial0002-.../
     ...
@@ -183,7 +182,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 
 未計測、`nan`、`inf` は空欄です。最後のsbで未計測なら、最終SBの指標を以前のsbの値で埋めません。`last8_*` は「最後の8回の検証」ではなく、末尾SB番号をNとしてN−7〜NのSB内だけを対象にします。8SB未満のepochはそのepoch全体を対象とし、epochをまたぎません（warmupのepoch 0も独立）。未計測・非有限値は指標ごとに除外し、有効値がなければ空欄です。未完了epochの平均も空欄です。各指標のepoch末best条件は完了時にstdoutへ表示します。単一の総合点や勝者は勝手に決めません。
 
-既存のCSVは次回起動または `--summary-only` で元ログから新しい列へ再集計されます。本体の再ビルドは不要です。起動中のrunnerには反映されません。元の `summary-learn.csv` と `summary-epoch-last.csv` は変更しません。
+既存のCSVは次回起動または `--summary-only` で元ログから新しい列へ再集計されます。本体の再ビルドは不要です。起動中のrunnerには反映されません。元の `summary-learn.csv` は変更しません。
 
 本体の `save_rate`、epoch末保存の挙動はそのままです。**runnerはcheckpointを削除せず、bestの自動コピーも作りません。** 各条件の全保存分のディスク容量を見込んでください。
 
