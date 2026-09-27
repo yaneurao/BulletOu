@@ -499,6 +499,13 @@ class GridSearchTests(unittest.TestCase):
             self.assertIs(plan["trials"][1]["settings"]["ft_factorizer"], True)
             self.assertNotIn("sfnn_ft_factorizer", plan["trials"][0]["settings"])
 
+    def test_l1_factorizer_layer_name_matches_existing_grid_identity(self):
+        values = ["none", "shared", "axis", "pair"]
+        old = self.plan(["--grid", "sfnn_factorizer", *values])
+        for name in ("sfnn_l1_factorizer", "sfnn-l1-factorizer"):
+            new = self.plan(["--grid", name, *values])
+            self.assertEqual(new["trials"], old["trials"])
+
     def test_duplicate_axes_or_values_rejected(self):
         for extra in (["--grid", "lr", "0.001"], ["--grid", "wrm_target_scaling", "600", "600"],
                       ["--grid", "lr"], ["--grid", "initial-state", "abc"]):

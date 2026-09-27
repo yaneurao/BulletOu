@@ -1459,7 +1459,7 @@ struct CompareSfnnQuantizationArgs {
     wrm_target_epsilon: f32,
 
     /// Factorizer interpretation used while loading the fp32 state.
-    #[arg(long = "sfnn-factorizer", default_value = "shared")]
+    #[arg(long = "sfnn-l1-factorizer", visible_alias = "sfnn-factorizer", default_value = "shared")]
     sfnn_factorizer: String,
 
     /// Factorizer alpha used while forwarding the fp32 state.
@@ -1515,7 +1515,7 @@ struct AverageSfnnStateArgs {
     /// Default `none` folds existing factorizer tensors into base weights
     /// before averaging, which is usually what you want when the output is
     /// only an engine nn.bin.
-    #[arg(long = "sfnn-factorizer", default_value = "none")]
+    #[arg(long = "sfnn-l1-factorizer", visible_alias = "sfnn-factorizer", default_value = "none")]
     sfnn_factorizer: String,
 
     /// Overwrite output if it already exists.
@@ -4022,7 +4022,11 @@ fn bulletou_settings_json_value_to_args(
         return Err(format!("{} has invalid option key `{key}`", path.display()));
     }
     let normalized = key.replace('_', "-");
-    let normalized = if normalized == "sfnn-ft-factorizer" { "ft-factorizer" } else { &normalized };
+    let normalized = match normalized.as_str() {
+        "sfnn-ft-factorizer" => "ft-factorizer",
+        "sfnn-factorizer" => "sfnn-l1-factorizer",
+        _ => &normalized,
+    };
     let flag = format!("--{normalized}");
     let replacement = match flag.as_str() {
         "--no-ft-factorize" => Some("ft_factorizer"),
@@ -5138,7 +5142,7 @@ struct Args {
     /// `king=axis,hand=axis`, while `k3k3` becomes `king=axis`.
     /// Axis terms are full residual factors; they are folded into stack
     /// weights for validation and `nn.bin` export.
-    #[arg(long = "sfnn-factorizer", conflicts_with = "sfnn_factorized")]
+    #[arg(long = "sfnn-l1-factorizer", visible_alias = "sfnn-factorizer", conflicts_with = "sfnn_factorized")]
     sfnn_factorizer: Option<SfnnFactorizerSpec>,
 
     /// Scale the contribution of active SFNN factorizer terms during forward,
@@ -30256,6 +30260,24 @@ mod tests {
                 let from_json = Args::try_parse_from(cli).unwrap();
                 assert_eq!(from_json.ft_factorizer, enabled);
                 assert_eq!(resume_signature(&from_json), resume_signature(&args));
+            }
+        }
+    }
+
+    #[test]
+    fn sfnn_l1_factorizer_cli_json_and_resume_alias() {
+        for value in ["none", "shared", "axis", "pair"] {
+            let base = ["bulletou", "--teacher", "teacher.psv", "--arch", "SFNN_halfka2_1024_8_64_hand1024_k3k3_progress4"];
+            let old = Args::try_parse_from(base.into_iter().chain(["--sfnn-factorizer", value])).unwrap();
+            let new = Args::try_parse_from(base.into_iter().chain(["--sfnn-l1-factorizer", value])).unwrap();
+            assert_eq!(requested_sfnn_factorizer_spec(&old), requested_sfnn_factorizer_spec(&new));
+            assert_eq!(resume_signature(&old), resume_signature(&new));
+            for key in ["sfnn_l1_factorizer", "sfnn-l1-factorizer", "sfnn_factorizer"] {
+                let mut cli: Vec<std::ffi::OsString> = base.into_iter().map(Into::into).collect();
+                bulletou_settings_json_value_to_args(Path::new("settings.json"), key,
+                    &serde_json::Value::String(value.into()), &mut cli).unwrap();
+                let json = Args::try_parse_from(cli).unwrap();
+                assert_eq!(resume_signature(&old), resume_signature(&json));
             }
         }
     }

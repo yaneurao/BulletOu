@@ -2,7 +2,7 @@
 
 <a href="../../ja/advanced/sfnn-factorizer.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-This page explains `--sfnn-factorizer` for SFNN LayerStack architectures.
+Use `--sfnn-l1-factorizer none/shared/axis/pair` (JSON: `sfnn_l1_factorizer`) for L1; normal training defaults to `shared`. The old `--sfnn-factorizer` / `sfnn_factorizer` names remain aliases. Grid search accepts `--grid sfnn_l1_factorizer none shared axis pair`. Persisted grid settings/columns and checkpoint compatibility signatures retain the old internal name to preserve existing experiment identities. This option is independent of `sfnn_ft_factorizer`.
 
 You do not need this page for a first training run. Read it when you want to compare architectures with many buckets, such as `hand1024`, `k29k29`, or `progress8`.
 

@@ -2,7 +2,7 @@
 
 <a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-このページでは、SFNN の LayerStack で使う `--sfnn-factorizer` を説明します。
+L1の指定名は `--sfnn-l1-factorizer none/shared/axis/pair`（JSON: `sfnn_l1_factorizer`）です。通常学習のデフォルトは `shared`。旧名 `--sfnn-factorizer` / `sfnn_factorizer` もaliasとして使えます。grid searchでは `--grid sfnn_l1_factorizer none shared axis pair` と指定できます。既存実験との対応を維持するため、gridの保存設定・列名とcheckpointの互換性判定では従来の内部名を維持します。FTの `sfnn_ft_factorizer` とは独立した指定です。
 
 まず学習を1回動かしたいだけなら、このページを読む必要はありません。`hand1024`、`k29k29`、`progress8` のように bucket 数が多い architecture を比較したいときに読んでください。
 

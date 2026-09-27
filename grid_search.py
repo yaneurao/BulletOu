@@ -85,7 +85,9 @@ def key_name(key: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", key):
         raise ValueError(f"invalid BulletOu option name: {key!r}")
     normalized = key.replace("-", "_")
-    return "ft_factorizer" if normalized == "sfnn_ft_factorizer" else normalized
+    # Keep persisted grid identities stable while accepting the layer-specific name.
+    return {"sfnn_ft_factorizer": "ft_factorizer",
+            "sfnn_l1_factorizer": "sfnn_factorizer"}.get(normalized, normalized)
 
 
 def scalar(value):
