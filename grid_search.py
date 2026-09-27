@@ -48,6 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
+    "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",

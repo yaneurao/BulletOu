@@ -77,6 +77,27 @@ Use `--grid sfnn-l2-l3-center true` to run only the enabled condition. Both hyph
 
 `--sfnn-init-l2-l3-glorot` (JSON: `"sfnn_init_l2_l3_glorot": true`, default false) changes **scratch L2/L3 weights only** to Glorot uniform. FT, L1, all biases and random seeds are unchanged. This option is independent of centering.
 
+L1 initialization can also be selected independently. These are scratch-only options: they do not reset weights loaded from a checkpoint.
+
+| JSON key (replace underscores with hyphens for CLI) | false (default) | true |
+|---|---|---|
+| `sfnn_init_l1_glorot` | Bucket L1 uniform ±0.01 × init scale | Glorot uniform |
+| `sfnn_init_l1_shared_zero` | Shared L1 uniform ±0.01 | Zero |
+| `sfnn_init_l2_l3_glorot` | Legacy L2/L3 initialization | Glorot uniform |
+
+The L1 Glorot half-width is `nnue_pytorch_init_scale * sqrt(6 / (fan_in + fan_out))`, using dense L1 input/output sizes (including the skip output, if present), not the number of buckets. Bias initialization is unchanged; shared bias is always zero. The new L1 options require cuda-cpp dense SFNN. Shared initialization has no effect when sharing is disabled.
+
+To match Conductor's L1/L2/L3 initialization distributions and zero shared weights, use the following with default unit initialization multipliers and zero biases. This does not match FT initialization, optimizer or loss automatically. Conductor tiles identical initial weights across buckets; BulletOu retains independent random weights per bucket. This is not an identical initial state.
+
+```json
+"sfnn_l1_factorizer": "shared",
+"sfnn_init_l1_glorot": true,
+"sfnn_init_l1_shared_zero": true,
+"sfnn_init_l2_l3_glorot": true
+```
+
+Grid search accepts `--grid sfnn-init-l1-glorot false true`, `--grid sfnn-init-l1-shared-zero false true`, and `--grid sfnn-init-l2-l3-glorot false true`. Combining all three produces eight conditions. Existing defaults and the meaning of the L2/L3 option are preserved.
+
 - L2: `U(-a,a)`, where `a = sqrt(6 / (2*H1 + H2))`.
 - L3: `U(-a,a)`, where `a = sqrt(6 / (H2 + 1))`.
 - With the flag off, both base half-widths remain 0.01.

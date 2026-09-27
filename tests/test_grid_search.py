@@ -15,6 +15,16 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_independent_l1_initialization_grid(self):
+        keys = ["sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero", "sfnn_init_l2_l3_glorot"]
+        args = []
+        for key in keys:
+            args.extend(["--grid", key.replace("_", "-"), "false", "true"])
+            self.assertIn(key, grid.COMMON_COLUMNS)
+        plan = self.plan(args)
+        combinations = {tuple(t["settings"][k] for k in keys) for t in plan["trials"]}
+        self.assertEqual(len(combinations), 8)
+
     def test_bn_affine_lr_multiplier_grid_and_epoch(self):
         key="sfnn_bn_affine_lr_multiplier"
         plan=self.plan(["--grid","sfnn-bn-affine-lr-multiplier","1","0.1","0"])

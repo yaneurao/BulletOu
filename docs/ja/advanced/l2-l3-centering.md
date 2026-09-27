@@ -80,6 +80,27 @@ python .\grid_search.py `
 
 `--sfnn-init-l2-l3-glorot`（JSON: `"sfnn_init_l2_l3_glorot": true`、デフォルトfalse）は、**新規学習のL2/L3重みだけ**をGlorot uniformに変更します。FT・L1・各bias・乱数seedは変更しません。中心化とは独立したオプションです。
 
+L1の初期化も独立して選択できます。すべて新規学習用であり、checkpointから読み込んだ重みをリセットする機能ではありません。
+
+| JSON項目（CLIでは `_` を `-` に置換） | false（デフォルト） | true |
+|---|---|---|
+| `sfnn_init_l1_glorot` | L1個別重みを一様乱数±0.01×初期化倍率 | Glorot uniform |
+| `sfnn_init_l1_shared_zero` | L1 shared重みを一様乱数±0.01 | ゼロ |
+| `sfnn_init_l2_l3_glorot` | L2/L3を従来方式で初期化 | Glorot uniform |
+
+L1のGlorot半幅は `nnue_pytorch_init_scale * sqrt(6 / (fan_in + fan_out))` です。dense L1の入力数と出力数（skip出力があればそれも含む）を使い、bucket数は掛けません。bias設定は変更しません（shared biasは常に0）。L1の新オプションはcuda-cppのdense SFNN用です。shared無効時にはsharedの初期化指定は効果がありません。
+
+ConductorのL1/L2/L3の初期化分布とsharedのゼロ化に合わせるには、次を指定します。倍率は標準の1、biasは標準のzeroを使ってください。FT初期化・optimizer・lossまでConductorに合わせる設定ではありません。また、Conductorは同じ初期重みをbucket間で複製しますが、BulletOuは従来通りbucketごとに独立した乱数を使用します。完全に同一の初期状態になる指定ではありません。
+
+```json
+"sfnn_l1_factorizer": "shared",
+"sfnn_init_l1_glorot": true,
+"sfnn_init_l1_shared_zero": true,
+"sfnn_init_l2_l3_glorot": true
+```
+
+grid searchでは `--grid sfnn-init-l1-glorot false true`、`--grid sfnn-init-l1-shared-zero false true`、`--grid sfnn-init-l2-l3-glorot false true` を指定できます。3つ同時なら8条件です。既存のL2/L3オプションの意味と、指定しない場合の動作は変えていません。
+
 - L2: `U(-a, a)`、`a = sqrt(6 / (2*H1 + H2))`。
 - L3: `U(-a, a)`、`a = sqrt(6 / (H2 + 1))`。
 - OFF時の基本半幅は両層とも従来どおり0.01。
