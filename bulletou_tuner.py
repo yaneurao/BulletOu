@@ -272,9 +272,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-temp", action="store_true", help="Keep candidate temp directories for debugging")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--no-stream-child-output",
-        action="store_true",
-        help="Do not mirror bulletou.exe stdout to console; logs are still written under runner logs/.",
+        "--stream-child-output",
+        choices=["true", "false"], default="true",
+        help="Mirror bulletou.exe stdout to console (default: true); logs are always written.",
     )
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--debug", action="store_true", help="Print Python traceback for runner errors")
@@ -1245,7 +1245,7 @@ def train_candidate_stage(
         code, elapsed = run_command(
             cmd,
             log_path,
-            stream=not args.no_stream_child_output,
+            stream=args.stream_child_output == "true",
             stream_prefix=child_prefix,
         )
         if code != 0:
@@ -1674,7 +1674,7 @@ def run_once_from_settings(
         print("  " + subprocess.list2cmdline(cmd), flush=True)
         return 0
 
-    code, elapsed = run_command(cmd, log_path, stream=not args.no_stream_child_output)
+    code, elapsed = run_command(cmd, log_path, stream=args.stream_child_output == "true")
 
     if managed:
         assert ordinary_output is not None
@@ -1838,7 +1838,7 @@ def main() -> int:
                 worker = WorkerClient(
                     run.exe,
                     log_dir / "worker.stderr.log",
-                    stream=not args.no_stream_child_output,
+                    stream=args.stream_child_output == "true",
                     color=color,
                 )
                 worker.request("hello", prefix=paint(color, "[WORKER] ", "magenta"))

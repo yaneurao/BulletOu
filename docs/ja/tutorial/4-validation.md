@@ -111,13 +111,13 @@ epoch末の暗黙保存も無効にするには、次のように指定します
 ```json
 {
   "save_rate": 0,
-  "no_save_epoch_end": true
+  "save_epoch_end": false
 }
 ```
 
-CLIでは `--save-rate none --no-save-epoch-end` です。これで学習中の番号付きcheckpointを保存しなくなります。正常終了時の `cuda-cpp-direct/` への最終出力は別処理で、この指定では無効になりません。途中で停止した場合、未保存の重みからはresumeできません。
+CLIでは `--save-rate none --save-epoch-end false` です。これで学習中の番号付きcheckpointを保存しなくなります。正常終了時の `cuda-cpp-direct/` への最終出力は別処理で、この指定では無効になりません。途中で停止した場合、未保存の重みからはresumeできません。
 
-正の `save_rate` を指定したままの場合、`no_save_epoch_end` は定期保存を止めません。例えば `superbatches: 324, save_rate: 81` なら、sb 324も定期保存の対象です。
+正の `save_rate` を指定したままの場合、`save_epoch_end: false` は定期保存を止めません。例えば `superbatches: 324, save_rate: 81` なら、sb 324も定期保存の対象です。
 
 保存頻度を変えても、明示した検証頻度は変わりません。`save_rate: 0` で検証頻度を省略すると、通常のvalidationはepoch末のみ、量子化validationは保存時のみです。`lr_schedule: "plateau"` は従来どおり `save_rate: 1` が必要です。
 

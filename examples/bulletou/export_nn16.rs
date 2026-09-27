@@ -87,7 +87,7 @@ pub(super) fn run(args: &ExportNn16Args) -> Result<(), String> {
         feature.base_input_size(),
         feature.virtual_rows(),
         ft_size,
-        train_args.no_ft_factorize,
+        !train_args.ft_factorizer,
     )?;
     // Export is not a resume: never migrate/rebase/extract or create new factors.
     if records.contains_key("l1fw") != (spec.shared && !shape.has_compact_l1())

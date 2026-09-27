@@ -82,7 +82,7 @@ WRM教師勝率を0/1から内側へ圧縮する `--wrm-target-epsilon`（既定
 | `--validation-rate` | 何 sb ごとに検証するか。保存頻度とは独立 | `--save-rate` と同じ |
 | `--test-positions` | 検証に使う局面数。省略すると検証ファイルの全局面を使う | 全件 |
 | `--test-batch-size` | 検証時のGPU batch size。VRAM不足のときだけ下げる | 65536 |
-| `--save-epoch-end` / `--no-save-epoch-end` | epoch末に保存するか | on |
+| `--save-epoch-end` / `--save-epoch-end false` | epoch末に保存するか | on |
 | `--lr` | 学習率の開始値 | 0.000875 |
 | `--lr-min` | 学習率の下限 | 0.00001 |
 | `--lr-schedule` | 学習率schedule。まずは `step` でよい | `step` |

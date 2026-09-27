@@ -111,13 +111,13 @@ To disable implicit epoch-end saves as well:
 ```json
 {
   "save_rate": 0,
-  "no_save_epoch_end": true
+  "save_epoch_end": false
 }
 ```
 
-The CLI equivalent is `--save-rate none --no-save-epoch-end`. This disables numbered checkpoints during training. The final output to `cuda-cpp-direct/` on normal completion is a separate operation and is not disabled by these settings. Unsaved weights cannot be resumed after interruption.
+The CLI equivalent is `--save-rate none --save-epoch-end false`. This disables numbered checkpoints during training. The final output to `cuda-cpp-direct/` on normal completion is a separate operation and is not disabled by these settings. Unsaved weights cannot be resumed after interruption.
 
-With a positive `save_rate`, `no_save_epoch_end` does not disable periodic saves. For example, `superbatches: 324, save_rate: 81` still saves at sb 324 because it is a periodic boundary.
+With a positive `save_rate`, `save_epoch_end: false` does not disable periodic saves. For example, `superbatches: 324, save_rate: 81` still saves at sb 324 because it is a periodic boundary.
 
 Explicit validation rates remain independent of saves. With `save_rate: 0` and omitted validation rates, ordinary validation runs at epoch end, while quantized validation runs only on saves. `lr_schedule: "plateau"` still requires `save_rate: 1`.
 

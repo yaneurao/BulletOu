@@ -485,12 +485,19 @@ class GridSearchTests(unittest.TestCase):
 
     def test_generic_grid_string_boolean_and_zero(self):
         plan = self.plan(["--grid", "sfnn-factorizer-alpha", "shared=0.5", "shared=1.0",
-                          "--grid", "no-ft-factorize", "false", "true",
+                          "--grid", "ft-factorizer", "false", "true",
                           "--grid", "validation_rate", "0"])
         self.assertEqual(len(plan["trials"]), 8)
         self.assertEqual(plan["trials"][0]["settings"]["sfnn_factorizer_alpha"], "shared=0.5")
-        self.assertIs(plan["trials"][0]["settings"]["no_ft_factorize"], False)
+        self.assertIs(plan["trials"][0]["settings"]["ft_factorizer"], False)
         self.assertEqual(plan["trials"][0]["settings"]["validation_rate"], 0)
+
+    def test_ft_factorizer_alias(self):
+        for name in ("sfnn-ft-factorizer", "sfnn_ft_factorizer"):
+            plan = self.plan(["--grid", name, "false", "true"])
+            self.assertIs(plan["trials"][0]["settings"]["ft_factorizer"], False)
+            self.assertIs(plan["trials"][1]["settings"]["ft_factorizer"], True)
+            self.assertNotIn("sfnn_ft_factorizer", plan["trials"][0]["settings"])
 
     def test_duplicate_axes_or_values_rejected(self):
         for extra in (["--grid", "lr", "0.001"], ["--grid", "wrm_target_scaling", "600", "600"],
@@ -1012,7 +1019,7 @@ class GridSearchTests(unittest.TestCase):
         for arguments in ([*argv, "--resume", "--epochs", "1"],):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 grid.main(arguments)
-        grid.atomic_json(self.settings_path, {**self.common, "no_ft_factorize": True})
+        grid.atomic_json(self.settings_path, {**self.common, "ft_factorizer": False})
         with self.assertRaisesRegex(ValueError, "checkpoint-incompatible"):
             grid.main([*argv, "--resume", "--epochs", "7"])
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())

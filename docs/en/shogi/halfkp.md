@@ -100,7 +100,7 @@ The file is the nnue-pytorch / Stockfish binary format, byte-identical to what `
 | `--batch-size` | Positions per gradient step. If omitted, BulletOu uses the tatara-aligned default | 65536 |
 | `--positions-per-superbatch` | Target positions per superbatch. Effective value is rounded down to a multiple of `batch-size` | 100000000 |
 | `--save-rate` | Save every N superbatches; epoch end is also saved by default | 20 |
-| `--save-epoch-end` / `--no-save-epoch-end` | Keep or disable the implicit epoch-end save | on |
+| `--save-epoch-end` / `--save-epoch-end false` | Keep or disable the implicit epoch-end save | on |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR schedule (`step` = StepLR, `geometric` = geometric, `cos` = cosine; see [Advanced: Adjust training settings](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | Blend weight between teacher eval and WDL (= Win/Draw/Loss game-result label). Matches YaneuraOu's `lambda` convention: `λ × teacher_eval + (1−λ) × game_result`. `λ=1.0` is pure eval, `λ=0.0` is pure WDL | 1.0 |
 | `--loss-pow-exp` | Exponent `p` in `|prediction - target|^p` | 2.0 |

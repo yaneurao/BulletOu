@@ -82,7 +82,7 @@ Fuller option table:
 | `--validation-rate` | Validate every N sb. Independent from saving | same as `--save-rate` |
 | `--test-positions` | Number of validation positions. If omitted, use all positions in `--test-teacher` | all |
 | `--test-batch-size` | GPU batch size for validation. Lower only when validation runs out of VRAM | 65536 |
-| `--save-epoch-end` / `--no-save-epoch-end` | Whether to save at the end of each epoch | on |
+| `--save-epoch-end` / `--save-epoch-end false` | Whether to save at the end of each epoch | on |
 | `--lr` | Learning rate at epoch start | 0.000875 |
 | `--lr-min` | Minimum learning rate | 0.00001 |
 | `--lr-schedule` | Learning-rate schedule. Start with `step` | `step` |

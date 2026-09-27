@@ -100,7 +100,7 @@ checkpoints/my-halfkp/
 | `--batch-size` | 1 gradient step あたりの局面数。省略時は tatara に合わせて 65536 | 65536 |
 | `--positions-per-superbatch` | superbatch あたりの目標局面数。実効値は `batch-size` の倍数へ切り捨て | 100000000 |
 | `--save-rate` | N superbatch ごとに save。デフォルトでは epoch 末尾も save | 20 |
-| `--save-epoch-end` / `--no-save-epoch-end` | epoch 末尾の暗黙 save を有効/無効にする | on |
+| `--save-epoch-end` / `--save-epoch-end false` | epoch 末尾の暗黙 save を有効/無効にする | on |
 | `--lr` / `--lr-schedule` / `--lr-min` | LR スケジューラ (`step` = StepLR、`geometric` = geometric、`cos` = cosine、`plateau` = validation loss が改善しないときだけ減衰。詳細は [応用編: 学習設定を調整する](../advanced/tuning.md)) | 0.000875 / `step` / 0.00001 |
 | `--lambda` | 教師 eval と対局結果 (WDL = Win/Draw/Loss) のブレンド比 (やねうら王内蔵学習器の `lambda` と同じ慣例): `λ × 教師eval + (1−λ) × 対局結果`。`λ=1.0` で純 eval、`λ=0.0` で純 WDL | 1.0 |
 | `--loss-pow-exp` | `|prediction - target|^p` の `p` | 2.0 |

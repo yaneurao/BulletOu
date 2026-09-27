@@ -76,7 +76,7 @@ Total effective epochs trained: 3 + 3 = 6.
 |---|---|
 | `--arch` | Changes the evaluation function or layer sizes, so saved weights no longer match. |
 | `--arch` LayerStack part, such as `k3k3` or `hand1024` | Changes the number of SFNN branches, so saved weights no longer match. |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | Short forms for `--sfnn-factorizer shared` / `--sfnn-factorizer none`. Prefer `--sfnn-factorizer`. |
+| `--sfnn-factorized` / `--sfnn-factorized false` | Short forms for `--sfnn-factorizer shared` / `--sfnn-factorizer none`. Prefer `--sfnn-factorizer`. |
 | `--tag` | Changing this lands you in a different output dir = fresh training. (Useful only when starting a new experiment.) |
 
 To change any of these, pass a different `--tag` and run as a separate experiment.

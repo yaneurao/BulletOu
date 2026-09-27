@@ -121,7 +121,7 @@ Lists form a Cartesian product, not zipped pairs. Invalid combinations such as `
 | `--resume` | Resume unfinished conditions from their latest checkpoints; archive unsaved attempts and restart from the original initial state if no checkpoint exists |
 | `--continue-on-error` | Continue remaining conditions after a child training failure. Runner still exits nonzero if any failed |
 
-The runner controls `output`, `output_folder`, `tag`, `resume`, and `no_resume` per trial. Other common settings are preserved except explicit grid overrides and `--epochs`. The original JSON is never edited. Relative input paths use the **invocation working directory**, just as in standalone BulletOu. Resume from the same directory with the same command.
+The runner controls `output`, `output_folder`, `tag`, `resume` per trial. Other common settings are preserved except explicit grid overrides and `--epochs`. The original JSON is never edited. Relative input paths use the **invocation working directory**, just as in standalone BulletOu. Resume from the same directory with the same command.
 
 Without `--checkpoint`, existing `initial_state`/`initial_dataloader_pos` in the common JSON are honored; without either, training starts from scratch. Optimizer loading and factorizer-migration reset rules remain those of BulletOu. The runner adds no optimizer resets.
 
@@ -147,11 +147,11 @@ python .\grid_search.py `
   --output-folder D:\BulletOu-snapshots\20260911\grid-shared `
   --checkpoint C:\path\to\0033 `
   --grid sfnn_factorizer_alpha "shared=0.5" "shared=1.0" `
-  --grid no_ft_factorize false true `
+  --grid ft_factorizer false true `
   --epochs 1 2
 ```
 
-This runs four conditions. As in BulletOu JSON, `true` passes a flag and `false` omits it; **false does not necessarily disable the underlying feature**. Numbers and strings are supported. Lifecycle/initial-state options, including output paths, and resume, cannot be grid axes.
+This runs four conditions. The positive boolean options `ft_factorizer` (alias `sfnn_ft_factorizer`), `save_epoch_end`, and `sfnn_factorized` explicitly pass both `true` and `false`. Other flags retain the JSON convention: `true` passes a flag and `false` omits it, so false does not necessarily disable a default-enabled feature. Numbers and strings are supported. Lifecycle/initial-state options, including output paths and resume, cannot be grid axes.
 
 Use `--grid max-epochs 1 2` (`max_epochs` also works) to train independent one-epoch and two-epoch conditions. Combining it with `--grid superbatches 16 32` produces four conditions. The grid axis overrides common JSON and `--max-epochs`. Reports stop at each condition's endpoint; `--epochs` optionally selects reported epochs within that range. On resume, a different epoch-budget grid value is a separate condition, not an extension of an existing condition.
 
@@ -212,7 +212,7 @@ The previous trial directory is moved intact to `<grid root>/interrupted-runs/<t
 
 Ordinary reruns reject a changed plan. With `--resume`, the same grid condition resumes its own checkpoint while accepting changes to the common JSON, including LR, batch size, bpu, and save/validation rates. `[SETTINGS CHANGED]` prints the old and new values. Changes apply at the next invocation; the runner does not hot-reload JSON during training.
 
-Explicit grid arguments identify conditions and override common JSON values. For example, `--lrs 0.0001 0.0002` overrides JSON `lr`. A different grid value creates a new condition rather than reusing another condition's checkpoint. Changes to `arch`, `backend`, or `no_ft_factorize` are rejected for checkpoint compatibility. Other settings remain subject to native BulletOu argument and checkpoint validation.
+Explicit grid arguments identify conditions and override common JSON values. For example, `--lrs 0.0001 0.0002` overrides JSON `lr`. A different grid value creates a new condition rather than reusing another condition's checkpoint. Changes to `arch`, `backend`, or `ft_factorizer` are rejected for checkpoint compatibility. Other settings remain subject to native BulletOu argument and checkpoint validation.
 
 Changing settings alone does not restart completed trials: increase `max_epochs` to extend them. Results after common-setting changes are not equivalent to training with one constant configuration from the beginning. Rebuilding the executable at the same path is allowed, but implementation changes and input-file content changes also affect comparisons.
 

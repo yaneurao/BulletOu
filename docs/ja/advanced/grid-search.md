@@ -123,7 +123,7 @@ LR 2通り × 教師側scaling 2通り = **4条件**です。`--dry-run` は実�
 | `--resume` | 未完了条件を最新保存checkpointから再開する。checkpointがなければ途中ログを退避して元の初期状態から再実行 |
 | `--continue-on-error` | ある条件が学習エラーになっても残りを実行する。エラーがあればrunnerの終了コードは非0 |
 
-共通設定の `output` / `output_folder` / `tag` / `resume` / `no_resume` はrunnerが条件ごとに管理します。それ以外はgridで明示した項目と `--epochs` による上書きを除き保持します。元の設定JSONには書き戻しません。入力データ等の相対パスは、BulletOu単体と同じく**コマンド実行時の作業フォルダ**基準です。再開時も同じ作業フォルダ・同じコマンドを使ってください。
+共通設定の `output` / `output_folder` / `tag` / `resume` はrunnerが条件ごとに管理します。それ以外はgridで明示した項目と `--epochs` による上書きを除き保持します。元の設定JSONには書き戻しません。入力データ等の相対パスは、BulletOu単体と同じく**コマンド実行時の作業フォルダ**基準です。再開時も同じ作業フォルダ・同じコマンドを使ってください。
 
 `--checkpoint` を省略した場合、共通JSONの `initial_state` / `initial_dataloader_pos` があればそれを使い、なければscratchから始めます。optimizer stateも通常のBulletOu仕様で読み込みます。factorizer構造変更などによる本体側のreset規則は変えません。runner独自のresetや、前の条件の重みの流用はありません。
 
@@ -149,11 +149,11 @@ python .\grid_search.py `
   --output-folder D:\BulletOu-snapshots\20260911\grid-shared `
   --checkpoint C:\path\to\0033 `
   --grid sfnn_factorizer_alpha "shared=0.5" "shared=1.0" `
-  --grid no_ft_factorize false true `
+  --grid ft_factorizer false true `
   --epochs 1 2
 ```
 
-これも2×2の4条件です。JSONと同様に、`true` はフラグを指定、`false` はフラグを省略します（**falseが必ず「機能OFF」を意味するわけではありません**）。数値や文字列も指定できます。出力先・開始state・resumeなどの実行管理項目はgrid軸にはできません。
+これも2×2の4条件です。`ft_factorizer`（alias: `sfnn_ft_factorizer`）、`save_epoch_end`、`sfnn_factorized` は `true` / `false` の両方を明示的に渡します。それ以外のフラグはJSONと同様に、`true` で指定、`false` で省略するため、falseが必ず既定で有効な機能をOFFにするとは限りません。数値や文字列も指定できます。出力先・開始state・resumeなどの実行管理項目はgrid軸にはできません。
 
 `--grid max-epochs 1 2`（`max_epochs`表記も可）で、1epochと2epochを独立した条件として学習できます。`--grid superbatches 16 32`と併用すれば4条件です。grid指定は共通JSONや `--max-epochs` より優先します。集計は各条件の終了epochまでで、`--epochs`を併用するとその範囲内の指定epochだけを表示します。再開時もepoch数が異なるgrid値は別条件です。既存条件の延長ではありません。
 
@@ -214,7 +214,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 
 通常の再実行ではmanifestと異なる計画を拒否します。ただし `--resume` では、同じgrid条件のcheckpointを引き継ぎつつ、共通JSONのLR・batch size・bpu・保存／検証頻度などを変更できます。stdoutの `[SETTINGS CHANGED]` に変更前後を表示します。実行中のJSON変更を自動反映する機能ではなく、次の起動から反映します。
 
-条件の識別には明示的なgrid引数を使います。例えば `--lrs 0.0001 0.0002` を指定していれば、JSONの `lr` よりその値を優先します。gridの値を変更した条件には、別条件のcheckpointを流用せず、新規trialを作ります。`arch`・`backend`・`no_ft_factorize` の変更は既存checkpointとの互換性のため拒否します。それ以外もBulletOu本体の読み込み・引数検証は行われます。
+条件の識別には明示的なgrid引数を使います。例えば `--lrs 0.0001 0.0002` を指定していれば、JSONの `lr` よりその値を優先します。gridの値を変更した条件には、別条件のcheckpointを流用せず、新規trialを作ります。`arch`・`backend`・`ft_factorizer` の変更は既存checkpointとの互換性のため拒否します。それ以外もBulletOu本体の読み込み・引数検証は行われます。
 
 完了済みtrialは設定変更だけでは再実行しません。延長するには `max_epochs` を増やしてください。共通設定を途中変更した結果は、最初から同一条件で学習した結果とは区別して比較してください。実行ファイルは同じpathで再ビルドできますが、入力ファイルの内容変更や実装変更も比較に影響します。
 

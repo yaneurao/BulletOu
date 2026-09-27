@@ -84,7 +84,8 @@ def atomic_json(path: Path, obj: dict) -> None:
 def key_name(key: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", key):
         raise ValueError(f"invalid BulletOu option name: {key!r}")
-    return key.replace("-", "_")
+    normalized = key.replace("-", "_")
+    return "ft_factorizer" if normalized == "sfnn_ft_factorizer" else normalized
 
 
 def scalar(value):
@@ -588,8 +589,8 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
         trial = matches[0]
         old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
-        defaults = {"backend": "cuda-cpp", "no_ft_factorize": False}
-        incompatible = [k for k in ("arch", "backend", "no_ft_factorize")
+        defaults = {"backend": "cuda-cpp", "ft_factorizer": True}
+        incompatible = [k for k in ("arch", "backend", "ft_factorizer")
                         if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))]
         if incompatible:
             raise ValueError(

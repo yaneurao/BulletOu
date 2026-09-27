@@ -18,7 +18,8 @@ effective_FT_weight[k, p] = individual_weight[k, p] + alpha_FT * shared_weight[p
 The shared weight receives gradients from the same piece feature across king positions. Individual weights remain trainable, so king-specific differences can still be learned.
 Shared weights start at zero and are added to the individual weights when exporting `nn.bin`.
 
-FT factorization is enabled by default. `--no-ft-factorize` disables allocation, addition, and updates of the shared FT weights.
+FT factorization is enabled by default. `--ft-factorizer false` disables allocation, addition, and updates of the shared FT weights.
+The canonical name is `ft_factorizer`. JSON also accepts `sfnn_ft_factorizer`, and the CLI accepts `--sfnn-ft-factorizer true/false` as an equivalent alias. Grid search accepts `--grid sfnn-ft-factorizer false true`. The alias is normalized to the canonical name without changing defaults or checkpoint compatibility checks.
 This switch also applies to `NNUE_halfkp` architectures. Inputs without an FT factorizer do not gain shared rows.
 
 `--sfnn-factorizer` controls **L1 sharing only**, independently of the FT.
@@ -29,17 +30,17 @@ Compact-L1 architectures do not use this L1 sharing either.
 |---|---|---|
 | Neither option specified | On | `shared` |
 | `--sfnn-factorizer none` | On | None |
-| `--no-ft-factorize` | Off | `shared` |
-| `--no-ft-factorize --sfnn-factorizer none` | Off | None |
+| `--ft-factorizer false` | Off | `shared` |
+| `--ft-factorizer false --sfnn-factorizer none` | Off | None |
 
 To compare fresh training with all this sharing disabled, add these fields to `bulletou-settings.json`:
 
 ```json
-"no_ft_factorize": true,
+"ft_factorizer": false,
 "sfnn_factorizer": "none"
 ```
 
-To enable FT factorization, omit `no_ft_factorize` or set it to `false`. Startup prints `FT factorizer = on/off`.
+To enable FT factorization, omit `ft_factorizer` or set it to `true`. Startup prints `FT factorizer = on/off`.
 `sfnn_factorizer_alpha` does not scale the shared FT weights.
 
 Loading `state.bin` through `--resume` or `--initial-state` requires the same FT setting as the saved checkpoint.
@@ -80,9 +81,9 @@ validation use the same coefficient. FT biases are not shared terms and are not 
 
 `sfnn_factorizer_alpha: "all=0.5"` controls L1 shared/axis/pair, not the FT.
 FT alpha 0 keeps the shared array allocated with zero contribution;
-`no_ft_factorize: true` removes the array entirely. These are different settings.
+`ft_factorizer: false` removes the array entirely. These are different settings.
 Non-default FT alpha is supported only for `SFNN_halfka2` with FT sharing enabled.
-Other architectures, including `NNUE_halfkp`, or `no_ft_factorize: true` produce an error.
+Other architectures, including `NNUE_halfkp`, or `ft_factorizer: false` produce an error.
 
 ### Rebasing when alpha changes
 

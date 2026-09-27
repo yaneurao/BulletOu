@@ -459,7 +459,7 @@ current cuda-cpp follow-up queue.
 - Also aligned the standard NNUE Ranger update clamp policy with tatara: the FT layer stays unclamped in fp32 training state, while the later quantized layers use their signed-int8-compatible clamp ranges.
 - Controlled 4M same-PSV comparison on `target\tatara-parity\parity-20260718-073904\teacher-4194304.psv`:
   - tatara factorized, `threads=1`: superbatch64 train `loss=0.053733`, held-out `test_loss=0.054000`, `test_acc=0.6655`;
-  - tatara non-factorized, `threads=1 --no-ft-factorize`: superbatch64 train `loss=0.056900`, held-out `test_loss=0.055529`, `test_acc=0.6503`;
+  - tatara non-factorized, `threads=1 --ft-factorizer false`: superbatch64 train `loss=0.056900`, held-out `test_loss=0.055529`, `test_acc=0.6503`;
   - BulletOu non-factorized control: superbatch64 average train `loss=0.056960131`, matching tatara's non-factorized result;
   - BulletOu factorized speed run: `4194304` positions in `3.797s`, `1104772` pos/s, superbatch64 average train `loss=0.053683987`, `step512_loss mean=0.053936914`;
   - BulletOu factorized validation run: `4194304` positions in `3.832s`, `1094486` pos/s, `step512_loss mean=0.053869173`, held-out `test_loss=0.052451`, `test_acc=0.664429`.
@@ -1101,7 +1101,7 @@ current cuda-cpp follow-up queue.
 - Defaults:
   - dense-L1 SFNN LayerStack: L1/L2/L3 shared terms are enabled;
   - compact-L1 SFNN LayerStack (`cN_sMxG`): L1 shared term remains disabled, but L2/L3 shared terms are enabled;
-  - `--no-sfnn-factorized` disables all SFNN shared stack factorizer terms.
+  - `--sfnn-factorized false` disables all SFNN shared stack factorizer terms.
 - Export/validation:
   - validation weights and `nn.bin` fold L1/L2/L3 shared terms into each bucket's stacked weights;
   - full `state.bin` preserves the unfused shared tensors and their optimizer state for resume.
@@ -1115,7 +1115,7 @@ current cuda-cpp follow-up queue.
 
 - Added static `--sfnn-factorizer` selection for SFNN LayerStack experiments:
   - `shared` is the default and matches the previous shared stack-factorizer behavior;
-  - `none` disables all SFNN residual factorizer terms (`--no-sfnn-factorized` remains a compatibility alias);
+  - `none` disables all SFNN residual factorizer terms (`--sfnn-factorized false` remains a compatibility alias);
   - `axis` enables shared plus all available bucket-axis residual terms;
   - mixed forms such as `king=axis,hand=shared` enable king-axis residuals while keeping hand bucket effects in the global shared residual only.
 - `factorizer-schedule` was intentionally not implemented. To change factorizer usage between epochs, stop at an epoch boundary and restart with explicit `--resume --sfnn-factorizer ...`.

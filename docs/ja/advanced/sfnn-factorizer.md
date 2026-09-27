@@ -18,7 +18,8 @@ FTの実効重み[k, p] = 個別重み[k, p] + α_FT * 共通重み[p]
 同じ駒特徴の共通重みには、異なる玉位置の局面から勾配が集まります。
 個別重みは残るため、玉位置ごとの差も学習できます。共通重みは0で初期化し、`nn.bin` の書き出し時に個別重みへ足し込みます。
 
-FT factorizerはデフォルトで有効です。`--no-ft-factorize` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
+FT factorizerはデフォルトで有効です。`--ft-factorizer false` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
+正式名は `ft_factorizer` ですが、JSONでは `sfnn_ft_factorizer`、CLIでは `--sfnn-ft-factorizer true/false` も同じ意味のaliasとして使えます。grid searchでも `--grid sfnn-ft-factorizer false true` を指定できます。内部では正式名に統一され、既定値やcheckpointの互換性判定は変わりません。
 この切り替えは `NNUE_halfkp` 系にも使えます。FT factorizerを持たない入力では、共有項は追加されません。
 
 `--sfnn-factorizer` が設定するのは**L1の共有だけ**です。FTとは独立しています。
@@ -29,17 +30,17 @@ compact L1のarchitectureでは、このL1共有も無効です。
 |---|---|---|
 | 指定なし | 有効 | `shared` |
 | `--sfnn-factorizer none` | 有効 | なし |
-| `--no-ft-factorize` | 無効 | `shared` |
-| `--no-ft-factorize --sfnn-factorizer none` | 無効 | なし |
+| `--ft-factorizer false` | 無効 | `shared` |
+| `--ft-factorizer false --sfnn-factorizer none` | 無効 | なし |
 
 共有をすべて外して新規学習を比較するなら、`bulletou-settings.json` に次の2項目を指定します。
 
 ```json
-"no_ft_factorize": true,
+"ft_factorizer": false,
 "sfnn_factorizer": "none"
 ```
 
-FTを有効にするには `no_ft_factorize` を省略するか `false` にします。起動時の `FT factorizer = on/off` でも確認できます。
+FTを有効にするには `ft_factorizer` を省略するか `true` にします。起動時の `FT factorizer = on/off` でも確認できます。
 `sfnn_factorizer_alpha` はFTの共通重みには掛かりません。
 
 `--resume` または `--initial-state` で `state.bin` を読み込むときは、保存元と同じFT設定が必要です。
@@ -79,9 +80,9 @@ FTのbiasは共有項ではないため、この係数は掛かりません。
 
 `sfnn_factorizer_alpha: "all=0.5"` はL1のshared・axis・pairを指定するもので、FTには影響しません。
 FTの係数0は、共通重みの配列を残したまま寄与を0にします。
-`no_ft_factorize: true` はその配列自体を作らない指定で、同じ意味ではありません。
+`ft_factorizer: false` はその配列自体を作らない指定で、同じ意味ではありません。
 非デフォルトのFT係数はFT共有が有効な `SFNN_halfka2` 専用です。
-`NNUE_halfkp` などや `no_ft_factorize: true` との組み合わせはエラーになります。
+`NNUE_halfkp` などや `ft_factorizer: false` との組み合わせはエラーになります。
 
 ### αを変えて追加学習する場合のrebase
 

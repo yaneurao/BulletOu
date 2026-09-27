@@ -3580,7 +3580,7 @@ fn quantized_validation_mode_label(args: &Args) -> &'static str {
 }
 
 fn effective_save_epoch_end(args: &Args) -> bool {
-    args.save_epoch_end && !args.no_save_epoch_end
+    args.save_epoch_end
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3997,7 +3997,7 @@ impl std::str::FromStr for SfnnFactorizerAlphaSpec {
 }
 
 fn requested_sfnn_factorizer_spec(args: &Args) -> SfnnFactorizerSpec {
-    if args.no_sfnn_factorized {
+    if args.sfnn_factorized == Some(false) {
         SfnnFactorizerSpec::NONE
     } else if let Some(spec) = args.sfnn_factorizer {
         spec
@@ -4021,7 +4021,26 @@ fn bulletou_settings_json_value_to_args(
     {
         return Err(format!("{} has invalid option key `{key}`", path.display()));
     }
-    let flag = format!("--{}", key.replace('_', "-"));
+    let normalized = key.replace('_', "-");
+    let normalized = if normalized == "sfnn-ft-factorizer" { "ft-factorizer" } else { &normalized };
+    let flag = format!("--{normalized}");
+    let replacement = match flag.as_str() {
+        "--no-ft-factorize" => Some("ft_factorizer"),
+        "--no-save-epoch-end" => Some("save_epoch_end"),
+        "--no-sfnn-factorized" => Some("sfnn_factorized"),
+        "--no-resume" => Some("resume"),
+        _ => None,
+    };
+    if let Some(replacement) = replacement {
+        return Err(format!("{key} was removed; use {replacement} with the inverse boolean value"));
+    }
+    if matches!(flag.as_str(), "--ft-factorizer" | "--save-epoch-end" | "--sfnn-factorized" | "--resume") {
+        if let serde_json::Value::Bool(value) = value {
+            out.push(flag.into());
+            out.push(value.to_string().into());
+            return Ok(());
+        }
+    }
     match value {
         serde_json::Value::Null => Ok(()),
         serde_json::Value::Bool(false) => Ok(()),
@@ -4729,14 +4748,9 @@ struct Args {
     /// even if its stored resume config is missing or differs from the
     /// current command line. Use this only when you intentionally want to
     /// continue an old run with changed training controls.
-    #[arg(long, conflicts_with = "no_resume")]
-    resume: bool,
-
-    /// Refuse to load any checkpoint from the output directory. If the
-    /// directory already contains a resumable checkpoint, the program
-    /// stops instead of mixing a fresh run into the same checkpoint series.
-    #[arg(long, conflicts_with = "resume")]
-    no_resume: bool,
+    /// Set false to forbid resuming; omission retains automatic checkpoint detection.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    resume: Option<bool>,
 
     /// Number of epochs to train. With explicit `--superbatches N`, one
     /// epoch is an LR/validation cycle of N superbatches; the teacher stream
@@ -4958,7 +4972,7 @@ struct Args {
 
     /// Save every N superbatches (1 = save every superbatch, 5 = every 5th).
     /// Use 0 or none to disable periodic saves; each epoch's final superbatch
-    /// is still saved unless --no-save-epoch-end is set. Omission defaults to 20.
+    /// is still saved unless --save-epoch-end false is set. Omission defaults to 20.
     #[arg(long, value_parser = parse_save_rate, value_name = "N|none")]
     save_rate: Option<usize>,
 
@@ -4984,12 +4998,8 @@ struct Args {
     quantized_validation_exact: bool,
 
     /// Also save the final superbatch of each epoch even when it is not on a save-rate boundary.
-    #[arg(long, default_value_t = true, action = ArgAction::SetTrue)]
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     save_epoch_end: bool,
-
-    /// Disable the implicit checkpoint at the final superbatch of each epoch.
-    #[arg(long = "no-save-epoch-end")]
-    no_save_epoch_end: bool,
 
     /// Teacher batch preparation worker threads (CPU side). Omit or set `0`
     /// for auto = OS logical thread count (`available_parallelism()`). If
@@ -5063,12 +5073,12 @@ struct Args {
     #[arg(long)]
     arch: Option<TrainArch>,
 
-    /// Disable FT piece-feature factorization for HalfKA2 / HalfKP training.
+    /// Enable FT piece-feature factorization for HalfKA2 / HalfKP training.
     /// Default: enabled for those inputs. Independent of --sfnn-factorizer,
     /// which controls LayerStack L1 sharing. Checkpoints must use the same
     /// FT factorization setting when resuming or loading --initial-state.
-    #[arg(long)]
-    no_ft_factorize: bool,
+    #[arg(long, visible_alias = "sfnn-ft-factorizer", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    ft_factorizer: bool,
 
     /// Multiplier of FT shared piece weights (SFNN HalfKA2), default 1.
     /// Forward, gradients and export use the same coefficient. Range 0..=100.
@@ -5115,9 +5125,10 @@ struct Args {
     #[arg(
         long = "sfnn-factorized",
         alias = "sfnn-factorized-l1",
-        conflicts_with_all = ["no_sfnn_factorized", "sfnn_factorizer"]
+        conflicts_with = "sfnn_factorizer",
+        num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set
     )]
-    sfnn_factorized: bool,
+    sfnn_factorized: Option<bool>,
 
     /// Select SFNN dense-L1 factorizer terms (never L2/L3). Accepted values:
     /// `none`, `shared`, `axis`, or comma-separated per-family forms such as
@@ -5127,7 +5138,7 @@ struct Args {
     /// `king=axis,hand=axis`, while `k3k3` becomes `king=axis`.
     /// Axis terms are full residual factors; they are folded into stack
     /// weights for validation and `nn.bin` export.
-    #[arg(long = "sfnn-factorizer", conflicts_with_all = ["sfnn_factorized", "no_sfnn_factorized"])]
+    #[arg(long = "sfnn-factorizer", conflicts_with = "sfnn_factorized")]
     sfnn_factorizer: Option<SfnnFactorizerSpec>,
 
     /// Scale the contribution of active SFNN factorizer terms during forward,
@@ -5319,12 +5330,6 @@ struct Args {
     /// penalized; lower values start damping earlier.
     #[arg(long = "sfnn-saturation-threshold", default_value = "127.0")]
     sfnn_saturation_threshold: f32,
-
-    /// Compatibility alias for `--sfnn-factorizer none`; disables all SFNN
-    /// residual factorizer terms. Use this when resuming an older
-    /// non-factorized SFNN experiment.
-    #[arg(long = "no-sfnn-factorized", conflicts_with = "sfnn_factorizer")]
-    no_sfnn_factorized: bool,
 
     /// Held-out test set (.hcpe / .psv / .bin) for sign-agreement validation
     /// during training. When set, the trainer runs validation after
@@ -5571,7 +5576,7 @@ impl Args {
             }
         }
         if self.ft_factorizer_alpha != 1.0
-            && (self.no_ft_factorize || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
+            && (!self.ft_factorizer || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
         {
             return Err("--ft-factorizer-alpha requires SFNN_halfka2 with FT factorization enabled".to_string());
         }
@@ -5660,11 +5665,8 @@ impl Args {
         ) {
             return Err(format!("--backend cuda-cpp does not support {} train steps", eval_type.cli_name()));
         }
-        if self.sfnn_factorized && !eval_type.uses_layerstack() {
+        if self.sfnn_factorized.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorized currently applies to SFNN / LayerStack eval types only".to_string());
-        }
-        if self.no_sfnn_factorized && !eval_type.uses_layerstack() {
-            return Err("--no-sfnn-factorized currently applies to SFNN / LayerStack eval types only".to_string());
         }
         if self.sfnn_factorizer.is_some() && !eval_type.uses_layerstack() {
             return Err("--sfnn-factorizer currently applies to SFNN / LayerStack eval types only".to_string());
@@ -5981,9 +5983,9 @@ impl Args {
         if self.optimizer != OptimizerKind::Ranger {
             return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
         }
-        if self.initial_state.is_some() && (self.resume || self.no_resume) {
+        if self.initial_state.is_some() && self.resume.is_some() {
             return Err(
-                "--initial-state starts a new run from an explicit checkpoint state; do not combine it with --resume/--no-resume"
+                "--initial-state starts a new run from an explicit checkpoint state; do not combine it with --resume true/false"
                     .to_string(),
             );
         }
@@ -5995,7 +5997,7 @@ impl Args {
                 || self.save_rate.is_some_and(|save_rate| save_rate != 1)
                 || self.validation_rate.is_some_and(|validation_rate| validation_rate != 1)
                 || self.quantized_validation_rate.is_some_and(|rate| rate != 1)
-                || self.no_save_epoch_end)
+                || !self.save_epoch_end)
         {
             return Err(
                 "--backend cuda-cpp direct-step mode does not honor production schedule flags; use --superbatches with --max-epochs instead"
@@ -10809,7 +10811,7 @@ impl WorkerSfnnSession {
     fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
         print_sfnn_qat_mode(args);
         if self.feature_kind.input_size_for_args(args) != self.shape.input_size {
-            return Err("worker FT factorizer setting differs from the opened session; --no-ft-factorize cannot change within a session".to_string());
+            return Err("worker FT factorizer setting differs from the opened session; --ft-factorizer cannot change within a session".to_string());
         }
         let old_args = self.args.clone();
         let new_count_settings = Self::compute_count_settings(args, self.shape)?;
@@ -11161,7 +11163,7 @@ impl WorkerSfnnSession {
             return Err("worker trial arch differs from the opened session".to_string());
         }
         if trial_feature.input_size_for_args(&trial_args) != self.shape.input_size {
-            return Err("worker trial --no-ft-factorize differs from the opened session".to_string());
+            return Err("worker trial --ft-factorizer differs from the opened session".to_string());
         }
         if trial_args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3) != self.layerstack {
             return Err("worker trial layerstack differs from the opened session".to_string());
@@ -12641,7 +12643,7 @@ fn main() {
             std::process::exit(2);
         }
     }
-    if args.sfnn_factorized && !args.eval_type().uses_layerstack() {
+    if args.sfnn_factorized.is_some() && !args.eval_type().uses_layerstack() {
         eprintln!("error: --sfnn-factorized currently applies to SFNN / LayerStack eval types only.");
         std::process::exit(2);
     }
@@ -13058,7 +13060,7 @@ impl CudaCppNnueFeatureKind {
     }
 
     fn input_size_for_args(self, args: &Args) -> usize {
-        if args.no_ft_factorize { self.base_input_size() } else { self.training_input_size() }
+        if !args.ft_factorizer { self.base_input_size() } else { self.training_input_size() }
     }
 
     fn virtual_rows(self) -> usize {
@@ -13131,9 +13133,9 @@ fn validate_ft_factorizer_checkpoint(
             if stored_enabled { "on" } else { "off" },
             if no_ft_factorize { "off" } else { "on" },
             if stored_enabled {
-                "omit --no-ft-factorize to use this checkpoint"
+                "pass --ft-factorizer true to use this checkpoint"
             } else {
-                "pass --no-ft-factorize to use this checkpoint"
+                "pass --ft-factorizer false to use this checkpoint"
             },
         ));
     }
@@ -13252,7 +13254,7 @@ impl CudaCppSfnnFeatureKind {
     }
 
     fn input_size_for_args(self, args: &Args) -> usize {
-        if args.no_ft_factorize { self.base_input_size() } else { self.training_input_size() }
+        if !args.ft_factorizer { self.base_input_size() } else { self.training_input_size() }
     }
 
     fn max_active(self) -> usize {
@@ -13948,7 +13950,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
                 );
             } else {
                 eprintln!(
-                    "  {} {} checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                    "  {} {} checkpoint skipped at epoch={}, superbatch={} (--save-epoch-end false)",
                     paint("cuda-cpp", ConsoleColor::Dim),
                     component.label(),
                     chunk.epoch,
@@ -14446,7 +14448,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
     } else {
         print_startup_kv_colored(
             "initial weights",
-            feature_kind.scratch_init_label(args.no_ft_factorize),
+            feature_kind.scratch_init_label(!args.ft_factorizer),
             ConsoleColor::Yellow,
         );
     }
@@ -15158,7 +15160,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                     last_checkpoint_metrics = test_metrics;
                 } else {
                     eprintln!(
-                        "  cuda-cpp checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                        "  cuda-cpp checkpoint skipped at epoch={}, superbatch={} (--save-epoch-end false)",
                         chunk.epoch, chunk.superbatch
                     );
                     if let Some(progress) = schedule.progress_for_step(seen_steps) {
@@ -18876,7 +18878,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     last_checkpoint_metrics = test_metrics;
                 } else {
                     eprintln!(
-                        "  cuda-cpp SFNN checkpoint skipped at epoch={}, superbatch={} (--no-save-epoch-end)",
+                        "  cuda-cpp SFNN checkpoint skipped at epoch={}, superbatch={} (--save-epoch-end false)",
                         chunk.epoch, chunk.superbatch
                     );
                     let progress = schedule.progress_for_step(seen_steps);
@@ -21779,7 +21781,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         feature_kind.base_input_size(),
         feature_kind.virtual_rows(),
         ft_size,
-        args.no_ft_factorize,
+        !args.ft_factorizer,
     )?;
     let (mut weights, progress_axis_appended) =
         load_cuda_cpp_sfnn_weights_from_records(feature_kind, shape, &weights_records).map_err(|err| {
@@ -23582,7 +23584,7 @@ fn load_cuda_cpp_nnue_initial_state(
         feature_kind.base_input_size(),
         feature_kind.virtual_rows(),
         l1_size,
-        args.no_ft_factorize,
+        !args.ft_factorizer,
     )?;
     let weights = load_cuda_cpp_nnue_owned_weights(feature_kind, shape, &weights_records).map_err(|err| {
         format!(
@@ -25657,7 +25659,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("save_epoch_end={}", effective_save_epoch_end(args)),
         format!("score_drop_abs={}", args.score_drop_abs),
         format!("nnue_pytorch_init_scale={:.9}", args.nnue_pytorch_init_scale),
-        format!("no_ft_factorize={}", args.no_ft_factorize),
+        format!("ft_factorizer={}", args.ft_factorizer),
         format!("ft_factorizer_alpha={:.9}", args.ft_factorizer_alpha),
         format!("sfnn_init_bias={}", args.sfnn_init_bias.cli_name()),
         format!("sfnn_init_l2_l3_glorot={}", args.sfnn_init_l2_l3_glorot),
@@ -25803,6 +25805,13 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     }
 
     for line in &mut out {
+        if let Some(value) = line.strip_prefix("no_ft_factorize=") {
+            *line = match value.trim() {
+                "true" => "ft_factorizer=false".to_string(),
+                "false" => "ft_factorizer=true".to_string(),
+                _ => line.clone(),
+            };
+        }
         if let Some(value) = line.strip_prefix("grad_accum_batches=") {
             *line = format!("batches_per_update={value}");
         }
@@ -25855,8 +25864,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "wrm_target_offset=", "wrm_in_scaling=", "wrm_target_offset=270.000000000");
     ensure_line_after(&mut out, "wrm_target_scaling=", "wrm_target_offset=", "wrm_target_scaling=380.000000000");
     ensure_line_after(&mut out, "wrm_target_epsilon=", "wrm_target_scaling=", "wrm_target_epsilon=0.000000000");
-    ensure_line_after(&mut out, "no_ft_factorize=", "nnue_pytorch_init_scale=", "no_ft_factorize=false");
-    ensure_line_after(&mut out, "ft_factorizer_alpha=", "no_ft_factorize=", "ft_factorizer_alpha=1.000000000");
+    ensure_line_after(&mut out, "ft_factorizer=", "nnue_pytorch_init_scale=", "ft_factorizer=true");
+    ensure_line_after(&mut out, "ft_factorizer_alpha=", "ft_factorizer=", "ft_factorizer_alpha=1.000000000");
     ensure_line_after(&mut out, "sfnn_init_bias=", "ft_factorizer_alpha=", "sfnn_init_bias=zero");
     ensure_line_after(&mut out, "sfnn_init_l2_l3_glorot=", "sfnn_init_bias=", "sfnn_init_l2_l3_glorot=false");
     ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_l2_l3_glorot=", "sfnn_init_l2_l3_scale=0.500000000");
@@ -26164,13 +26173,13 @@ fn mark_latest_checkpoint_epoch_done(output_dir: &std::path::Path) {
 }
 
 fn resume_enabled(args: &Args, output_dir: &std::path::Path) -> bool {
-    if args.no_resume {
+    if args.resume == Some(false) {
         return false;
     }
     if find_latest_state_bin_raw(output_dir).is_none() {
         return false;
     }
-    if args.resume {
+    if args.resume == Some(true) {
         return true;
     }
     resume_config_matches(output_dir, args).unwrap_or(false)
@@ -26198,16 +26207,16 @@ fn prepare_resume_config_or_exit(args: &Args) {
     let output_dir = args.output_dir();
     let latest_state = find_latest_state_bin_raw(&output_dir);
 
-    if latest_state.is_some() && args.no_resume {
+    if latest_state.is_some() && args.resume == Some(false) {
         eprintln!(
-            "error: --no-resume was specified, but {} already contains a resumable checkpoint.\n  \
+            "error: --resume false was specified, but {} already contains a resumable checkpoint.\n  \
              Use a different --tag/--output, or remove/rename the existing checkpoint directory.",
             output_dir.display()
         );
         std::process::exit(2);
     }
 
-    if latest_state.is_some() && !args.resume {
+    if latest_state.is_some() && args.resume != Some(true) {
         match resume_config_matches(&output_dir, args) {
             Ok(true) => {}
             Ok(false) => {
@@ -27599,7 +27608,7 @@ mod tests {
         assert_eq!(cuda_cpp_run_schedule(&args).unwrap().chunks[0].epoch,6);
         args.warmup_sb=32;
         assert_eq!(cuda_cpp_run_schedule(&args).unwrap().chunks[0].epoch,6);
-        args.no_resume=true;
+        args.resume=Some(false);
         assert!(starting_epoch_settings(&args).unwrap_err().contains("starting epoch 0"));
         std::fs::remove_dir_all(tmp).unwrap();
     }
@@ -29110,7 +29119,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--no-save-epoch-end",
+            "--save-epoch-end", "false",
         ])
         .unwrap();
 
@@ -29477,7 +29486,7 @@ mod tests {
             "1",
             "--save-rate",
             "2",
-            "--no-save-epoch-end",
+            "--save-epoch-end", "false",
             "--batch-size",
             "1024",
             "--positions-per-superbatch",
@@ -29555,7 +29564,7 @@ mod tests {
             }
 
             // Disable epoch-end saves too, without suppressing explicit validation.
-            frequent.no_save_epoch_end = true;
+            frequent.save_epoch_end = false;
             let schedule = cuda_cpp_run_schedule(&frequent).unwrap();
             assert_eq!(schedule.total_steps, 12);
             assert_eq!(schedule.chunks.len(), 6);
@@ -29564,7 +29573,7 @@ mod tests {
             );
 
             let mut unsaved = base.clone();
-            unsaved.no_save_epoch_end = true;
+            unsaved.save_epoch_end = false;
             let schedule = cuda_cpp_run_schedule(&unsaved).unwrap();
             assert_eq!(schedule.chunks.len(), 2);
             // Default ordinary validation inherits rate=0 (epoch-end); default qvalid follows saves.
@@ -29995,7 +30004,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--no-sfnn-factorized",
+            "--sfnn-factorized", "false",
         ])
         .unwrap();
 
@@ -30179,7 +30188,7 @@ mod tests {
               "backend": "cuda-cpp",
               "cuda_cpp_train_steps": 1,
               "arch": "SFNN_halfka2_1024_7_64_k3k3",
-              "no_ft_factorize": true,
+              "ft_factorizer": false,
               "lr": 0.001,
               "lr_min": 0.0001,
               "sfnn_dirty_bucket_update": true
@@ -30205,9 +30214,50 @@ mod tests {
         assert!((args.lr - 0.002).abs() < 1.0e-9);
         assert!((args.lr_min - 0.0001).abs() < 1.0e-9);
         assert!(args.sfnn_dirty_bucket_update);
-        assert!(args.no_ft_factorize);
+        assert!(!args.ft_factorizer);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn positive_boolean_options_preserve_false_in_json_and_cli() {
+        for enabled in [false, true] {
+            let mut cli: Vec<std::ffi::OsString> = vec!["bulletou".into(), "--teacher".into(), "teacher.psv".into()];
+            for key in ["ft_factorizer", "save_epoch_end", "sfnn_factorized", "resume"] {
+                bulletou_settings_json_value_to_args(Path::new("settings.json"), key,
+                    &serde_json::Value::Bool(enabled), &mut cli).unwrap();
+            }
+            let args = Args::try_parse_from(cli).unwrap();
+            assert_eq!(args.ft_factorizer, enabled);
+            assert_eq!(effective_save_epoch_end(&args), enabled);
+            assert_eq!(args.sfnn_factorized, Some(enabled));
+            assert_eq!(args.resume, Some(enabled));
+            assert_eq!(requested_sfnn_factorizer_spec(&args).any(), enabled);
+        }
+        let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv"]).unwrap();
+        assert!(args.ft_factorizer);
+        assert!(effective_save_epoch_end(&args));
+        assert_eq!(args.resume, None);
+        assert_eq!(args.sfnn_factorized, None);
+        let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv", "--resume"]).unwrap();
+        assert_eq!(args.resume, Some(true));
+    }
+
+    #[test]
+    fn sfnn_ft_factorizer_alias_matches_canonical_option() {
+        for enabled in [false, true] {
+            let value = enabled.to_string();
+            let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--sfnn-ft-factorizer", &value]).unwrap();
+            assert_eq!(args.ft_factorizer, enabled);
+            for key in ["sfnn_ft_factorizer", "sfnn-ft-factorizer"] {
+                let mut cli: Vec<std::ffi::OsString> = vec!["bulletou".into(), "--teacher".into(), "teacher.psv".into(), "--arch".into(), "SFNN_halfka2_1024_8_64_k3k3".into()];
+                bulletou_settings_json_value_to_args(Path::new("settings.json"), key,
+                    &serde_json::Value::Bool(enabled), &mut cli).unwrap();
+                let from_json = Args::try_parse_from(cli).unwrap();
+                assert_eq!(from_json.ft_factorizer, enabled);
+                assert_eq!(resume_signature(&from_json), resume_signature(&args));
+            }
+        }
     }
 
     #[test]
@@ -31743,7 +31793,7 @@ mod tests {
         assert_eq!(effective_sfnn_factorizer_alpha(&args).ft, 0.5);
         assert_eq!(effective_sfnn_factorizer_alpha(&args).shared, 0.25);
         assert!(resume_signature(&args).contains("ft_factorizer_alpha=0.500000000"));
-        args.no_ft_factorize = true;
+        args.ft_factorizer = false;
         assert!(args.validate_arch_flags().unwrap_err().contains("FT factorization enabled"));
         for bad in ["-1", "NaN", "inf", "100.1"] {
             assert!(parse_ft_factorizer_alpha(bad).is_err());
@@ -31902,13 +31952,15 @@ mod tests {
             "none",
         ])
         .unwrap();
-        assert!(!args.no_ft_factorize);
+        assert!(args.ft_factorizer);
         assert!(!effective_sfnn_factorizer_spec(&args).any());
         let on_signature = resume_signature(&args);
-        let missing_flag = resume_signature_without_line(&on_signature, "no_ft_factorize=");
+        assert!(resume_signature_matches(&on_signature.replace("ft_factorizer=true", "no_ft_factorize=false"), &args));
+        let missing_flag = resume_signature_without_line(&on_signature, "ft_factorizer=");
         assert!(resume_signature_matches(&missing_flag, &args));
-        args.no_ft_factorize = true;
-        assert!(resume_signature(&args).contains("no_ft_factorize=true"));
+        args.ft_factorizer = false;
+        assert!(resume_signature(&args).contains("ft_factorizer=false"));
+        assert!(resume_signature_matches(&resume_signature(&args).replace("ft_factorizer=false", "no_ft_factorize=true"), &args));
         assert!(!resume_signature_matches(&on_signature, &args));
         assert!(!resume_signature_matches(&missing_flag, &args));
         assert!(!effective_sfnn_factorizer_spec(&args).any());
@@ -31935,7 +31987,7 @@ mod tests {
         .unwrap();
         let kind = CudaCppSfnnFeatureKind::Halfka2;
         let on = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
-        args.no_ft_factorize = true;
+        args.ft_factorizer = false;
         let off = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
         assert_eq!(off.shape.input_size, kind.base_input_size());
         assert_eq!(on.shape.input_size, off.shape.input_size + kind.virtual_rows());
@@ -31979,11 +32031,11 @@ mod tests {
                 ("nnue/weights/l3b", weights.l3b.as_slice()),
             ];
             write_cuda_cpp_state_records_atomic(&path, records).unwrap();
-            args.no_ft_factorize = disabled;
+            args.ft_factorizer = !disabled;
             let loaded = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap();
             assert_eq!(loaded.weights.l0w, weights.l0w);
             assert_eq!(loaded.weights.shape.input_size, kind.input_size_for_args(&args));
-            args.no_ft_factorize = !disabled;
+            args.ft_factorizer = disabled;
             let err = match load_cuda_cpp_sfnn_initial_state(&path, &args, kind) {
                 Err(err) => err,
                 Ok(_) => panic!("FT mode mismatch must not silently transform a checkpoint"),
@@ -32010,7 +32062,7 @@ mod tests {
         .unwrap();
         let kind = CudaCppNnueFeatureKind::Halfkp;
         let on = build_nnue_initial_weights_for_cuda_cpp(&args, kind).unwrap();
-        args.no_ft_factorize = true;
+        args.ft_factorizer = false;
         let off = build_nnue_initial_weights_for_cuda_cpp(&args, kind).unwrap();
         assert_eq!(off.shape.input_size, kind.base_input_size());
         assert_eq!(off.l0w, on.l0w[kind.virtual_rows() * off.shape.l1..]);
@@ -32031,7 +32083,7 @@ mod tests {
             validate_ft_factorizer_checkpoint(&records, 6, 2, 2, !enabled).unwrap();
             let err = validate_ft_factorizer_checkpoint(&records, 6, 2, 2, enabled).unwrap_err();
             assert!(err.contains("checkpoint FT factorizer"), "{err}");
-            assert!(err.contains("--no-ft-factorize"), "{err}");
+            assert!(err.contains("--ft-factorizer"), "{err}");
         }
     }
 
@@ -32136,7 +32188,7 @@ mod tests {
             "cuda-cpp",
             "--cuda-cpp-train-steps",
             "1",
-            "--no-sfnn-factorized",
+            "--sfnn-factorized", "false",
         ])
         .unwrap();
 
@@ -34006,7 +34058,7 @@ mod tests {
         std::fs::create_dir_all(&checkpoint).unwrap();
         std::fs::write(checkpoint.join("state.bin"), b"state").unwrap();
         std::fs::write(checkpoint.join("dataloader_pos.txt"), "1024,0\n").unwrap();
-        args.resume = true;
+        args.resume = Some(true);
         for (epoch, sb, next_epoch, next_sb) in [(0,2,0,3), (0,4,1,1), (1,2,2,1)] {
             std::fs::write(checkpoint.join("learn.log"), format!("{LEARN_LOG_HEADER}\nSFNN_HALFKA2,{}, {},1,0.6,0.1,0.5,0.2,0.1,0.1,1,1024,teacher.psv\n", epoch, sb).replace(", ", ",")).unwrap();
             let resumed = cuda_cpp_run_schedule(&args).unwrap();
@@ -34850,7 +34902,7 @@ mod tests {
         assert_eq!(args.validation_rate, None);
         assert_eq!(validation_period(&args), Some(DEFAULT_SAVE_RATE));
         assert!(args.save_epoch_end);
-        assert!(!args.no_save_epoch_end);
+        assert!(args.save_epoch_end);
         assert!(effective_save_epoch_end(&args));
     }
 

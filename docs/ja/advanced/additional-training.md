@@ -84,7 +84,7 @@
 |---|---|
 | `--arch` | 評価関数の種類や層サイズが変わるため、保存済み重みと合わない |
 | `--arch` の `k3k3` / `hand1024` など | SFNN の分岐数が変わるため、保存済み重みと合わない |
-| `--sfnn-factorized` / `--no-sfnn-factorized` | `--sfnn-factorizer shared` / `--sfnn-factorizer none` の短縮指定。基本形を使う |
+| `--sfnn-factorized` / `--sfnn-factorized false` | `--sfnn-factorizer shared` / `--sfnn-factorizer none` の短縮指定。基本形を使う |
 | `--tag` | これを変えると別ディレクトリになり、新規学習として扱われる |
 
 これらを変えるなら **`--tag` を変えて別の学習として起動** してください。`--resume` を付けても保存済み重みの形が合わないので復元できません。

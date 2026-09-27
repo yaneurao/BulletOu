@@ -206,7 +206,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
-    parser.add_argument("--no-stream-child-output", action="store_true")
+    parser.add_argument("--stream-child-output", choices=["true", "false"], default="true",
+                        help="Mirror child stdout to console (default: true); log files are always written")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     parser.add_argument(
         "--reset-generation",
@@ -1343,7 +1344,7 @@ def train_args(
         str(quantized_validation_rate),
     ]
     if not save_checkpoint:
-        cmd.append("--no-save-epoch-end")
+        cmd.extend(["--save-epoch-end", "false"])
     if include_initial_state and base_checkpoint is not None:
         cmd.extend(
             [
@@ -2105,7 +2106,7 @@ def main() -> int:
                     worker = tuner.WorkerClient(
                         run.exe,
                         log_dir / "worker.stderr.log",
-                        stream=not args.no_stream_child_output,
+                        stream=args.stream_child_output == "true",
                         color=color,
                     )
                     worker.request("hello", prefix=tuner.paint(color, "[WORKER] ", "magenta"))
@@ -2276,7 +2277,7 @@ def main() -> int:
                         code, elapsed = tuner.run_command(
                             cmd,
                             log_path,
-                            stream=not args.no_stream_child_output,
+                            stream=args.stream_child_output == "true",
                             stream_prefix=tuner.paint(color, f"{display_prefix} ", "magenta"),
                         )
                         if code != 0:
@@ -2545,7 +2546,7 @@ def main() -> int:
                         code, elapsed = tuner.run_command(
                             commit_cmd,
                             log_dir / f"generation{generation:04d}-commit.stdout.log",
-                            stream=not args.no_stream_child_output,
+                            stream=args.stream_child_output == "true",
                             stream_prefix=tuner.paint(color, f"[GEN {generation} COMMIT] ", "magenta"),
                         )
                         if code != 0:

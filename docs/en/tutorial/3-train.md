@@ -190,7 +190,7 @@ For `recommended-parameters.json` and the recommendation formula, see [Advanced:
 
 Next: [4. Enable validation](4-validation.md)
 
-HalfKA2 / HalfKP FT (first-layer) weight sharing is enabled by default. Disable it with `"no_ft_factorize": true` in JSON or `--no-ft-factorize` on the CLI. This is separate from `"sfnn_factorizer": "none"`, which disables L1 sharing. L2/L3 do not use sharing. Resume with the same FT ON/OFF setting as the saved checkpoint.
+HalfKA2 / HalfKP FT (first-layer) weight sharing is enabled by default. Disable it with `"ft_factorizer": false` in JSON or `--ft-factorizer false` on the CLI. This is separate from `"sfnn_factorizer": "none"`, which disables L1 sharing. L2/L3 do not use sharing. Resume with the same FT ON/OFF setting as the saved checkpoint.
 
 For `SFNN_halfka2`, `"ft_factorizer_alpha": 0.5` also controls FT sharing strength (default 1.0). L1 shared strength is set separately with `"sfnn_factorizer_alpha": "shared=0.5"`. When resuming with changed alpha from a checkpoint that records its coefficients, rebase preserves the immediate effective weights. See [settings and rebase caveats](../advanced/sfnn-factorizer.md).
 

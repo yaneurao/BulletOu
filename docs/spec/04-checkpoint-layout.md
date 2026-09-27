@@ -21,9 +21,9 @@
     └── learn.log
 ```
 
-番号は **save が走るごとに 1 ずつインクリメント**。デフォルトでは `--save-rate=20` で 20 superbatch ごとに save し、さらに `--save-epoch-end` が ON なので epoch 末尾 superbatch も save する。`--no-save-epoch-end` で epoch 末尾の暗黙 save を無効化できる。`--save-rate=1` なら 1 superbatch ごと。
+番号は **save が走るごとに 1 ずつインクリメント**。デフォルトでは `--save-rate=20` で 20 superbatch ごとに save し、さらに `--save-epoch-end` が ON なので epoch 末尾 superbatch も save する。`--save-epoch-end false` で epoch 末尾の暗黙 save を無効化できる。`--save-rate=1` なら 1 superbatch ごと。
 
-`--save-rate=0` または `--save-rate=none` は途中の定期保存なし（両者は同じ値として解釈）。各epoch末尾の保存は残る。JSONでは `"save_rate": 0` または `"save_rate": "none"` と書く。`null` / 省略はデフォルト20であり、保存なしではない。`--no-save-epoch-end` と併用すれば番号付きcheckpointは保存しないが、正常終了時の `cuda-cpp-direct/` の最終出力は別処理として残る。正のsave rateの倍数に当たるepoch末尾は、`--no-save-epoch-end` 指定時でも定期保存される。
+`--save-rate=0` または `--save-rate=none` は途中の定期保存なし（両者は同じ値として解釈）。各epoch末尾の保存は残る。JSONでは `"save_rate": 0` または `"save_rate": "none"` と書く。`null` / 省略はデフォルト20であり、保存なしではない。`--save-epoch-end false` と併用すれば番号付きcheckpointは保存しないが、正常終了時の `cuda-cpp-direct/` の最終出力は別処理として残る。正のsave rateの倍数に当たるepoch末尾は、`--save-epoch-end false` 指定時でも定期保存される。
 
 resume 時は **既存番号の続きから連番**。例えば前回 `0005/` まで存在する dir に対して再実行すると、新規 save は `0006/`, `0007/`, ... となる。
 
