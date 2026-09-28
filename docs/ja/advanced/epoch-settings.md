@@ -25,10 +25,10 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 
 ### FT factorizerを途中epochからOFFにする
 
-非BNの `SFNN_halfka2` では、次の指定でepoch 1～2をON、epoch 3以降をOFFにできます。`sfnn_ft_factorizer` も同じ意味のaliasです。
+非BNの `SFNN_halfka2` では、次の指定でepoch 1～2をON、epoch 3以降をOFFにできます。正式名は`sfnn_ft_factorizer`、旧名`ft_factorizer`はaliasです。
 
 ```json
-"ft_factorizer": {"epoch1": true, "epoch3": false}
+"sfnn_ft_factorizer": {"epoch1": true, "epoch3": false}
 ```
 
 epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldします。Lookahead slow重みも別途foldし、共有行を削除します。個別FTのmomentum/velocityと更新回数は維持し、共有FTのmomentum/velocityは破棄します。実効重みは保持しますが、浮動小数点の加算順による微差はあり、その後のoptimizer更新はON時と等価ではありません。unitのリセットは行いません。

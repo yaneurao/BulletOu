@@ -40,7 +40,7 @@ PLURAL_OPTIONS = {
     "wrm_in_scalings": "wrm_in_scaling",
     "wrm_nnue2scores": "wrm_nnue2score",
     "batch_sizes": "batch_size", "batches_per_updates": "batches_per_update",
-    "factorizers": "sfnn_factorizer", "loss_pow_exps": "loss_pow_exp",
+    "factorizers": "sfnn_l1_factorizer", "loss_pow_exps": "loss_pow_exp",
 }
 OUTPUT_KEYS = {"output", "output_folder", "tag", "resume", "no_resume"}
 FORBIDDEN_GRID = OUTPUT_KEYS | {
@@ -48,7 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
-    "ft_factorizer",
+    "sfnn_ft_factorizer",
     "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3",
     "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -62,7 +62,7 @@ COMMON_COLUMNS = (
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",
     "sfnn_bn_ft", "sfnn_bn_l1", "sfnn_bn_l2", "sfnn_bn_qat", "sfnn_bn_gamma", "sfnn_bn_beta", "sfnn_bn_momentum", "sfnn_bn_epsilon",
     "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
-    "positions_per_superbatch", "superbatches", "sfnn_factorizer",
+    "positions_per_superbatch", "superbatches", "sfnn_l1_factorizer",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip", "sfnn_init_l2_l3_glorot", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
     "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
@@ -75,7 +75,24 @@ def read_json(path: Path) -> dict:
         obj = json.load(f)
     if not isinstance(obj, dict):
         raise ValueError(f"{path}: JSON object required")
-    return obj
+    return canonical_factorizer_names(obj)
+
+
+def canonical_factorizer_names(value):
+    """Normalize legacy settings/manifests without renaming trial directories."""
+    aliases = {"ft_factorizer": "sfnn_ft_factorizer", "sfnn_factorizer": "sfnn_l1_factorizer"}
+    if isinstance(value, list):
+        return [canonical_factorizer_names(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        name = aliases.get(key, key)
+        if name in result:
+            raise ValueError(f"duplicate normalized setting: {name}")
+        result[name] = ([aliases.get(k, k) for k in item] if key == "changed_setting_columns"
+                        else canonical_factorizer_names(item))
+    return result
 
 
 def atomic_json(path: Path, obj: dict) -> None:
@@ -90,9 +107,9 @@ def key_name(key: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", key):
         raise ValueError(f"invalid BulletOu option name: {key!r}")
     normalized = key.replace("-", "_")
-    # Keep persisted grid identities stable while accepting the layer-specific name.
-    return {"sfnn_ft_factorizer": "ft_factorizer",
-            "sfnn_l1_factorizer": "sfnn_factorizer",
+    # Layer-specific names are canonical; historical spellings remain aliases.
+    return {"ft_factorizer": "sfnn_ft_factorizer",
+            "sfnn_factorizer": "sfnn_l1_factorizer",
             "sfnn_l1_factorizer_alpha": "sfnn_factorizer_alpha"}.get(normalized, normalized)
 
 
@@ -191,7 +208,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 EPOCH_SETTING_KEYS = {
     "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
-    "ft_factorizer",
+    "sfnn_ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
@@ -204,6 +221,7 @@ EPOCH_SETTING_KEYS = {
 
 
 def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
+    settings = canonical_factorizer_names(settings)
     epoch = max(1, epoch)  # Warmup epoch 0 inherits epoch 1 controls.
     resolved = dict(settings)
     for key, value in settings.items():
@@ -217,18 +235,18 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
         for name, item in value.items():
             if not re.fullmatch(r"epoch[1-9][0-9]*", name):
                 raise ValueError(f"{key}: invalid epoch key {name!r}")
-            if revival or key in ("ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
+            if revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")
             elif type(item) not in (int, float) or not math.isfinite(item):
                 raise ValueError(f"{key}.{name} must be a finite number")
-        if key == "ft_factorizer":
+        if key == "sfnn_ft_factorizer":
             ordered = [value[n] for n in sorted(value, key=lambda n: int(n[5:]))]
             if any(not a and b for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("ft_factorizer epoch schedule supports only true -> false")
         name = max((n for n in value if int(n[5:]) <= epoch), key=lambda n: int(n[5:]), default=None)
         resolved[key] = value[name] if name is not None else False
-        if key == "ft_factorizer" and not resolved[key]:
+        if key == "sfnn_ft_factorizer" and not resolved[key]:
             resolved["ft_factorizer_alpha"] = 1.0
     return resolved
 
@@ -583,6 +601,8 @@ def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
 
 def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[int]]:
     """Read-only reconciliation. Preserve IDs, folders and unselected conditions."""
+    stored = canonical_factorizer_names(stored)
+    requested = canonical_factorizer_names(requested)
     if (stored.get("version") != 1 or any(stored.get(k) != requested.get(k) for k in ("exe", "cwd"))
             or not set(requested["axes"]).issubset(stored.get("axes", {}))):
         raise ValueError("existing grid manifest differs: resume requires the same executable path and cwd; adding grid axis names is not supported")
@@ -622,10 +642,10 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
             raise ValueError(f"existing grid manifest differs: no unique existing condition for {candidate['parameters']}")
         trial = matches[0]
         old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
-        defaults = {"backend": "cuda-cpp", "ft_factorizer": True}
+        defaults = {"backend": "cuda-cpp", "sfnn_ft_factorizer": True}
         layout_keys = ["arch", "backend"]
         if not str(candidate["settings"].get("arch", "")).startswith("SFNN_halfka2_"):
-            layout_keys.append("ft_factorizer")
+            layout_keys.append("sfnn_ft_factorizer")
         incompatible = [k for k in layout_keys
                         if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))]
         if incompatible:
@@ -658,6 +678,7 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
 
 
 def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[list[str], list[dict]]:
+    plan = canonical_factorizer_names(plan)
     parameter_columns = list(dict.fromkeys([*plan["axes"], *COMMON_COLUMNS]))
     all_settings = [settings for trial in plan["trials"]
                     for settings in [trial["settings"],

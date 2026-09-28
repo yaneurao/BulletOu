@@ -15,6 +15,30 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_legacy_factorizer_manifest_resume_and_csv_names(self):
+        requested = self.plan(["--grid", "sfnn-ft-factorizer", "false", "true",
+                               "--grid", "sfnn-l1-factorizer", "none", "shared"])
+        legacy = json.loads(json.dumps(requested).replace('"sfnn_ft_factorizer":', '"ft_factorizer":')
+                            .replace('"sfnn_l1_factorizer":', '"sfnn_factorizer":'))
+        legacy["changed_setting_columns"] = ["ft_factorizer", "sfnn_factorizer"]
+        for t in legacy["trials"]:
+            t["initial_settings"] = dict(t["settings"])
+            t["epoch_settings"] = {"1": {"settings": dict(t["settings"]), "rows_digest": "old"}}
+        merged, selected = grid.plan_resume(self.output, legacy, requested)
+        self.assertEqual(len(selected), len(requested["trials"]))
+        self.assertEqual([t["name"] for t in merged["trials"]], [t["name"] for t in legacy["trials"]])
+        fields, rows = grid.summarize(self.output, legacy)
+        for key in ("sfnn_ft_factorizer", "sfnn_l1_factorizer"):
+            self.assertIn(key, fields)
+        for key in ("ft_factorizer", "sfnn_factorizer"):
+            self.assertNotIn(key, fields)
+        self.assertIs(rows[0]["sfnn_ft_factorizer"], False)
+        self.assertEqual(rows[0]["sfnn_l1_factorizer"], "none")
+
+    def test_duplicate_factorizer_aliases_rejected(self):
+        with self.assertRaisesRegex(ValueError, "duplicate normalized"):
+            grid.canonical_factorizer_names({"ft_factorizer": True, "sfnn_ft_factorizer": False})
+
     def test_revival_epoch_settings(self):
         for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero"):
             settings = {key: {"epoch3": True, "epoch4": False}}
@@ -31,11 +55,11 @@ class GridSearchTests(unittest.TestCase):
             grid.atomic_json(self.settings_path, {**self.common, alias:schedule})
             plan=self.plan()
             settings=plan["trials"][0]["settings"]
-            self.assertTrue(grid.resolve_epoch_settings(settings,2)["ft_factorizer"])
-            self.assertFalse(grid.resolve_epoch_settings(settings,3)["ft_factorizer"])
-            self.assertFalse(grid.resolve_epoch_settings(settings,20)["ft_factorizer"])
+            self.assertTrue(grid.resolve_epoch_settings(settings,2)["sfnn_ft_factorizer"])
+            self.assertFalse(grid.resolve_epoch_settings(settings,3)["sfnn_ft_factorizer"])
+            self.assertFalse(grid.resolve_epoch_settings(settings,20)["sfnn_ft_factorizer"])
         with self.assertRaisesRegex(ValueError,"true -> false"):
-            grid.resolve_epoch_settings({"ft_factorizer":{"epoch1":False,"epoch2":True}},1)
+            grid.resolve_epoch_settings({"sfnn_ft_factorizer":{"epoch1":False,"epoch2":True}},1)
 
     def test_l1_revival_grid_flags(self):
         for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero"):
@@ -563,15 +587,15 @@ class GridSearchTests(unittest.TestCase):
                           "--grid", "validation_rate", "0"])
         self.assertEqual(len(plan["trials"]), 8)
         self.assertEqual(plan["trials"][0]["settings"]["sfnn_factorizer_alpha"], "shared=0.5")
-        self.assertIs(plan["trials"][0]["settings"]["ft_factorizer"], False)
+        self.assertIs(plan["trials"][0]["settings"]["sfnn_ft_factorizer"], False)
         self.assertEqual(plan["trials"][0]["settings"]["validation_rate"], 0)
 
     def test_ft_factorizer_alias(self):
         for name in ("sfnn-ft-factorizer", "sfnn_ft_factorizer"):
             plan = self.plan(["--grid", name, "false", "true"])
-            self.assertIs(plan["trials"][0]["settings"]["ft_factorizer"], False)
-            self.assertIs(plan["trials"][1]["settings"]["ft_factorizer"], True)
-            self.assertNotIn("sfnn_ft_factorizer", plan["trials"][0]["settings"])
+            self.assertIs(plan["trials"][0]["settings"]["sfnn_ft_factorizer"], False)
+            self.assertIs(plan["trials"][1]["settings"]["sfnn_ft_factorizer"], True)
+            self.assertNotIn("ft_factorizer", plan["trials"][0]["settings"])
 
     def test_l1_factorizer_layer_name_matches_existing_grid_identity(self):
         values = ["none", "shared", "axis", "pair"]
@@ -645,7 +669,7 @@ class GridSearchTests(unittest.TestCase):
 
     def test_preflight_accepts_visible_alias_but_not_prose(self):
         plan = {"exe": sys.executable, "cwd": str(Path.cwd()),
-                "trials": [{"settings": {"sfnn_factorizer": "none"}}]}
+                "trials": [{"settings": {"sfnn_l1_factorizer": "none"}}]}
         help_text = ('  --settings-file <PATH>\n  --resume\n'
                      '  --sfnn-l1-factorizer <MODE>\n'
                      '      [aliases: --sfnn-factorizer]\n'
@@ -1114,10 +1138,10 @@ class GridSearchTests(unittest.TestCase):
         for arguments in ([*argv, "--resume", "--epochs", "1"],):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 grid.main(arguments)
-        grid.atomic_json(self.settings_path, {**self.common, "ft_factorizer": False})
+        grid.atomic_json(self.settings_path, {**self.common, "sfnn_ft_factorizer": False})
         requested = grid.make_plan(grid.parse_args([*argv, "--epochs", "7"]))
         merged, _ = grid.plan_resume(self.output, old, requested)
-        self.assertTrue(all(t["settings"]["ft_factorizer"] is False for t in merged["trials"]))
+        self.assertTrue(all(t["settings"]["sfnn_ft_factorizer"] is False for t in merged["trials"]))
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
 
     def test_resume_common_changes_preserve_historical_epochs_and_original_launch(self):

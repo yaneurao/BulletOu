@@ -4023,7 +4023,7 @@ fn bulletou_settings_json_value_to_args(
     }
     let normalized = key.replace('_', "-");
     let normalized = match normalized.as_str() {
-        "sfnn-ft-factorizer" => "ft-factorizer",
+        "ft-factorizer" => "sfnn-ft-factorizer",
         "sfnn-factorizer" => "sfnn-l1-factorizer",
         "sfnn-factorizer-alpha" => "sfnn-l1-factorizer-alpha",
         _ => &normalized,
@@ -4039,7 +4039,7 @@ fn bulletou_settings_json_value_to_args(
     if let Some(replacement) = replacement {
         return Err(format!("{key} was removed; use {replacement} with the inverse boolean value"));
     }
-    if matches!(flag.as_str(), "--ft-factorizer" | "--save-epoch-end" | "--sfnn-factorized" | "--resume") {
+    if matches!(flag.as_str(), "--sfnn-ft-factorizer" | "--save-epoch-end" | "--sfnn-factorized" | "--resume") {
         if let serde_json::Value::Bool(value) = value {
             out.push(flag.into());
             out.push(value.to_string().into());
@@ -4081,6 +4081,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
     for (key, value) in root {
         if value.is_object() {
             let key = key.replace('-', "_");
+            let key = if key == "sfnn_ft_factorizer" { "ft_factorizer".to_string() } else { key };
             validate_epoch_setting(&key, value)?;
             bulletou_settings_json_value_to_args(path, &key, epoch_setting_value_for(&key, value, 1)?, &mut out)?;
             schedules.insert(key, value.clone());
@@ -4261,7 +4262,8 @@ fn expand_settings_file_args(raw_args: Vec<std::ffi::OsString>) -> Result<Vec<st
             serde_json::from_str(&settings_args[index + 1].to_string_lossy()).map_err(|e| e.to_string())?;
         for arg in raw_args.iter().skip(1) {
             if let Some(flag) = arg.to_string_lossy().strip_prefix("--") {
-                schedules.remove(&flag.split('=').next().unwrap_or(flag).replace('-', "_"));
+                let key = flag.split('=').next().unwrap_or(flag).replace('-', "_");
+                schedules.remove(if key == "sfnn_ft_factorizer" { "ft_factorizer" } else { &key });
             }
         }
         if schedules.is_empty() { settings_args.drain(index..index + 2); }
@@ -5109,7 +5111,7 @@ struct Args {
     /// Default: enabled for those inputs. Independent of --sfnn-factorizer,
     /// which controls LayerStack L1 sharing. Checkpoints must use the same
     /// FT factorization setting when resuming or loading --initial-state.
-    #[arg(long, visible_alias = "sfnn-ft-factorizer", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    #[arg(long = "sfnn-ft-factorizer", visible_alias = "ft-factorizer", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     ft_factorizer: bool,
 
     /// Multiplier of FT shared piece weights (SFNN HalfKA2), default 1.
@@ -30566,11 +30568,15 @@ mod tests {
 
     #[test]
     fn sfnn_ft_factorizer_alias_matches_canonical_option() {
+        use clap::CommandFactory;
+        let cmd=Args::command();
+        assert_eq!(cmd.get_arguments().find(|a|a.get_id()=="ft_factorizer").unwrap().get_long(),Some("sfnn-ft-factorizer"));
+        assert_eq!(cmd.get_arguments().find(|a|a.get_id()=="sfnn_factorizer").unwrap().get_long(),Some("sfnn-l1-factorizer"));
         for enabled in [false, true] {
             let value = enabled.to_string();
             let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv", "--arch", "SFNN_halfka2_1024_8_64_k3k3", "--sfnn-ft-factorizer", &value]).unwrap();
             assert_eq!(args.ft_factorizer, enabled);
-            for key in ["sfnn_ft_factorizer", "sfnn-ft-factorizer"] {
+            for key in ["sfnn_ft_factorizer", "sfnn-ft-factorizer", "ft_factorizer", "ft-factorizer"] {
                 let mut cli: Vec<std::ffi::OsString> = vec!["bulletou".into(), "--teacher".into(), "teacher.psv".into(), "--arch".into(), "SFNN_halfka2_1024_8_64_k3k3".into()];
                 bulletou_settings_json_value_to_args(Path::new("settings.json"), key,
                     &serde_json::Value::Bool(enabled), &mut cli).unwrap();
@@ -30579,6 +30585,22 @@ mod tests {
                 assert_eq!(resume_signature(&from_json), resume_signature(&args));
             }
         }
+    }
+
+    #[test]
+    fn canonical_ft_schedule_with_legacy_cli_override() {
+        let path=std::env::temp_dir().join(format!("bulletou-ft-canonical-{}.json",std::process::id()));
+        std::fs::write(&path,r#"{"arch":"SFNN_halfka2_128_8_32","teacher":"unused","sfnn_ft_factorizer":{"epoch1":true,"epoch3":false}}"#).unwrap();
+        let raw=vec!["bulletou".into(),"--settings-file".into(),path.as_os_str().to_owned()];
+        let args=Args::try_parse_from(expand_settings_file_args(raw.clone()).unwrap()).unwrap();
+        assert!(args_at_epoch(&args,1).unwrap().ft_factorizer);
+        assert!(!args_at_epoch(&args,3).unwrap().ft_factorizer);
+        for name in ["--sfnn-ft-factorizer","--ft-factorizer"] {
+            let mut cli=raw.clone();cli.extend([name.into(),"true".into()]);
+            let args=Args::try_parse_from(expand_settings_file_args(cli).unwrap()).unwrap();
+            assert!(args_at_epoch(&args,3).unwrap().ft_factorizer);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

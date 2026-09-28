@@ -4,7 +4,7 @@ Use `--sfnn-l1-factorizer-alpha` (JSON: `sfnn_l1_factorizer_alpha`) for L1 coeff
 
 <a href="../../ja/advanced/sfnn-factorizer.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 
-Use `--sfnn-l1-factorizer none/shared/axis/pair` (JSON: `sfnn_l1_factorizer`) for L1; normal training defaults to `shared`. The old `--sfnn-factorizer` / `sfnn_factorizer` names remain aliases. Grid search accepts `--grid sfnn_l1_factorizer none shared axis pair`. Persisted grid settings/columns and checkpoint compatibility signatures retain the old internal name to preserve existing experiment identities. This option is independent of `sfnn_ft_factorizer`.
+Use `--sfnn-l1-factorizer none/shared/axis/pair` (JSON: `sfnn_l1_factorizer`) for L1; normal training defaults to `shared`. The old `--sfnn-factorizer` / `sfnn_factorizer` names remain aliases. Grid search accepts `--grid sfnn_l1_factorizer none shared axis pair`. Persisted grid settings and columns use the canonical names; internal checkpoint compatibility signatures remain unchanged. This option is independent of `sfnn_ft_factorizer`.
 
 You do not need this page for a first training run. Read it when you want to compare architectures with many buckets, such as `hand1024`, `k29k29`, or `progress8`.
 
@@ -29,7 +29,7 @@ The shared weight receives gradients from the same piece feature across king pos
 Shared weights start at zero and are added to the individual weights when exporting `nn.bin`.
 
 FT factorization is enabled by default. `--ft-factorizer false` disables allocation, addition, and updates of the shared FT weights.
-The canonical name is `ft_factorizer`. JSON also accepts `sfnn_ft_factorizer`, and the CLI accepts `--sfnn-ft-factorizer true/false` as an equivalent alias. Grid search accepts `--grid sfnn-ft-factorizer false true`. The alias is normalized to the canonical name without changing defaults or checkpoint compatibility checks.
+The canonical name is `sfnn_ft_factorizer` (CLI: `--sfnn-ft-factorizer`). `ft_factorizer` / `--ft-factorizer` remain aliases. L1 uses `sfnn_l1_factorizer`, with `sfnn_factorizer` as its legacy alias. Grid settings and CSV columns use canonical names. Legacy manifests are normalized on read without changing trial IDs, folders or historical values.
 This switch also applies to `NNUE_halfkp` architectures. Inputs without an FT factorizer do not gain shared rows.
 
 `--sfnn-factorizer` controls **L1 sharing only**, independently of the FT.

@@ -4,7 +4,7 @@ L1の係数は `--sfnn-l1-factorizer-alpha`（JSON: `sfnn_l1_factorizer_alpha`�
 
 <a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 
-L1の指定名は `--sfnn-l1-factorizer none/shared/axis/pair`（JSON: `sfnn_l1_factorizer`）です。通常学習のデフォルトは `shared`。旧名 `--sfnn-factorizer` / `sfnn_factorizer` もaliasとして使えます。grid searchでは `--grid sfnn_l1_factorizer none shared axis pair` と指定できます。既存実験との対応を維持するため、gridの保存設定・列名とcheckpointの互換性判定では従来の内部名を維持します。FTの `sfnn_ft_factorizer` とは独立した指定です。
+L1の指定名は `--sfnn-l1-factorizer none/shared/axis/pair`（JSON: `sfnn_l1_factorizer`）です。通常学習のデフォルトは `shared`。旧名 `--sfnn-factorizer` / `sfnn_factorizer` もaliasとして使えます。grid searchでは `--grid sfnn_l1_factorizer none shared axis pair` と指定できます。gridの保存設定・列名は正式名に統一し、checkpointの内部互換性判定は維持します。FTの `sfnn_ft_factorizer` とは独立した指定です。
 
 まず学習を1回動かしたいだけなら、このページを読む必要はありません。`hand1024`、`k29k29`、`progress8` のように bucket 数が多い architecture を比較したいときに読んでください。
 
@@ -29,7 +29,7 @@ FTの実効重み[k, p] = 個別重み[k, p] + α_FT * 共通重み[p]
 個別重みは残るため、玉位置ごとの差も学習できます。共通重みは0で初期化し、`nn.bin` の書き出し時に個別重みへ足し込みます。
 
 FT factorizerはデフォルトで有効です。`--ft-factorizer false` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
-正式名は `ft_factorizer` ですが、JSONでは `sfnn_ft_factorizer`、CLIでは `--sfnn-ft-factorizer true/false` も同じ意味のaliasとして使えます。grid searchでも `--grid sfnn-ft-factorizer false true` を指定できます。内部では正式名に統一され、既定値やcheckpointの互換性判定は変わりません。
+正式名は `sfnn_ft_factorizer`（CLI: `--sfnn-ft-factorizer`）です。`ft_factorizer` / `--ft-factorizer` は互換aliasです。L1の正式名は `sfnn_l1_factorizer`、旧名 `sfnn_factorizer` はaliasです。gridの保存設定・CSV列も正式名に統一します。既存manifestは読み込み時に正規化し、trial番号・フォルダ名・過去の条件値は維持します。
 この切り替えは `NNUE_halfkp` 系にも使えます。FT factorizerを持たない入力では、共有項は追加されません。
 
 `--sfnn-factorizer` が設定するのは**L1の共有だけ**です。FTとは独立しています。

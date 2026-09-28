@@ -21,10 +21,10 @@ Merge these fields into a complete training configuration. Values apply from the
 
 ### Disable the FT factorizer at an epoch boundary
 
-Non-BN `SFNN_halfka2` supports this one-way schedule (`sfnn_ft_factorizer` is an alias):
+Non-BN `SFNN_halfka2` supports this one-way schedule (`ft_factorizer` is a legacy alias):
 
 ```json
-"ft_factorizer": {"epoch1": true, "epoch3": false}
+"sfnn_ft_factorizer": {"epoch1": true, "epoch3": false}
 ```
 
 Before the first batch of epoch 3, shared FT weights are folded into individual weights. Lookahead slow weights are folded separately and virtual rows are removed. Individual momentum/velocity and step counters survive; shared momentum/velocity is discarded. Effective weights are preserved (floating-point addition order can cause small differences), but future optimizer updates are not equivalent to ON mode. Units are not reset.
