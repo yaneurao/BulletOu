@@ -4082,7 +4082,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
         if value.is_object() {
             let key = key.replace('-', "_");
             validate_epoch_setting(&key, value)?;
-            bulletou_settings_json_value_to_args(path, &key, epoch_setting_value(value, 1)?, &mut out)?;
+            bulletou_settings_json_value_to_args(path, &key, epoch_setting_value_for(&key, value, 1)?, &mut out)?;
             schedules.insert(key, value.clone());
         } else {
             bulletou_settings_json_value_to_args(path, key, value, &mut out)?;
@@ -4096,6 +4096,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
     "ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
@@ -4112,7 +4113,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         return Err(format!("epoch schedule is not supported for `{key}`; supported: {}", EPOCH_SETTING_KEYS.join(", ")));
     }
     let map = value.as_object().ok_or("epoch schedule must be an object")?;
-    if !map.contains_key("epoch1") {
+    if !map.contains_key("epoch1") && !is_revival_setting(key) {
         return Err(format!("epoch schedule `{key}` requires epoch1"));
     }
     for (name, v) in map {
@@ -4120,7 +4121,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4133,6 +4134,17 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         }
     }
     Ok(())
+}
+
+fn is_revival_setting(key: &str) -> bool {
+    matches!(key, "sfnn_l1_revive" | "sfnn_l1_revive_zero" | "sfnn_l2_revive" | "sfnn_l2_revive_zero")
+}
+
+fn epoch_setting_value_for<'a>(key: &str, value: &'a serde_json::Value, epoch: usize) -> Result<&'a serde_json::Value, String> {
+    match epoch_setting_value(value, epoch) {
+        Err(_) if is_revival_setting(key) => Ok(&serde_json::Value::Bool(false)),
+        result => result,
+    }
 }
 
 fn epoch_setting_value(value: &serde_json::Value, epoch: usize) -> Result<&serde_json::Value, String> {
@@ -4179,7 +4191,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
     let schedules: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).map_err(|e| format!("invalid epoch settings: {e}"))?;
     for (key, schedule) in &schedules {
         validate_epoch_setting(key, schedule)?;
-        let value = epoch_setting_value(schedule, epoch)?;
+        let value = epoch_setting_value_for(key, schedule, epoch)?;
         macro_rules! assign {
             ($($field:ident),* $(,)?) => { match key.as_str() {
                 $(stringify!($field) => resolved.$field = serde_json::from_value(value.clone())
@@ -4187,7 +4199,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(sfnn_l1_revive, sfnn_l1_revive_zero, sfnn_l2_revive, sfnn_l2_revive_zero, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
@@ -5316,16 +5328,16 @@ struct Args {
     /// Requires L2 BN and frozen-stat BN QAT. Default: off.
     #[arg(long)]
     sfnn_bn_l2_effective_weight_clip: bool,
-    /// On checkpoint restore, revive always-upper L2 units once using teacher calibration.
+    /// At each enabled epoch start, revive always-upper L2 units using teacher calibration.
     #[arg(long)]
     sfnn_l2_revive: bool,
-    /// On checkpoint restore, revive always-zero L2 units once using teacher calibration.
+    /// At each enabled epoch start, revive always-zero L2 units using teacher calibration.
     #[arg(long)]
     sfnn_l2_revive_zero: bool,
-    /// Restore only: revive L1 units whose normal AND squared branches are always upper.
+    /// At each enabled epoch start, revive L1 units whose normal AND squared branches are always upper.
     #[arg(long)]
     sfnn_l1_revive: bool,
-    /// Restore only: revive L1 units whose normal AND squared branches are always zero.
+    /// At each enabled epoch start, revive L1 units whose normal AND squared branches are always zero.
     #[arg(long)]
     sfnn_l1_revive_zero: bool,
     #[arg(long, default_value_t = 0.25)]
@@ -17466,6 +17478,23 @@ fn run_cuda_cpp_sfnn_ka2_direct_steps(args: &Args) -> Result<(), String> {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>, epoch:usize) -> Result<(),String> {
+    if !(args.sfnn_l1_revive || args.sfnn_l1_revive_zero || args.sfnn_l2_revive || args.sfnn_l2_revive_zero) { return Ok(()); }
+    ctx.synchronize().map_err(|e|e.to_string())?;
+    runner.begin_revival_epoch();
+    eprintln!("  [REVIVE] epoch={epoch} START: teacher calibration; only qualifying units are reset");
+    if args.sfnn_l1_revive || args.sfnn_l1_revive_zero {
+        run_sfnn_l1_revival(args,feature_kind,ctx,runner,config)?;
+    }
+    if args.sfnn_l2_revive || args.sfnn_l2_revive_zero {
+        run_sfnn_l2_revival(args,feature_kind,ctx,runner,config)?;
+    }
+    eprintln!("  [REVIVE] epoch={epoch} END");
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
@@ -17639,13 +17668,6 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     print_startup_kv_colored("device", format!("{device}: {name}"), ConsoleColor::BoldYellow);
     let auto_resume_state_bin = cuda_cpp_auto_resume_state_bin(args);
     let initial_state = build_sfnn_initial_state_for_cuda_cpp(args, feature_kind)?;
-    if (args.sfnn_l1_revive || args.sfnn_l1_revive_zero || args.sfnn_l2_revive || args.sfnn_l2_revive_zero)
-        && args.initial_state.is_none() && auto_resume_state_bin.is_none() {
-        return Err("L1/L2 revival requires a restored checkpoint, not scratch training".into());
-    }
-    if (args.sfnn_l2_revive || args.sfnn_l2_revive_zero) && args.sfnn_bn_l2 && initial_state.weights.batch_norm.0[2].is_none() {
-        return Err("L2 revival requires a checkpoint containing calibrated L2 BN (not scratch training)".into());
-    }
     let sfnn_progress_train_state = initial_state.progress.clone();
     let sfnn_progress_params = cuda_cpp_sfnn_progress_params_for_state(sfnn_progress_train_state.as_ref())?;
     let frozen_progress_params = if progress_enabled {
@@ -18159,11 +18181,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         profile_prepare: args.cuda_cpp_profile_teacher_prepare,
     };
 
-    if args.sfnn_l1_revive || args.sfnn_l1_revive_zero {
-        run_sfnn_l1_revival(args,feature_kind,&ctx,&mut runner,&config)?;
-    }
-    if args.sfnn_l2_revive || args.sfnn_l2_revive_zero {
-        run_sfnn_l2_revival(args,feature_kind,&ctx,&mut runner,&config)?;
+    if !schedule.production {
+        run_sfnn_epoch_revival(args,feature_kind,&ctx,&mut runner,&config,1)?;
     }
     let validation_cache_started = std::time::Instant::now();
     let mut sfnn_resident_validation_cache = CudaCppSfnnResidentValidationCache::try_new(
@@ -18201,6 +18220,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 args.lr_plateau_monitor,
             );
             let mut plateau_epoch_final_metrics = None;
+            if schedule.chunks[checkpoint_chunk_idx].superbatch == 1 {
+                let mut revival_config = config.clone();
+                revival_config.dataloader_resume_pos = current_resume_pos;
+                run_sfnn_epoch_revival(args,feature_kind,&ctx,&mut runner,&revival_config,epoch)?;
+            }
             while checkpoint_chunk_idx < schedule.chunks.len() && schedule.chunks[checkpoint_chunk_idx].epoch == epoch {
                 let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
                 let snapshot_weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
@@ -18586,6 +18610,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut active_epoch = None;
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
+        let revival_resume_pos = last_dataloader_pos.or(config.dataloader_resume_pos);
         last_dataloader_pos = teacher_batch.dataloader_pos;
         let mut progress_for_step = schedule.progress_for_step(seen_steps);
         if let Some(progress) = progress_for_step.as_mut() {
@@ -18623,7 +18648,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 schedule.lr_step_gamma = effective_lr_step_gamma(&epoch_args, schedule.batches_per_superbatch)?.0;
                 let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_str(base_args.epoch_settings_json.as_ref().unwrap()).map_err(|e| e.to_string())?;
                 let resolved: serde_json::Map<String, serde_json::Value> = changes.iter()
-                    .map(|(key, value)| Ok((key.clone(), epoch_setting_value(value, progress.epoch.max(1))?.clone())))
+                    .map(|(key, value)| Ok((key.clone(), epoch_setting_value_for(key, value, progress.epoch.max(1))?.clone())))
                     .collect::<Result<_, String>>()?;
                 eprintln!("  [epoch settings] epoch={} {}", progress.epoch, serde_json::Value::Object(resolved));
                 active_epoch = Some(progress.epoch);
@@ -18632,6 +18657,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         }
         let args = &epoch_args;
         let loss_kind = cuda_cpp_scalar_loss_kind(args);
+        if progress_for_step.is_some_and(|p| p.superbatch == 1 && p.batch_in_superbatch == 1) {
+            upload_ctx.synchronize().map_err(|e|e.to_string())?;
+            let mut revival_config = config.clone();
+            revival_config.dataloader_resume_pos = revival_resume_pos;
+            run_sfnn_epoch_revival(args,feature_kind,&ctx,&mut runner,&revival_config,progress_for_step.unwrap().epoch)?;
+        }
         print_epoch_banner_for_progress(&mut last_epoch_banner, progress_for_step, args.max_epochs);
         sfnn_diagnostics.observe_teacher(teacher_batch.timing);
         let batches_per_update = args.batches_per_update;
@@ -32137,6 +32168,26 @@ mod tests {
         assert!(validate_epoch_setting("ft_factorizer",&serde_json::json!({"epoch1":true,"epoch3":0})).is_err());
         args.sfnn_bn_l1=true;
         assert!(args_at_epoch(&args,1).unwrap_err().contains("non-BN"));
+    }
+
+    #[test]
+    fn revival_epoch_switch_settings() {
+        let mut args=Args::try_parse_from(["bulletou","--arch","SFNN_halfka2_128_8_32_k3k3",
+            "--teacher","/dev/null","--backend","cuda-cpp","--superbatches","1","--max-epochs","5"]).unwrap();
+        let schedule=serde_json::json!({"epoch3":true,"epoch4":false});
+        let mut maps=serde_json::Map::new();
+        for key in ["sfnn_l1_revive","sfnn_l1_revive_zero","sfnn_l2_revive","sfnn_l2_revive_zero"] {
+            validate_epoch_setting(key,&schedule).unwrap();
+            assert_eq!(epoch_setting_value_for(key,&schedule,1).unwrap(),&serde_json::json!(false));
+            assert!(validate_epoch_setting(key,&serde_json::json!({"epoch3":1})).is_err());
+            maps.insert(key.into(),schedule.clone());
+        }
+        args.epoch_settings_json=Some(serde_json::Value::Object(maps).to_string());
+        for epoch in 1..=5 {
+            let a=args_at_epoch(&args,epoch).unwrap();
+            assert_eq!([a.sfnn_l1_revive,a.sfnn_l1_revive_zero,a.sfnn_l2_revive,a.sfnn_l2_revive_zero],[epoch==3;4]);
+        }
+        assert!(validate_epoch_setting("lr",&serde_json::json!({"epoch3":0.001})).is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

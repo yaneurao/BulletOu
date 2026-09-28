@@ -13,7 +13,7 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 
 既存の学習設定に加える項目の例です。epoch 1～10は前半、11以降は後半の値です。`true`→`false`、`false`→`true`のどちらも可能です。
 
-- `epoch1` は必須。キーは `epoch1`, `epoch2`, …（先頭ゼロ不可）。順序は問いません。
+- 通常は`epoch1`必須です。4つのrevive設定のみ省略でき、最初の指定まではfalseです。キーは `epoch1`, `epoch2`, …（先頭ゼロ不可）。順序は問いません。
 - 未指定epochは直前の値を引き継ぎます。従来の数値・真偽値だけの指定は全epoch共通です。
 - `lr` / `lr_min` は各epoch内のLRスケジュールの開始値／下限値。stepの自動gammaも再計算します。
 - `--resume` は再開先epochの値を使います。別runを `--initial-state` から開始する場合は、新runのepoch 1からです。
@@ -63,3 +63,24 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 教師shuffleの窓幅は起動時に有効な設定で決まり、同じ実行中には変更しません。将来のbpuを参照して窓幅を変えることもありません。設定全体の構文検査と実行予定の作成は起動時に行いますが、将来の設定値を現在の学習計算に適用しません。
 
 [Grid search](grid-search.md) / [English](../../en/advanced/epoch-settings.md)
+## epoch開始時のunit再初期化
+
+`sfnn_l1_revive`, `sfnn_l1_revive_zero`, `sfnn_l2_revive`, `sfnn_l2_revive_zero`
+は、そのepochでtrueなら最初のbatchの学習前に判定・処理します。単一のtrueは毎epoch適用されます。
+
+```json
+{
+  "sfnn_l1_revive": {"epoch3": true, "epoch4": false},
+  "sfnn_l1_revive_zero": {"epoch3": true, "epoch4": false},
+  "sfnn_l2_revive": {"epoch3": true, "epoch4": false},
+  "sfnn_l2_revive_zero": {"epoch3": true, "epoch4": false}
+}
+```
+
+この例はepoch3だけに適用します。この4項目に限りepoch1を省略でき、最初の指定まではfalseです。epoch4:falseを省略するとepoch3以降の毎epochで適用します。
+
+L1→L2の順に、その時点の重みを使って教師16batchで再判定します。全unitの無条件リセットではありません。既存の判定条件（bucket内1024局面以上・サンプル全件で定数）と初期化方式は変更していません。
+
+epoch途中からresumeした場合は重複処理せず、次のepoch開始を待ちます。前epoch末尾からresumeする場合は実施します。保存前に中断して古いcheckpointへ戻った場合は再判定します。FT factorizer切り替えやBN QAT設定変更が同時にある場合は、それらの適用後に処理します。warmup epoch0はepoch1設定を使用します。
+
+L1はBNなし、L2はBNなしまたは校正済み・統計固定BN QATに対応します。workerでの対応範囲は従来どおり未対応です。校正・処理履歴は連番CSVとstdoutの[REVIVE] epoch=N START/ENDに残します。

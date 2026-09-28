@@ -41,7 +41,7 @@ QAT is active from the start. Epoch1 updates BN statistics; before the first bat
 
 Later false values resume statistics updates. Resume resolves the resumed epoch; warmup epoch0 uses epoch1. Future settings do not affect earlier epochs. Frozen mode requires calibrated statistics and QAT enabled. BN L2 effective clipping and restore-time L2 revival require frozen mode and cannot remain enabled during statistics-updating training. Worker mode does not support epoch schedules. User settings files are not automatically rewritten.
 
-## One-shot L2 revival on restore
+## L2 revival at epoch start
 
 For non-BN L1, see the separate [L1 revival feature](l1-revive.md).
 
@@ -57,9 +57,9 @@ For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_
 
 The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, all with output zero. Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. The old contribution is zero, so only subtract the new mean contribution from L3 bias. This is not exact function preservation.
 
-Compare with `--grid sfnn-l2-revive-zero false true`. Upper/zero completion markers are independent, allowing zero revival after an earlier upper revival. Each is performed once, including calibration with no candidates. Enabling both shares one calibration pass. BN state headers are 1=neither, 2=upper only, 3=zero only, 4=both. Old 1/2 remain readable; older executables cannot read 3/4. nn.bin is unchanged.
+Compare with `--grid sfnn-l2-revive-zero false true`. Both kinds share one calibration pass when enabled. Completion markers apply within an epoch; the next enabled epoch recalibrates. See [epoch settings](epoch-settings.md).
 
-`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units once after restoring a checkpoint, before training. It does **not** run every epoch. **Only when BN is enabled**, it requires `sfnn_bn_l2`, `sfnn_bn_qat`, `sfnn_bn_qat_freeze_stats` and a calibrated L2 BN checkpoint. Do not enable BN just for non-BN revival. Direct training/grid_search only; worker, ordinary NNUE, scratch initialization, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers are rejected.
+`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units before the first batch of every enabled epoch. Epoch maps may omit epoch1 (defaults to false). When BN is enabled, calibrated frozen L2 BN QAT is required. Non-BN scratch training is allowed. Worker, ordinary NNUE, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers remain unsupported.
 
 ```json
 "sfnn_bn_l2": true,
@@ -74,7 +74,7 @@ Compare with `--grid sfnn-l2-revive false true` using the same `initial_state` i
 - Only units reaching the upper clamp in **every** observed position in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. This is an empirical criterion, not proof of constant output on unseen positions.
 - Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); center the mean calibration preactivation at 0.5 using L2 bias without BN, or BN beta with scale one when BN is enabled. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
 - Reset selected moments and synchronize Lookahead slow state. Do not reset other units or FT/L1. `sfnn_l2_revive` alone does not reset always-zero units.
-- Completion is persisted in the `l2_revival_flags` record in state.bin/weights.bin, even when no units qualify. Legacy completion flags inside L2 BN are still read and written. Subsequent restores skip completed kinds. Old checkpoints remain readable. The exported nn.bin format is unchanged.
+- Completion flags are saved, but each enabled new epoch recalibrates. Mid-epoch checkpoint resumes do not repeat revival. Checkpoint and nn.bin formats are unchanged.
 - `l2-revive.csv` records per-bucket/unit counts, upper/lower hits and selection. Existing audits are preserved with numbered filenames. Interruption before a new checkpoint is saved causes recalibration from the original checkpoint on restart.
 
 This intentionally changes the function slightly; it is not an exact equivalence transformation or a guarantee of improved strength. Temporary GPU proxy/workspace and CPU calibration inputs are released before training.

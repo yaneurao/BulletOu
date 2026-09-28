@@ -15,6 +15,16 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_revival_epoch_settings(self):
+        for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero"):
+            settings = {key: {"epoch3": True, "epoch4": False}}
+            for epoch in (1, 2, 3, 4, 5):
+                self.assertEqual(grid.resolve_epoch_settings(settings, epoch)[key], epoch == 3)
+            self.assertTrue(grid.resolve_epoch_settings({key: True}, 20)[key])
+            self.assertTrue(grid.resolve_epoch_settings({key: {"epoch3": True}}, 20)[key])
+            with self.assertRaisesRegex(ValueError, "true/false"):
+                grid.resolve_epoch_settings({key: {"epoch3": 1}}, 1)
+
     def test_ft_factorizer_epoch_switch(self):
         schedule={"epoch1": True, "epoch3": False}
         for alias in ("ft_factorizer", "sfnn_ft_factorizer"):

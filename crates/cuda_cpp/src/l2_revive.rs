@@ -42,6 +42,16 @@ impl Calibration {
 }
 
 impl SfnnTrainStepRunner {
+    /// Epoch boundary only. Checkpoint flags prevent duplicate work within an epoch,
+    /// but must not suppress a newly requested calibration in a later epoch.
+    pub fn begin_revival_epoch(&mut self) {
+        self.l1_revival_flags = 0;
+        self.l2_revival_flags = 0;
+        if let Some((layer, _)) = self.batch_norm.as_mut().and_then(|b| b.layers[2].as_mut()) {
+            layer.revival_done = false;
+            layer.zero_revival_done = false;
+        }
+    }
     pub fn l2_revival_done(&self) -> bool {
         self.l2_revival_flags & 1 != 0 || self.batch_norm.as_ref().and_then(|b| b.layers[2].as_ref()).is_some_and(|(l,_)|l.revival_done)
     }

@@ -11,7 +11,7 @@ Standalone SFNN training and `grid_search.py` accept epoch maps in the common tr
 }
 ```
 
-Merge these fields into a complete training configuration. Values apply from the specified epoch until the next boundary. Both boolean transition directions work. `epoch1` is required; keys must be `epoch1`, `epoch2`, etc. without leading zeros. Object order does not matter. Scalars still apply to every epoch.
+Merge these fields into a complete training configuration. Values apply from the specified epoch until the next boundary. Boolean transition directions work except for the one-way FT switch below. `epoch1` is required except for the four revival controls, which default to false before their first entry. Keys must be `epoch1`, `epoch2`, etc. without leading zeros. Object order does not matter. Scalars still apply to every epoch.
 
 `lr` and `lr_min` retain their within-epoch start/lower-limit meanings. Automatic step gamma is recalculated per epoch. Resume selects the resumed epoch's values; a separate run using `initial_state` starts at its epoch 1. Explicit CLI values and grid axes override the corresponding entire map. Settings are read at startup, not hot-reloaded.
 
@@ -57,3 +57,24 @@ Batches/SB are rounded down using **only the BPU active in that epoch**, prevent
 The teacher shuffle window uses the settings active at startup and remains fixed within that execution; future BPUs do not affect it. Startup still validates the settings and builds the execution plan, but future values are not applied to current training computations.
 
 [Grid search](grid-search.md) / [日本語](../../ja/advanced/epoch-settings.md)
+## Unit revival at epoch boundaries
+
+`sfnn_l1_revive`, `sfnn_l1_revive_zero`, `sfnn_l2_revive`, `sfnn_l2_revive_zero`
+run before the first training batch of each epoch where enabled. A scalar true runs every epoch.
+
+```json
+{
+  "sfnn_l1_revive": {"epoch3": true, "epoch4": false},
+  "sfnn_l1_revive_zero": {"epoch3": true, "epoch4": false},
+  "sfnn_l2_revive": {"epoch3": true, "epoch4": false},
+  "sfnn_l2_revive_zero": {"epoch3": true, "epoch4": false}
+}
+```
+
+This example applies only at epoch3. Only these four settings may omit epoch1; the default before the first entry is false. Omitting epoch4:false keeps revival enabled for all later epochs.
+
+L1 runs before L2, with fresh 16-teacher-batch calibration using current weights. This is not an unconditional reset of every unit. Existing eligibility criteria (at least 1024 positions per bucket, constant in every sampled position) and initialization are unchanged.
+
+Mid-epoch resume skips revival; resume from the previous epoch end performs it. Interruption before saving recalibrates when restarting from the old checkpoint. FT factorizer and BN QAT transitions are applied before revival. Warmup epoch0 uses epoch1 settings.
+
+L1 requires non-BN training; L2 supports non-BN or calibrated frozen-statistics BN QAT. Worker trials remain unsupported. Numbered audit CSVs and [REVIVE] epoch=N START/END messages record each pass.

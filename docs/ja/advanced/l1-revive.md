@@ -1,4 +1,4 @@
-# L1の定数unitを復元時に再初期化する
+# L1の定数unitをepoch開始時に再初期化する
 
 BNなしのcuda-cpp SFNNで使用できます。両方ともデフォルトはfalseです。
 
@@ -13,19 +13,21 @@ BNなしのcuda-cpp SFNNで使用できます。両方ともデフォルトはfa
 
 CLIは `--sfnn-l1-revive` / `--sfnn-l1-revive-zero`。grid searchでは
 `--grid sfnn-l1-revive false true` / `--grid sfnn-l1-revive-zero false true` です。
-同じ`initial_state`を共通設定に指定して比較できます。scratchからの学習では使用できません。
+同じ`initial_state`を共通設定に指定して比較できます。scratch開始にも対応します。
 
 ## 判定と適用タイミング
 
-checkpoint復元後・学習開始前に、復元した教師読み出し位置から16batchを推論します。
+trueのepochの最初のbatchを学習する前に、その時点の教師読み出し位置から16batchを推論します。
 検証セットではなく教師を使用し、学習の読み出し位置は進めません。校正時のshuffleは無効です。
 学習のsample weightが0の局面は判定から除外します。
 量子化proxyの両枝を調べ、bucket内に1,024局面以上あり、その全局面で条件を満たした場合のみ対象にします。
 これは有限サンプルでの判定であり、全局面での定数性の証明ではありません。
 
 各種類の処理済み情報はstate.bin/weights.binに保存します。対象0件でも処理済みとなります。
-以後のresumeでは同じ種類を再実行しません。各epoch開始時にも実行しません。
-上限側だけ実施したcheckpointに、後からゼロ側を追加できます。
+次のepoch開始時には改めて判定します。epoch途中のcheckpointからresumeすると、そのepochでは再実行しません。
+4つのrevive設定はepoch別指定にも対応します。指定開始前はfalse、指定後は次の指定まで値を引き継ぎます。
+`"sfnn_l1_revive": {"epoch3": true, "epoch4": false}`ならepoch3だけです。
+単一のtrueなら全epoch（warmup epoch0を含む）で判定します。詳しくは[epoch設定](epoch-settings.md)。
 処理後のcheckpoint保存前に中断した場合は、元checkpointから再判定します。
 
 判定内容は学習出力フォルダの`l1-revive.csv`に記録します。既存ファイルは上書きせず連番にします。
