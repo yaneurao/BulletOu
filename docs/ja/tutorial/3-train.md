@@ -183,7 +183,7 @@ python .\tuning_parameters.py `
 
 次へ: [4. validation を有効にする](4-validation.md)
 
-HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"ft_factorizer": false`、CLIなら `--ft-factorizer false` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。再開時は保存元と同じFTのON/OFF設定にしてください。
+HalfKA2 / HalfKPのFT（最初の層）の重み共有はデフォルトで有効です。無効にする場合はJSONに `"ft_factorizer": false`、CLIなら `--ft-factorizer false` を指定します。L1の共有を無効にする `"sfnn_factorizer": "none"` とは別の設定です。L2・L3には共有を適用しません。非BN SFNN HalfKA2では `"ft_factorizer": {"epoch1": true, "epoch3": false}` で途中epochからOFFへ自動foldできます。[切り替えとresumeの仕様](../advanced/epoch-settings.md)。それ以外は保存元と同じFTのON/OFF設定で再開してください。
 
 `SFNN_halfka2` では `"ft_factorizer_alpha": 0.5` のようにFT共有の強さも指定できます（デフォルト1.0）。L1共有の強さは `"sfnn_l1_factorizer_alpha": "shared=0.5"` で別に指定します。係数を記録したcheckpointからαを変更して再開すると、開始直後の実効重みを保つrebaseを行います。[設定例とrebaseの注意点](../advanced/sfnn-factorizer.md)
 

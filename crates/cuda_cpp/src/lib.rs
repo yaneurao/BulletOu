@@ -5,6 +5,7 @@ mod bn_qat;
 mod layer_qat;
 pub mod l2_revive;
 pub mod l1_revive;
+pub mod ft_factorizer_switch;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CudaCppError {

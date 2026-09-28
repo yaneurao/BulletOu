@@ -220,7 +220,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 
 通常の再実行ではmanifestと異なる計画を拒否します。ただし `--resume` では、同じgrid条件のcheckpointを引き継ぎつつ、共通JSONのLR・batch size・bpu・保存／検証頻度などを変更できます。stdoutの `[SETTINGS CHANGED]` に変更前後を表示します。実行中のJSON変更を自動反映する機能ではなく、次の起動から反映します。
 
-条件の識別には明示的なgrid引数を使います。例えば `--lrs 0.0001 0.0002` を指定していれば、JSONの `lr` よりその値を優先します。gridの値を変更した条件には、別条件のcheckpointを流用せず、新規trialを作ります。`arch`・`backend`・`ft_factorizer` の変更は既存checkpointとの互換性のため拒否します。それ以外もBulletOu本体の読み込み・引数検証は行われます。
+条件の識別には明示的なgrid引数を使います。例えば `--lrs 0.0001 0.0002` を指定していれば、JSONの `lr` よりその値を優先します。gridの値を変更した条件には、別条件のcheckpointを流用せず、新規trialを作ります。`arch`・`backend` の変更は既存checkpointとの互換性のため拒否します。非BN SFNN HalfKA2の `ft_factorizer` は、共通JSONでON→OFFへ変更・epoch指定でき、本体が自動foldします。それ以外のFT構造変更は未対応です。BulletOu本体の読み込み・引数検証も行われます。
 
 完了済みtrialは設定変更だけでは再実行しません。延長するには `max_epochs` を増やしてください。共通設定を途中変更した結果は、最初から同一条件で学習した結果とは区別して比較してください。実行ファイルは同じpathで再ビルドできますが、入力ファイルの内容変更や実装変更も比較に影響します。
 

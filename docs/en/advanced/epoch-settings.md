@@ -19,10 +19,25 @@ Merge these fields into a complete training configuration. Values apply from the
 
 ## Supported fields
 
+### Disable the FT factorizer at an epoch boundary
+
+Non-BN `SFNN_halfka2` supports this one-way schedule (`sfnn_ft_factorizer` is an alias):
+
+```json
+"ft_factorizer": {"epoch1": true, "epoch3": false}
+```
+
+Before the first batch of epoch 3, shared FT weights are folded into individual weights. Lookahead slow weights are folded separately and virtual rows are removed. Individual momentum/velocity and step counters survive; shared momentum/velocity is discarded. Effective weights are preserved (floating-point addition order can cause small differences), but future optimizer updates are not equivalent to ON mode. Units are not reset.
+
+Use the same JSON with `--resume`: an ON checkpoint is folded on restoration into an OFF epoch; an already-OFF checkpoint is not folded again. OFF→ON, BN, other architectures, worker and plateau transitions are unsupported. A colored `[FT FACTORIZER]` line reports the conversion.
+
+Grid search accepts the schedule in its common JSON. Remove any explicit `--grid ft-factorizer true` axis because it overrides the entire schedule. Settings are not hot-reloaded; resume from a saved checkpoint after changing them.
+
 | Fields | Meaning |
 |---|---|
 | `lr`, `lr_min` | LR start and lower limit |
 | `batches_per_update` | Accumulation batches per update |
+| `ft_factorizer` / `sfnn_ft_factorizer` | Non-BN SFNN HalfKA2 ON→OFF automatic fold |
 | `sfnn_qat_l1` | Enable/disable L1 QAT |
 | `sfnn_bn_qat` | Enable/disable BN QAT; enable BN layers from startup, e.g. `{"epoch1":false,"epoch6":true}` |
 | `sfnn_freeze_l1` | Freeze/unfreeze L1 |
@@ -33,7 +48,7 @@ Merge these fields into a complete training configuration. Values apply from the
 | `optimizer_weight_decay` | Weight decay strength |
 | `bce_error_weight_k` | BCE error weighting (requires BCE) |
 
-Unsupported maps fail explicitly. Architecture, batch size, teacher, factorizer structure and loss type cannot be scheduled. Worker/tuning, direct-step smoke and plateau are not supported.
+Unsupported maps fail explicitly. Architecture, batch size, teacher, non-FT factorizer structure and loss type cannot be scheduled. Worker/tuning, direct-step smoke and plateau are not supported.
 
 ## Accumulation alignment
 

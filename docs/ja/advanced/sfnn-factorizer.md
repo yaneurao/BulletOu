@@ -12,6 +12,8 @@ L1の指定名は `--sfnn-l1-factorizer none/shared/axis/pair`（JSON: `sfnn_l1_
 
 ### 学習済みFT factorizerをOFFへ変換する
 
+通常学習・grid searchでは `"ft_factorizer": {"epoch1": true, "epoch3": false}` でepoch 3から自動foldしてOFFにできます（非BN SFNN HalfKA2のみ）。同じ設定でresumeでき、ONのcheckpointは復元時にfold、OFFのcheckpointはそのまま読み込みます。手動変換は不要です。詳細は[epoch別設定](epoch-settings.md#ft-factorizerを途中epochからoffにする)。以下のスクリプトは、独立した変換済みcheckpointを作りたい場合に使います。
+
 非BNの `SFNN_halfka2` checkpointは、`python convert_ft_factorizer_off.py --checkpoint <保存フォルダ> --output <新規フォルダ>` で変換できます（NumPyが必要）。元ファイルは変更せず、通常重みとLookahead slow重みの共通FT項を個別重みへfoldします。個別FTのmomentum/velocityとstepは維持し、共通FTのmomentum/velocityは破棄します。これはON時と等価なoptimizer更新ではありません。他層は変更しません。変換結果は全recordを検証します。
 
 追加学習では `--initial-state <新規フォルダ>/state.bin --initial-dataloader-pos <新規フォルダ>/dataloader_pos.txt --ft-factorizer false` を指定し、学習出力先も別にします。progress付きならコピーされた `progress.bin` を使えます。変換先には `nn.bin` をコピーしません。切り替え直後の実効重みは保存されるため、飽和率がその瞬間に下がる処理ではありません。

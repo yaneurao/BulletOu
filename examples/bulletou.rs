@@ -4096,6 +4096,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
@@ -4119,9 +4120,16 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if epoch.is_none() || name != &format!("epoch{}", epoch.unwrap()) {
             return Err(format!("invalid epoch key `{name}` in `{key}`; use epoch1, epoch2, ..."));
         }
-        let boolean = matches!(key, "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
+        }
+    }
+    if key == "ft_factorizer" {
+        let mut entries: Vec<_> = map.iter().map(|(k,v)| (k[5..].parse::<usize>().unwrap(), v.as_bool().unwrap())).collect();
+        entries.sort_by_key(|x| x.0);
+        if entries.windows(2).any(|w| !w[0].1 && w[1].1) {
+            return Err("ft_factorizer epoch schedule supports only true -> false (OFF -> ON is not supported)".into());
         }
     }
     Ok(())
@@ -4179,11 +4187,18 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
+    }
+    if schedules.contains_key("ft_factorizer") {
+        if resolved.resolved_eval_type() != Some(EvalType::SfnnHalfka2)
+            || resolved.sfnn_bn_ft || resolved.sfnn_bn_l1 || resolved.sfnn_bn_l2 {
+            return Err("ft_factorizer epoch schedule currently requires non-BN SFNN_halfka2".into());
+        }
+        if !resolved.ft_factorizer { resolved.ft_factorizer_alpha = 1.0; }
     }
     if !resolved.lr.is_finite() || !resolved.lr_min.is_finite() || resolved.lr <= 0.0
         || resolved.lr_min <= 0.0 || resolved.lr_min > resolved.lr || resolved.batches_per_update == 0 {
@@ -18001,7 +18016,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     print_startup_kv_colored("upload pipeline", "enabled (2 slots; non-profiled steps)", ConsoleColor::BoldGreen);
 
-    let cuda_shape = initial_weights.shape;
+    let mut cuda_shape = initial_weights.shape;
     let ctx = Context::new(device).map_err(|e| e.to_string())?;
     let initial_host_weights = initial_weights.as_host();
     let max_active = feature_kind.max_active();
@@ -18577,6 +18592,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
                 ctx.synchronize().map_err(|e| e.to_string())?;
                 let next_args = args_at_epoch(base_args, progress.epoch)?;
+                if next_args.ft_factorizer != epoch_args.ft_factorizer {
+                    if next_args.ft_factorizer {
+                        return Err("FT factorizer OFF -> ON is not supported during training".into());
+                    }
+                    upload_ctx.synchronize().map_err(|e|e.to_string())?;
+                    runner.disable_ft_factorizer(&ctx, feature_kind.base_input_size(), feature_kind.virtual_rows())
+                        .map_err(|e|e.to_string())?;
+                    cuda_shape = runner.shape;
+                    sfnn_resident_validation_cache = None;
+                    sfnn_quantized_validation_cache = None;
+                    eprintln!("{}", paint(format!("  [FT FACTORIZER] epoch={} ON -> OFF: folded master + Lookahead slow weights; base moments/steps retained, shared moments discarded", progress.epoch), ConsoleColor::BoldYellow));
+                }
                 if next_args.sfnn_bn_qat != epoch_args.sfnn_bn_qat
                     || next_args.sfnn_bn_qat_freeze_stats != epoch_args.sfnn_bn_qat_freeze_stats {
                     // Only the QAT proxy changes; keep master weights, optimizer,
@@ -21913,6 +21940,39 @@ fn load_cuda_cpp_sfnn_initial_state(
     let weights_records = initial_sections.remove("weights").unwrap_or_default();
 
     validate_sfnn_l1_only_factorizer_checkpoint(&weights_records)?;
+
+    // Resume exactly at (or after) the scheduled boundary, including checkpoints
+    // saved before the first OFF epoch. Do not fold an already compact checkpoint.
+    let base = feature_kind.base_input_size();
+    let virtual_rows = feature_kind.virtual_rows();
+    let width = args.arch().dims().0;
+    if !args.ft_factorizer && virtual_rows > 0
+        && weights_records.get("l0w").is_some_and(|w| w.len() == (base+virtual_rows)*width) {
+        if args.resolved_eval_type() != Some(EvalType::SfnnHalfka2)
+            || args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2
+            || weights_records.keys().any(|k| k.starts_with("bn_")) {
+            return Err("automatic FT factorizer ON -> OFF requires non-BN SFNN_halfka2".into());
+        }
+        let train = initial_sections.get("train").cloned().unwrap_or_default();
+        let alpha = load_sfnn_shared_coefficients(&train)?.map_or(1.0, |v|v[0]);
+        drop(weights_records);
+        drop(initial_sections);
+        let mut on = args.clone();
+        on.ft_factorizer = true;
+        on.ft_factorizer_alpha = alpha;
+        let mut state = load_cuda_cpp_sfnn_initial_state(path, &on, feature_kind)?;
+        bulletou_cuda_cpp::ft_factorizer_switch::fold_rows(&mut state.weights.l0w, base, virtual_rows, width, alpha)
+            .map_err(|e|e.to_string())?;
+        if let Some(opt) = state.optimizer_states.as_mut() {
+            bulletou_cuda_cpp::ft_factorizer_switch::fold_rows(&mut opt.l0w.slow_params, base, virtual_rows, width, alpha)
+                .map_err(|e|e.to_string())?;
+            opt.l0w.momentum.truncate(base*width);
+            opt.l0w.velocity.truncate(base*width);
+        }
+        state.weights.shape.input_size = base;
+        eprintln!("{}", paint("  [FT FACTORIZER] restore ON -> OFF: folded master + Lookahead slow weights; base moments/steps retained, shared moments discarded", ConsoleColor::BoldYellow));
+        return Ok(state);
+    }
 
     let (ft_size, l1_hidden, l2_size) = args.arch().dims();
     let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
@@ -26204,8 +26264,14 @@ fn resume_signature_for_match(signature: &str) -> String {
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
-    let current = resume_signature_for_match(&resume_signature(args));
-    let stored = resume_signature_for_match(stored);
+    let mut current = resume_signature_for_match(&resume_signature(args));
+    let mut stored = resume_signature_for_match(stored);
+    if args.resolved_eval_type() == Some(EvalType::SfnnHalfka2) {
+        // The actual state layout is checked by the loader. ON -> OFF folds;
+        // OFF -> ON still errors there. Epoch1's scalar need not match a later checkpoint.
+        current = resume_signature_without_line(&current, "ft_factorizer=");
+        stored = resume_signature_without_line(&stored, "ft_factorizer=");
+    }
     if stored.trim_end() == current.trim_end() {
         return true;
     }
@@ -32056,6 +32122,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ft_factorizer_epoch_switch_settings() {
+        let mut args=Args::try_parse_from(["bulletou","--arch","SFNN_halfka2_128_8_32_k3k3",
+            "--teacher","/dev/null","--backend","cuda-cpp","--superbatches","1","--max-epochs","4"]).unwrap();
+        args.ft_factorizer_alpha=0.5;
+        args.epoch_settings_json=Some(serde_json::json!({"ft_factorizer":{"epoch1":true,"epoch3":false}}).to_string());
+        assert!(args_at_epoch(&args,2).unwrap().ft_factorizer);
+        let off=args_at_epoch(&args,3).unwrap();
+        assert!(!off.ft_factorizer);
+        assert_eq!(off.ft_factorizer_alpha,1.0);
+        assert!(!args_at_epoch(&args,20).unwrap().ft_factorizer);
+        assert!(validate_epoch_setting("ft_factorizer",&serde_json::json!({"epoch1":false,"epoch3":true})).is_err());
+        assert!(validate_epoch_setting("ft_factorizer",&serde_json::json!({"epoch1":true,"epoch3":0})).is_err());
+        args.sfnn_bn_l1=true;
+        assert!(args_at_epoch(&args,1).unwrap_err().contains("non-BN"));
+    }
+
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn shared_host_rebase_transposes_and_preserves_effective_weights() {
@@ -32217,8 +32300,8 @@ mod tests {
         args.ft_factorizer = false;
         assert!(resume_signature(&args).contains("ft_factorizer=false"));
         assert!(resume_signature_matches(&resume_signature(&args).replace("ft_factorizer=false", "no_ft_factorize=true"), &args));
-        assert!(!resume_signature_matches(&on_signature, &args));
-        assert!(!resume_signature_matches(&missing_flag, &args));
+        assert!(resume_signature_matches(&on_signature, &args));
+        assert!(resume_signature_matches(&missing_flag, &args));
         assert!(!effective_sfnn_factorizer_spec(&args).any());
         args.sfnn_factorizer = Some(SfnnFactorizerSpec::SHARED);
         assert!(effective_sfnn_factorized_l1(&args));
@@ -32292,11 +32375,14 @@ mod tests {
             assert_eq!(loaded.weights.l0w, weights.l0w);
             assert_eq!(loaded.weights.shape.input_size, kind.input_size_for_args(&args));
             args.ft_factorizer = disabled;
-            let err = match load_cuda_cpp_sfnn_initial_state(&path, &args, kind) {
-                Err(err) => err,
-                Ok(_) => panic!("FT mode mismatch must not silently transform a checkpoint"),
-            };
-            assert!(err.contains("checkpoint FT factorizer"), "{err}");
+            if disabled {
+                assert!(load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap_err().contains("checkpoint FT factorizer"));
+            } else {
+                let folded=load_cuda_cpp_sfnn_initial_state(&path,&args,kind).unwrap();
+                assert_eq!(folded.weights.shape.input_size,kind.base_input_size());
+                assert_eq!(folded.weights.l0w,fold_sfnn_halfka2_piece_factorized_l0w(
+                    &weights.l0w,kind.base_input_size(),kind.virtual_rows(),off_shape.ft_size,1.0).unwrap());
+            }
         }
         std::fs::remove_file(path).unwrap();
     }

@@ -15,6 +15,18 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_ft_factorizer_epoch_switch(self):
+        schedule={"epoch1": True, "epoch3": False}
+        for alias in ("ft_factorizer", "sfnn_ft_factorizer"):
+            grid.atomic_json(self.settings_path, {**self.common, alias:schedule})
+            plan=self.plan()
+            settings=plan["trials"][0]["settings"]
+            self.assertTrue(grid.resolve_epoch_settings(settings,2)["ft_factorizer"])
+            self.assertFalse(grid.resolve_epoch_settings(settings,3)["ft_factorizer"])
+            self.assertFalse(grid.resolve_epoch_settings(settings,20)["ft_factorizer"])
+        with self.assertRaisesRegex(ValueError,"true -> false"):
+            grid.resolve_epoch_settings({"ft_factorizer":{"epoch1":False,"epoch2":True}},1)
+
     def test_l1_revival_grid_flags(self):
         for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero"):
             plan = self.plan(["--grid", key.replace("_", "-"), "false", "true"])
@@ -1093,8 +1105,9 @@ class GridSearchTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 grid.main(arguments)
         grid.atomic_json(self.settings_path, {**self.common, "ft_factorizer": False})
-        with self.assertRaisesRegex(ValueError, "checkpoint-incompatible"):
-            grid.main([*argv, "--resume", "--epochs", "7"])
+        requested = grid.make_plan(grid.parse_args([*argv, "--epochs", "7"]))
+        merged, _ = grid.plan_resume(self.output, old, requested)
+        self.assertTrue(all(t["settings"]["ft_factorizer"] is False for t in merged["trials"]))
         self.assertEqual(before, (self.output / grid.MANIFEST).read_bytes())
 
     def test_resume_common_changes_preserve_historical_epochs_and_original_launch(self):

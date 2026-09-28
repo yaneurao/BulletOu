@@ -218,7 +218,7 @@ The previous trial directory is moved intact to `<grid root>/interrupted-runs/<t
 
 Ordinary reruns reject a changed plan. With `--resume`, the same grid condition resumes its own checkpoint while accepting changes to the common JSON, including LR, batch size, bpu, and save/validation rates. `[SETTINGS CHANGED]` prints the old and new values. Changes apply at the next invocation; the runner does not hot-reload JSON during training.
 
-Explicit grid arguments identify conditions and override common JSON values. For example, `--lrs 0.0001 0.0002` overrides JSON `lr`. A different grid value creates a new condition rather than reusing another condition's checkpoint. Changes to `arch`, `backend`, or `ft_factorizer` are rejected for checkpoint compatibility. Other settings remain subject to native BulletOu argument and checkpoint validation.
+Explicit grid arguments identify conditions and override common JSON values. For example, `--lrs 0.0001 0.0002` overrides JSON `lr`. A different grid value creates a new condition rather than reusing another condition's checkpoint. Changes to `arch` or `backend` are rejected for checkpoint compatibility. Non-BN SFNN HalfKA2 accepts a common-JSON `ft_factorizer` ON→OFF change or epoch schedule, with automatic folding by BulletOu. Other FT layout transitions are unsupported. Native BulletOu argument and checkpoint validation still applies.
 
 Changing settings alone does not restart completed trials: increase `max_epochs` to extend them. Results after common-setting changes are not equivalent to training with one constant configuration from the beginning. Rebuilding the executable at the same path is allowed, but implementation changes and input-file content changes also affect comparisons.
 

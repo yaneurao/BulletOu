@@ -48,6 +48,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
     "cuda_cpp_train_steps",
 }
 COMMON_COLUMNS = (
+    "ft_factorizer",
     "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3",
     "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -189,6 +190,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
+    "ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
@@ -213,13 +215,19 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
         for name, item in value.items():
             if not re.fullmatch(r"epoch[1-9][0-9]*", name):
                 raise ValueError(f"{key}: invalid epoch key {name!r}")
-            if key in ("sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
+            if key in ("ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")
             elif type(item) not in (int, float) or not math.isfinite(item):
                 raise ValueError(f"{key}.{name} must be a finite number")
+        if key == "ft_factorizer":
+            ordered = [value[n] for n in sorted(value, key=lambda n: int(n[5:]))]
+            if any(not a and b for a, b in zip(ordered, ordered[1:])):
+                raise ValueError("ft_factorizer epoch schedule supports only true -> false")
         name = max((n for n in value if int(n[5:]) <= epoch), key=lambda n: int(n[5:]))
         resolved[key] = value[name]
+        if key == "ft_factorizer" and not resolved[key]:
+            resolved["ft_factorizer_alpha"] = 1.0
     return resolved
 
 
@@ -613,7 +621,10 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         trial = matches[0]
         old, new = trial["settings"]["max_epochs"], candidate["settings"]["max_epochs"]
         defaults = {"backend": "cuda-cpp", "ft_factorizer": True}
-        incompatible = [k for k in ("arch", "backend", "ft_factorizer")
+        layout_keys = ["arch", "backend"]
+        if not str(candidate["settings"].get("arch", "")).startswith("SFNN_halfka2_"):
+            layout_keys.append("ft_factorizer")
+        incompatible = [k for k in layout_keys
                         if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))]
         if incompatible:
             raise ValueError(

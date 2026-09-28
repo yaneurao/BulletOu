@@ -23,10 +23,25 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 
 ## 対応項目
 
+### FT factorizerを途中epochからOFFにする
+
+非BNの `SFNN_halfka2` では、次の指定でepoch 1～2をON、epoch 3以降をOFFにできます。`sfnn_ft_factorizer` も同じ意味のaliasです。
+
+```json
+"ft_factorizer": {"epoch1": true, "epoch3": false}
+```
+
+epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldします。Lookahead slow重みも別途foldし、共有行を削除します。個別FTのmomentum/velocityと更新回数は維持し、共有FTのmomentum/velocityは破棄します。実効重みは保持しますが、浮動小数点の加算順による微差はあり、その後のoptimizer更新はON時と等価ではありません。unitのリセットは行いません。
+
+`--resume` でも同じJSONを使えます。ONのcheckpointからOFFのepochへ再開する場合は復元時にfoldし、すでにOFFのcheckpointなら再foldしません。OFF→ONは未対応です。BN、他のarch、worker、plateauでの途中切り替えも未対応です。切り替え時には色付きの `[FT FACTORIZER]` 行を表示します。
+
+`grid_search.py` の共通JSONでも使えます。ただし `--grid ft-factorizer true` 等を明示するとJSONのepoch指定全体を上書きするため、そのgrid軸は外してください。実行中のJSON編集は反映しないので、設定変更後はcheckpointから `--resume` してください。
+
 | 項目 | 意味 |
 |---|---|
 | `lr`, `lr_min` | 学習率の開始値・下限値 |
 | `batches_per_update` | 1更新あたりの累積batch数 |
+| `ft_factorizer` / `sfnn_ft_factorizer` | 非BN SFNN HalfKA2でON→OFFへ自動fold |
 | `sfnn_qat_l1` | L1 QATの有効・無効 |
 | `sfnn_bn_qat` | BN QATの有効・無効（BN層は最初から有効化。例：`{"epoch1":false,"epoch6":true}`） |
 | `sfnn_freeze_l1` | L1の固定・解除 |
@@ -37,7 +52,7 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 | `optimizer_weight_decay` | weight decay係数 |
 | `bce_error_weight_k` | BCEの誤差重み付け係数（BCE有効時のみ） |
 
-未対応項目のオブジェクト指定はエラーです。arch、batch size、教師データ、factorizer構造、loss種類などは途中切替できません。worker/tuning、direct-step smoke、plateauにも未対応です。
+未対応項目のオブジェクト指定はエラーです。arch、batch size、教師データ、FT以外のfactorizer構造、loss種類などは途中切替できません。worker/tuning、direct-step smoke、plateauにも未対応です。
 
 ## bpu変更時の丸め
 

@@ -12,6 +12,8 @@ You do not need this page for a first training run. Read it when you want to com
 
 ### Convert a trained FT factorizer to OFF
 
+Standalone training/grid search supports `"ft_factorizer": {"epoch1": true, "epoch3": false}` for an automatic fold at epoch 3 (non-BN SFNN HalfKA2 only). Resume with the same settings: ON checkpoints fold on restoration; OFF checkpoints load unchanged. No manual conversion is needed. See [per-epoch settings](epoch-settings.md#disable-the-ft-factorizer-at-an-epoch-boundary). The script below remains useful for creating a separate converted checkpoint.
+
 For non-BN `SFNN_halfka2` checkpoints, run `python convert_ft_factorizer_off.py --checkpoint <checkpoint-directory> --output <new-directory>` (requires NumPy). The source is unchanged. Master and Lookahead slow FT weights are folded separately. Individual FT momentum/velocity and step counters are retained; virtual-row momentum/velocity is discarded. This does not preserve the factorized optimizer update. Other layers are unchanged, and every output record is verified.
 
 Continue training into a separate output directory with `--initial-state <new-directory>/state.bin --initial-dataloader-pos <new-directory>/dataloader_pos.txt --ft-factorizer false`. Use the copied `progress.bin` when applicable. No `nn.bin` is copied. Effective weights are preserved at conversion, so switching off does not instantly reduce saturation.
