@@ -15,6 +15,45 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_locked_summary_never_stops_training_and_can_be_regenerated(self):
+        original_replace = Path.replace
+        def locked(path, target):
+            if Path(target).name == "grid_summary.csv":
+                raise PermissionError(13, "locked")
+            return original_replace(path, target)
+        def child(command, directory, cwd, trial_id):
+            settings = grid.read_json(Path(command[2]))
+            self.summary(directory, [self.metrics(epoch=e) for e in range(1, settings["max_epochs"]+1)])
+            return 0, 0.1
+        with patch.object(Path, "replace", locked), patch.object(grid, "preflight_exe"), \
+                patch.object(grid, "run_child", side_effect=child) as run, redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(grid.main(self.argv), 0)
+        self.assertEqual(run.call_count, len(self.plan()["trials"]))
+        self.assertIn("summary update deferred", out.getvalue())
+        self.assertNotIn("[SUMMARY] updated:", out.getvalue())
+        self.assertNotIn("[SUMMARY] initialized:", out.getvalue())
+        plan = grid.read_json(self.output / grid.MANIFEST)
+        for trial in plan["trials"]:
+            self.assertEqual(grid.read_json(grid.trial_dir(self.output, trial) / "grid-state.json")["status"], "done")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main(["--output-folder", str(self.output), "--summary-only"]), 0)
+        self.assertTrue(self.csv_rows(self.output / "grid_summary.csv"))
+
+    def test_summary_failure_does_not_mask_keyboard_interrupt(self):
+        with patch.object(grid, "preflight_exe"), \
+                patch.object(grid, "write_summary", side_effect=PermissionError("locked")), \
+                patch.object(grid, "run_child", side_effect=KeyboardInterrupt), redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                grid.main(self.argv)
+
+    def test_summary_temp_open_failure_is_nonfatal_but_state_write_is_fatal(self):
+        with patch.object(grid, "write_summary", side_effect=OSError("temp write failed")), redirect_stdout(io.StringIO()):
+            self.assertIsNone(grid.try_write_training_summary(self.output, self.plan(), self.output/"grid_summary.csv"))
+        with patch.object(grid, "preflight_exe"), \
+                patch.object(grid, "atomic_json", side_effect=PermissionError("state locked")), redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(PermissionError, "state locked"):
+                grid.main(self.argv)
+
     def test_legacy_factorizer_manifest_resume_and_csv_names(self):
         requested = self.plan(["--grid", "sfnn-ft-factorizer", "false", "true",
                                "--grid", "sfnn-l1-factorizer", "none", "shared"])

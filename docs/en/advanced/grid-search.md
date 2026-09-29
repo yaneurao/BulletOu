@@ -272,3 +272,14 @@ Add `--epochs 1 2` to regenerate only those epochs. Source logs are untouched. T
 - Each condition uses a **separate trainer process**, not worker mode. Teacher RAM and validation caches are not shared across conditions; startup overhead matters for very short trials.
 - Validation rate `0` means epoch-end only; `-1` disables periodic validation. Quantized validation on saves follows the native rules.
 - This runner does not implement YOSC's `--value-loss-min-weight` in BulletOu. Unsupported executable options are rejected before training.
+## Locked or unwritable summary CSV
+
+`grid_summary.csv` is a derived report. During training, CSV update failures emit a warning and do not prevent subsequent trials from running. Publication is retried at the next update; there is no unsafe in-place overwrite fallback and no false success message. Checkpoint, state and manifest failures remain fatal.
+
+After releasing the lock, regenerate without training (do not run concurrently with the same grid runner):
+
+```powershell
+python .\grid_search.py --output-folder <existing-grid-root> --summary-only
+```
+
+`--summary-only` still fails if it cannot produce the requested CSV. Already-running Python processes do not pick up this fix. Resume normal execution with the original command plus `--resume`.

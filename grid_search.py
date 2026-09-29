@@ -751,6 +751,22 @@ def write_summary(root: Path, plan: dict, path: Path, epochs=None, *, trial_rows
     return rows
 
 
+def try_write_training_summary(root: Path, plan: dict, path: Path) -> list[dict] | None:
+    """A derived report must never abort training or hide the child's exception.
+
+    Keep write_summary strict for --summary-only and the live updater (which
+    already retries). State/manifest writes deliberately remain fatal.
+    """
+    try:
+        return write_summary(root, plan, path)
+    except (OSError, ValueError, csv.Error) as exc:
+        print(warning_console_line(
+            f"[WARN] summary update deferred: {path}: {exc}. "
+            "This report failure does not abort training; retry at the next summary update or regenerate with --summary-only."
+        ), flush=True)
+        return None
+
+
 @contextmanager
 def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, interval=1.0):
     """Publish completed epochs while the child is alive, even if stdout is quiet.
@@ -819,10 +835,14 @@ def stop_child(proc: subprocess.Popen) -> None:
 
 def trial_console_line(trial_id: int, line: str) -> str:
     text = f"[TRIAL {trial_id}] {line}"
+    return warning_console_line(text) if re.match(r"\s*(?:WARN(?:ING)?:|\[WARN(?:ING)?\])", line) else text
+
+
+def warning_console_line(text: str) -> str:
     color_mode = os.environ.get("BULLETOU_COLOR", "auto").lower()
     color = ("NO_COLOR" not in os.environ and color_mode != "never"
              and (color_mode == "always" or (sys.stdout.isatty() and os.environ.get("TERM") != "dumb")))
-    if color and re.match(r"\s*(?:WARN(?:ING)?:|\[WARN(?:ING)?\])", line):
+    if color:
         ending = "\n" if text.endswith("\n") else ""
         return "\x1b[1;33m" + text.rstrip("\n") + "\x1b[0m" + ending
     return text
@@ -951,8 +971,8 @@ def main(argv=None) -> int:
         if args.resume:
             restart_unsaved_trials(root, plan, selected)
             atomic_json(manifest_path, plan)
-        write_summary(root, plan, summary_path)
-        print(f"[SUMMARY] initialized: {summary_path}", flush=True)
+        if try_write_training_summary(root, plan, summary_path) is not None:
+            print(f"[SUMMARY] initialized: {summary_path}", flush=True)
         for trial in plan["trials"]:
             if trial["id"] not in selected:
                 print(f"[SKIP] trial={trial['id']} not selected; existing results retained", flush=True)
@@ -979,7 +999,7 @@ def main(argv=None) -> int:
             record_settings_launch(directory, trial, resume)
             old_elapsed = state.get("elapsed_seconds", 0)
             atomic_json(state_path, {"status": "running", "elapsed_seconds": old_elapsed})
-            write_summary(root, plan, summary_path)
+            try_write_training_summary(root, plan, summary_path)
             print(f"[TRIAL {trial['id']} START] {trial['parameters']} resume={resume}", flush=True)
             print("[COMMAND] " + subprocess.list2cmdline(command), flush=True)
             started = time.monotonic()
@@ -995,19 +1015,22 @@ def main(argv=None) -> int:
                                        "elapsed_seconds": round(old_elapsed + elapsed, 3)})
             except BaseException:
                 atomic_json(state_path, {"status": "interrupted", "elapsed_seconds": round(old_elapsed + time.monotonic() - started, 3)})
-                write_summary(root, plan, summary_path)
+                try_write_training_summary(root, plan, summary_path)
                 raise
-            summaries = write_summary(root, plan, summary_path)
+            summaries = try_write_training_summary(root, plan, summary_path)
             print(f"[TRIAL {trial['id']} END] status={status} exit={code} elapsed={elapsed:.1f}s", flush=True)
-            print(f"[SUMMARY] updated: {summary_path}", flush=True)
+            if summaries is not None:
+                print(f"[SUMMARY] updated: {summary_path}", flush=True)
             if status != "done":
                 failures += 1
                 if not args.continue_on_error:
                     print(f"[ERROR] see {directory / 'stdout.log'}", flush=True)
                     return 1
-        summaries = write_summary(root, plan, summary_path)
-        print_leaders(summaries)
-    print(f"[SUMMARY] {summary_path}", flush=True)
+        summaries = try_write_training_summary(root, plan, summary_path)
+        if summaries is not None:
+            print_leaders(summaries)
+    if summaries is not None:
+        print(f"[SUMMARY] {summary_path}", flush=True)
     return 1 if failures else 0
 
 

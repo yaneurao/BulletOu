@@ -275,3 +275,14 @@ python .\grid_search.py `
 - 各条件は本体の**別プロセス**です。workerを使わず、教師RAM cacheやvalidation cacheを条件間で共有しません。短すぎるtrialでは起動コストが目立ちます。
 - `validation_rate=0` はepoch末だけ、`-1` は定期検証無効。量子化検証は保存時にも行われる本体の規則に従います。
 - YOSCの `--value-loss-min-weight` に相当する機能は、このスクリプトだけでは追加されません。実行ファイルに存在しない引数は実行前にエラーにします。
+## CSV更新がファイルロックで失敗した場合
+
+`grid_summary.csv`は学習ログから再生成できる集計です。学習中は、CSV更新に失敗しても警告を出すだけで、次のtrialへ進みます。元のCSVを直接上書きするfallbackは行わず、次回の更新で再試行します。失敗時に「更新済み」とは表示しません。checkpoint・state・manifestの保存失敗は別扱いで、エラーを隠しません。
+
+ロック解消後、学習を実行せずに再生成できます（同じgridのrunnerが動いている間は実行しないでください）。
+
+```powershell
+python .\grid_search.py --output-folder <既存gridフォルダ> --summary-only
+```
+
+`--summary-only`はCSV生成自体が目的なので、書き出せない場合はエラー終了します。修正前から稼働中のPythonプロセスには変更が反映されません。通常の再開は元のコマンドに`--resume`を付けます。
