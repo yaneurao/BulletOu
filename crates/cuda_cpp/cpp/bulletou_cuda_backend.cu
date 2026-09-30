@@ -1019,6 +1019,7 @@ __global__ void dense_add_bias_kernel(
 }
 
 constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
+constexpr size_t SFNN_KA2_INPUT_SIZE = 1791;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
 constexpr float SFNN_PAIRWISE_SCALE = 127.0f / 128.0f;
@@ -4109,6 +4110,37 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     }
 }
 
+// Ka2 has very few feature rows and long occurrence lists. Divide each list
+// among eight warps instead of serialising it in one thread per FT channel.
+// One block owns the complete feature/channel tile, so accumulation across
+// views and microbatches needs neither global atomics nor extra VRAM scratch.
+__global__ void sfnn_ka2_gather_l0w_gradients_kernel(
+    const float* pre_gradients, const int* positions, const int* offsets,
+    float* gradients, size_t ft_size, int add_to_existing) {
+    constexpr unsigned lanes = 32, groups = 8;
+    const size_t feature = blockIdx.x;
+    const unsigned lane = threadIdx.x % lanes, group = threadIdx.x / lanes;
+    const size_t row = blockIdx.y * lanes + lane;
+    const int begin = offsets[feature], end = offsets[feature + 1];
+    __shared__ float sums[groups][lanes];
+    float sum = 0.0f;
+    if (row < ft_size) {
+        for (int i = begin + group; i < end; i += groups) {
+            sum += pre_gradients[static_cast<size_t>(positions[i]) * ft_size + row];
+        }
+    }
+    sums[group][lane] = sum;
+    __syncthreads();
+    if (group == 0 && row < ft_size) {
+        float total = 0.0f;
+        #pragma unroll
+        for (unsigned g = 0; g < groups; ++g) total += sums[g][lane];
+        const size_t idx = feature * ft_size + row;
+        if (add_to_existing) gradients[idx] += total;
+        else gradients[idx] = total;
+    }
+}
+
 __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float* l0w_gradients,
     size_t ft_size, float ft_factorizer_alpha) {
@@ -5532,7 +5564,7 @@ unsigned int sfnn_dense_reduce_split_count(size_t batch) {
     return static_cast<unsigned int>(splits);
 }
 
-// BN L1: contiguous input lanes, compile-time indexed bucket accumulators.
+// Compact L1: contiguous input lanes, compile-time indexed bucket accumulators.
 template<int Outputs>
 __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float* shared,
     const int* buckets,float* dx,size_t batch,size_t width,size_t stacks,float alpha) {
@@ -5621,7 +5653,12 @@ int launch_sfnn_dense_param_reduce_tiled(
     if (batch == 0 || input_dim == 0 || output_dim == 0 || num_stacks == 0) {
         return 0;
     }
-    if(ctx->bn[1].params && input_dim>=32 && output_dim>=ctx->bn[1].width && output_dim<=ctx->bn[1].width+1 && output_dim<=16 && num_stacks<=16 &&
+    const bool compact_l1 = input_dim >= 1024 && (output_dim == 8 || output_dim == 9);
+    const bool bn_l1 = ctx->bn[1].params && input_dim >= 32 &&
+        output_dim >= ctx->bn[1].width && output_dim <= ctx->bn[1].width + 1;
+    // This is an affine-gradient reduction, not a BN operation. The same
+    // coalesced kernel also applies to ordinary/QAT L1 with no axis terms.
+    if((bn_l1 || compact_l1) && output_dim<=16 && num_stacks<=16 &&
         has_axis==0 && use_crelu_gradient==0 && !bn_use_reference()) {
         dim3 grid(static_cast<unsigned>((input_dim+31)/32),static_cast<unsigned>((batch+255)/256),
             static_cast<unsigned>((output_dim+7)/8));
@@ -6089,6 +6126,13 @@ int launch_sfnn_inverse_index_for_perspective(
     size_t ft_size, int add_to_existing) {
     if (launch_sfnn_build_inverse_index(ctx, indices, batch, max_active, n_features) != 0)
         return -1;
+    if (n_features == SFNN_KA2_INPUT_SIZE && ft_size >= 1024 && batch >= 1024) {
+        sfnn_ka2_gather_l0w_gradients_kernel<<<
+            dim3(static_cast<unsigned>(n_features), static_cast<unsigned>((ft_size + 31) / 32)),
+            256, 0, ctx->stream>>>(pre_gradients, ctx->sfnn_inverse_positions,
+                ctx->sfnn_inverse_offsets, l0w_gradients, ft_size, add_to_existing);
+        return check_kernel_launch("sfnn_ka2_gather_l0w_gradients_kernel launch");
+    }
     constexpr int gather_threads = 128;
     const bool bn_fast=ctx->bn[0].params && !bn_use_reference();
 
@@ -6759,12 +6803,14 @@ int launch_sfnn_backward_kernels(
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_factorized_l1_backward_kernel") != 0) {
             return -1;
         }
-        const bool bn_input_fast=ctx->bn[1].params && !bn_use_reference() &&
+        const bool compact_input_fast=(ctx->bn[1].params || ft_size >= 1024) && !bn_use_reference() &&
             reduce_l1_params && has_l1ax==0 &&
-            !qat_l1w && !residual_count_gates && (l1_out==8 || l1_out==9);
-        if(bn_input_fast) {
-            if(l1_out==8)bn_l1_input_gradient<8><<<blocks,threads,0,ctx->stream>>>(l1_gradients,l1w,has_l1f?l1fw:nullptr,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
-            else bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,l1w,has_l1f?l1fw:nullptr,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+            !residual_count_gates && (l1_out==8 || l1_out==9);
+        if(compact_input_fast) {
+            const float* effective = qat_l1w ? qat_l1w : l1w;
+            const float* shared = !qat_l1w && has_l1f ? l1fw : nullptr;
+            if(l1_out==8)bn_l1_input_gradient<8><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+            else bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
         } else sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,

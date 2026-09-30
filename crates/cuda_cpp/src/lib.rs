@@ -10240,6 +10240,9 @@ mod tests {
     mod qat {
         include!("qat_tests.rs");
     }
+    mod ka2_backward {
+        include!("ka2_backward_tests.rs");
+    }
     use super::*;
 
     #[test]
