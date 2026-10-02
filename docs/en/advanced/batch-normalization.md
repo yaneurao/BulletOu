@@ -14,7 +14,7 @@ Lookahead and projection mean the actual parameter displacement need not scale e
 CLI, JSON, epoch schedules and grid search are supported:
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn-ft-lr-mult 1.0 0.25
+python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
 ```
 
 ```json
@@ -57,7 +57,7 @@ For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_
 
 The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, all with output zero. Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. The old contribution is zero, so only subtract the new mean contribution from L3 bias. This is not exact function preservation.
 
-Compare with `--grid sfnn-l2-revive-zero false true`. Both kinds share one calibration pass when enabled. Completion markers apply within an epoch; the next enabled epoch recalibrates. See [epoch settings](epoch-settings.md).
+Compare with `--grid sfnn_l2_revive_zero false true`. Both kinds share one calibration pass when enabled. Completion markers apply within an epoch; the next enabled epoch recalibrates. See [epoch settings](epoch-settings.md).
 
 `--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units before the first batch of every enabled epoch. Epoch maps may omit epoch1 (defaults to false). When BN is enabled, calibrated frozen L2 BN QAT is required. Non-BN scratch training is allowed. Worker, ordinary NNUE, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers remain unsupported.
 
@@ -68,7 +68,7 @@ Compare with `--grid sfnn-l2-revive-zero false true`. Both kinds share one calib
 "sfnn_l2_revive": true
 ```
 
-Compare with `--grid sfnn-l2-revive false true` using the same `initial_state` in common settings.
+Compare with `--grid sfnn_l2_revive false true` using the same `initial_state` in common settings.
 
 - Calibration independently reads 16 teacher batches from the restored position, without shuffling. The training cursor/shuffle is unchanged. Validation data and target labels are not used for calibration.
 - Only units reaching the upper clamp in **every** observed position in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. This is an empirical criterion, not proof of constant output on unseen positions.
@@ -98,7 +98,7 @@ Only **L2 weights** are affected, not biases, FT, L1, or L3. This differs from r
 
 Legacy active L2 shared weights are unsupported and rejected; current L1-only shared factorization is supported.
 
-Use `--grid sfnn-bn-l2-effective-weight-clip false true` with the required BN/QAT/frozen-stat flags in common settings. Per-epoch schedules for this option are not supported. This addresses float/quantized discrepancies; accuracy or playing-strength gains are not guaranteed.
+Use `--grid sfnn_bn_l2_effective_weight_clip false true` with the required BN/QAT/frozen-stat flags in common settings. Per-epoch schedules for this option are not supported. This addresses float/quantized discrepancies; accuracy or playing-strength gains are not guaranteed.
 
 ## Ordinary NNUE
 
@@ -126,9 +126,9 @@ Grid example (use an ordinary NNUE architecture in `settings.json`):
 python .\grid_search.py `
   --settings-file .\settings.json `
   --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
-  --grid nnue-bn-ft false true `
-  --grid nnue-bn-l1 true `
-  --grid nnue-bn-l2 true
+  --grid nnue_bn_ft false true `
+  --grid nnue_bn_l1 true `
+  --grid nnue_bn_l2 true
 ```
 
 Validation folds running statistics into weights. Export folds the same statistics before conventional
@@ -199,14 +199,14 @@ Epoch schedules are supported, e.g.:
 ```
 
 Future values do not affect the current epoch. Add
-`--grid sfnn-bn-affine-lr-multiplier 1.0 0.1 0` to a grid_search command to compare.
+`--grid sfnn_bn_affine_lr_multiplier 1.0 0.1 0` to a grid_search command to compare.
 The startup `BN affine LR` line and grid_summary.csv record the multiplier.
 Smaller values smooth fluctuations but also lag behind changing weights; strength gains are not established.
 
 For separate grid conditions:
 
 ```powershell
-python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn-bn-momentum 0.1 0.01 0.001
+python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
 ```
 
 To continue an existing trial, change the common settings JSON and reuse the original
@@ -299,13 +299,13 @@ conditions, including the non-BN baseline:
 python .\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260923-progress8-bceloss.json `
   --output-folder D:\BulletOu-snapshots\20260925\grid-progress8-bn `
-  --grid sfnn-bn-ft false true `
-  --grid sfnn-bn-l1 false true `
-  --grid sfnn-bn-l2 false `
-  --grid sfnn-qat-l1 false `
-  --grid sfnn-l1-effective-weight-clip false `
-  --grid sfnn-ft-saturation-penalty 0 `
-  --grid sfnn-saturation-penalty 0
+  --grid sfnn_bn_ft false true `
+  --grid sfnn_bn_l1 false true `
+  --grid sfnn_bn_l2 false `
+  --grid sfnn_qat_l1 false `
+  --grid sfnn_l1_effective_weight_clip false `
+  --grid sfnn_ft_saturation_penalty 0 `
+  --grid sfnn_saturation_penalty 0
 ```
 
 This runs four combinations. Change the L2 axis to `false true` for eight.
@@ -391,7 +391,7 @@ For a scratch comparison, use common settings with BN enabled and no `initial_st
 python .\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
-  --grid sfnn-bn-qat false true
+  --grid sfnn_bn_qat false true
 ```
 
 By default both ON and OFF update statistics. Explicit frozen mode additionally changes

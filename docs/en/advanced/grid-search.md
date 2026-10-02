@@ -1,5 +1,7 @@
 # Compare training conditions with grid search
 
+Use underscore JSON keys for every `--grid` axis, e.g. `--grid sfnn_init_ft_glorot true` and `--grid max_epochs 1`. Hyphenated keys remain accepted input aliases. Runner arguments such as `--settings-file` are unchanged.
+
 ### Removing a grid axis on resume
 
 With `--resume`, you can remove e.g. `--grid lr 0.0004` and use the settings-file LR or epoch schedule instead, provided the remaining axes uniquely identify an existing trial. Its directory/checkpoint identity and completed-epoch settings/results are preserved. Original parameters retain the old LR as historical identity; `[SETTINGS CHANGED]` and per-epoch CSV settings show the effective changes.
@@ -159,7 +161,7 @@ python .\grid_search.py `
 
 This runs four conditions. The positive boolean options `ft_factorizer` (alias `sfnn_ft_factorizer`), `save_epoch_end`, and `sfnn_factorized` explicitly pass both `true` and `false`. Other flags retain the JSON convention: `true` passes a flag and `false` omits it, so false does not necessarily disable a default-enabled feature. Numbers and strings are supported. Lifecycle/initial-state options, including output paths and resume, cannot be grid axes.
 
-Use `--grid max-epochs 1 2` (`max_epochs` also works) to train independent one-epoch and two-epoch conditions. Combining it with `--grid superbatches 16 32` produces four conditions. The grid axis overrides common JSON and `--max-epochs`. Reports stop at each condition's endpoint; `--epochs` optionally selects reported epochs within that range. On resume, a different epoch-budget grid value is a separate condition, not an extension of an existing condition.
+Use `--grid max_epochs 1 2` to train independent one-epoch and two-epoch conditions. Combining it with `--grid superbatches 16 32` produces four conditions. The grid axis overrides common JSON and `--max-epochs`. Reports stop at each condition's endpoint; `--epochs` optionally selects reported epochs within that range. On resume, a different epoch-budget grid value is a separate condition, not an extension of an existing condition.
 
 ## Outputs
 

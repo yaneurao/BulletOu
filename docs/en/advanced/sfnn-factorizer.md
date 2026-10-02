@@ -1,6 +1,6 @@
 # SFNN factorizer
 
-Use `--sfnn-l1-factorizer-alpha` (JSON: `sfnn_l1_factorizer_alpha`) for L1 coefficients, e.g. `"sfnn_l1_factorizer_alpha": "shared=0.5"`. The old `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` names remain aliases. Grid search accepts `--grid sfnn-l1-factorizer-alpha shared=0.5 shared=1.0`. Persisted grid settings, CSV columns and checkpoint compatibility signatures retain the internal name `sfnn_factorizer_alpha` to preserve existing run identities and resume behavior. Computation and defaults are unchanged.
+Use `--sfnn-l1-factorizer-alpha` (JSON: `sfnn_l1_factorizer_alpha`) for L1 coefficients, e.g. `"sfnn_l1_factorizer_alpha": "shared=0.5"`. The old `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` names remain aliases. Grid search accepts `--grid sfnn_l1_factorizer_alpha shared=0.5 shared=1.0`. Persisted grid settings, CSV columns and checkpoint compatibility signatures retain the internal name `sfnn_factorizer_alpha` to preserve existing run identities and resume behavior. Computation and defaults are unchanged.
 
 <a href="../../ja/advanced/sfnn-factorizer.md"><img alt="Read in Japanese" src="https://img.shields.io/badge/Lang-Japanese-2563EB?style=flat-square"></a>
 

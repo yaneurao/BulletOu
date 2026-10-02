@@ -200,6 +200,6 @@ For tuning and comparison experiments, see the [Advanced guide](../advanced/).
 
 For the opt-in [L2/L3 optimizer centering](../advanced/l2-l3-centering.md) experiment, set `sfnn_l2_l3_center: true` (default off). bpu>1 is supported. Weight clipping is disabled with a warning while centering is active; other constraints are documented on the linked page.
 
-L1 has an independent `sfnn_l1_center: true` option (default off). Compare it with `--grid sfnn-l1-center false true`; details and constraints are on the same page.
+L1 has an independent `sfnn_l1_center: true` option (default off). Compare it with `--grid sfnn_l1_center false true`; details and constraints are on the same page.
 
 Previous: [2. Prepare training data](2-data.md)

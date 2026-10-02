@@ -19,7 +19,7 @@
 python .\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <新しい比較フォルダ> `
-  --grid sfnn-l1-effective-weight-clip false true
+  --grid sfnn_l1_effective_weight_clip false true
 ```
 
 acc/qaccの差を減らすだけでは成功とは言えません。量子化側の精度・飽和率・棋力で評価してください。optimizer履歴は保持されるため、checkpoint途中からONにする実験と、最初からONの学習は異なります。
@@ -32,8 +32,8 @@ acc/qaccの差を減らすだけでは成功とは言えません。量子化側
 python .\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <新しい比較フォルダ> `
-  --grid sfnn-l2-l3-center true `
-  --grid sfnn-l1-center false true
+  --grid sfnn_l2_l3_center true `
+  --grid sfnn_l1_center false true
 ```
 
 L1に入力されるFT結合特徴の平均をGPU上で求め、bucket個別重みとshared重みに適用します。bucket別平均ではなく、更新対象の全バッチにわたる共通平均です。BPU>1、L1 QATに対応します。dense L1・factorizer none/sharedに限定し、その他の併用条件は下記と同じです。FT自身の中心化・出力の正規化・飽和率への罰則ではありません。飽和率低下は保証されないため、A/Bで確認してください。
@@ -71,54 +71,54 @@ CLIでは `--sfnn-l2-l3-center --batches-per-update 1 --optimizer-weight-clip 0`
 python .\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <比較結果フォルダ> `
-  --grid sfnn-l2-l3-center false true
+  --grid sfnn_l2_l3_center false true
 ```
 
-`--grid sfnn-l2-l3-center true` ならONだけを試します。ハイフン表記と `sfnn_l2_l3_center` の両方を指定できます。`grid_summary.csv`にもON/OFFが記録されます。epoch指定の `{"epoch1": false, "epoch2": true}` も使用できます。
+`--grid sfnn_l2_l3_center true` ならONだけを試します。ハイフン表記と `sfnn_l2_l3_center` の両方を指定できます。`grid_summary.csv`にもON/OFFが記録されます。epoch指定の `{"epoch1": false, "epoch2": true}` も使用できます。
 
 ## Glorot初期化との組み合わせ比較
 
-`--sfnn-init-l2-l3-glorot`（JSON: `"sfnn_init_l2_l3_glorot": true`、デフォルトfalse）は、**新規学習のL2/L3重みだけ**をGlorot uniformに変更します。FT・L1・各bias・乱数seedは変更しません。中心化とは独立したオプションです。
+初期化は層ごとに独立して指定できます。すべてcuda-cpp SFNNの新規学習用で、checkpointから読み込んだ重みは変更しません。JSONとgridの項目名はアンダースコアで統一します。
 
-L1の初期化も独立して選択できます。すべて新規学習用であり、checkpointから読み込んだ重みをリセットする機能ではありません。
-
-| JSON項目（CLIでは `_` を `-` に置換） | false（デフォルト） | true |
+| JSON / grid項目 | デフォルト | trueの動作 |
 |---|---|---|
-| `sfnn_init_l1_glorot` | L1個別重みを一様乱数±0.01×初期化倍率 | Glorot uniform |
-| `sfnn_init_l1_shared_zero` | L1 shared重みを一様乱数±0.01 | ゼロ |
-| `sfnn_init_l2_l3_glorot` | L2/L3を従来方式で初期化 | Glorot uniform |
+| `sfnn_init_ft_glorot` | false | FT本体のGlorot uniform |
+| `sfnn_init_l1_glorot` | false | L1個別重みのGlorot uniform |
+| `sfnn_init_l2_glorot` | false | L2のGlorot uniform |
+| `sfnn_init_l3_glorot` | false | L3のGlorot uniform |
+| `sfnn_init_ft_shared_zero` | true | FT shared重みをゼロ初期化 |
+| `sfnn_init_l1_shared_zero` | false | L1 shared重みをゼロ初期化 |
 
-L1のGlorot半幅は `nnue_pytorch_init_scale * sqrt(6 / (fan_in + fan_out))` です。dense L1の入力数と出力数（skip出力があればそれも含む）を使い、bucket数は掛けません。bias設定は変更しません（shared biasは常に0）。L1の新オプションはcuda-cppのdense SFNN用です。shared無効時にはsharedの初期化指定は効果がありません。
-
-ConductorのL1/L2/L3の初期化分布とsharedのゼロ化に合わせるには、次を指定します。倍率は標準の1、biasは標準のzeroを使ってください。FT初期化・optimizer・lossまでConductorに合わせる設定ではありません。また、Conductorは同じ初期重みをbucket間で複製しますが、BulletOuは従来通りbucketごとに独立した乱数を使用します。完全に同一の初期状態になる指定ではありません。
+`sfnn_init_l2_l3_glorot` は廃止しました。L2/L3をそれぞれ指定してください。
 
 ```json
-"sfnn_l1_factorizer": "shared",
-"sfnn_init_l1_glorot": true,
-"sfnn_init_l1_shared_zero": true,
-"sfnn_init_l2_l3_glorot": true
+{
+  "sfnn_init_ft_glorot": true,
+  "sfnn_init_l1_glorot": true,
+  "sfnn_init_l2_glorot": true,
+  "sfnn_init_l3_glorot": true,
+  "sfnn_init_ft_shared_zero": true,
+  "sfnn_init_l1_shared_zero": true
+}
 ```
 
-grid searchでは `--grid sfnn-init-l1-glorot false true`、`--grid sfnn-init-l1-shared-zero false true`、`--grid sfnn-init-l2-l3-glorot false true` を指定できます。3つ同時なら8条件です。既存のL2/L3オプションの意味と、指定しない場合の動作は変えていません。
+Glorot半幅は `sqrt(6 / (fan_in + fan_out))` に `nnue_pytorch_init_scale` を掛けます。FT本体は特徴数とFT幅、L1はdense入力/出力数（skip出力を含む）、L2は `2*H1 + H2`、L3は `H2 + 1` を分母に使います。bucket数は掛けません。L2/L3は既存の層別初期化scaleも掛けます。biasは従来の設定のままです。
 
-- L2: `U(-a, a)`、`a = sqrt(6 / (2*H1 + H2))`。
-- L3: `U(-a, a)`、`a = sqrt(6 / (H2 + 1))`。
-- OFF時の基本半幅は両層とも従来どおり0.01。
-- ON/OFFとも、半幅に既存の `nnue_pytorch_init_scale` と層別初期化scaleを掛けます。層別scaleは `sfnn_init_l2_scale` / `sfnn_init_l3_scale`、未指定なら `sfnn_init_l2_l3_scale`（デフォルト1.0）です。標準Glorot幅にするにはこれらを1.0にしてください。
+FT sharedをfalseにすると、同じFT初期化方式をshared行数のfan-inで適用し、別seedの乱数で初期化します。FT本体の乱数は変わりません。FT factorizerが無効ならshared指定は作用しません。L1 sharedのfalseは従来の一様乱数±0.01です。FT sharedは従来からゼロだったため、既定値trueを維持しています。
 
-1024/7/64なら倍率1でL2が約±0.2773501、L3が約±0.3038218です。bucket数はfan-in/outに含めません。適用時にはstdoutへ方式と実際の半幅を表示します。Conductor全体の初期化を再現するものではありません。
+FT Glorotがfalseの場合、FT本体は従来の±`init_scale / sqrt(特徴数)`です。HalfKA2ではこの幅がFT量子化の半刻みより小さく、QATで全ゼロになることがあります。非BNのFT QATを有効にするときは、fold・量子化後のFT重みとbiasが全部ゼロなら警告して停止します。初期化やQAT設定を自動変更しません。この検査はQAT開始・切替・復元時に行い、毎batchのCPU読み戻しは行いません。
 
-4通りの比較例（共通JSONは上記の中心化対応条件にしてください）：
+4通りの比較例：
 
 ```powershell
 python .\grid_search.py `
   --settings-file <新規学習用の共通設定.json> `
   --output-folder <新しい比較結果フォルダ> `
-  --grid sfnn-init-l2-l3-glorot false true `
-  --grid sfnn-l2-l3-center false true
+  --grid sfnn_init_ft_glorot false true `
+  --grid sfnn_init_ft_shared_zero false true
 ```
 
-`grid_summary.csv`には両オプションが出ます。初期化はscratch時だけなので、`initial_state`等のcheckpoint指定は外して比較してください。既存checkpointを読み込むと重みを再初期化しません。途中epochからGlorotに切り替える指定は非対応です。再開時は元の初期化設定を維持してください。
+6項目すべて `--grid 項目名 false true` で比較できます（同時なら64条件）。初期化の比較ではcheckpoint入力を外してください。途中epochでの初期化変更は非対応です。これだけでConductor全体の条件が同一になるわけではありません。BulletOuはbucketごとに独立した乱数を使います。
 
 ## 中心化の計算
 

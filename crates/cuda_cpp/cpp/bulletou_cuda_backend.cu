@@ -7510,6 +7510,21 @@ extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
     return check_kernel_launch("layer QAT");
 }
 
+__global__ void layer_qat_nonzero_kernel(const float* w, size_t nw, const float* b, size_t nb, float* flag) {
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    bool nonzero = i < nw ? w[i] != 0.0f : (i < nw + nb && b[i - nw] != 0.0f);
+    if (__syncthreads_or(nonzero) && threadIdx.x == 0) atomicExch(flag, 1.0f);
+}
+
+extern "C" int bulletou_layer_qat_nonzero(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* b, BulletOuCudaCppF32Buffer* flag) {
+    if (!ctx || !w || !b || !flag || validate_buffer(ctx,w,w->len,"FT QAT weights")
+        || validate_buffer(ctx,b,b->len,"FT QAT bias") || validate_buffer(ctx,flag,1,"FT QAT flag")) return -1;
+    layer_qat_nonzero_kernel<<<static_cast<unsigned>((w->len+b->len+255)/256),256,0,ctx->stream>>>(
+        w->ptr,w->len,b->ptr,b->len,flag->ptr);
+    return check_kernel_launch("FT QAT zero check");
+}
+
 extern "C" int bulletou_cuda_cpp_last_error(char* out, size_t out_len) {
     if (out == nullptr || out_len == 0) {
         return fail_message("last_error output buffer is null or empty");

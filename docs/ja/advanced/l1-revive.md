@@ -12,7 +12,7 @@ BNなしのcuda-cpp SFNNで使用できます。両方ともデフォルトはfa
 - L1 skip出力は対象外です。二乗枝だけが飽和しているunitも対象外です。
 
 CLIは `--sfnn-l1-revive` / `--sfnn-l1-revive-zero`。grid searchでは
-`--grid sfnn-l1-revive false true` / `--grid sfnn-l1-revive-zero false true` です。
+`--grid sfnn_l1_revive false true` / `--grid sfnn_l1_revive_zero false true` です。
 同じ`initial_state`を共通設定に指定して比較できます。scratch開始にも対応します。
 
 ## 判定と適用タイミング

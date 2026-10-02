@@ -18,6 +18,21 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn rejects_only_all_zero_quantized_ft() {
+        let ctx = Context::new(0).unwrap();
+        let w = F32Buffer::from_host(&ctx, &[0.002, -0.002]).unwrap();
+        let b = F32Buffer::from_host(&ctx, &[0.0]).unwrap();
+        let mut pair = None;
+        prepare(&ctx, &mut pair, &w, &b, true, true, 0, 0, 1, 1.0).unwrap();
+        let (qw, qb) = pair.as_ref().unwrap();
+        assert!(reject_zero_ft(&ctx, qw, qb).unwrap_err().to_string().contains("rounded every"));
+        let nonzero = F32Buffer::from_host(&ctx, &[1.0 / 127.0]).unwrap();
+        assert!(reject_zero_ft(&ctx, qw, &nonzero).is_ok());
+        assert!(reject_zero_ft(&ctx, &nonzero, qb).is_ok());
+        assert_eq!(w.download(&ctx).unwrap(), vec![0.002, -0.002]);
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn all_layer_qat_matches_quantized_proxy_with_ft_factorizer() {
         const BASE: usize = 131949;
         const VR: usize = 1629;
@@ -217,6 +232,9 @@ mod tests {
 }
 
 unsafe extern "C" {
+    fn bulletou_layer_qat_nonzero(ctx: *mut ffi::BulletOuCudaCppContext,
+        w: *mut ffi::BulletOuCudaCppF32Buffer, b: *mut ffi::BulletOuCudaCppF32Buffer,
+        flag: *mut ffi::BulletOuCudaCppF32Buffer) -> i32;
     fn bulletou_layer_qat(
         ctx: *mut ffi::BulletOuCudaCppContext,
         src: *mut ffi::BulletOuCudaCppF32Buffer,
@@ -287,7 +305,29 @@ fn prepare(
     Ok(())
 }
 
+fn reject_zero_ft(ctx: &Context, w: &F32Buffer, b: &F32Buffer) -> Result<()> {
+    let flag = F32Buffer::from_host(ctx, &[0.0])?;
+    check(unsafe { bulletou_layer_qat_nonzero(ctx.as_ptr(), w.as_ptr(), b.as_ptr(), flag.as_ptr()) })?;
+    if flag.download(ctx)?[0] == 0.0 {
+        let message = "FT QAT rounded every effective FT weight and bias to zero (scale=127); pairwise FT gradients vanish. Training stopped. Use --sfnn-init-ft-glorot for scratch initialization, or disable --sfnn-qat-ft until a trained checkpoint is available. No options were automatically changed.";
+        use std::io::IsTerminal;
+        let color = std::env::var("BULLETOU_COLOR").unwrap_or_default();
+        if std::env::var_os("NO_COLOR").is_none() && !color.eq_ignore_ascii_case("never")
+            && (color.eq_ignore_ascii_case("always") || std::io::stderr().is_terminal()) {
+            eprintln!("\x1b[1;33mWARNING: {message}\x1b[0m");
+        } else {
+            eprintln!("WARNING: {message}");
+        }
+        return Err(CudaCppError::message(message));
+    }
+    Ok(())
+}
+
 impl State {
+    pub(crate) fn invalidate(&mut self) {
+        // Keep large proxy allocations across worker restores.
+        self.signature = None;
+    }
     fn swap(&mut self, w: &mut SfnnForwardDeviceWeights) {
         for (pair, ww, bb) in [
             (&mut self.ft, &mut w.l0w, &mut w.l0b),
@@ -345,6 +385,11 @@ pub(crate) fn step<T>(
                 r.shape.ft_size,
                 r.factorizer_alpha.ft,
             )?;
+            // One scalar readback only on activation/layout change/restore,
+            // never on every batch. Check actual folded, quantized tensors.
+            if q.signature != Some(signature) {
+                if let Some((w, b)) = &q.ft { reject_zero_ft(ctx, w, b)?; }
+            }
             prepare(ctx, &mut q.l2, &r.weights.l2w, &r.weights.l2b, lr.qat_l2, false, 0, 0, 1, 1.0)?;
             prepare(ctx, &mut q.l3, &r.weights.l3w, &r.weights.l3b, lr.qat_l3, false, 0, 0, 1, 1.0)?;
             q.signature = Some(signature);

@@ -29,7 +29,7 @@ $$
 既存のgridコマンドに次を加えます（値は比較の出発点であり最適値ではありません）。
 
 ```powershell
-  --grid sfnn-ft-saturation-penalty 0 0.001 0.01 0.1 1.0
+  --grid sfnn_ft_saturation_penalty 0 0.001 0.01 0.1 1.0
 ```
 
 同じ初期状態、lr、学習量などを使い、`--verbose`でFT平均飽和率とunit最大飽和率も比較してください。短期の飽和率改善が棋力改善を保証するものではありません。

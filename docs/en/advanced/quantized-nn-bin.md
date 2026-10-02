@@ -31,7 +31,7 @@ CUDA SFNN supports independent `sfnn_qat_ft`, `sfnn_qat_l2`, and `sfnn_qat_l3` b
 - During gradient accumulation, rounded copies are reused until a weight update. Updates, restores and selected-layer configuration changes trigger a refresh.
 - Legacy L2/L3 factorizer tensors are unsupported.
 
-For an eight-condition grid use `--grid sfnn-qat-ft false true --grid sfnn-qat-l2 false true --grid sfnn-qat-l3 false true`. Use only `true` per flag to enable all three in a single condition. The L1 flag is independent.
+For an eight-condition grid use `--grid sfnn_qat_ft false true --grid sfnn_qat_l2 false true --grid sfnn_qat_l3 false true`. Use only `true` per flag to enable all three in a single condition. The L1 flag is independent.
 
 ### Compare L1 QAT on/off
 

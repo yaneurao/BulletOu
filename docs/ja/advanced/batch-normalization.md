@@ -13,7 +13,7 @@ Lookaheadやclipがあるため、実際の重み変化量が毎回厳密にそ�
 CLI、JSON、epoch指定、grid searchに対応します。例:
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn-ft-lr-mult 1.0 0.25
+python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
 ```
 
 ```json
@@ -38,7 +38,7 @@ BNなしでL1/L2両方を指定した場合は、L1を処理してから、変�
 
 ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ全出力0の場合だけ処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・bias調整（BNありではBN再設定）・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与は0なのでbiasに加算せず、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
 
-grid比較は `--grid sfnn-l2-revive-zero false true`。両種類を指定すると校正は1回です。処理済みフラグはepoch内の情報であり、次の有効なepochでは再判定します。[epoch設定](epoch-settings.md)も参照してください。
+grid比較は `--grid sfnn_l2_revive_zero false true`。両種類を指定すると校正は1回です。処理済みフラグはepoch内の情報であり、次の有効なepochでは再判定します。[epoch設定](epoch-settings.md)も参照してください。
 
 `--sfnn-l2-revive`（JSON: `"sfnn_l2_revive": true`、デフォルトfalse）は、trueの各epochの最初のbatch前に校正・再初期化します。epoch別指定ではepoch1を省略でき、最初の指定まではfalseです。BNありの場合は校正済みL2 BN・QAT・統計固定が必要です。BNなしならscratchからも使用できます。
 **BNを使用している場合だけ**、`sfnn_bn_l2`、`sfnn_bn_qat`、`sfnn_bn_qat_freeze_stats`をtrueにし、校正済みL2 BNを使用してください。BNなしなら不要です。直接学習とgrid_searchに対応し、worker、通常NNUE、compact L1、axis/pair・residual count gate・旧L2/L3 factorizerは未対応です。
@@ -50,7 +50,7 @@ grid比較は `--grid sfnn-l2-revive-zero false true`。両種類を指定する
 "sfnn_l2_revive": true
 ```
 
-gridのA/B比較は `--grid sfnn-l2-revive false true`。共通設定の`initial_state`に同じcheckpointを指定してください。
+gridのA/B比較は `--grid sfnn_l2_revive false true`。共通設定の`initial_state`に同じcheckpointを指定してください。
 
 - 復元した教師位置から16batchを別途読み、量子化推論で校正します。校正時のshuffleは0。学習側の位置・shuffle設定は進めたり変更したりしません。検証データ・正解評価値は校正に使用しません。
 - bucket内で1,024局面以上観測され、その全てで出力1のL2 unitだけが対象です。少数・未出現bucketは処理しません。「サンプル全件」であり、未知の全局面で定数という証明ではありません。
@@ -80,7 +80,7 @@ gridのA/B比較は `--grid sfnn-l2-revive false true`。共通設定の`initial
 
 古いL2 shared重みが有効な構成には未対応で、明示的にエラーにします。現在のL1のみのsharedは対応しています。
 
-grid searchでは `--grid sfnn-bn-l2-effective-weight-clip false true` で比較できます。共通設定には必要なBN/QAT/統計固定を指定してください。途中epochのON/OFFスケジュールはこのオプションでは未対応です。
+grid searchでは `--grid sfnn_bn_l2_effective_weight_clip false true` で比較できます。共通設定には必要なBN/QAT/統計固定を指定してください。途中epochのON/OFFスケジュールはこのオプションでは未対応です。
 
 この制限は量子化前後の乖離を抑えるためのもので、acc・qacc・棋力の向上を保証するものではありません。
 
@@ -110,9 +110,9 @@ grid searchの例（`settings.json` のarchには通常NNUEを指定）：
 python .\grid_search.py `
   --settings-file .\settings.json `
   --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
-  --grid nnue-bn-ft false true `
-  --grid nnue-bn-l1 true `
-  --grid nnue-bn-l2 true
+  --grid nnue_bn_ft false true `
+  --grid nnue_bn_l1 true `
+  --grid nnue_bn_l2 true
 ```
 
 validationはrunning統計をfoldした重みで計算します。`nn.bin`にもfoldしてから従来どおり量子化するため、
@@ -190,7 +190,7 @@ epoch指定も可能です。未来の設定は現在epochに適用されませ�
 grid_searchの既存コマンドに追加して比較できます:
 
 ```powershell
---grid sfnn-bn-affine-lr-multiplier 1.0 0.1 0
+--grid sfnn_bn_affine_lr_multiplier 1.0 0.1 0
 ```
 
 起動ログの `BN affine LR` に倍率、grid_summary.csvに設定値を出力します。
@@ -199,7 +199,7 @@ grid_searchの既存コマンドに追加して比較できます:
 新規の条件比較はgrid searchでも指定できます。
 
 ```powershell
-python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn-bn-momentum 0.1 0.01 0.001
+python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
 ```
 
 **既存trialを続けたい場合はgrid軸を追加せず、共通設定JSONの値を変更し、元のgrid指定に `--resume` を付けます。**
@@ -272,16 +272,16 @@ BN OFFならこれらの追加領域・経路は使いません。加算順序�
 python .\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260923-progress8-bceloss.json `
   --output-folder D:\BulletOu-snapshots\20260925\grid-progress8-bn `
-  --grid sfnn-bn-ft false true `
-  --grid sfnn-bn-l1 false true `
-  --grid sfnn-bn-l2 false `
-  --grid sfnn-qat-l1 false `
-  --grid sfnn-l1-effective-weight-clip false `
-  --grid sfnn-ft-saturation-penalty 0 `
-  --grid sfnn-saturation-penalty 0
+  --grid sfnn_bn_ft false true `
+  --grid sfnn_bn_l1 false true `
+  --grid sfnn_bn_l2 false `
+  --grid sfnn_qat_l1 false `
+  --grid sfnn_l1_effective_weight_clip false `
+  --grid sfnn_ft_saturation_penalty 0 `
+  --grid sfnn_saturation_penalty 0
 ```
 
-L2も比較するなら `--grid sfnn-bn-l2 false true` に変更すると8条件になります。
+L2も比較するなら `--grid sfnn_bn_l2 false true` に変更すると8条件になります。
 BN以外の学習条件は共通JSONから引き継ぎます。BNの各条件は`grid_summary.csv`にも出力されます。
 新しいBN機能を使用する前にBulletOuを再ビルドしてください。学習中の実行ファイルは置き換えないでください。
 
@@ -371,7 +371,7 @@ resumeは再開epochの値を使用します。warmupのepoch 0はepoch1の値�
 python .\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
-  --grid sfnn-bn-qat false true
+  --grid sfnn_bn_qat false true
 ```
 
 既定ではON/OFFとも統計を更新します。固定モードを選ぶ場合だけ、量子化に加えて統計固定の影響も入ります。

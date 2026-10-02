@@ -16,7 +16,7 @@ Epoch boolean schedules and resume toggling are supported. The option is recorde
 python .\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <new-grid-root> `
-  --grid sfnn-l1-effective-weight-clip false true
+  --grid sfnn_l1_effective_weight_clip false true
 ```
 
 Keep other conditions identical. Judge quantized accuracy/loss, saturation, and playing strength, not merely agreement between FP32 and quantized metrics. Optimizer histories are retained when enabling this on resume.
@@ -29,8 +29,8 @@ Keep other conditions identical. Judge quantized accuracy/loss, saturation, and 
 python .\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <new-comparison-folder> `
-  --grid sfnn-l2-l3-center true `
-  --grid sfnn-l1-center false true
+  --grid sfnn_l2_l3_center true `
+  --grid sfnn_l1_center false true
 ```
 
 The GPU computes a global mean of the combined FT features feeding L1 across all batches in an update. The same mean applies to bucket-specific and shared L1 weights; it is not a per-bucket mean. BPU>1 and L1 QAT are supported. Dense L1 and factorizer none/shared are required; other restrictions below also apply. This does not center FT itself, normalize outputs, or penalize saturation. A reduction in saturation is not guaranteed.
@@ -68,54 +68,54 @@ With a compatible common JSON, compare using:
 python .\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <comparison-folder> `
-  --grid sfnn-l2-l3-center false true
+  --grid sfnn_l2_l3_center false true
 ```
 
-Use `--grid sfnn-l2-l3-center true` to run only the enabled condition. Both hyphenated and underscore key names are supported. The flag is recorded in `grid_summary.csv`. Epoch schedules such as `{"epoch1": false, "epoch2": true}` are supported.
+Use `--grid sfnn_l2_l3_center true` to run only the enabled condition. Both hyphenated and underscore key names are supported. The flag is recorded in `grid_summary.csv`. Epoch schedules such as `{"epoch1": false, "epoch2": true}` are supported.
 
 ## Comparing Glorot initialization with centering
 
-`--sfnn-init-l2-l3-glorot` (JSON: `"sfnn_init_l2_l3_glorot": true`, default false) changes **scratch L2/L3 weights only** to Glorot uniform. FT, L1, all biases and random seeds are unchanged. This option is independent of centering.
+Initialization is independently selectable per layer for cuda-cpp SFNN scratch training. Loaded checkpoint weights are never reinitialized. Use underscore keys in JSON and with `--grid`.
 
-L1 initialization can also be selected independently. These are scratch-only options: they do not reset weights loaded from a checkpoint.
-
-| JSON key (replace underscores with hyphens for CLI) | false (default) | true |
+| JSON / grid key | Default | Effect when true |
 |---|---|---|
-| `sfnn_init_l1_glorot` | Bucket L1 uniform ±0.01 × init scale | Glorot uniform |
-| `sfnn_init_l1_shared_zero` | Shared L1 uniform ±0.01 | Zero |
-| `sfnn_init_l2_l3_glorot` | Legacy L2/L3 initialization | Glorot uniform |
+| `sfnn_init_ft_glorot` | false | Glorot-uniform FT base weights |
+| `sfnn_init_l1_glorot` | false | Glorot-uniform dense bucket L1 weights |
+| `sfnn_init_l2_glorot` | false | Glorot-uniform L2 weights |
+| `sfnn_init_l3_glorot` | false | Glorot-uniform L3 weights |
+| `sfnn_init_ft_shared_zero` | true | Zero FT shared weights |
+| `sfnn_init_l1_shared_zero` | false | Zero L1 shared weights |
 
-The L1 Glorot half-width is `nnue_pytorch_init_scale * sqrt(6 / (fan_in + fan_out))`, using dense L1 input/output sizes (including the skip output, if present), not the number of buckets. Bias initialization is unchanged; shared bias is always zero. The new L1 options require cuda-cpp dense SFNN. Shared initialization has no effect when sharing is disabled.
-
-To match Conductor's L1/L2/L3 initialization distributions and zero shared weights, use the following with default unit initialization multipliers and zero biases. This does not match FT initialization, optimizer or loss automatically. Conductor tiles identical initial weights across buckets; BulletOu retains independent random weights per bucket. This is not an identical initial state.
+`sfnn_init_l2_l3_glorot` was removed. Specify L2 and L3 separately.
 
 ```json
-"sfnn_l1_factorizer": "shared",
-"sfnn_init_l1_glorot": true,
-"sfnn_init_l1_shared_zero": true,
-"sfnn_init_l2_l3_glorot": true
+{
+  "sfnn_init_ft_glorot": true,
+  "sfnn_init_l1_glorot": true,
+  "sfnn_init_l2_glorot": true,
+  "sfnn_init_l3_glorot": true,
+  "sfnn_init_ft_shared_zero": true,
+  "sfnn_init_l1_shared_zero": true
+}
 ```
 
-Grid search accepts `--grid sfnn-init-l1-glorot false true`, `--grid sfnn-init-l1-shared-zero false true`, and `--grid sfnn-init-l2-l3-glorot false true`. Combining all three produces eight conditions. Existing defaults and the meaning of the L2/L3 option are preserved.
+Glorot half-width is `sqrt(6 / (fan_in + fan_out)) * nnue_pytorch_init_scale`. FT uses base feature count and FT width; dense L1 includes its skip output, if any; L2 uses denominator `2*H1 + H2`; L3 uses `H2 + 1`. Bucket count is not included. L2/L3 also apply their existing per-layer initialization scales. Bias initialization is unchanged.
 
-- L2: `U(-a,a)`, where `a = sqrt(6 / (2*H1 + H2))`.
-- L3: `U(-a,a)`, where `a = sqrt(6 / (H2 + 1))`.
-- With the flag off, both base half-widths remain 0.01.
-- In either mode, multiply the half-width by `nnue_pytorch_init_scale` and the layer's initialization scale (`sfnn_init_l2_scale` / `sfnn_init_l3_scale`, falling back to `sfnn_init_l2_l3_scale`, default 1.0). Set all applicable multipliers to 1.0 for standard Glorot widths.
+With FT shared-zero false, initialize shared rows using the selected FT method and shared-row fan-in, with a separate random seed. Base FT random weights are unchanged. Without FT factorization, shared initialization has no effect. L1 shared-zero false retains uniform ±0.01. FT shared was already zero-initialized, so its default remains true.
 
-For 1024/7/64 with unit multipliers, widths are approximately +/-0.2773501 (L2) and +/-0.3038218 (L3). Bucket count is not part of fan-in/out. Scratch initialization prints the chosen method and actual widths. This does not reproduce Conductor's entire initialization.
+Without FT Glorot, base FT retains ±`init_scale / sqrt(feature_count)`. HalfKA2 can therefore round entirely to zero under FT QAT. Non-BN FT QAT warns and stops if every folded, quantized FT weight and bias is zero. It never silently changes initialization or disables QAT. This check runs on activation/configuration change/restore, not as a CPU readback on every batch.
 
-Four-way comparison (the common JSON must satisfy centering constraints):
+Four-way comparison:
 
 ```powershell
 python .\grid_search.py `
   --settings-file <scratch-common-settings.json> `
   --output-folder <new-comparison-folder> `
-  --grid sfnn-init-l2-l3-glorot false true `
-  --grid sfnn-l2-l3-center false true
+  --grid sfnn_init_ft_glorot false true `
+  --grid sfnn_init_ft_shared_zero false true
 ```
 
-Both flags appear in `grid_summary.csv`. Remove checkpoint inputs such as `initial_state` to compare initializations. Loading a checkpoint never reinitializes its weights. Epoch-wise switching of this initialization option is unsupported; retain the original initialization setting on resume.
+All six keys accept `--grid KEY false true` (64 combinations if all are varied). Remove checkpoint inputs for initialization experiments. Epoch-wise initialization changes are unsupported. This does not reproduce all Conductor conditions: BulletOu uses independent random weights per bucket.
 
 ## Centered update equations
 

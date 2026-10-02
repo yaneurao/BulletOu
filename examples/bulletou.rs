@@ -4022,6 +4022,9 @@ fn bulletou_settings_json_value_to_args(
         return Err(format!("{} has invalid option key `{key}`", path.display()));
     }
     let normalized = key.replace('_', "-");
+    if normalized == "sfnn-init-l2-l3-glorot" {
+        return Err("sfnn_init_l2_l3_glorot was removed; specify sfnn_init_l2_glorot and sfnn_init_l3_glorot separately".into());
+    }
     let normalized = match normalized.as_str() {
         "ft-factorizer" => "sfnn-ft-factorizer",
         "sfnn-factorizer" => "sfnn-l1-factorizer",
@@ -4039,7 +4042,7 @@ fn bulletou_settings_json_value_to_args(
     if let Some(replacement) = replacement {
         return Err(format!("{key} was removed; use {replacement} with the inverse boolean value"));
     }
-    if matches!(flag.as_str(), "--sfnn-ft-factorizer" | "--save-epoch-end" | "--sfnn-factorized" | "--resume") {
+    if matches!(flag.as_str(), "--sfnn-ft-factorizer" | "--sfnn-init-ft-shared-zero" | "--save-epoch-end" | "--sfnn-factorized" | "--resume") {
         if let serde_json::Value::Bool(value) = value {
             out.push(flag.into());
             out.push(value.to_string().into());
@@ -5132,10 +5135,22 @@ struct Args {
     #[arg(long = "sfnn-init-bias", value_enum, default_value = "zero")]
     sfnn_init_bias: SfnnInitBiasMode,
 
-    /// Glorot-uniform L2/L3 scratch weights: sqrt(6/(fan_in+fan_out)).
-    /// Default off. FT/L1/biases unchanged; existing init-scale multipliers still apply.
+    /// Glorot-uniform FT base weights (scratch only); default false.
     #[arg(long)]
-    sfnn_init_l2_l3_glorot: bool,
+    sfnn_init_ft_glorot: bool,
+
+    /// Zero FT shared weights (scratch only). False uses the selected FT
+    /// initializer with shared-row fan-in. No effect without FT factorization.
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
+    sfnn_init_ft_shared_zero: bool,
+
+    /// Glorot-uniform L2 scratch weights; default false.
+    #[arg(long)]
+    sfnn_init_l2_glorot: bool,
+
+    /// Glorot-uniform L3 scratch weights; default false.
+    #[arg(long)]
+    sfnn_init_l3_glorot: bool,
 
     /// Glorot-uniform dense L1 bucket weights at scratch initialization only.
     /// Default off; shared weights and biases are controlled separately.
@@ -5558,8 +5573,10 @@ impl Args {
             || !self.eval_type().uses_layerstack() || self.sfnn_update_scope != SfnnUpdateScopeArg::All) {
             return Err("--sfnn-ft-saturation-penalty requires cuda-cpp SFNN and --sfnn-update-scope all".into());
         }
-        if self.sfnn_init_l2_l3_glorot && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
-            return Err("--sfnn-init-l2-l3-glorot requires --backend cuda-cpp and an SFNN arch".into());
+        if (self.sfnn_init_ft_glorot || !self.sfnn_init_ft_shared_zero
+            || self.sfnn_init_l2_glorot || self.sfnn_init_l3_glorot)
+            && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
+            return Err("SFNN initialization options require --backend cuda-cpp and an SFNN arch".into());
         }
         if (self.sfnn_init_l1_glorot || self.sfnn_init_l1_shared_zero)
             && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
@@ -6217,9 +6234,12 @@ fn effective_sfnn_init_l3_scale(args: &Args) -> f32 {
 
 fn sfnn_l2_l3_weight_init_bounds(args: &Args) -> (f32, f32) {
     let (_, hidden, l2) = args.arch().dims();
-    let (b2, b3) = if args.sfnn_init_l2_l3_glorot {
-        ((6.0 / (2 * hidden + l2) as f32).sqrt(), (6.0 / (l2 + 1) as f32).sqrt())
-    } else { (DEFAULT_SFNN_INIT_HALF_WIDTH, DEFAULT_SFNN_INIT_HALF_WIDTH) };
+    let b2 = if args.sfnn_init_l2_glorot {
+        (6.0 / (2 * hidden + l2) as f32).sqrt()
+    } else { DEFAULT_SFNN_INIT_HALF_WIDTH };
+    let b3 = if args.sfnn_init_l3_glorot {
+        (6.0 / (l2 + 1) as f32).sqrt()
+    } else { DEFAULT_SFNN_INIT_HALF_WIDTH };
     (b2 * args.nnue_pytorch_init_scale * effective_sfnn_init_l2_scale(args),
      b3 * args.nnue_pytorch_init_scale * effective_sfnn_init_l3_scale(args))
 }
@@ -21693,11 +21713,25 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         ));
     }
 
-    let mut l0w =
-        cuda_cpp_tatara_uniform_fan_in_init(base_input_size * ft_size, 0x5f11_e001, base_input_size, init_scale);
+    let ft_bound = |fan_in: usize| init_scale * if args.sfnn_init_ft_glorot {
+        (6.0 / (fan_in + ft_size) as f32).sqrt()
+    } else { (1.0 / fan_in.max(1) as f32).sqrt() };
+    let mut l0w = cuda_cpp_tatara_uniform_abs_init(
+        base_input_size * ft_size, 0x5f11_e001, ft_bound(base_input_size));
     if input_size != base_input_size {
-        l0w.resize(input_size * ft_size, 0.0);
+        if args.sfnn_init_ft_shared_zero {
+            l0w.resize(input_size * ft_size, 0.0);
+        } else {
+            l0w.extend(cuda_cpp_tatara_uniform_abs_init(
+                (input_size - base_input_size) * ft_size, 0x5f11_e003_f7,
+                ft_bound(input_size - base_input_size)));
+        }
     }
+    print_startup_kv("SFNN FT init", format!(
+        "base={} uniform +/-{:.9}; shared={}; scratch only (loaded tensors preserved)",
+        if args.sfnn_init_ft_glorot { "Glorot" } else { "legacy" }, ft_bound(base_input_size),
+        if input_size == base_input_size { "disabled" }
+        else if args.sfnn_init_ft_shared_zero { "zero" } else { "random (shared-row fan-in)" }));
     let l0_bound = init_scale * (1.0 / base_input_size.max(1) as f32).sqrt();
     let l0b = cuda_cpp_sfnn_hidden_bias_init(ft_size, 0x5f11_e002, l0_bound, args.sfnn_init_bias);
 
@@ -21705,8 +21739,9 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let l2_bound = l1_bound * l2_init_scale;
     let (l2_weight_bound, l3_bound) = sfnn_l2_l3_weight_init_bounds(args);
     print_startup_kv("SFNN L2/L3 init", format!(
-        "{} uniform: L2 +/-{:.9}, L3 +/-{:.9}; scratch weights only; FT/L1/bias unchanged",
-        if args.sfnn_init_l2_l3_glorot { "Glorot" } else { "tatara-style" }, l2_weight_bound, l3_bound));
+        "L2={} +/-{:.9}, L3={} +/-{:.9}; scratch weights only; biases unchanged",
+        if args.sfnn_init_l2_glorot { "Glorot" } else { "legacy" }, l2_weight_bound,
+        if args.sfnn_init_l3_glorot { "Glorot" } else { "legacy" }, l3_bound));
     let l1_weight_bound = if args.sfnn_init_l1_glorot {
         init_scale * (6.0 / (ft_size + l1_out) as f32).sqrt()
     } else { l1_bound };
@@ -24980,13 +25015,6 @@ fn cuda_cpp_tatara_uniform_abs_init(len: usize, seed: u64, half_width: f32) -> V
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-fn cuda_cpp_tatara_uniform_fan_in_init(len: usize, seed: u64, fan_in: usize, init_scale: f32) -> Vec<f32> {
-    let fan_in = fan_in.max(1) as f32;
-    let half_width = init_scale * (1.0 / fan_in).sqrt();
-    cuda_cpp_tatara_uniform_abs_init(len, seed, half_width)
-}
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_should_read_loss(step: usize, total_steps: usize, interval: usize) -> bool {
     if interval == 0 {
         false
@@ -25932,7 +25960,10 @@ fn resume_signature_values(args: &Args) -> String {
         format!("ft_factorizer={}", args.ft_factorizer),
         format!("ft_factorizer_alpha={:.9}", args.ft_factorizer_alpha),
         format!("sfnn_init_bias={}", args.sfnn_init_bias.cli_name()),
-        format!("sfnn_init_l2_l3_glorot={}", args.sfnn_init_l2_l3_glorot),
+        format!("sfnn_init_ft_glorot={}", args.sfnn_init_ft_glorot),
+        format!("sfnn_init_ft_shared_zero={}", args.sfnn_init_ft_shared_zero),
+        format!("sfnn_init_l2_glorot={:?}", args.sfnn_init_l2_glorot),
+        format!("sfnn_init_l3_glorot={:?}", args.sfnn_init_l3_glorot),
         format!("sfnn_init_l1_glorot={}", args.sfnn_init_l1_glorot),
         format!("sfnn_init_l1_shared_zero={}", args.sfnn_init_l1_shared_zero),
         format!("sfnn_init_l2_l3_scale={:.9}", args.sfnn_init_l2_l3_scale),
@@ -26142,10 +26173,13 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "ft_factorizer=", "nnue_pytorch_init_scale=", "ft_factorizer=true");
     ensure_line_after(&mut out, "ft_factorizer_alpha=", "ft_factorizer=", "ft_factorizer_alpha=1.000000000");
     ensure_line_after(&mut out, "sfnn_init_bias=", "ft_factorizer_alpha=", "sfnn_init_bias=zero");
-    ensure_line_after(&mut out, "sfnn_init_l2_l3_glorot=", "sfnn_init_bias=", "sfnn_init_l2_l3_glorot=false");
-    ensure_line_after(&mut out, "sfnn_init_l1_glorot=", "sfnn_init_l2_l3_glorot=", "sfnn_init_l1_glorot=false");
+    ensure_line_after(&mut out, "sfnn_init_ft_glorot=", "sfnn_init_bias=", "sfnn_init_ft_glorot=false");
+    ensure_line_after(&mut out, "sfnn_init_ft_shared_zero=", "sfnn_init_ft_glorot=", "sfnn_init_ft_shared_zero=true");
+    ensure_line_after(&mut out, "sfnn_init_l2_glorot=", "sfnn_init_ft_shared_zero=", "sfnn_init_l2_glorot=false");
+    ensure_line_after(&mut out, "sfnn_init_l3_glorot=", "sfnn_init_l2_glorot=", "sfnn_init_l3_glorot=false");
+    ensure_line_after(&mut out, "sfnn_init_l1_glorot=", "sfnn_init_l3_glorot=", "sfnn_init_l1_glorot=false");
     ensure_line_after(&mut out, "sfnn_init_l1_shared_zero=", "sfnn_init_l1_glorot=", "sfnn_init_l1_shared_zero=false");
-    ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_l2_l3_glorot=", "sfnn_init_l2_l3_scale=0.500000000");
+    ensure_line_after(&mut out, "sfnn_init_l2_l3_scale=", "sfnn_init_l3_glorot=", "sfnn_init_l2_l3_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l2_scale=", "sfnn_init_l2_l3_scale=", "sfnn_init_l2_scale=0.500000000");
     ensure_line_after(&mut out, "sfnn_init_l3_scale=", "sfnn_init_l2_scale=", "sfnn_init_l3_scale=0.500000000");
     ensure_line_after(
@@ -34743,15 +34777,62 @@ mod tests {
     }
 
     #[test]
+    fn ft_and_split_glorot_initialization_choices() {
+        let argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_32_1_2_k3k3"].map(Into::into).to_vec();
+        let base = Args::try_parse_from(argv.clone()).unwrap();
+        let a = build_sfnn_initial_weights_for_cuda_cpp(&base, CudaCppSfnnFeatureKind::Halfka2).unwrap();
+        let n = CudaCppSfnnFeatureKind::Halfka2.base_input_size();
+        let offset = n * 32;
+        assert!(a.l0w[..offset].iter().all(|x| (127.0 * x).round() == 0.0));
+        assert!(a.l0w[offset..].iter().all(|x| *x == 0.0));
+        for glorot in [false, true] {
+            for zero in [false, true] {
+                let mut cli = argv.clone();
+                for (key, value) in [("sfnn_init_ft_glorot", glorot), ("sfnn_init_ft_shared_zero", zero)] {
+                    bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), key,
+                        &serde_json::json!(value), &mut cli).unwrap();
+                }
+                let args = Args::try_parse_from(cli).unwrap();
+                let b = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Halfka2).unwrap();
+                let bound = if glorot { (6.0 / (n + 32) as f32).sqrt() } else { (1.0 / n as f32).sqrt() };
+                assert!(b.l0w[..offset].iter().all(|x| x.abs() <= bound));
+                assert_eq!(b.l0w[..offset].iter().any(|x| (127.0 * x).round() != 0.0), glorot);
+                assert_eq!(b.l0w[offset..].iter().all(|x| *x == 0.0), zero);
+                assert_eq!(a.l0b, b.l0b);
+                assert_eq!(a.l1w, b.l1w); assert_eq!(a.l2w, b.l2w); assert_eq!(a.l3w, b.l3w);
+                if !glorot { assert_eq!(a.l0w[..offset], b.l0w[..offset]); }
+            }
+        }
+        let mut cli = argv;
+        for key in ["sfnn_init_ft_glorot", "sfnn_init_l1_glorot", "sfnn_init_l2_glorot",
+            "sfnn_init_l3_glorot", "sfnn_init_ft_shared_zero", "sfnn_init_l1_shared_zero"] {
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"), key,
+                &serde_json::json!(true), &mut cli).unwrap();
+        }
+        let mut args = Args::try_parse_from(cli).unwrap();
+        assert!(args.validate_arch_flags().is_ok());
+        let both = sfnn_l2_l3_weight_init_bounds(&args);
+        args.sfnn_init_l2_glorot = false;
+        assert_eq!(sfnn_l2_l3_weight_init_bounds(&args), (0.01, both.1));
+        args.sfnn_init_l2_glorot = true; args.sfnn_init_l3_glorot = false;
+        assert_eq!(sfnn_l2_l3_weight_init_bounds(&args), (both.0, 0.01));
+        assert!(bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),
+            "sfnn_init_l2_l3_glorot", &serde_json::json!(false), &mut vec![]).unwrap_err().contains("removed"));
+    }
+
+    #[test]
     fn glorot_l2_l3_initialization_cli_json_and_weights() {
         let mut argv:Vec<std::ffi::OsString>=["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
             "--arch","SFNN_ka2_32_1_2_k3k3"].map(Into::into).to_vec();
         let base=Args::try_parse_from(argv.clone()).unwrap();
-        assert!(!base.sfnn_init_l2_l3_glorot);
+        assert!(!base.sfnn_init_l2_glorot && !base.sfnn_init_l3_glorot);
         assert_eq!(sfnn_l2_l3_weight_init_bounds(&base),(0.01,0.01));
-        let legacy=resume_signature_without_line(&resume_signature(&base),"sfnn_init_l2_l3_glorot=");
+        let legacy=resume_signature_without_line(&resume_signature(&base),"sfnn_init_l2_glorot=");
         assert!(resume_signature_matches(&legacy,&base));
-        bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"sfnn_init_l2_l3_glorot",&serde_json::json!(true),&mut argv).unwrap();
+        for key in ["sfnn-init-l2-glorot", "sfnn-init-l3-glorot"] {
+            bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),key,&serde_json::json!(true),&mut argv).unwrap();
+        }
         let mut enabled=Args::try_parse_from(argv).unwrap();
         assert!(enabled.validate_arch_flags().is_ok());
         assert!(!resume_signature_matches(&legacy,&enabled));

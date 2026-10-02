@@ -10,7 +10,7 @@ These opt-in flags support the non-BN cuda-cpp SFNN trainer. Both default to fal
 `--sfnn-l1-revive` selects units whose normal **and** squared branches always output 1.
 `--sfnn-l1-revive-zero` selects units whose two branches always output 0.
 Zero upper-hit rate is NOT an always-zero activation. The skip output and squared-only saturation are excluded.
-Grid syntax: `--grid sfnn-l1-revive false true` and `--grid sfnn-l1-revive-zero false true`.
+Grid syntax: `--grid sfnn_l1_revive false true` and `--grid sfnn_l1_revive_zero false true`.
 Use a common `initial_state` checkpoint for A/B comparisons; scratch runs are also supported.
 
 ## Calibration and timing

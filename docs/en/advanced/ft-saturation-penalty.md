@@ -27,7 +27,7 @@ Reported loss/qloss exclude this penalty. It is separate from the existing `sfnn
 Append to an existing grid command:
 
 ```powershell
-  --grid sfnn-ft-saturation-penalty 0 0.001 0.01 0.1 1.0
+  --grid sfnn_ft_saturation_penalty 0 0.001 0.01 0.1 1.0
 ```
 
 These are starting points, not validated optimal strengths. Keep initialization, learning rate and training budget identical. Use `--verbose` to compare mean and maximum per-unit saturation as well as accuracy and playing strength.

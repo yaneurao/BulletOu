@@ -35,7 +35,7 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 
 `--resume` でも同じJSONを使えます。ONのcheckpointからOFFのepochへ再開する場合は復元時にfoldし、すでにOFFのcheckpointなら再foldしません。OFF→ONは未対応です。BN、他のarch、worker、plateauでの途中切り替えも未対応です。切り替え時には色付きの `[FT FACTORIZER]` 行を表示します。
 
-`grid_search.py` の共通JSONでも使えます。ただし `--grid ft-factorizer true` 等を明示するとJSONのepoch指定全体を上書きするため、そのgrid軸は外してください。実行中のJSON編集は反映しないので、設定変更後はcheckpointから `--resume` してください。
+`grid_search.py` の共通JSONでも使えます。ただし `--grid ft_factorizer true` 等を明示するとJSONのepoch指定全体を上書きするため、そのgrid軸は外してください。実行中のJSON編集は反映しないので、設定変更後はcheckpointから `--resume` してください。
 
 | 項目 | 意味 |
 |---|---|

@@ -31,7 +31,7 @@ Before the first batch of epoch 3, shared FT weights are folded into individual 
 
 Use the same JSON with `--resume`: an ON checkpoint is folded on restoration into an OFF epoch; an already-OFF checkpoint is not folded again. OFF→ON, BN, other architectures, worker and plateau transitions are unsupported. A colored `[FT FACTORIZER]` line reports the conversion.
 
-Grid search accepts the schedule in its common JSON. Remove any explicit `--grid ft-factorizer true` axis because it overrides the entire schedule. Settings are not hot-reloaded; resume from a saved checkpoint after changing them.
+Grid search accepts the schedule in its common JSON. Remove any explicit `--grid ft_factorizer true` axis because it overrides the entire schedule. Settings are not hot-reloaded; resume from a saved checkpoint after changing them.
 
 | Fields | Meaning |
 |---|---|

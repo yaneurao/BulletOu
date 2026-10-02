@@ -1,6 +1,6 @@
 # SFNN factorizer
 
-L1の係数は `--sfnn-l1-factorizer-alpha`（JSON: `sfnn_l1_factorizer_alpha`）で指定します。例: `"sfnn_l1_factorizer_alpha": "shared=0.5"`。旧名 `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` はaliasです。`--grid sfnn-l1-factorizer-alpha shared=0.5 shared=1.0` も使えます。既存gridの再開・条件IDを維持するため、保存設定・CSV列・checkpoint互換性判定の内部名は `sfnn_factorizer_alpha` のままです。係数の計算・デフォルト値は変更していません。
+L1の係数は `--sfnn-l1-factorizer-alpha`（JSON: `sfnn_l1_factorizer_alpha`）で指定します。例: `"sfnn_l1_factorizer_alpha": "shared=0.5"`。旧名 `--sfnn-factorizer-alpha` / `sfnn_factorizer_alpha` はaliasです。`--grid sfnn_l1_factorizer_alpha shared=0.5 shared=1.0` も使えます。既存gridの再開・条件IDを維持するため、保存設定・CSV列・checkpoint互換性判定の内部名は `sfnn_factorizer_alpha` のままです。係数の計算・デフォルト値は変更していません。
 
 <a href="../../en/advanced/sfnn-factorizer.md"><img alt="Read in English" src="https://img.shields.io/badge/Lang-English-DC2626?style=flat-square"></a>
 

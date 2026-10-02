@@ -143,14 +143,19 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual(old, new)
 
     def test_independent_l1_initialization_grid(self):
-        keys = ["sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero", "sfnn_init_l2_l3_glorot"]
+        keys = ["sfnn_init_ft_glorot", "sfnn_init_ft_shared_zero", "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero", "sfnn_init_l2_glorot", "sfnn_init_l3_glorot"]
         args = []
         for key in keys:
-            args.extend(["--grid", key.replace("_", "-"), "false", "true"])
+            args.extend(["--grid", key, "false", "true"])
             self.assertIn(key, grid.COMMON_COLUMNS)
         plan = self.plan(args)
         combinations = {tuple(t["settings"][k] for k in keys) for t in plan["trials"]}
-        self.assertEqual(len(combinations), 8)
+        self.assertEqual(len(combinations), 64)
+        for key in keys:
+            self.assertEqual(grid.key_name(key), key)
+            self.assertEqual(grid.key_name(key.replace("_", "-")), key)
+        with self.assertRaisesRegex(ValueError, "removed.*sfnn_init_l2_glorot"):
+            self.plan(["--grid", "sfnn_init_l2_l3_glorot", "true"])
 
     def test_bn_affine_lr_multiplier_grid_and_epoch(self):
         key="sfnn_bn_affine_lr_multiplier"
@@ -482,11 +487,11 @@ class GridSearchTests(unittest.TestCase):
         self.assertTrue(all(t["settings"]["sfnn_l2_l3_center"] is True for t in single["trials"]))
 
     def test_glorot_and_centering_cartesian_grid(self):
-        plan=self.plan(["--grid","sfnn-init-l2-l3-glorot","false","true",
+        plan=self.plan(["--grid","sfnn-init-l2-glorot","false","true",
                         "--grid","sfnn-l2-l3-center","false","true"])
         fields,rows=grid.summarize(self.output,plan)
-        self.assertEqual(fields.count("sfnn_init_l2_l3_glorot"),1)
-        self.assertEqual({(r["sfnn_init_l2_l3_glorot"],r["sfnn_l2_l3_center"]) for r in rows},
+        self.assertEqual(fields.count("sfnn_init_l2_glorot"),1)
+        self.assertEqual({(r["sfnn_init_l2_glorot"],r["sfnn_l2_l3_center"]) for r in rows},
                          {(False,False),(False,True),(True,False),(True,True)})
 
     def test_batch_norm_axes_and_summary(self):

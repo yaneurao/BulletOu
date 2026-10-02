@@ -51,6 +51,7 @@ COMMON_COLUMNS = (
     "sfnn_ft_factorizer",
     "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3",
     "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
+    "sfnn_init_ft_glorot", "sfnn_init_ft_shared_zero", "sfnn_init_l2_glorot", "sfnn_init_l3_glorot",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
@@ -64,7 +65,7 @@ COMMON_COLUMNS = (
     "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_l1_factorizer",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip", "sfnn_init_l2_l3_glorot", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
+    "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",
     "wrm_target_scaling", "wrm_target_epsilon", "wrm_in_offset", "wrm_target_offset", "loss_pow_exp",
 )
 MANIFEST = "grid-manifest.json"
@@ -107,6 +108,8 @@ def key_name(key: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", key):
         raise ValueError(f"invalid BulletOu option name: {key!r}")
     normalized = key.replace("-", "_")
+    if normalized == "sfnn_init_l2_l3_glorot":
+        raise ValueError("sfnn_init_l2_l3_glorot was removed; specify sfnn_init_l2_glorot and sfnn_init_l3_glorot separately")
     # Layer-specific names are canonical; historical spellings remain aliases.
     return {"ft_factorizer": "sfnn_ft_factorizer",
             "sfnn_factorizer": "sfnn_l1_factorizer",
@@ -142,7 +145,7 @@ def parse_args(argv=None):
         p.add_argument("--" + option.replace("_", "-"), nargs="+", metavar="VALUE",
                        help=f"Grid values for BulletOu {PLURAL_OPTIONS[option]} (Cartesian product)")
     p.add_argument("--grid", action="append", nargs="+", default=[], metavar="KEY_OR_VALUE",
-                   help="Repeatable generic axis: --grid sfnn_l1_factorizer_alpha shared=0.5 shared=1.0")
+                   help="Repeatable generic axis using underscore JSON keys: --grid sfnn_init_ft_glorot false true (hyphenated keys remain input aliases)")
     p.add_argument("--summary-csv", type=Path)
     p.add_argument("--summary-only", action="store_true", help="Rebuild CSV from the manifest and existing logs; no trainer needed")
     p.add_argument("--dry-run", action="store_true", help="Validate and display the plan without writing files or training")

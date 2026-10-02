@@ -193,4 +193,4 @@ SFNNでは、学習中の重み制限がデフォルトで有効です。tatara�
 
 L2/L3の飽和を抑える比較実験用の [L2/L3中心化](../advanced/l2-l3-centering.md) は、`sfnn_l2_l3_center: true` で有効化します（デフォルト無効）。bpu>1にも対応します。中心化中はweight clipを警告付きで無効化して続行します。他の対応条件はリンク先を確認してください。
 
-L1も中心化する場合は独立した `sfnn_l1_center: true` を指定します（デフォルト無効）。grid searchでは `--grid sfnn-l1-center false true` で比較できます。詳細・制約は同じページに記載しています。
+L1も中心化する場合は独立した `sfnn_l1_center: true` を指定します（デフォルト無効）。grid searchでは `--grid sfnn_l1_center false true` で比較できます。詳細・制約は同じページに記載しています。

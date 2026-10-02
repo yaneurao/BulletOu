@@ -1,13 +1,15 @@
 # Grid searchで学習条件を比較する
 
+`--grid`の項目名はJSONと同じアンダースコア表記を使います。例：`--grid sfnn_init_ft_glorot true`、`--grid max_epochs 1`。全項目で共通です。以前のハイフン表記も入力aliasとして受け付けますが、ヘルプ・設定・比較条件ではアンダースコア表記を使います。`--settings-file`等、runner自体の引数名は変更していません。
+
 ### 再開時にgrid軸を外す
 
 `--resume` 時に、たとえば `--grid lr 0.0004` を外してsettings.jsonのlr（epoch別スケジュールも可）へ切り替えられます。残したgrid条件で既存trialが一意に決まる場合に限り、同じフォルダ・checkpointから継続します。完了済みepochの設定・集計値は保持します。trialの元の条件ID・parametersには旧lrが残りますが、実際に次回使う値は`[SETTINGS CHANGED]`およびepoch別のCSVに反映されます。
 
 以前lrを複数値で試していて、外すと複数trialに一致する場合は、勝手に選ばずエラーにします。明示して残したgrid軸の値は従来どおり条件の識別に使います。`--resume --dry-run`で、ファイル変更・学習起動なしに確認できます。
 
-FT・L1・L2のBNは `--grid sfnn-bn-ft false true`、`--grid sfnn-bn-l1 false true`、
-`--grid sfnn-bn-l2 false true` で比較できます。全指定で8条件です。
+FT・L1・L2のBNは `--grid sfnn_bn_ft false true`、`--grid sfnn_bn_l1 false true`、
+`--grid sfnn_bn_l2 false true` で比較できます。全指定で8条件です。
 初期値・併用制限・保存仕様は [Batch Normalization](batch-normalization.md) を参照してください。
 
 ## 共通設定を編集せずに短い実験を行う
@@ -161,7 +163,7 @@ python .\grid_search.py `
 
 これも2×2の4条件です。`ft_factorizer`（alias: `sfnn_ft_factorizer`）、`save_epoch_end`、`sfnn_factorized` は `true` / `false` の両方を明示的に渡します。それ以外のフラグはJSONと同様に、`true` で指定、`false` で省略するため、falseが必ず既定で有効な機能をOFFにするとは限りません。数値や文字列も指定できます。出力先・開始state・resumeなどの実行管理項目はgrid軸にはできません。
 
-`--grid max-epochs 1 2`（`max_epochs`表記も可）で、1epochと2epochを独立した条件として学習できます。`--grid superbatches 16 32`と併用すれば4条件です。grid指定は共通JSONや `--max-epochs` より優先します。集計は各条件の終了epochまでで、`--epochs`を併用するとその範囲内の指定epochだけを表示します。再開時もepoch数が異なるgrid値は別条件です。既存条件の延長ではありません。
+`--grid max_epochs 1 2`で、1epochと2epochを独立した条件として学習できます。`--grid superbatches 16 32`と併用すれば4条件です。grid指定は共通JSONや `--max-epochs` より優先します。集計は各条件の終了epochまでで、`--epochs`を併用するとその範囲内の指定epochだけを表示します。再開時もepoch数が異なるgrid値は別条件です。既存条件の延長ではありません。
 
 ## 出力と集計
 

@@ -82,7 +82,7 @@ CUDA SFNNでは次を個別に指定できます。すべてデフォルトOFF�
 - bpuによる勾配蓄積中は、重みが更新されるまで丸め済みのコピーを再利用します。更新・復元・層別QAT設定変更時は再計算します。
 - 旧形式のL2/L3 factorizerテンソルを残した状態は対象外です。
 
-grid searchでは、例えば `--grid sfnn-qat-ft false true --grid sfnn-qat-l2 false true --grid sfnn-qat-l3 false true` で8条件を比較できます。全層を一度にONにするなら各値を `true` だけにします。既存のL1指定は独立です。
+grid searchでは、例えば `--grid sfnn_qat_ft false true --grid sfnn_qat_l2 false true --grid sfnn_qat_l3 false true` で8条件を比較できます。全層を一度にONにするなら各値を `true` だけにします。既存のL1指定は独立です。
 
 ### 保存済みのnn.binを計測する
 

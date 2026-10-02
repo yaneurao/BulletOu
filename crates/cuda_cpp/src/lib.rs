@@ -7099,6 +7099,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.layer_qat.invalidate();
         self.l1_revival_flags = src.l1_revival_flags;
         self.l2_revival_flags = src.l2_revival_flags;
         self.restore_batch_norm(ctx,&src.batch_norm)?;
@@ -7128,6 +7129,7 @@ impl SfnnTrainStepRunner {
         if self.batch_norm.is_some() {
             return Err(CudaCppError::message("host-only runner restore cannot restore BN state; use the complete device snapshot restore"));
         }
+        self.layer_qat.invalidate();
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
         self.output_center_batches = 0;
