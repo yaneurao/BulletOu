@@ -5583,11 +5583,33 @@ __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float*
     }
     dx[j]=sum;
 }
+struct CompactL1AxisGradient {
+    float *weights, *biases;
+    size_t stacks, king_dim, hand_dim;
+    int king, hand, progress, kh, kp, hp;
+    float king_alpha, hand_alpha, progress_alpha, pair_alpha;
+    const float* confidence;
+
+    __device__ void add(size_t stack, size_t cell, size_t width, size_t out,
+                        size_t outputs, bool bias, float gradient) const {
+        size_t ids[8];
+        const size_t n=sfnn_factorizer_axis_ids(stack,stacks,king_dim,hand_dim,
+            king,hand,progress,kh,kp,hp,ids);
+        float alphas[8];
+        sfnn_factorizer_axis_alphas(ids,n,stacks,king_dim,hand_dim,kh,kp,hp,
+            king_alpha,hand_alpha,progress_alpha,pair_alpha,confidence,alphas);
+        for(size_t a=0;a<n;++a) {
+            float* dst=bias?biases+ids[a]*outputs+out:weights+ids[a]*width*outputs+cell;
+            atomicAdd(dst,alphas[a]*gradient);
+        }
+    }
+};
+
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
-template<int Stacks>
+template<int Stacks, bool Axis=false>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
     float* dw,float* db,float* dfw,float* dfb,size_t batch,size_t width,size_t outputs,
-    size_t stacks,float alpha,bool input_major) {
+    size_t stacks,float alpha,bool input_major,CompactL1AxisGradient axis={}) {
     size_t lane=threadIdx.x%32,out=blockIdx.z*8+threadIdx.x/32,in=blockIdx.x*32+lane;
     if(out>=outputs || in>width)return;
     size_t begin=blockIdx.y*256,end=min(batch,begin+256);
@@ -5611,6 +5633,12 @@ __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int
     for(int s=0;s<Stacks;++s) {
         if(s<stacks) {
             if(ws[s]!=0)atomicAdd(bias?db+s*outputs+out:dw+(s*outputs+out)*width+in,ws[s]);
+            // Scatter this tile's contribution, never the BPU-accumulated
+            // residual gradient (which would count earlier microbatches twice).
+            if constexpr(Axis) {
+                if(ws[s]!=0)axis.add(s,input_major?in*outputs+out:out*width+in,
+                    width,out,outputs,bias,ws[s]);
+            }
             shared_w+=ws[s];
         }
     }
@@ -5660,14 +5688,37 @@ int launch_sfnn_dense_param_reduce_tiled(
     const bool bn_l1 = ctx->bn[1].params && input_dim >= 32 &&
         output_dim >= ctx->bn[1].width && output_dim <= ctx->bn[1].width + 1;
     // This is an affine-gradient reduction, not a BN operation. The same
-    // coalesced kernel also applies to ordinary/QAT L1 with no axis terms.
+    // coalesced kernel also applies to ordinary/QAT L1. Axis contributions
+    // are scattered once per tile/bucket, outside the sample accumulation loop.
     if((bn_l1 || compact_l1) && output_dim<=16 && num_stacks<=16 &&
-        has_axis==0 && use_crelu_gradient==0 && !bn_use_reference()) {
+        use_crelu_gradient==0 && !bn_use_reference()) {
         dim3 grid(static_cast<unsigned>((input_dim+1+31)/32),static_cast<unsigned>((batch+255)/256),
             static_cast<unsigned>((output_dim+7)/8));
         // Keep only the actual small bucket set in registers. The previous
         // 16-bucket accumulator paid for unused buckets on every input row.
-        if (num_stacks<=8) {
+        if (has_axis) {
+            const CompactL1AxisGradient axis={axis_weight_gradients,axis_bias_gradients,
+                num_stacks,factorizer_king_axis_dim,factorizer_hand_axis_dim,
+                use_king_axis,use_hand_axis,use_progress_axis,use_king_hand_pair,
+                use_king_progress_pair,use_hand_progress_pair,king_axis_alpha,hand_axis_alpha,
+                progress_axis_alpha,pair_alpha,factorizer_axis_confidences};
+            if(num_stacks<=8) {
+                bn_l1_param_reduce<8,true><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                    weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                    has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                    shared_alpha,shared_weight_input_major!=0,axis);
+            } else if(num_stacks==9) {
+                bn_l1_param_reduce<9,true><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                    weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                    has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                    shared_alpha,shared_weight_input_major!=0,axis);
+            } else {
+                bn_l1_param_reduce<16,true><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                    weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                    has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                    shared_alpha,shared_weight_input_major!=0,axis);
+            }
+        } else if (num_stacks<=8) {
             bn_l1_param_reduce<8><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
                 weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
                 has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
@@ -6821,8 +6872,8 @@ int launch_sfnn_backward_kernels(
             return -1;
         }
         const bool compact_input_fast=(ctx->bn[1].params || ft_size >= 1024) && !bn_use_reference() &&
-            reduce_l1_params && has_l1ax==0 &&
-            !residual_count_gates && (l1_out==8 || l1_out==9);
+            reduce_l1_params && (has_l1ax==0 || qat_l1w) &&
+            (!residual_count_gates || qat_l1w) && (l1_out==8 || l1_out==9);
         if(compact_input_fast) {
             const float* effective = qat_l1w ? qat_l1w : l1w;
             const float* shared = !qat_l1w && has_l1f ? l1fw : nullptr;
