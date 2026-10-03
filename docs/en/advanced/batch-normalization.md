@@ -55,7 +55,7 @@ For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_
 "sfnn_l2_revive_zero": true
 ```
 
-The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, all with output zero. Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. The old contribution is zero, so only subtract the new mean contribution from L3 bias. This is not exact function preservation.
+The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, with zero-output fraction at least `sfnn_l2_revive_zero_threshold` (default 0.99). Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. Approximate the old contribution as zero, then subtract the new mean contribution from L3 bias. This is not exact function preservation.
 
 Compare with `--grid sfnn_l2_revive_zero false true`. Both kinds share one calibration pass when enabled. Completion markers apply within an epoch; the next enabled epoch recalibrates. See [epoch settings](epoch-settings.md).
 
@@ -71,7 +71,7 @@ Compare with `--grid sfnn_l2_revive_zero false true`. Both kinds share one calib
 Compare with `--grid sfnn_l2_revive false true` using the same `initial_state` in common settings.
 
 - Calibration independently reads 16 teacher batches from the restored position, without shuffling. The training cursor/shuffle is unchanged. Validation data and target labels are not used for calibration.
-- Only units reaching the upper clamp in **every** observed position in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. This is an empirical criterion, not proof of constant output on unseen positions.
+- Units reaching the upper clamp in at least `sfnn_l2_revive_threshold` (default 0.99) of observed positions in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. Use 1.0 for the previous strict criterion. See [threshold settings](l1-revive.md) for epoch maps and grid search.
 - Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); center the mean calibration preactivation at 0.5 using L2 bias without BN, or BN beta with scale one when BN is enabled. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
 - Reset selected moments and synchronize Lookahead slow state. Do not reset other units or FT/L1. `sfnn_l2_revive` alone does not reset always-zero units.
 - Completion flags are saved, but each enabled new epoch recalibrates. Mid-epoch checkpoint resumes do not repeat revival. Checkpoint and nn.bin formats are unchanged.

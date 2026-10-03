@@ -36,7 +36,7 @@ BNなしでL1/L2両方を指定した場合は、L1を処理してから、変�
 "sfnn_l2_revive_zero": true
 ```
 
-ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ全出力0の場合だけ処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・bias調整（BNありではBN再設定）・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与は0なのでbiasに加算せず、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
+ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ出力0の割合が`sfnn_l2_revive_zero_threshold`（デフォルト0.99）以上の場合に処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・bias調整（BNありではBN再設定）・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与を0と近似して、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
 
 grid比較は `--grid sfnn_l2_revive_zero false true`。両種類を指定すると校正は1回です。処理済みフラグはepoch内の情報であり、次の有効なepochでは再判定します。[epoch設定](epoch-settings.md)も参照してください。
 
@@ -53,7 +53,7 @@ grid比較は `--grid sfnn_l2_revive_zero false true`。両種類を指定する
 gridのA/B比較は `--grid sfnn_l2_revive false true`。共通設定の`initial_state`に同じcheckpointを指定してください。
 
 - 復元した教師位置から16batchを別途読み、量子化推論で校正します。校正時のshuffleは0。学習側の位置・shuffle設定は進めたり変更したりしません。検証データ・正解評価値は校正に使用しません。
-- bucket内で1,024局面以上観測され、その全てで出力1のL2 unitだけが対象です。少数・未出現bucketは処理しません。「サンプル全件」であり、未知の全局面で定数という証明ではありません。
+- bucket内で1,024局面以上観測され、出力1の割合が`sfnn_l2_revive_threshold`（デフォルト0.99）以上のL2 unitが対象です。少数・未出現bucketは処理しません。1.0で従来の全件一致です。[閾値設定](l1-revive.md)はepoch別・grid指定も可能です。
 - 定数寄与をL3 biasへ移し、入力をGlorot一様分布（seed=20260926）で再初期化。BNなしではL2 bias、BNありでは倍率1のBN betaを設定し、校正入力で平均preactivationを0.5にします。L3接続を元と同符号の±1/64から再学習し、その平均寄与もbias補償します。
 - 対象のmomentとLookahead slowを整合させます。他unitとFT/L1はリセットしません。`sfnn_l2_revive` 単独では出力0のunitはリセットしません。
 - 処理済み情報はcheckpointに保存しますが、次の有効なepoch開始時には再判定します。epoch途中のcheckpointからresumeした場合は重複処理しません。checkpoint/nn.binの形式は変更しません。

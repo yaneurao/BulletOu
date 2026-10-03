@@ -15,6 +15,21 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_revival_threshold_epoch_settings(self):
+        keys = ["sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold",
+                "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"]
+        settings = {k: {"epoch1": 0.99, "epoch9": 1.0} for k in keys}
+        self.assertEqual(grid.resolve_epoch_settings(settings, 8), dict.fromkeys(keys, 0.99))
+        self.assertEqual(grid.resolve_epoch_settings(settings, 9), dict.fromkeys(keys, 1.0))
+        for key in keys:
+            plan = self.plan(["--grid", key, "0.99", "1.0"])
+            fields, rows = grid.summarize(self.output, plan)
+            self.assertIn(key, fields)
+            self.assertEqual({r[key] for r in rows}, {0.99, 1.0})
+            for bad in [0, -0.1, 1.01, True, float("nan")]:
+                with self.assertRaises(ValueError):
+                    grid.check_settings({**self.common, key: bad})
+
     def test_locked_summary_never_stops_training_and_can_be_regenerated(self):
         original_replace = Path.replace
         def locked(path, target):

@@ -7,8 +7,8 @@ These opt-in flags support the non-BN cuda-cpp SFNN trainer. Both default to fal
 "sfnn_l1_revive_zero": true
 ```
 
-`--sfnn-l1-revive` selects units whose normal **and** squared branches always output 1.
-`--sfnn-l1-revive-zero` selects units whose two branches always output 0.
+`--sfnn-l1-revive` selects units whose normal **and** squared branches jointly output 1 at or above the threshold.
+`--sfnn-l1-revive-zero` selects units whose two branches jointly output 0 at or above the threshold.
 Zero upper-hit rate is NOT an always-zero activation. The skip output and squared-only saturation are excluded.
 Grid syntax: `--grid sfnn_l1_revive false true` and `--grid sfnn_l1_revive_zero false true`.
 Use a common `initial_state` checkpoint for A/B comparisons; scratch runs are also supported.
@@ -19,7 +19,25 @@ Before the first training batch of each enabled epoch, infer 16 teacher batches 
 without calibration shuffling or advancing the training cursor. This is not validation-set calibration.
 Positions with zero training sample weight are excluded.
 Both branches are inspected in the quantized proxy. A bucket must have at least 1,024 positions,
-with 100% of them satisfying the requested condition. This finite sample cannot prove constancy on all positions.
+with the configured fraction satisfying the requested condition. This finite sample cannot prove constancy on all positions.
+
+### Thresholds for L1 and L2
+
+```json
+"sfnn_l1_revive_threshold": 0.99,
+"sfnn_l1_revive_zero_threshold": 0.99,
+"sfnn_l2_revive_threshold": 0.99,
+"sfnn_l2_revive_zero_threshold": 0.99
+```
+
+All default to 0.99, accept finite values in (0, 1], and use inclusive comparisons.
+Use 1.0 for the previous all-observations criterion. Thresholds do not enable revival by themselves.
+Epoch maps such as `{"epoch1": 1.0, "epoch9": 0.99}` require epoch1.
+Grid example: `--grid sfnn_l1_revive_threshold 0.99 1.0`.
+If very low thresholds allow both conditions, the enabled upper condition takes precedence.
+Reviving a nonconstant unit is approximate: outputs may change on nonqualifying positions.
+Stdout reports measured fractions and thresholds and prints a yellow WARNING for nonconstant selections.
+Audit CSVs also store thresholds; existing audit files and source checkpoints are not overwritten.
 
 Independent upper/zero completion flags are persisted in state.bin/weights.bin, including when no candidates exist.
 Recalibrate at the next enabled epoch boundary. A mid-epoch checkpoint resume does not repeat revival.

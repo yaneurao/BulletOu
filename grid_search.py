@@ -212,6 +212,7 @@ def positive_int(settings: dict, key: str) -> int:
 EPOCH_SETTING_KEYS = {
     "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
+    "sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold", "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold",
     "sfnn_ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
@@ -279,6 +280,11 @@ def check_settings(settings: dict) -> None:
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
     warmup = settings.get("warmup_sb", 0)
+    for key in ("sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold",
+                "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"):
+        value = settings.get(key, 0.99)
+        if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= 1:
+            raise ValueError(f"{key} must be finite and in (0, 1]")
     if type(warmup) is not int or warmup < 0:
         raise ValueError("warmup_sb must be a nonnegative integer")
     if warmup and settings.get("lr_schedule", "step") == "plateau":

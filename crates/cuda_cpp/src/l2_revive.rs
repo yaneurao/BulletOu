@@ -7,12 +7,30 @@ pub struct Calibration {
     pub counts: Vec<usize>,
     pub upper: Vec<usize>,
     pub lower: Vec<usize>,
+    upper_threshold: f64,
+    zero_threshold: f64,
     inputs: Vec<Vec<f32>>,
 }
 impl Calibration {
     pub fn new(input: usize, width: usize, groups: usize) -> Self {
         Self { input, width, counts: vec![0; groups], upper: vec![0; groups*width],
-            lower: vec![0; groups*width], inputs: vec![Vec::new(); groups] }
+            lower: vec![0; groups*width], upper_threshold: 0.99, zero_threshold: 0.99,
+            inputs: vec![Vec::new(); groups] }
+    }
+    pub fn set_thresholds(&mut self, upper: f64, zero: f64) -> Result<()> {
+        if [upper,zero].iter().any(|v| !v.is_finite() || *v<=0.0 || *v>1.0) {
+            return Err(CudaCppError::message("revival thresholds must be finite and in (0, 1]"));
+        }
+        self.upper_threshold=upper; self.zero_threshold=zero;
+        Ok(())
+    }
+    pub fn is_upper(&self, i: usize, enabled: bool) -> bool {
+        let n=self.counts[i/self.width];
+        enabled && n>=1024 && self.upper[i] as f64/n as f64>=self.upper_threshold
+    }
+    fn is_zero(&self, i: usize, enabled: bool) -> bool {
+        let n=self.counts[i/self.width];
+        enabled && n>=1024 && self.lower[i] as f64/n as f64>=self.zero_threshold
     }
     pub fn add(&mut self, buckets: &[i32], x: &[f32], y: &[f32]) -> Result<()> {
         expect_len("revive inputs",buckets.len()*self.input,x.len())?;
@@ -34,9 +52,8 @@ impl Calibration {
         self.candidates_for(true, false)
     }
     pub fn candidates_for(&self, upper: bool, zero: bool) -> Vec<usize> {
-        self.upper.iter().enumerate().filter_map(|(i,&hits)| {
-            let n=self.counts[i/self.width];
-            (n>=1024 && ((upper && hits==n) || (zero && self.lower[i]==n))).then_some(i)
+        self.upper.iter().enumerate().filter_map(|(i,_)| {
+            (self.is_upper(i,upper) || self.is_zero(i,zero)).then_some(i)
         }).collect()
     }
 }
@@ -104,7 +121,7 @@ impl SfnnTrainStepRunner {
                     +((beta*8128.0).round()/8128.0) as f64; v.clamp(0.0,1.0)
             }).sum::<f64>()/count as f64;
             let v=if out[i]<0.0 {-1.0/64.0} else {1.0/64.0};
-            let old_activation=if c.lower[i]==c.counts[g] {0.0} else {1.0};
+            let old_activation=if c.is_upper(i,upper) {1.0} else {0.0};
             ob[g]+=old_activation*out[i]-v*mean_y as f32;
             obs.slow_params[g]+=old_activation*os.slow_params[i]-v*mean_y as f32;
             out[i]=v;os.slow_params[i]=v;os.momentum[i]=0.0;os.velocity[i]=0.0;
@@ -140,6 +157,27 @@ impl SfnnTrainStepRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn configurable_thresholds_and_zero_classification() {
+        let mut c=Calibration::new(1,4,1);
+        c.counts[0]=10000;
+        c.upper=vec![9900,9899,0,0];
+        c.lower=vec![0,0,9900,9899];
+        assert_eq!(c.candidates_for(true,true),vec![0,2]);
+        assert!(!c.is_upper(2,true));
+        assert!(c.candidates_for(false,false).is_empty());
+        c.set_thresholds(1.0,1.0).unwrap();
+        assert!(c.candidates_for(true,true).is_empty());
+        c.set_thresholds(0.98,0.995).unwrap();
+        assert_eq!(c.candidates_for(true,true),vec![0,1]);
+        for bad in [0.0,-0.1,1.01,f64::NAN,f64::INFINITY] {
+            assert!(c.set_thresholds(bad,0.99).is_err());
+            assert!(c.set_thresholds(0.99,bad).is_err());
+        }
+        c.set_thresholds(0.99,0.99).unwrap();
+        c.counts[0]=5331; c.upper[0]=5323; c.upper[1]=0; c.lower.fill(0);
+        assert_eq!(c.candidates_for(true,false),vec![0]); // reported epoch9 case
+    }
     #[test]
     fn non_bn_upper_zero_and_l1_combination_roundtrip_and_train() {
         let ctx=Context::new(0).unwrap(); let shape=crate::tests::tiny_sfnn_shape();
@@ -180,6 +218,7 @@ mod tests {
             r.optimizer_states.l3w.slow_params.fill(&ctx,0.75).unwrap();
             assert_eq!(r.revive_l2_selected(&ctx,&c,true,false).unwrap(),vec![0]);
             assert!(r.l2_revival_done() && !r.l2_zero_revival_done());
+            c.lower[1]-=1; // near-zero selection must still compensate as zero, not one
             assert_eq!(r.revive_l2_selected(&ctx,&c,true,true).unwrap(),vec![1]);
             let new=r.read_weights(&ctx).unwrap();
             assert_eq!(new.l2_revival_flags,3); assert_eq!(new.l1_revival_flags,3);
@@ -221,6 +260,7 @@ mod tests {
     #[test]
     fn candidates_require_coverage_and_all_upper() {
         let mut c=Calibration::new(1,3,2);
+        c.set_thresholds(1.0,1.0).unwrap();
         c.add(&vec![0;1024],&vec![0.5;1024],&[1.0,0.0,0.5].repeat(1024)).unwrap();
         assert_eq!(c.candidates(),vec![0]);assert_eq!(c.lower[1],1024);
         assert_eq!(c.candidates_for(false,true),vec![1]);

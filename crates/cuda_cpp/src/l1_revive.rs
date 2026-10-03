@@ -7,13 +7,31 @@ pub struct Calibration {
     pub counts: Vec<usize>,
     pub upper: Vec<usize>,
     pub lower: Vec<usize>,
+    upper_threshold: f64,
+    zero_threshold: f64,
     sums: Vec<f64>,
 }
 
 impl Calibration {
     pub fn new(input: usize, width: usize, groups: usize) -> Self {
         Self { input, width, counts: vec![0; groups], upper: vec![0; groups*width],
-            lower: vec![0; groups*width], sums: vec![0.0; groups*input] }
+            lower: vec![0; groups*width], upper_threshold: 0.99, zero_threshold: 0.99,
+            sums: vec![0.0; groups*input] }
+    }
+    pub fn set_thresholds(&mut self, upper: f64, zero: f64) -> Result<()> {
+        if [upper,zero].iter().any(|v| !v.is_finite() || *v<=0.0 || *v>1.0) {
+            return Err(CudaCppError::message("revival thresholds must be finite and in (0, 1]"));
+        }
+        self.upper_threshold=upper; self.zero_threshold=zero;
+        Ok(())
+    }
+    pub fn is_upper(&self, i: usize, enabled: bool) -> bool {
+        let n=self.counts[i/self.width];
+        enabled && n>=1024 && self.upper[i] as f64/n as f64>=self.upper_threshold
+    }
+    fn is_zero(&self, i: usize, enabled: bool) -> bool {
+        let n=self.counts[i/self.width];
+        enabled && n>=1024 && self.lower[i] as f64/n as f64>=self.zero_threshold
     }
     /// x is the combined FT input; y is [squared branches, normal branches].
     pub fn add(&mut self, buckets: &[i32], x: &[f32], y: &[f32]) -> Result<()> {
@@ -48,8 +66,7 @@ impl Calibration {
     }
     pub fn candidates_for(&self, upper: bool, zero: bool) -> Vec<usize> {
         (0..self.upper.len()).filter(|&i| {
-            let n=self.counts[i/self.width];
-            n>=1024 && ((upper && self.upper[i]==n) || (zero && self.lower[i]==n))
+            self.is_upper(i,upper) || self.is_zero(i,zero)
         }).collect()
     }
 }
@@ -96,7 +113,7 @@ impl SfnnTrainStepRunner {
         for &id in &ids {
             let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
             let out=bucket*s.l1_out()+u;
-            let constant=if c.lower[id]==c.counts[bucket] {0.0} else {1.0};
+            let constant=if c.is_upper(id,upper) {1.0} else {0.0};
             let mut rng=0x9e3779b97f4a7c15u64 ^ id as u64;
             let mut mean=0.0f64;
             for j in 0..s.ft_size {
@@ -148,6 +165,27 @@ impl SfnnTrainStepRunner {
 mod tests {
     use super::*;
     #[test]
+    fn configurable_thresholds_and_zero_classification() {
+        let mut c=Calibration::new(1,4,1);
+        c.counts[0]=10000;
+        c.upper=vec![9900,9899,0,0];
+        c.lower=vec![0,0,9900,9899];
+        assert_eq!(c.candidates_for(true,true),vec![0,2]);
+        assert!(!c.is_upper(2,true));
+        assert!(c.candidates_for(false,false).is_empty());
+        c.set_thresholds(1.0,1.0).unwrap();
+        assert!(c.candidates_for(true,true).is_empty());
+        c.set_thresholds(0.98,0.995).unwrap();
+        assert_eq!(c.candidates_for(true,true),vec![0,1]);
+        for bad in [0.0,-0.1,1.01,f64::NAN,f64::INFINITY] {
+            assert!(c.set_thresholds(bad,0.99).is_err());
+            assert!(c.set_thresholds(0.99,bad).is_err());
+        }
+        c.set_thresholds(0.99,0.99).unwrap();
+        c.counts[0]=5331; c.upper[0]=5323; c.upper[1]=0; c.lower.fill(0);
+        assert_eq!(c.candidates_for(true,false),vec![0]); // reported epoch9 case
+    }
+    #[test]
     fn gpu_revival_preserves_outputs_shared_skip_and_slow_state() {
         let ctx=Context::new(0).unwrap();
         let shape=crate::tests::tiny_sfnn_shape();
@@ -187,6 +225,7 @@ mod tests {
             r.optimizer_states.l2b.slow_params.fill(&ctx,0.1).unwrap();
             assert_eq!(r.revive_l1_selected(&ctx,&c,true,false).unwrap(),vec![0]);
             assert!(r.l1_revival_done() && !r.l1_zero_revival_done());
+            c.lower[2]-=1; // near-zero selection must still compensate as zero, not one
             assert_eq!(r.revive_l1_selected(&ctx,&c,true,true).unwrap(),vec![2]);
             let after=forward(&r);
             assert!(before.iter().zip(after).all(|(a,b)|(a-b).abs()<1e-5));
@@ -226,6 +265,7 @@ mod tests {
     #[test]
     fn both_branches_and_coverage_required() {
         let mut c=Calibration::new(1,4,2);
+        c.set_thresholds(1.0,1.0).unwrap();
         let y=[1.0,1.0,0.0,0.0, 1.0,0.5,0.0,0.3];
         c.add(&vec![0;1024],&vec![0.2;1024],&y.repeat(1024)).unwrap();
         assert_eq!(c.candidates_for(true,true),vec![0,2]);

@@ -7,8 +7,8 @@ BNなしのcuda-cpp SFNNで使用できます。両方ともデフォルトはfa
 "sfnn_l1_revive_zero": true
 ```
 
-- `sfnn_l1_revive`: 通常枝・二乗枝の**両方が常に1**のunitを対象にします。
-- `sfnn_l1_revive_zero`: 両枝が**常に0**のunitを対象にします。上限到達率0%とは異なります。
+- `sfnn_l1_revive`: 通常枝・二乗枝の**両方が1になる割合が閾値以上**のunitを対象にします。
+- `sfnn_l1_revive_zero`: 両枝が**同時に0になる割合が閾値以上**のunitを対象にします。上限到達率の低さとは異なります。
 - L1 skip出力は対象外です。二乗枝だけが飽和しているunitも対象外です。
 
 CLIは `--sfnn-l1-revive` / `--sfnn-l1-revive-zero`。grid searchでは
@@ -20,7 +20,7 @@ CLIは `--sfnn-l1-revive` / `--sfnn-l1-revive-zero`。grid searchでは
 trueのepochの最初のbatchを学習する前に、その時点の教師読み出し位置から16batchを推論します。
 検証セットではなく教師を使用し、学習の読み出し位置は進めません。校正時のshuffleは無効です。
 学習のsample weightが0の局面は判定から除外します。
-量子化proxyの両枝を調べ、bucket内に1,024局面以上あり、その全局面で条件を満たした場合のみ対象にします。
+量子化proxyの両枝を調べ、bucket内に1,024局面以上あり、指定割合以上で条件を満たした場合に対象にします。
 これは有限サンプルでの判定であり、全局面での定数性の証明ではありません。
 
 各種類の処理済み情報はstate.bin/weights.binに保存します。対象0件でも処理済みとなります。
@@ -33,6 +33,25 @@ trueのepochの最初のbatchを学習する前に、その時点の教師読み
 判定内容は学習出力フォルダの`l1-revive.csv`に記録します。既存ファイルは上書きせず連番にします。
 
 ## 何を変更するか
+
+### 閾値（L1/L2共通の指定方法）
+
+```json
+"sfnn_l1_revive_threshold": 0.99,
+"sfnn_l1_revive_zero_threshold": 0.99,
+"sfnn_l2_revive_threshold": 0.99,
+"sfnn_l2_revive_zero_threshold": 0.99
+```
+
+すべてデフォルト0.99、範囲は0より大きく1以下です。1.0なら従来の全件一致です。
+閾値だけでは有効化されず、対応するrevive/revive_zeroのON/OFFに従います。
+`{"epoch1": 1.0, "epoch9": 0.99}`のepoch別指定にも対応します（epoch1必須）。
+gridでは `--grid sfnn_l1_revive_threshold 0.99 1.0` のように指定します。
+非常に低い閾値で両条件を満たす場合は、有効な上限側を優先します。
+
+100%未満のunitをリセットすると、条件を満たさない局面では出力が変わります。
+完全等価ではありません。対象unitの実測割合・閾値をstdoutに出し、非定数なら黄色のWARNINGを出します。
+判定CSVにも閾値を保存します。既存CSV・checkpointは書き換えません。
 
 1. 上限側では両枝からL2への定数寄与をL2のbiasに足します。ゼロ側では足しません。
 2. 対象unitのL1有効重みをGlorot一様分布で再初期化し、校正入力での平均preactivationが0.5になるようbiasを設定します。
