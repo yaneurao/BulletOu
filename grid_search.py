@@ -56,6 +56,7 @@ COMMON_COLUMNS = (
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
     "sfnn_l1_revive",
+    "sfnn_ft_revive",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",
@@ -209,7 +210,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 EPOCH_SETTING_KEYS = {
     "sfnn_l1_factorizer",
-    "sfnn_l1_revive", "sfnn_l2_revive",
+    "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -232,7 +233,7 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
             continue
         if key not in EPOCH_SETTING_KEYS:
             raise ValueError(f"epoch schedule is not supported for {key}")
-        revival = key in ("sfnn_l1_revive", "sfnn_l2_revive")
+        revival = key in ("sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive")
         if "epoch1" not in value and not revival:
             raise ValueError(f"{key}: epoch schedule requires epoch1")
         for name, item in value.items():
@@ -283,7 +284,7 @@ def check_settings(settings: dict) -> None:
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
     warmup = settings.get("warmup_sb", 0)
-    for key in ("sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
+    for key in ("sfnn_ft_revive_contribution_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
         value = settings.get(key, 0.01)
         if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"{key} must be finite and in (0, 1]")

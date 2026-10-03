@@ -59,8 +59,50 @@ CSV R/threshold values are fractions (0..1); stdout uses percentages. Numbered a
 Supports cuda-cpp dense SFNN, L1 none/shared, ordinary/per-layer-QAT training, standalone/grid.
 L1 requires non-BN; L2 with BN requires calibrated L2 BN, BN QAT and frozen statistics.
 Worker, ordinary NNUE, compact L1, axis/pair, residual count gates and legacy L2/L3 factorizers remain unsupported.
-FT revival is not included. Checkpoint/nn.bin formats are unchanged.
+FT revival is described below. Checkpoint/nn.bin formats are unchanged.
 
 `sfnn_l1_revive_zero`, `sfnn_l2_revive_zero` and the old per-layer `revive_threshold` / `revive_zero_threshold` options are removed.
 Their presence produces a migration error. Remove them and use 0.01 above; do not carry over 0.99.
 Existing checkpoints remain readable; remove obsolete keys from launch settings.
+
+## Shared FT product-pair revival
+
+```json
+"sfnn_ft_revive": {"epoch5": true, "epoch6": false, "epoch9": true, "epoch13": false},
+"sfnn_ft_revive_contribution_threshold": 0.01
+```
+
+Runs at the start of epoch5 and epochs9–12. Use epoch10:false for epoch9 only.
+Disabled by default and before the first schedule entry. The threshold defaults to 0.01,
+must be finite in (0,1], and also supports an epoch schedule (epoch1 required).
+Mid-epoch resume does not run it; the next enabled epoch boundary does.
+
+Measure product pairs i × (i+FT width/2), not individual FT activations.
+For each bucket, sum both perspectives' MAD(product) × sum(abs(outgoing L1 weights)),
+including L1 skip. Normalize by that bucket's maximum pair utility (all zero => relative zero).
+Select only pairs strictly below the threshold in EVERY bucket, not a frequency-weighted average.
+If ANY bucket has fewer than 1,024 usable positions, warn and skip all FT revival.
+
+Replay the same 16 teacher batches twice for exact empirical mean/MAD with the quantized GPU proxy;
+ignore zero sample weights, do not use validation data, and do not advance the training cursor.
+Only bucket×width aggregates are kept on CPU, not all FT activations.
+Proxy/workspace VRAM and CPU weight/optimizer readback are still required, as in existing revival.
+
+Reinitialize both selected FT columns: real feature weights are uniform within
+max(sqrt(6/(real input count+FT width)),1/127), rounded to the 1/127 grid;
+bias is 0.5 and selected virtual factorizer columns are zeroed. This is a revival-specific
+initialization, not ordinary scratch initialization. Both perspectives' outgoing L1 connections
+become signed 1/64; compensate L1 shared weights through the residual columns.
+Transfer the measured old mean to L1 bias, replay the same teacher sample a third time,
+and subtract the new mean contribution. Reset affected moments and compensate Lookahead separately.
+This is approximate mean compensation, NOT pointwise-equivalent or guaranteed to preserve strength.
+
+Order: FT, then L1, then L2. Audit: ft-revive.csv (numbered to avoid overwrites), fractions in CSV,
+percentages on stdout. Counts may differ from offline validation-set integer nn.bin analysis.
+Supports non-BN dense SFNN, L1 none/shared, FT factorizer on/off, per-layer QAT, standalone/grid.
+BN, compact L1, axis/pair, count gates and worker trials are unsupported.
+
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results `
+  --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
+```

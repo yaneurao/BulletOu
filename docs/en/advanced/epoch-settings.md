@@ -31,7 +31,7 @@ Standalone SFNN training and `grid_search.py` accept epoch maps in the common tr
 }
 ```
 
-Merge these fields into a complete training configuration. Values apply from the specified epoch until the next boundary. Boolean transition directions work except for the one-way FT switch below. `epoch1` is required except for the four revival controls, which default to false before their first entry. Keys must be `epoch1`, `epoch2`, etc. without leading zeros. Object order does not matter. Scalars still apply to every epoch.
+Merge these fields into a complete training configuration. Values apply from the specified epoch until the next boundary. Boolean transition directions work except for the one-way FT switch below. `epoch1` is required except for FT/L1/L2 revival enable controls, which default to false before their first entry. Keys must be `epoch1`, `epoch2`, etc. without leading zeros. Object order does not matter. Scalars still apply to every epoch.
 
 `lr` and `lr_min` retain their within-epoch start/lower-limit meanings. Automatic step gamma is recalculated per epoch. Resume selects the resumed epoch's values; a separate run using `initial_state` starts at its epoch 1. Explicit CLI values and grid axes override the corresponding entire map. Settings are read at startup, not hot-reloaded.
 
@@ -79,7 +79,7 @@ The teacher shuffle window uses the settings active at startup and remains fixed
 [Grid search](grid-search.md) / [日本語](../../ja/advanced/epoch-settings.md)
 ## Unit revival at epoch boundaries
 
-`sfnn_l1_revive`, `sfnn_l2_revive`
+`sfnn_ft_revive`, `sfnn_l1_revive`, `sfnn_l2_revive`
 run before the first training batch of each epoch where enabled. A scalar true runs every epoch.
 
 ```json
@@ -91,7 +91,7 @@ run before the first training batch of each epoch where enabled. A scalar true r
 
 This example applies only at epoch3. Only these two settings may omit epoch1; the default before the first entry is false. Omitting epoch4:false keeps revival enabled for all later epochs.
 
-L1 runs before L2, with fresh 16-teacher-batch calibration using current weights. Require at least 1,024 positions per bucket and relative contribution strictly below the threshold. See [contribution-based revival](l1-revive.md).
+Order is FT, L1, L2, with fresh 16-teacher-batch calibration using current weights. Require at least 1,024 positions per bucket and relative contribution strictly below the threshold. FT pairs must qualify in every bucket. See [contribution-based revival](l1-revive.md).
 
 Mid-epoch resume skips revival; resume from the previous epoch end performs it. Interruption before saving recalibrates when restarting from the old checkpoint. FT factorizer and BN QAT transitions are applied before revival. Warmup epoch0 uses epoch1 settings.
 

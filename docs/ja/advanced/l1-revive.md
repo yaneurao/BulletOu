@@ -62,8 +62,55 @@ Rと閾値のCSV値は0～1、stdoutは%です。既存監査ファイルは上�
 cuda-cppのdense SFNN、L1 factorizer none/shared、通常学習または層別QAT、standalone/grid searchに対応。
 L1はBNなしのみ。L2でBNを使用する場合は校正済みL2 BN・BN QAT・統計固定が必要です。
 worker、通常NNUE、compact L1、axis/pair、residual count gate、旧L2/L3 factorizerは未対応です。
-FTの貢献度リセットは今回追加していません。nn.bin/checkpoint形式は変更しません。
+FTの対応は下記を参照してください。nn.bin/checkpoint形式は変更しません。
 
 `sfnn_l1_revive_zero` / `sfnn_l2_revive_zero`と、旧`revive_threshold` / `revive_zero_threshold`（各層）は廃止です。
 指定が残っていると移行エラーになります。旧0.99を新閾値へ転記せず、冒頭の0.01へ変更してください。
 古いcheckpointは読めますが、起動設定の旧項目は削除が必要です。
+
+## FTの積ペアをリセットする
+
+```json
+"sfnn_ft_revive": {
+  "epoch5": true,
+  "epoch6": false,
+  "epoch9": true,
+  "epoch13": false
+},
+"sfnn_ft_revive_contribution_threshold": 0.01
+```
+
+epoch5とepoch9〜12の開始時に再判定します。epoch9だけならepoch10をfalseにしてください。
+最初の指定まではfalse。既定は無効、閾値の既定は0.01、範囲は有限の `(0,1]` です。
+閾値もepoch指定できます（epoch1必須）。epoch途中の再開では実行せず、次の有効epoch開始時に実行します。
+
+FT単体ではなく `i × (i + FT幅/2)` の積を対象とします。FT幅1024なら512組です。
+両視点の積について、bucket別にMAD×L1接続重み絶対値和を求めて合算します。
+FTからの接続にはL1 skipも含みます。bucket内の最大を1として正規化し、
+**すべてのbucketで閾値未満**のペアだけをリセットします。全bucketの局面数加重平均は判定に使いません。
+全組の貢献度が0なら、そのbucketの相対値は0です。
+
+教師の現在位置から同じ16batchを2回読み、平均とMADを求めます。sample weight=0は除外。
+**1,024局面未満のbucketが一つでもあれば、警告を出してFTリセット全体を見送ります。**
+FTは全bucket共通なので、観測不足のbucketを無視してリセットしません。
+GPU量子化proxyを使用し、検証セットは使用せず、学習cursorは進めません。
+MADのために全局面のFT出力をRAMに保持せず、bucket×FT幅の集計だけを保持します。
+既存revive同様にGPU proxy/workspaceと重み・optimizerのCPU readbackが必要です。
+
+対象ペアの両FT列を再初期化します。実特徴の重みは
+`max(sqrt(6/(実入力数+FT幅)), 1/127)` を幅とする一様乱数を1/127刻みに丸め、
+biasは0.5、FT factorizerの仮想行は対象列だけ0にします。これは通常の初期学習の初期化とは別の再生用初期化です。
+L1の両視点への接続は元の符号の±1/64とし、L1 shared分は個別重み側で相殺します。
+旧積の実測平均寄与をL1 biasへ加算し、同じ16batchをもう一度推論して新しい平均寄与を差し引きます。
+対象のmomentum/velocityは0、Lookaheadのslow側も別の接続重みで補償します。
+**平均の近似補償であり、局面ごとの出力・棋力が維持される保証はありません。**
+
+処理順はFT→L1→L2です。監査は`ft-revive.csv`（既存時は連番）に保存されます。
+貢献度と閾値はCSVで0〜1、stdoutで%です。以前のepoch9検証セットの測定とは局面・GPU proxyが異なるため、選択個数は一致するとは限りません。
+対応はnon-BN dense SFNN、L1 none/shared、FT factorizer on/off、層別QAT、standalone/grid searchです。
+BN、compact L1、axis/pair、count gate、workerは未対応です。
+
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results `
+  --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
+```

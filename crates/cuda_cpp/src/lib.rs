@@ -5,6 +5,7 @@ mod bn_qat;
 mod layer_qat;
 pub mod l2_revive;
 pub mod l1_revive;
+pub mod ft_revive;
 pub mod ft_factorizer_switch;
 pub mod l1_factorizer_switch;
 

@@ -33,7 +33,7 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 
 既存の学習設定に加える項目の例です。epoch 1～10は前半、11以降は後半の値です。`true`→`false`、`false`→`true`のどちらも可能です。
 
-- 通常は`epoch1`必須です。4つのrevive設定のみ省略でき、最初の指定まではfalseです。キーは `epoch1`, `epoch2`, …（先頭ゼロ不可）。順序は問いません。
+- 通常は`epoch1`必須です。FT/L1/L2のrevive有効化設定のみ省略でき、最初の指定まではfalseです。キーは `epoch1`, `epoch2`, …（先頭ゼロ不可）。順序は問いません。
 - 未指定epochは直前の値を引き継ぎます。従来の数値・真偽値だけの指定は全epoch共通です。
 - `lr` / `lr_min` は各epoch内のLRスケジュールの開始値／下限値。stepの自動gammaも再計算します。
 - `--resume` は再開先epochの値を使います。別runを `--initial-state` から開始する場合は、新runのepoch 1からです。
@@ -85,7 +85,7 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 [Grid search](grid-search.md) / [English](../../en/advanced/epoch-settings.md)
 ## epoch開始時のunit再初期化
 
-`sfnn_l1_revive`, `sfnn_l2_revive`
+`sfnn_ft_revive`, `sfnn_l1_revive`, `sfnn_l2_revive`
 は、そのepochでtrueなら最初のbatchの学習前に判定・処理します。単一のtrueは毎epoch適用されます。
 
 ```json
@@ -97,7 +97,7 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 
 この例はepoch3だけに適用します。この2項目に限りepoch1を省略でき、最初の指定まではfalseです。epoch4:falseを省略するとepoch3以降の毎epochで適用します。
 
-L1→L2の順に、その時点の重みを使って教師16batchで再判定します。bucket内1,024局面以上かつ相対貢献度が閾値未満のunitを選びます。詳細は[貢献度ベースの再初期化](l1-revive.md)を参照してください。
+FT→L1→L2の順に、その時点の重みを使って教師16batchで再判定します。bucket内1,024局面以上かつ相対貢献度が閾値未満のunitを選びます。FTは全bucketでこの条件を満たす積ペアのみ対象です。詳細は[貢献度ベースの再初期化](l1-revive.md)を参照してください。
 
 epoch途中からresumeした場合は重複処理せず、次のepoch開始を待ちます。前epoch末尾からresumeする場合は実施します。保存前に中断して古いcheckpointへ戻った場合は再判定します。FT factorizer切り替えやBN QAT設定変更が同時にある場合は、それらの適用後に処理します。warmup epoch0はepoch1設定を使用します。
 
