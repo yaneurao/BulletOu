@@ -157,6 +157,14 @@ class GridSearchTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "removed.*sfnn_init_l2_glorot"):
             self.plan(["--grid", "sfnn_init_l2_l3_glorot", "true"])
 
+    def test_l1_factorizer_bidirectional_epoch_schedule(self):
+        settings = {"sfnn_l1_factorizer": {"epoch1": "axis", "epoch5": "shared", "epoch8": "axis"}}
+        for epoch, expected in [(0,"axis"),(1,"axis"),(4,"axis"),(5,"shared"),(7,"shared"),(8,"axis")]:
+            self.assertEqual(grid.resolve_epoch_settings(settings,epoch)["sfnn_l1_factorizer"],expected)
+        for bad in [True, "pair", "none", 1]:
+            with self.assertRaisesRegex(ValueError,"axis/shared"):
+                grid.resolve_epoch_settings({"sfnn_l1_factorizer":{"epoch1":bad}},1)
+
     def test_bn_affine_lr_multiplier_grid_and_epoch(self):
         key="sfnn_bn_affine_lr_multiplier"
         plan=self.plan(["--grid","sfnn-bn-affine-lr-multiplier","1","0.1","0"])

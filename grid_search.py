@@ -210,6 +210,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
+    "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
     "sfnn_ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -238,7 +239,10 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
         for name, item in value.items():
             if not re.fullmatch(r"epoch[1-9][0-9]*", name):
                 raise ValueError(f"{key}: invalid epoch key {name!r}")
-            if revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
+            if key == "sfnn_l1_factorizer":
+                if item not in ("axis", "shared"):
+                    raise ValueError(f"{key}.{name} must be axis/shared")
+            elif revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")
             elif type(item) not in (int, float) or not math.isfinite(item):

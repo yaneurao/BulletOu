@@ -1,5 +1,25 @@
 # epochごとの設定変更
 
+## L1 factorizerのaxis/shared切替
+
+```json
+"sfnn_l1_factorizer": {
+  "epoch1": "axis",
+  "epoch5": "shared",
+  "epoch8": "axis"
+}
+```
+
+epoch開始時に切り替えます。`axis → shared`では、axisの重み・biasを、その時点のalpha/count係数を使ってbucket個別重みへfoldします。Lookaheadのslow重みも同じ変換を行います。base/sharedのmomentum・velocityと更新stepは保持し、axisのmomentum・velocityは破棄します。浮動小数点の丸めを除き直後のforwardは維持しますが、切替後の更新則まで等価にはなりません。
+
+`shared → axis`ではbase/sharedを保持し、axisの重み・bias・optimizer状態をゼロで追加します。過去に削除したaxisの復活や、個別重みからの再推定はしません。
+
+非BN・dense L1のcuda-cpp SFNN通常学習に対応します。k3k3、progress8、複合archとも、そのarchに存在する軸だけを使います。progress8のみでは軸とbucketが一対一なので、bucket間共有の効果はありません。BN/compact L1およびworkerのepochスケジュールは未対応です。count gateが0で非ゼロ係数のaxisをfoldできない場合は、出力を黙って変えず停止します。
+
+checkpoint再開でも保存済みaxisの有無に応じて必要な変換だけを行います。将来のaxis指定で初期epochにaxisを先行確保しません。`[L1 FACTORIZER]`に切替方向・optimizerの扱いを表示します。
+
+grid searchでは共通JSONに指定してください。`--grid sfnn_l1_factorizer shared`等の明示指定はJSONのスケジュール全体を上書きするので、途中切替するときはそのgrid軸を外します。
+
 SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epochから数値・真偽値を切り替えられます。重み・optimizer stateは維持し、プロセス再起動は行いません。
 
 ```json

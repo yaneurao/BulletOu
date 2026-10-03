@@ -1,5 +1,25 @@
 # Per-epoch settings
 
+## Switching L1 axis/shared factorization
+
+```json
+"sfnn_l1_factorizer": {
+  "epoch1": "axis",
+  "epoch5": "shared",
+  "epoch8": "axis"
+}
+```
+
+At epoch boundaries, axis-to-shared folds axis weights/biases into bucket base weights using current alpha/count coefficients. Lookahead slow weights receive the same transformation. Base/shared momentum, velocity and update steps survive; removed axis moments are discarded. Forward output is preserved apart from floating-point rounding, but subsequent optimizer dynamics are not equivalent.
+
+Shared-to-axis retains base/shared parameters and adds zero axis weights, biases and optimizer states. It does not restore previously removed axes or extract them from base weights.
+
+Supported for non-BN dense cuda-cpp SFNN production training, including k3k3, progress8 and combinations. Only existing architectural axes are used. Progress8 alone maps axes one-to-one to buckets, without cross-bucket sharing. BN/compact L1 and worker epoch schedules are unsupported. A zero residual gate with a nonzero axis coefficient raises an error instead of silently changing output.
+
+Checkpoint restore checks actual axis presence to apply each boundary once. Future axis settings do not allocate axes in earlier shared epochs. `[L1 FACTORIZER]` records the transition and optimizer policy.
+
+Use the common JSON in grid search. An explicit `--grid sfnn_l1_factorizer shared` overrides the entire schedule; omit that grid axis to retain epoch switching.
+
 Standalone SFNN training and `grid_search.py` accept epoch maps in the common training JSON. Weights and optimizer state are retained; the process is not restarted.
 
 ```json
