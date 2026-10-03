@@ -15,6 +15,37 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_historical_removed_revival_schedules_remain_reportable(self):
+        settings = {"sfnn_l1_revive_zero": {"epoch5": True, "epoch6": False},
+                    "sfnn_l2_revive_zero": {"epoch9": True},
+                    "sfnn_l1_revive_zero_threshold": {"epoch1": .99, "epoch9": .95}}
+        self.assertFalse(grid.resolve_epoch_settings(settings, 1, historical=True)["sfnn_l1_revive_zero"])
+        self.assertTrue(grid.resolve_epoch_settings(settings, 5, historical=True)["sfnn_l1_revive_zero"])
+        resolved = grid.resolve_epoch_settings(settings, 9, historical=True)
+        self.assertFalse(resolved["sfnn_l1_revive_zero"])
+        self.assertTrue(resolved["sfnn_l2_revive_zero"])
+        self.assertEqual(resolved["sfnn_l1_revive_zero_threshold"], .95)
+        with self.assertRaises(ValueError):
+            grid.resolve_epoch_settings(settings, 1)
+        with self.assertRaises(ValueError):
+            grid.resolve_epoch_settings({"unknown": {"epoch1": 1}}, 1, historical=True)
+
+    def test_summary_preserves_removed_options_in_epoch_history(self):
+        plan = self.plan()
+        self.complete_plan(plan)
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        trial["settings"]["sfnn_l1_revive_zero"] = {"epoch2": True}
+        trial["settings"]["sfnn_l1_revive_zero_threshold"] = {"epoch1": .99}
+        grid.remember_completed_epoch_settings(directory, trial)
+        del trial["settings"]["sfnn_l1_revive_zero"]
+        del trial["settings"]["sfnn_l1_revive_zero_threshold"]
+        fields, rows = grid.summarize(self.output, plan)
+        old = [r for r in rows if r["trial"] == trial["id"]]
+        self.assertEqual([r["sfnn_l1_revive_zero"] for r in old], [False, True])
+        self.assertTrue(all(r["sfnn_l1_revive_zero_threshold"] == .99 for r in old))
+        self.assertTrue(all(r["status"] == "done" for r in old))
+
     def test_revival_threshold_epoch_settings(self):
         keys = ["sfnn_ft_revive_contribution_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"]
         settings = {k: {"epoch1": 0.99, "epoch9": 1.0} for k in keys}

@@ -224,16 +224,24 @@ EPOCH_SETTING_KEYS = {
 }
 
 
-def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
+def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = False) -> dict:
+    # Reporting old experiments must not revalidate their options against today's
+    # launch schema. Keep this compatibility strictly out of training settings.
+    legacy_revival = {
+        "sfnn_l1_revive_zero", "sfnn_l2_revive_zero",
+        "sfnn_l1_revive_threshold", "sfnn_l2_revive_threshold",
+        "sfnn_l1_revive_zero_threshold", "sfnn_l2_revive_zero_threshold",
+    }
     settings = canonical_factorizer_names(settings)
     epoch = max(1, epoch)  # Warmup epoch 0 inherits epoch 1 controls.
     resolved = dict(settings)
     for key, value in settings.items():
         if not isinstance(value, dict):
             continue
-        if key not in EPOCH_SETTING_KEYS:
+        if key not in EPOCH_SETTING_KEYS and not (historical and key in legacy_revival):
             raise ValueError(f"epoch schedule is not supported for {key}")
-        revival = key in ("sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive")
+        revival = key in ("sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive") or (
+            historical and key in ("sfnn_l1_revive_zero", "sfnn_l2_revive_zero"))
         if "epoch1" not in value and not revival:
             raise ValueError(f"{key}: epoch schedule requires epoch1")
         for name, item in value.items():
@@ -727,7 +735,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                 continue  # Unselected conditions were not extended.
             group = [row for row in rows if int(row["epoch"]) == epoch]
             last = group[-1] if group else {}
-            settings = resolve_epoch_settings(epoch_settings(trial, epoch, group), epoch)
+            settings = resolve_epoch_settings(epoch_settings(trial, epoch, group), epoch, historical=True)
             closed = last and int(last["superbatch"]) == (settings.get("warmup_sb", 0) if epoch == 0 else settings["superbatches"])
             row = {key: settings.get(key, "") for key in parameter_columns}
             if not closed:
