@@ -59,9 +59,12 @@ Rと閾値のCSV値は0～1、stdoutは%です。既存監査ファイルは上�
 
 ## 対応範囲・移行
 
-cuda-cppのdense SFNN、L1 factorizer none/shared、通常学習または層別QAT、standalone/grid searchに対応。
+cuda-cppのdense SFNN、L1 factorizer none/shared/axis、通常学習または層別QAT、standalone/grid searchに対応。
 L1はBNなしのみ。L2でBNを使用する場合は校正済みL2 BN・BN QAT・統計固定が必要です。
-worker、通常NNUE、compact L1、axis/pair、residual count gate、旧L2/L3 factorizerは未対応です。
+worker、通常NNUE、compact L1、pair、residual count gate、旧L2/L3 factorizerは未対応です。
+axisではshared・axis重みとそのoptimizer状態は保持し、対象bucketの個別重み・biasで共有分を差し引きます。
+alphaとaxis confidenceを含めてmaster/Lookaheadを別々に補償します。別bucketを共有因子のリセットに巻き込みません。
+L2のリセットはL1のaxis重みを変更しません。axis→sharedのepoch切り替えとも併用できます。
 FTの対応は下記を参照してください。nn.bin/checkpoint形式は変更しません。
 
 `sfnn_l1_revive_zero` / `sfnn_l2_revive_zero`と、旧`revive_threshold` / `revive_zero_threshold`（各層）は廃止です。
@@ -107,8 +110,9 @@ L1の両視点への接続は元の符号の±1/64とし、L1 shared分は個別
 
 処理順はFT→L1→L2です。監査は`ft-revive.csv`（既存時は連番）に保存されます。
 貢献度と閾値はCSVで0〜1、stdoutで%です。以前のepoch9検証セットの測定とは局面・GPU proxyが異なるため、選択個数は一致するとは限りません。
-対応はnon-BN dense SFNN、L1 none/shared、FT factorizer on/off、層別QAT、standalone/grid searchです。
-BN、compact L1、axis/pair、count gate、workerは未対応です。
+対応はnon-BN dense SFNN、L1 none/shared/axis、FT factorizer on/off、層別QAT、standalone/grid searchです。
+FTのL1への新接続も、sharedとaxisを合算した実効接続が±1/64になるよう個別重みで補償します。
+BN、compact L1、pair、residual count gate、workerは未対応です。
 
 ```powershell
 python .\grid_search.py --settings-file settings.json --output-folder results `

@@ -56,9 +56,13 @@ CSV R/threshold values are fractions (0..1); stdout uses percentages. Numbered a
 
 ## Support and migration
 
-Supports cuda-cpp dense SFNN, L1 none/shared, ordinary/per-layer-QAT training, standalone/grid.
+Supports cuda-cpp dense SFNN, L1 none/shared/axis, ordinary/per-layer-QAT training, standalone/grid.
 L1 requires non-BN; L2 with BN requires calibrated L2 BN, BN QAT and frozen statistics.
-Worker, ordinary NNUE, compact L1, axis/pair, residual count gates and legacy L2/L3 factorizers remain unsupported.
+Worker, ordinary NNUE, compact L1, pair, residual count gates and legacy L2/L3 factorizers remain unsupported.
+Axis revival retains shared/axis tensors and their optimizer states, subtracting their contribution
+from selected bucket-specific weights/biases. Master and Lookahead are compensated separately,
+including alpha and axis confidence. Unselected buckets are not reset through a common factor.
+L2 revival leaves upstream L1 axis weights untouched. Epoch axis-to-shared switching remains supported.
 FT revival is described below. Checkpoint/nn.bin formats are unchanged.
 
 `sfnn_l1_revive_zero`, `sfnn_l2_revive_zero` and the old per-layer `revive_threshold` / `revive_zero_threshold` options are removed.
@@ -99,8 +103,9 @@ This is approximate mean compensation, NOT pointwise-equivalent or guaranteed to
 
 Order: FT, then L1, then L2. Audit: ft-revive.csv (numbered to avoid overwrites), fractions in CSV,
 percentages on stdout. Counts may differ from offline validation-set integer nn.bin analysis.
-Supports non-BN dense SFNN, L1 none/shared, FT factorizer on/off, per-layer QAT, standalone/grid.
-BN, compact L1, axis/pair, count gates and worker trials are unsupported.
+Supports non-BN dense SFNN, L1 none/shared/axis, FT factorizer on/off, per-layer QAT, standalone/grid.
+FT outgoing residuals compensate both shared and axis terms so effective new connections are signed 1/64.
+BN, compact L1, pair, residual count gates and worker trials are unsupported.
 
 ```powershell
 python .\grid_search.py --settings-file settings.json --output-folder results `

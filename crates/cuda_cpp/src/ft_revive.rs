@@ -80,13 +80,14 @@ impl SfnnTrainStepRunner {
     pub fn revive_ft(&mut self,ctx:&Context,c:&Calibration,ids:&[usize],base_inputs:usize)->Result<()> {
         let s=self.shape;let pairs=s.ft_size/2;
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
-            || self.factorizer.any_axis() || self.residual_count_gates_enabled || s.has_compact_l1()
+            || self.residual_count_gates_enabled || s.has_compact_l1()
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some()
             || c.width!=s.ft_size || c.counts.len()!=s.num_stacks || base_inputs==0 || base_inputs>s.input_size
             || ids.iter().any(|&i|i>=pairs) || c.counts.iter().any(|&n|n<1024) {
-            return Err(CudaCppError::message("FT revival requires calibrated non-BN dense SFNN, L1 none/shared, no count gates or pending gradients"));
+            return Err(CudaCppError::message("FT revival requires calibrated non-BN dense SFNN, L1 none/shared/axis, no residual count gates or pending gradients"));
         }
         if ids.is_empty() {return Ok(());}
+        let common=revive_common::Common::read(self,ctx)?;
         // Reinitialize real feature rows. Reset virtual factorizer columns to zero.
         let mut w=self.weights.l0w.download(ctx)?;
         let mut state=self.optimizer_states.l0w.download(ctx)?;
@@ -108,19 +109,15 @@ impl SfnnTrainStepRunner {
         self.optimizer_states.l0b.upload(ctx,b.len(),RangerParamHostState{momentum:&state.momentum,velocity:&state.velocity,slow_params:&state.slow_params})?;
         let mut w=self.weights.l1w.download(ctx)?;let mut b=self.weights.l1b.download(ctx)?;
         let mut ws=self.optimizer_states.l1w.download(ctx)?;let mut bs=self.optimizer_states.l1b.download(ctx)?;
-        let (shared,slow)=if self.factorizer.shared {
-            (self.weights.l1fw.as_ref().unwrap().download(ctx)?,self.optimizer_states.l1fw.as_ref().unwrap().slow_params.download(ctx)?)
-        } else {(vec![0.0;s.ft_size*s.l1_out()],vec![0.0;s.ft_size*s.l1_out()])};
-        let a=self.factorizer_alpha.shared;
         for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
             let row=bucket*s.l1_out()+u;
             for &id in ids {for col in [id,id+pairs] {
-                let i=row*s.ft_size+col;let j=col*s.l1_out()+u;
-                let old=w[i]+a*shared[j];let old_slow=ws.slow_params[i]+a*slow[j];
+                let i=row*s.ft_size+col;
+                let old=w[i]+common.weight(bucket,u,col,false);let old_slow=ws.slow_params[i]+common.weight(bucket,u,col,true);
                 let mean=c.means[bucket*s.ft_size+col] as f32;
                 b[row]+=old*mean;bs.slow_params[row]+=old_slow*mean;
                 let v=if old<0.0 {-1.0/64.0} else {1.0/64.0};
-                w[i]=v-a*shared[j];reset(&mut ws,i,v-a*slow[j]);
+                w[i]=v-common.weight(bucket,u,col,false);reset(&mut ws,i,v-common.weight(bucket,u,col,true));
             }}
             bs.momentum[row]=0.0;bs.velocity[row]=0.0;
         }}
@@ -137,16 +134,14 @@ impl SfnnTrainStepRunner {
             return Err(CudaCppError::message("invalid FT mean compensation"));
         }
         let w=self.weights.l1w.download(ctx)?;let sw=self.optimizer_states.l1w.slow_params.download(ctx)?;
-        let (shared,slow)=if self.factorizer.shared {
-            (self.weights.l1fw.as_ref().unwrap().download(ctx)?,self.optimizer_states.l1fw.as_ref().unwrap().slow_params.download(ctx)?)
-        } else {(vec![0.0;s.ft_size*s.l1_out()],vec![0.0;s.ft_size*s.l1_out()])};
+        let common=revive_common::Common::read(self,ctx)?;
         let mut b=self.weights.l1b.download(ctx)?;let mut sb=self.optimizer_states.l1b.slow_params.download(ctx)?;
         for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
             let row=bucket*s.l1_out()+u;
             for &id in ids {for col in [id,id+s.ft_size/2] {
-                let i=row*s.ft_size+col;let j=col*s.l1_out()+u;let m=c.means[bucket*s.ft_size+col] as f32;
-                b[row]-=(w[i]+self.factorizer_alpha.shared*shared[j])*m;
-                sb[row]-=(sw[i]+self.factorizer_alpha.shared*slow[j])*m;
+                let i=row*s.ft_size+col;let m=c.means[bucket*s.ft_size+col] as f32;
+                b[row]-=(w[i]+common.weight(bucket,u,col,false))*m;
+                sb[row]-=(sw[i]+common.weight(bucket,u,col,true))*m;
             }}
         }}
         self.weights.l1b.upload(ctx,&b)?;self.optimizer_states.l1b.slow_params.upload(ctx,&sb)?;

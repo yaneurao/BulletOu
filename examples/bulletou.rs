@@ -5605,8 +5605,8 @@ impl Args {
             let spec=effective_sfnn_factorizer_spec(self);
             if self.backend!=BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
                 || self.arch().sfnn_l1_group_count()!=1 || self.arch().sfnn_l1_common_size.is_some()
-                || (spec!=SfnnFactorizerSpec::NONE && spec!=SfnnFactorizerSpec::SHARED) {
-                return Err("FT/L1/L2 revival requires cuda-cpp dense SFNN with L1 factorizer none/shared".into());
+                || spec.king_hand_pair || spec.king_progress_pair || spec.hand_progress_pair {
+                return Err("FT/L1/L2 revival requires cuda-cpp dense SFNN with L1 factorizer none/shared/axis (pair unsupported)".into());
             }
         }
         if self.sfnn_bn_l2_effective_weight_clip &&
@@ -17581,8 +17581,8 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
 fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
-    if runner.batch_norm.is_some() || runner.factorizer.any_axis() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1() {
-        return Err("FT revival requires non-BN dense SFNN, L1 none/shared and no count gates".into());
+    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1() {
+        return Err("FT revival requires non-BN dense SFNN, L1 none/shared/axis and no residual count gates".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -17647,9 +17647,9 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     if !upper && !zero {
         eprintln!("  [L1 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
-    if runner.batch_norm.is_some() || runner.factorizer.any_axis() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
         || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
-        return Err("--sfnn-l1-revive currently requires non-BN dense L1, no axes/count gates, and no legacy L2/L3 factorizers".into());
+        return Err("--sfnn-l1-revive requires non-BN dense L1, no residual count gates, and no legacy L2/L3 factorizers".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -17721,9 +17721,9 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     if !upper && !zero {
         eprintln!("  [L2 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
-    if runner.factorizer.any_axis() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+    if runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
         || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
-        return Err("--sfnn-l2-revive currently requires dense L1, no axes/count gates, and no legacy L2/L3 factorizers".into());
+        return Err("--sfnn-l2-revive requires dense L1, no residual count gates, and no legacy L2/L3 factorizers".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -32564,6 +32564,26 @@ mod tests {
             assert_eq!([a.sfnn_l1_revive,a.sfnn_l2_revive],[epoch==3;2]);
         }
         assert!(validate_epoch_setting("lr",&serde_json::json!({"epoch3":0.001})).is_err());
+    }
+
+    #[test]
+    fn axis_revival_epoch_schedule() {
+        let mut args=Args::try_parse_from(["bulletou","--teacher","/dev/null","--arch","SFNN_halfka2_1024_7_64_k3k3"]).unwrap();
+        args.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_l1_factorizer":{"epoch1":"axis","epoch8":"shared"},
+            "sfnn_ft_revive":{"epoch2":true,"epoch7":false},
+            "sfnn_l1_revive":{"epoch2":true,"epoch7":false},
+            "sfnn_l2_revive":{"epoch2":true,"epoch7":false}
+        }).to_string());
+        for epoch in 1..=9 {
+            let e=args_at_epoch(&args,epoch).unwrap();
+            e.validate_arch_flags().unwrap();
+            assert_eq!(e.sfnn_ft_revive,(2..7).contains(&epoch));
+            let spec=effective_sfnn_factorizer_spec(&e);
+            assert!(spec.shared);
+            assert_eq!(spec.king_axis,epoch<8);
+            assert!(!spec.hand_axis && !spec.progress_axis);
+        }
     }
 
     #[test]

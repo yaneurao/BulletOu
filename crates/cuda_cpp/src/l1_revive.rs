@@ -146,9 +146,9 @@ impl SfnnTrainStepRunner {
         let zero=zero && !self.l1_zero_revival_done();
         if !upper && !zero { return Ok(Vec::new()); }
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
-            || self.factorizer.any_axis() || self.residual_count_gates_enabled || self.shape.has_compact_l1()
+            || self.residual_count_gates_enabled || self.shape.has_compact_l1()
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
-            return Err(CudaCppError::message("L1 revival requires non-BN dense L1 (none/shared), no axis/count gates or legacy L2/L3 factorizers, and no pending gradients"));
+            return Err(CudaCppError::message("L1 revival requires non-BN dense L1 (none/shared/axis), no residual count gates or legacy L2/L3 factorizers, and no pending gradients"));
         }
         let s=self.shape;
         if c.input!=s.ft_size || c.width!=s.l1_hidden || c.counts.len()!=s.num_stacks
@@ -164,13 +164,7 @@ impl SfnnTrainStepRunner {
         let mut bs=self.optimizer_states.l1b.download(ctx)?;
         let mut os=self.optimizer_states.l2w.download(ctx)?;
         let mut obs=self.optimizer_states.l2b.download(ctx)?;
-        let (shared_w,shared_b,slow_w,slow_b)=if self.factorizer.shared {
-            (self.weights.l1fw.as_ref().unwrap().download(ctx)?,self.weights.l1fb.as_ref().unwrap().download(ctx)?,
-             self.optimizer_states.l1fw.as_ref().unwrap().slow_params.download(ctx)?,
-             self.optimizer_states.l1fb.as_ref().unwrap().slow_params.download(ctx)?)
-        } else { (vec![0.0;s.ft_size*s.l1_out()],vec![0.0;s.l1_out()],
-                  vec![0.0;s.ft_size*s.l1_out()],vec![0.0;s.l1_out()]) };
-        let a=self.factorizer_alpha.shared;
+        let common=revive_common::Common::read(self,ctx)?;
         let bound=(6.0/(s.ft_size+s.l1_hidden) as f32).sqrt();
         for &id in &ids {
             let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
@@ -181,13 +175,13 @@ impl SfnnTrainStepRunner {
                 rng^=rng<<13; rng^=rng>>7; rng^=rng<<17;
                 let value=(2.0*((rng>>40) as f32/16777216.0)-1.0)*bound;
                 mean+=value as f64*c.sums[bucket*s.ft_size+j]/c.counts[bucket] as f64;
-                let i=out*s.ft_size+j; let shared=j*s.l1_out()+u;
-                w1[i]=value-a*shared_w[shared];
-                reset(&mut ws,i,value-a*slow_w[shared]);
+                let i=out*s.ft_size+j;
+                w1[i]=value-common.weight(bucket,u,j,false);
+                reset(&mut ws,i,value-common.weight(bucket,u,j,true));
             }
             let bias=0.5-mean as f32;
-            b1[out]=bias-a*shared_b[u];
-            reset(&mut bs,out,bias-a*slow_b[u]);
+            b1[out]=bias-common.bias(bucket,u,false);
+            reset(&mut bs,out,bias-common.bias(bucket,u,true));
             // Quantization-visible connections allow immediate upstream gradients.
             // The caller measures the new branches and compensates their means
             // before training or saving. Treat Lookahead independently.
