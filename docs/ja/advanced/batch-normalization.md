@@ -24,42 +24,8 @@ python .\grid_search.py --settings-file settings.json --output-folder results --
 
 ## epoch開始時のL2再初期化
 
-BNなしのL1用は別機能です。[L1定数unitの再初期化](l1-revive.md)を参照してください。
-
-**L2もBNなしで使用できます。** BNなしではBNオプションやQATは必須ではなく、通常のL2 biasで再初期化後の出力位置を調整します。層別QATとの併用も可能です。
-BNなしでL1/L2両方を指定した場合は、L1を処理してから、変更後のネットワークでL2を校正・処理します。
-
-常時出力0のunitには、独立した `--sfnn-l2-revive-zero`（JSON: `"sfnn_l2_revive_zero": true`、既定false）を使います。上限側の `sfnn_l2_revive` と同時指定できます。
-
-```json
-"sfnn_l2_revive": true,
-"sfnn_l2_revive_zero": true
-```
-
-ゼロ側も下記と同じ条件・16batch校正で、bucket内1,024局面以上かつ出力0の割合が`sfnn_l2_revive_zero_threshold`（デフォルト0.99）以上の場合に処理します。上限到達率0%というだけでは選びません。Glorot入力再初期化・bias調整（BNありではBN再設定）・L3接続±1/64・選択unitのoptimizerリセットを行います。旧寄与を0と近似して、新しい平均寄与だけbiasから引きます。完全な関数保存ではありません。
-
-grid比較は `--grid sfnn_l2_revive_zero false true`。両種類を指定すると校正は1回です。処理済みフラグはepoch内の情報であり、次の有効なepochでは再判定します。[epoch設定](epoch-settings.md)も参照してください。
-
-`--sfnn-l2-revive`（JSON: `"sfnn_l2_revive": true`、デフォルトfalse）は、trueの各epochの最初のbatch前に校正・再初期化します。epoch別指定ではepoch1を省略でき、最初の指定まではfalseです。BNありの場合は校正済みL2 BN・QAT・統計固定が必要です。BNなしならscratchからも使用できます。
-**BNを使用している場合だけ**、`sfnn_bn_l2`、`sfnn_bn_qat`、`sfnn_bn_qat_freeze_stats`をtrueにし、校正済みL2 BNを使用してください。BNなしなら不要です。直接学習とgrid_searchに対応し、worker、通常NNUE、compact L1、axis/pair・residual count gate・旧L2/L3 factorizerは未対応です。
-
-```json
-"sfnn_bn_l2": true,
-"sfnn_bn_qat": true,
-"sfnn_bn_qat_freeze_stats": true,
-"sfnn_l2_revive": true
-```
-
-gridのA/B比較は `--grid sfnn_l2_revive false true`。共通設定の`initial_state`に同じcheckpointを指定してください。
-
-- 復元した教師位置から16batchを別途読み、量子化推論で校正します。校正時のshuffleは0。学習側の位置・shuffle設定は進めたり変更したりしません。検証データ・正解評価値は校正に使用しません。
-- bucket内で1,024局面以上観測され、出力1の割合が`sfnn_l2_revive_threshold`（デフォルト0.99）以上のL2 unitが対象です。少数・未出現bucketは処理しません。1.0で従来の全件一致です。[閾値設定](l1-revive.md)はepoch別・grid指定も可能です。
-- 定数寄与をL3 biasへ移し、入力をGlorot一様分布（seed=20260926）で再初期化。BNなしではL2 bias、BNありでは倍率1のBN betaを設定し、校正入力で平均preactivationを0.5にします。L3接続を元と同符号の±1/64から再学習し、その平均寄与もbias補償します。
-- 対象のmomentとLookahead slowを整合させます。他unitとFT/L1はリセットしません。`sfnn_l2_revive` 単独では出力0のunitはリセットしません。
-- 処理済み情報はcheckpointに保存しますが、次の有効なepoch開始時には再判定します。epoch途中のcheckpointからresumeした場合は重複処理しません。checkpoint/nn.binの形式は変更しません。
-- 出力先の`l2-revive.csv`に各bucket/unitの局面数・上限/下限回数・対象判定を保存します。既存ファイルは上書きせず連番にします。校正後、checkpoint保存前に中断した場合は、元checkpointから再校正します。
-
-これは完全な等価変換ではありません。定数寄与の移動後に新しい局面依存出力を作り、量子化丸めも変わります。精度・棋力の向上は保証しません。校正時のみ推論用GPU重み/workspaceとCPU入力サンプルを一時保持し、学習前に解放します。
+L2も貢献度ベースの判定に統合しました。上限/ゼロ別の判定は廃止です。
+設定・式・平均補償・対応範囲は[L1/L2再初期化](l1-revive.md)を参照してください。
 
 ## BN-QAT追加学習時のL2有効重み制限
 

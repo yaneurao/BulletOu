@@ -1,66 +1,66 @@
-# Revive constant L1 units at epoch start
-
-These opt-in flags support the non-BN cuda-cpp SFNN trainer. Both default to false:
+# Reviving low-contribution L1/L2 units at epoch boundaries
 
 ```json
 "sfnn_l1_revive": true,
-"sfnn_l1_revive_zero": true
+"sfnn_l2_revive": true,
+"sfnn_l1_revive_contribution_threshold": 0.01,
+"sfnn_l2_revive_contribution_threshold": 0.01
 ```
 
-`--sfnn-l1-revive` selects units whose normal **and** squared branches jointly output 1 at or above the threshold.
-`--sfnn-l1-revive-zero` selects units whose two branches jointly output 0 at or above the threshold.
-Zero upper-hit rate is NOT an always-zero activation. The skip output and squared-only saturation are excluded.
-Grid syntax: `--grid sfnn_l1_revive false true` and `--grid sfnn_l1_revive_zero false true`.
-Use a common `initial_state` checkpoint for A/B comparisons; scratch runs are also supported.
+Enables default to false; thresholds default to 0.01, finite in `(0, 1]`.
+Select strictly below the threshold: 0.01 means below 1%, not at or below 1%.
+These are relative contribution scores, not saturation rates or percentages of playing strength.
+
+$$U_i=\mathbb E[|h_i-\bar h_i|]\sum_j|w_{ji}|,\qquad R_i=U_i/\max_j U_j$$
+
+Use empirical mean absolute deviation (MAD), not EMA or variance. Normalize within each layer/bucket.
+L1 adds square and normal branch utilities, without cross-branch cancellation; exclude skip.
+L2 uses its outgoing L3 weight. Activations and outgoing weights come from the quantized GPU proxy.
+If every U in a bucket is zero, every R is zero and all units with sufficient coverage qualify.
+This includes mixed constants (normal=0, square=1), zero outputs, and zero quantized outgoing weights.
 
 ## Calibration and timing
 
-Before the first training batch of each enabled epoch, infer 16 teacher batches at its data position,
-without calibration shuffling or advancing the training cursor. This is not validation-set calibration.
-Positions with zero training sample weight are excluded.
-Both branches are inspected in the quantized proxy. A bucket must have at least 1,024 positions,
-with the configured fraction satisfying the requested condition. This finite sample cannot prove constancy on all positions.
-
-### Thresholds for L1 and L2
+Before the first batch of each enabled epoch (including warmup epoch0), read 16 unshuffled teacher batches
+from the current cursor, without advancing the training cursor. Exclude sample-weight-zero positions.
+Require at least 1,024 positions per bucket. Neither validation data nor target labels are used.
+Store outputs temporarily in CPU RAM for exact MAD (about 256MiB for 64 units and a million positions), not additional VRAM.
+With both layers enabled, revive L1 first, then calibrate L2 on the resulting network.
+Scores are finite-sample estimates, not guarantees over all possible positions.
 
 ```json
-"sfnn_l1_revive_threshold": 0.99,
-"sfnn_l1_revive_zero_threshold": 0.99,
-"sfnn_l2_revive_threshold": 0.99,
-"sfnn_l2_revive_zero_threshold": 0.99
+"sfnn_l1_revive": {"epoch3": true, "epoch4": false},
+"sfnn_l2_revive": {"epoch3": true, "epoch4": false},
+"sfnn_l1_revive_contribution_threshold": {"epoch1": 0.01, "epoch9": 0.02}
 ```
 
-All default to 0.99, accept finite values in (0, 1], and use inclusive comparisons.
-Use 1.0 for the previous all-observations criterion. Thresholds do not enable revival by themselves.
-Epoch maps such as `{"epoch1": 1.0, "epoch9": 0.99}` require epoch1.
-Grid example: `--grid sfnn_l1_revive_threshold 0.99 1.0`.
-If very low thresholds allow both conditions, the enabled upper condition takes precedence.
-Reviving a nonconstant unit is approximate: outputs may change on nonqualifying positions.
-Stdout reports measured fractions and thresholds and prints a yellow WARNING for nonconstant selections.
-Audit CSVs also store thresholds; existing audit files and source checkpoints are not overwritten.
+Enable maps default to false before their first entry; threshold maps require epoch1.
+Checkpoint markers prevent duplicate mid-epoch revival; each new enabled epoch recalibrates.
+Interruption before saving the modified checkpoint repeats calibration from the original checkpoint.
 
-Independent upper/zero completion flags are persisted in state.bin/weights.bin, including when no candidates exist.
-Recalibrate at the next enabled epoch boundary. A mid-epoch checkpoint resume does not repeat revival.
-All four revival controls support epoch maps, defaulting to false before the first entry and carrying values forward afterward.
-`"sfnn_l1_revive": {"epoch3": true, "epoch4": false}` applies only to epoch3.
-A scalar true applies at every epoch start (including warmup epoch0). See [epoch settings](epoch-settings.md).
-Interrupting before saving reruns calibration from the old checkpoint.
-The output folder receives `l1-revive.csv` with per-bucket/unit counts and selections; existing audits get numbered siblings.
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results `
+  --grid sfnn_l1_revive true --grid sfnn_l1_revive_contribution_threshold 0.005 0.01 0.02
+```
 
-## Mutation
+## Reset and mean compensation
 
-1. Transfer both constant upper-branch contributions to L2 bias (nothing to transfer for zero units).
-2. Glorot-uniform reinitialize the selected effective L1 input row; set bias to mean preactivation 0.5 on calibration inputs.
-3. Set both outgoing L2 columns to ±1/64, retaining each old sign (zero becomes positive). These connections survive L2 QAT, avoiding a wait for outgoing masters to cross the quantization threshold before upstream gradients can flow.
-4. Reset affected optimizer moments and independently compensate Lookahead slow weights.
+Transfer each old branch's measured mean times its outgoing weight into the next bias (not an assumed 0/1).
+Glorot-initialize incoming weights and center mean preactivation at 0.5. Preserve L1 shared weights by subtracting them from individual weights.
+Restart outgoing connections at the old sign times 1/64, then subtract their new mean contribution from the downstream bias.
+For L1, replay the same 16 batches after resetting to measure new branch means; L2 uses retained calibration inputs.
+Compensate Lookahead slow connections separately and reset affected moments. This is approximate mean compensation, not pointwise equivalence or a guarantee of accuracy/strength preservation.
 
-Shared L1 weights remain unchanged: compensate through the selected bucket's residual row. Other units, FT and L3 are not reset.
-If any units are selected, replay the same 16 teacher batches with the revived quantized proxy, measuring normal and squared branch means separately. Subtract each new connection times its branch mean from L2 bias; compensate Lookahead slow bias independently.
-The training cursor does not advance, and large teacher input arrays are not retained. This extra inference pass occurs only at revival.
-Like L2 revival, this is small-nonzero-connection plus mean compensation. It compensates mean L2 preactivation, not each position's output or mean final output. Even originally constant units are no longer pointwise-equivalent. Revival may saturate again and is not guaranteed to improve playing strength.
+`l1-revive.csv` / `l2-revive.csv` record counts, upper/zero hits, U, relative score R, selection and threshold.
+CSV R/threshold values are fractions (0..1); stdout uses percentages. Numbered audit files preserve previous records.
 
-Supported: dense L1, factorizer none/shared, non-BN training including per-layer QAT, standalone/grid search.
-BN, axis/pair, residual count gates, compact L1, legacy L2/L3 factorizers and worker trials are rejected explicitly.
-The nn.bin inference format is unchanged; old checkpoints without completion flags are treated as unprocessed.
+## Support and migration
 
-[L2 upper/zero revival](batch-normalization.md) also supports non-BN training. When all four flags are true, L1 revival runs before L2 calibration and revival.
+Supports cuda-cpp dense SFNN, L1 none/shared, ordinary/per-layer-QAT training, standalone/grid.
+L1 requires non-BN; L2 with BN requires calibrated L2 BN, BN QAT and frozen statistics.
+Worker, ordinary NNUE, compact L1, axis/pair, residual count gates and legacy L2/L3 factorizers remain unsupported.
+FT revival is not included. Checkpoint/nn.bin formats are unchanged.
+
+`sfnn_l1_revive_zero`, `sfnn_l2_revive_zero` and the old per-layer `revive_threshold` / `revive_zero_threshold` options are removed.
+Their presence produces a migration error. Remove them and use 0.01 above; do not carry over 0.99.
+Existing checkpoints remain readable; remove obsolete keys from launch settings.

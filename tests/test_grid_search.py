@@ -16,8 +16,7 @@ import grid_search as grid
 
 class GridSearchTests(unittest.TestCase):
     def test_revival_threshold_epoch_settings(self):
-        keys = ["sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold",
-                "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"]
+        keys = ["sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"]
         settings = {k: {"epoch1": 0.99, "epoch9": 1.0} for k in keys}
         self.assertEqual(grid.resolve_epoch_settings(settings, 8), dict.fromkeys(keys, 0.99))
         self.assertEqual(grid.resolve_epoch_settings(settings, 9), dict.fromkeys(keys, 1.0))
@@ -94,7 +93,7 @@ class GridSearchTests(unittest.TestCase):
             grid.canonical_factorizer_names({"ft_factorizer": True, "sfnn_ft_factorizer": False})
 
     def test_revival_epoch_settings(self):
-        for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero"):
+        for key in ("sfnn_l1_revive", "sfnn_l2_revive"):
             settings = {key: {"epoch3": True, "epoch4": False}}
             for epoch in (1, 2, 3, 4, 5):
                 self.assertEqual(grid.resolve_epoch_settings(settings, epoch)[key], epoch == 3)
@@ -116,7 +115,7 @@ class GridSearchTests(unittest.TestCase):
             grid.resolve_epoch_settings({"sfnn_ft_factorizer":{"epoch1":False,"epoch2":True}},1)
 
     def test_l1_revival_grid_flags(self):
-        for key in ("sfnn_l1_revive", "sfnn_l1_revive_zero"):
+        for key in ("sfnn_l1_revive",):
             plan = self.plan(["--grid", key.replace("_", "-"), "false", "true"])
             self.assertEqual({t["settings"][key] for t in plan["trials"]}, {False, True})
             self.assertIn(key, grid.COMMON_COLUMNS)
@@ -193,9 +192,13 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual({t["settings"]["sfnn_l2_revive"] for t in plan["trials"]},{False,True})
         self.assertIn("sfnn_l2_revive",grid.COMMON_COLUMNS)
     def test_l2_revive_zero_grid(self):
-        plan=self.plan(["--grid","sfnn-l2-revive-zero","false","true"])
-        self.assertEqual({t["settings"]["sfnn_l2_revive_zero"] for t in plan["trials"]},{False,True})
-        self.assertIn("sfnn_l2_revive_zero",grid.COMMON_COLUMNS)
+        for key in ("sfnn_l1_revive_zero", "sfnn_l2_revive_zero", "sfnn_l1_revive_threshold",
+                    "sfnn_l1_revive_zero_threshold", "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"):
+            with self.assertRaisesRegex(ValueError, "was removed"):
+                self.plan(["--grid",key,"false"])
+            for value in (False, None, {"epoch9": True}):
+                with self.assertRaisesRegex(ValueError, "was removed"):
+                    grid.check_settings({**self.common,key:value})
     def test_bn_l2_effective_clip_grid(self):
         plan=self.plan(["--grid","sfnn-bn-l2-effective-weight-clip","false","true"])
         self.assertEqual({t["settings"]["sfnn_bn_l2_effective_weight_clip"] for t in plan["trials"]},{False,True})

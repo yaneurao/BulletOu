@@ -55,9 +55,7 @@ COMMON_COLUMNS = (
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
-    "sfnn_l2_revive_zero",
     "sfnn_l1_revive",
-    "sfnn_l1_revive_zero",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",
@@ -211,8 +209,8 @@ def positive_int(settings: dict, key: str) -> int:
 
 EPOCH_SETTING_KEYS = {
     "sfnn_l1_factorizer",
-    "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
-    "sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold", "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold",
+    "sfnn_l1_revive", "sfnn_l2_revive",
+    "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_ft_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
@@ -234,7 +232,7 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
             continue
         if key not in EPOCH_SETTING_KEYS:
             raise ValueError(f"epoch schedule is not supported for {key}")
-        revival = key in ("sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero")
+        revival = key in ("sfnn_l1_revive", "sfnn_l2_revive")
         if "epoch1" not in value and not revival:
             raise ValueError(f"{key}: epoch schedule requires epoch1")
         for name, item in value.items():
@@ -260,6 +258,11 @@ def resolve_epoch_settings(settings: dict, epoch: int) -> dict:
 
 
 def check_settings(settings: dict) -> None:
+    for key in settings:
+        if key.replace("-", "_") in {"sfnn_l1_revive_zero", "sfnn_l2_revive_zero",
+                "sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold",
+                "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"}:
+            raise ValueError(f"{key} was removed; delete revive_zero and old saturation thresholds; use sfnn_l1_revive / sfnn_l2_revive with sfnn_l1_revive_contribution_threshold / sfnn_l2_revive_contribution_threshold = 0.01 (strictly below 1%); do not reuse 0.99")
     if any(isinstance(v, dict) for v in settings.values()):
         resolve_epoch_settings(settings, 1)  # Validate keys/types before parsing boundaries.
         boundaries = {1} | {int(n[5:]) for v in settings.values() if isinstance(v, dict) for n in v}
@@ -280,9 +283,8 @@ def check_settings(settings: dict) -> None:
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
     warmup = settings.get("warmup_sb", 0)
-    for key in ("sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold",
-                "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold"):
-        value = settings.get(key, 0.99)
+    for key in ("sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
+        value = settings.get(key, 0.01)
         if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"{key} must be finite and in (0, 1]")
     if type(warmup) is not int or warmup < 0:

@@ -4022,6 +4022,12 @@ fn bulletou_settings_json_value_to_args(
         return Err(format!("{} has invalid option key `{key}`", path.display()));
     }
     let normalized = key.replace('_', "-");
+    if matches!(normalized.as_str(), "sfnn-l1-revive-zero" | "sfnn-l2-revive-zero"
+        | "sfnn-l1-revive-threshold" | "sfnn-l1-revive-zero-threshold"
+        | "sfnn-l2-revive-threshold" | "sfnn-l2-revive-zero-threshold") {
+        return Err(format!("{key} was removed; delete revive_zero and old saturation thresholds; use sfnn_l1_revive / sfnn_l2_revive with sfnn_l1_revive_contribution_threshold / sfnn_l2_revive_contribution_threshold = 0.01 (strictly below 1%); do not reuse 0.99"));
+    }
+
     if normalized == "sfnn-init-l2-l3-glorot" {
         return Err("sfnn_init_l2_l3_glorot was removed; specify sfnn_init_l2_glorot and sfnn_init_l3_glorot separately".into());
     }
@@ -4101,8 +4107,8 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "sfnn_l1_revive_threshold", "sfnn_l1_revive_zero_threshold", "sfnn_l2_revive_threshold", "sfnn_l2_revive_zero_threshold",
-    "sfnn_l1_revive", "sfnn_l1_revive_zero", "sfnn_l2_revive", "sfnn_l2_revive_zero",
+    "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
+    "sfnn_l1_revive", "sfnn_l2_revive",
     "ft_factorizer",
     "sfnn_l1_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -4116,6 +4122,10 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
 ];
 
 fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), String> {
+    if matches!(key,"sfnn_l1_revive_zero" | "sfnn_l2_revive_zero" | "sfnn_l1_revive_threshold"
+        | "sfnn_l1_revive_zero_threshold" | "sfnn_l2_revive_threshold" | "sfnn_l2_revive_zero_threshold") {
+        return Err(format!("{key} was removed; use sfnn_l1_revive / sfnn_l2_revive and the corresponding revive_contribution_threshold = 0.01; do not reuse 0.99"));
+    }
     if !EPOCH_SETTING_KEYS.contains(&key) {
         return Err(format!("epoch schedule is not supported for `{key}`; supported: {}", EPOCH_SETTING_KEYS.join(", ")));
     }
@@ -4150,7 +4160,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
 }
 
 fn is_revival_setting(key: &str) -> bool {
-    matches!(key, "sfnn_l1_revive" | "sfnn_l1_revive_zero" | "sfnn_l2_revive" | "sfnn_l2_revive_zero")
+    matches!(key, "sfnn_l1_revive" | "sfnn_l2_revive")
 }
 
 fn epoch_setting_value_for<'a>(key: &str, value: &'a serde_json::Value, epoch: usize) -> Result<&'a serde_json::Value, String> {
@@ -4216,8 +4226,8 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(sfnn_l1_revive, sfnn_l1_revive_zero, sfnn_l2_revive, sfnn_l2_revive_zero, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
-            sfnn_l1_revive_threshold, sfnn_l1_revive_zero_threshold, sfnn_l2_revive_threshold, sfnn_l2_revive_zero_threshold,
+        assign!(sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+            sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
@@ -5365,30 +5375,30 @@ struct Args {
     /// Requires L2 BN and frozen-stat BN QAT. Default: off.
     #[arg(long)]
     sfnn_bn_l2_effective_weight_clip: bool,
-    /// At each enabled epoch start, revive L2 units meeting the upper-hit threshold using teacher calibration.
+    /// Reset low-contribution L2 units at each enabled epoch boundary.
     #[arg(long)]
     sfnn_l2_revive: bool,
-    /// At each enabled epoch start, revive L2 units meeting the zero-output threshold using teacher calibration.
-    #[arg(long)]
-    sfnn_l2_revive_zero: bool,
-    /// At each enabled epoch start, revive L1 units whose normal AND squared branches meet the joint upper-hit threshold.
+    /// Reset low-contribution L1 branch pairs at each enabled epoch boundary.
     #[arg(long)]
     sfnn_l1_revive: bool,
-    /// At each enabled epoch start, revive L1 units whose normal AND squared branches meet the joint zero-output threshold.
-    #[arg(long)]
+    /// Reset when relative contribution is strictly below this fraction (0, 1].
+    #[arg(long, default_value_t = 0.01)]
+    sfnn_l1_revive_contribution_threshold: f64,
+    /// Reset when relative contribution is strictly below this fraction (0, 1].
+    #[arg(long, default_value_t = 0.01)]
+    sfnn_l2_revive_contribution_threshold: f64,
+    #[arg(long, hide = true)]
     sfnn_l1_revive_zero: bool,
-    /// Required upper-hit fraction for L1 revival, in (0, 1].
-    #[arg(long, default_value_t = 0.99)]
-    sfnn_l1_revive_threshold: f64,
-    /// Required zero-output fraction for L1 revival, in (0, 1].
-    #[arg(long, default_value_t = 0.99)]
-    sfnn_l1_revive_zero_threshold: f64,
-    /// Required upper-hit fraction for L2 revival, in (0, 1].
-    #[arg(long, default_value_t = 0.99)]
-    sfnn_l2_revive_threshold: f64,
-    /// Required zero-output fraction for L2 revival, in (0, 1].
-    #[arg(long, default_value_t = 0.99)]
-    sfnn_l2_revive_zero_threshold: f64,
+    #[arg(long, hide = true)]
+    sfnn_l2_revive_zero: bool,
+    #[arg(long, hide = true)]
+    sfnn_l1_revive_threshold: Option<f64>,
+    #[arg(long, hide = true)]
+    sfnn_l1_revive_zero_threshold: Option<f64>,
+    #[arg(long, hide = true)]
+    sfnn_l2_revive_threshold: Option<f64>,
+    #[arg(long, hide = true)]
+    sfnn_l2_revive_zero_threshold: Option<f64>,
     #[arg(long, default_value_t = 0.25)]
     sfnn_bn_gamma: f32,
     #[arg(long, default_value_t = 0.5)]
@@ -5566,7 +5576,12 @@ impl Args {
         if self.sfnn_bn_qat_freeze_stats && !self.sfnn_bn_qat {
             return Err("--sfnn-bn-qat-freeze-stats requires --sfnn-bn-qat".into());
         }
-        for (name,value) in [("sfnn_l1_revive_threshold", self.sfnn_l1_revive_threshold), ("sfnn_l1_revive_zero_threshold", self.sfnn_l1_revive_zero_threshold), ("sfnn_l2_revive_threshold", self.sfnn_l2_revive_threshold), ("sfnn_l2_revive_zero_threshold", self.sfnn_l2_revive_zero_threshold)] {
+        if self.sfnn_l1_revive_zero || self.sfnn_l2_revive_zero
+            || self.sfnn_l1_revive_threshold.is_some() || self.sfnn_l1_revive_zero_threshold.is_some()
+            || self.sfnn_l2_revive_threshold.is_some() || self.sfnn_l2_revive_zero_threshold.is_some() {
+            return Err("revive_zero and saturation thresholds were removed; use sfnn_l1_revive / sfnn_l2_revive and sfnn_l1_revive_contribution_threshold / sfnn_l2_revive_contribution_threshold (default 0.01, strictly below 1%); do not reuse 0.99".into());
+        }
+        for (name,value) in [("sfnn_l1_revive_contribution_threshold", self.sfnn_l1_revive_contribution_threshold), ("sfnn_l2_revive_contribution_threshold", self.sfnn_l2_revive_contribution_threshold)] {
             if !value.is_finite() || value<=0.0 || value>1.0 {
                 return Err(format!("{name} must be finite and in (0, 1]"));
             }
@@ -17558,7 +17573,7 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
     let upper=args.sfnn_l1_revive && !runner.l1_revival_done();
-    let zero=args.sfnn_l1_revive_zero && !runner.l1_zero_revival_done();
+    let zero=false;
     if !upper && !zero {
         eprintln!("  [L1 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
@@ -17572,9 +17587,8 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
     let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,cfg.batch_size)).map_err(|e|e.to_string())?;
     let mut calibration=l1_revive::Calibration::new(shape.ft_size,shape.l1_hidden,shape.num_stacks);
-    calibration.set_thresholds(args.sfnn_l1_revive_threshold,args.sfnn_l1_revive_zero_threshold).map_err(|e|e.to_string())?;
-    eprintln!("  [L1 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket, upper={upper} zero={zero}, upper_threshold={} zero_threshold={}; learning cursor unchanged",
-        args.sfnn_l1_revive_threshold,args.sfnn_l1_revive_zero_threshold);
+    eprintln!("  [L1 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket; contribution < {}%; learning cursor unchanged",
+        100.0*args.sfnn_l1_revive_contribution_threshold);
     let measure = |calibration: &mut l1_revive::Calibration| -> std::result::Result<(),String> {
         for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
             let fast=teacher.batch;
@@ -17589,12 +17603,14 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
         Ok(())
     };
     measure(&mut calibration)?;
+    calibration.contribution.finish(&proxy.l2w.download(ctx).map_err(|e|e.to_string())?,
+        shape.l2_size, 2, args.sfnn_l1_revive_contribution_threshold).map_err(|e|e.to_string())?;
     let candidates=calibration.candidates_for(upper,zero);
-    let mut report=String::from("bucket,unit,positions,both_upper_hits,both_zero_hits,selected,upper_threshold,zero_threshold\n");
+    let mut report=String::from("bucket,unit,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold\n");
     for i in 0..calibration.upper.len() {
         let b=i/shape.l1_hidden;
-        report.push_str(&format!("{b},{},{},{},{},{},{},{}\n",i%shape.l1_hidden,calibration.counts[b],calibration.upper[i],calibration.lower[i],candidates.contains(&i),
-            args.sfnn_l1_revive_threshold,args.sfnn_l1_revive_zero_threshold));
+        report.push_str(&format!("{b},{},{},{},{},{:.10},{:.10},{},{}\n",i%shape.l1_hidden,calibration.counts[b],calibration.upper[i],calibration.lower[i],
+            calibration.contribution.utility[i],calibration.contribution.relative[i],candidates.contains(&i),args.sfnn_l1_revive_contribution_threshold));
     }
     // Persist the audit before mutating weights. Never touch the source checkpoint.
     std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
@@ -17618,14 +17634,11 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     }
     eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, outgoing L2 +/-1/64, per-branch mean bias compensation (approximate, not pointwise-equivalent), selected moments reset; audit={}",ids.len(),path.display());
     for i in ids {
-        let is_upper=calibration.is_upper(i,upper);
-        let n=calibration.counts[i/shape.l1_hidden];
-        let hits=if is_upper {calibration.upper[i]} else {calibration.lower[i]};
-        eprintln!("  [L1 REVIVE] bucket={} unit={} kind={} hits={hits}/{n} rate={:.6}% threshold={}",
-            i/shape.l1_hidden,i%shape.l1_hidden,if is_upper {"upper"} else {"zero"},
-            100.0*hits as f64/n as f64,if is_upper {args.sfnn_l1_revive_threshold} else {args.sfnn_l1_revive_zero_threshold});
-        if hits<n { eprintln!("{}",paint("  WARNING: revival of a nonconstant unit is approximate; outputs can change on nonqualifying positions.",ConsoleColor::BoldYellow)); }
+        eprintln!("  [L1 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
+            i/shape.l1_hidden,i%shape.l1_hidden,calibration.contribution.utility[i],
+            100.0*calibration.contribution.relative[i],100.0*args.sfnn_l1_revive_contribution_threshold);
     }
+    if !candidates.is_empty() { eprintln!("{}",paint("  WARNING: contribution-based revival preserves an estimated mean, not pointwise outputs; accuracy can change.",ConsoleColor::BoldYellow)); }
     Ok(())
 }
 
@@ -17634,7 +17647,7 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
     let upper=args.sfnn_l2_revive && !runner.l2_revival_done();
-    let zero=args.sfnn_l2_revive_zero && !runner.l2_zero_revival_done();
+    let zero=false;
     if !upper && !zero {
         eprintln!("  [L2 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
@@ -17648,9 +17661,8 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
     let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,cfg.batch_size)).map_err(|e|e.to_string())?;
     let mut calibration=l2_revive::Calibration::new(shape.l2_in(),shape.l2_size,shape.num_stacks);
-    calibration.set_thresholds(args.sfnn_l2_revive_threshold,args.sfnn_l2_revive_zero_threshold).map_err(|e|e.to_string())?;
-    eprintln!("  [L2 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket, upper={upper} zero={zero}, upper_threshold={} zero_threshold={}; learning cursor unchanged",
-        args.sfnn_l2_revive_threshold,args.sfnn_l2_revive_zero_threshold);
+    eprintln!("  [L2 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket; contribution < {}%; learning cursor unchanged",
+        100.0*args.sfnn_l2_revive_contribution_threshold);
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
         let fast=teacher.batch;
         let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
@@ -17658,15 +17670,17 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
         let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch {stm_indices:&stm,nstm_indices:&nstm,
             buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
         sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
-        calibration.add(&fast.buckets,&workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,
-            &workspace.l2.download(ctx).map_err(|e|e.to_string())?).map_err(|e|e.to_string())
+        calibration.add_masked(&fast.buckets,&workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,
+            &workspace.l2.download(ctx).map_err(|e|e.to_string())?,Some(&fast.weights)).map_err(|e|e.to_string())
     })?;
+    calibration.contribution.finish(&proxy.l3w.download(ctx).map_err(|e|e.to_string())?,
+        1, 1, args.sfnn_l2_revive_contribution_threshold).map_err(|e|e.to_string())?;
     let candidates=calibration.candidates_for(upper,zero);
-    let mut report=String::from("bucket,unit,positions,upper_hits,lower_hits,revived,upper_threshold,zero_threshold\n");
+    let mut report=String::from("bucket,unit,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold\n");
     for i in 0..calibration.upper.len() {
         let b=i/shape.l2_size;
-        report.push_str(&format!("{b},{},{},{},{},{},{},{}\n",i%shape.l2_size,calibration.counts[b],calibration.upper[i],calibration.lower[i],candidates.contains(&i),
-            args.sfnn_l2_revive_threshold,args.sfnn_l2_revive_zero_threshold));
+        report.push_str(&format!("{b},{},{},{},{},{:.10},{:.10},{},{}\n",i%shape.l2_size,calibration.counts[b],calibration.upper[i],calibration.lower[i],
+            calibration.contribution.utility[i],calibration.contribution.relative[i],candidates.contains(&i),args.sfnn_l2_revive_contribution_threshold));
     }
     // Persist the audit before mutating weights. Never touch the source checkpoint.
     std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
@@ -17682,14 +17696,11 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     let ids=runner.revive_l2_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
     eprintln!("  [L2 REVIVE] complete: {} units; Glorot inputs, L3=+/-1/64, bias compensation, selected moments reset; audit={}",ids.len(),path.display());
     for i in ids {
-        let is_upper=calibration.is_upper(i,upper);
-        let n=calibration.counts[i/shape.l2_size];
-        let hits=if is_upper {calibration.upper[i]} else {calibration.lower[i]};
-        eprintln!("  [L2 REVIVE] bucket={} unit={} kind={} hits={hits}/{n} rate={:.6}% threshold={}",
-            i/shape.l2_size,i%shape.l2_size,if is_upper {"upper"} else {"zero"},
-            100.0*hits as f64/n as f64,if is_upper {args.sfnn_l2_revive_threshold} else {args.sfnn_l2_revive_zero_threshold});
-        if hits<n { eprintln!("{}",paint("  WARNING: revival of a nonconstant unit is approximate; outputs can change on nonqualifying positions.",ConsoleColor::BoldYellow)); }
+        eprintln!("  [L2 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
+            i/shape.l2_size,i%shape.l2_size,calibration.contribution.utility[i],
+            100.0*calibration.contribution.relative[i],100.0*args.sfnn_l2_revive_contribution_threshold);
     }
+    if !candidates.is_empty() { eprintln!("{}",paint("  WARNING: contribution-based revival preserves an estimated mean, not pointwise outputs; accuracy can change.",ConsoleColor::BoldYellow)); }
     Ok(())
 }
 
@@ -27901,7 +27912,7 @@ mod tests {
     fn l1_revival_flags_load_legacy_and_validate() {
         let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
             "--arch","SFNN_ka2_32_8_32","--sfnn-l1-factorizer","none",
-            "--sfnn-l1-revive","--sfnn-l1-revive-zero","--sfnn-l2-revive","--sfnn-l2-revive-zero"]).unwrap();
+            "--sfnn-l1-revive","--sfnn-l2-revive"]).unwrap();
         args.validate_arch_flags().unwrap();
         let kind=CudaCppSfnnFeatureKind::Ka2;
         let initial=build_sfnn_initial_weights_for_cuda_cpp(&args,kind).unwrap();
@@ -28095,7 +28106,7 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
             "--arch","SFNN_halfka2_1024_8_64_progress8","--superbatches","324","--max-epochs","7",
-            "--sfnn-bn-l2","--sfnn-bn-qat","--sfnn-l2-revive","--sfnn-l2-revive-zero",
+            "--sfnn-bn-l2","--sfnn-bn-qat","--sfnn-l2-revive",
             "--sfnn-bn-l2-effective-weight-clip","--resume","--output",tmp.to_str().unwrap()]).unwrap();
         args.epoch_settings_json=Some(serde_json::json!({
             "sfnn_bn_qat_freeze_stats":{"epoch1":false,"epoch2":true},
@@ -32471,7 +32482,7 @@ mod tests {
             "--teacher","/dev/null","--backend","cuda-cpp","--superbatches","1","--max-epochs","5"]).unwrap();
         let schedule=serde_json::json!({"epoch3":true,"epoch4":false});
         let mut maps=serde_json::Map::new();
-        for key in ["sfnn_l1_revive","sfnn_l1_revive_zero","sfnn_l2_revive","sfnn_l2_revive_zero"] {
+        for key in ["sfnn_l1_revive","sfnn_l2_revive"] {
             validate_epoch_setting(key,&schedule).unwrap();
             assert_eq!(epoch_setting_value_for(key,&schedule,1).unwrap(),&serde_json::json!(false));
             assert!(validate_epoch_setting(key,&serde_json::json!({"epoch3":1})).is_err());
@@ -32480,7 +32491,7 @@ mod tests {
         args.epoch_settings_json=Some(serde_json::Value::Object(maps).to_string());
         for epoch in 1..=5 {
             let a=args_at_epoch(&args,epoch).unwrap();
-            assert_eq!([a.sfnn_l1_revive,a.sfnn_l1_revive_zero,a.sfnn_l2_revive,a.sfnn_l2_revive_zero],[epoch==3;4]);
+            assert_eq!([a.sfnn_l1_revive,a.sfnn_l2_revive],[epoch==3;2]);
         }
         assert!(validate_epoch_setting("lr",&serde_json::json!({"epoch3":0.001})).is_err());
     }
@@ -32488,25 +32499,32 @@ mod tests {
     #[test]
     fn revival_threshold_settings() {
         let mut args=Args::try_parse_from(["bulletou","--teacher","/dev/null","--arch","SFNN_halfka2_128_8_32_k3k3"]).unwrap();
-        assert_eq!(args.sfnn_l1_revive_threshold,0.99);
-        assert_eq!(args.sfnn_l1_revive_zero_threshold,0.99);
-        assert_eq!(args.sfnn_l2_revive_threshold,0.99);
-        assert_eq!(args.sfnn_l2_revive_zero_threshold,0.99);
+        assert_eq!(args.sfnn_l1_revive_contribution_threshold,0.01);
+        assert_eq!(args.sfnn_l2_revive_contribution_threshold,0.01);
         assert!(!args.sfnn_l1_revive && !args.sfnn_l2_revive);
         args.epoch_settings_json=Some(serde_json::json!({
-            "sfnn_l1_revive_threshold":{"epoch1":0.99,"epoch9":1.0},
-            "sfnn_l1_revive_zero_threshold":{"epoch1":0.98,"epoch9":0.995},
-            "sfnn_l2_revive_threshold":{"epoch1":1.0,"epoch9":0.99},
-            "sfnn_l2_revive_zero_threshold":{"epoch1":0.999,"epoch9":0.99}
+            "sfnn_l1_revive_contribution_threshold":{"epoch1":0.01,"epoch9":0.02},
+            "sfnn_l2_revive_contribution_threshold":{"epoch1":0.02,"epoch9":0.01}
         }).to_string());
         let e=args_at_epoch(&args,9).unwrap();
-        assert_eq!([e.sfnn_l1_revive_threshold,e.sfnn_l1_revive_zero_threshold,
-            e.sfnn_l2_revive_threshold,e.sfnn_l2_revive_zero_threshold],[1.0,0.995,0.99,0.99]);
+        assert_eq!([e.sfnn_l1_revive_contribution_threshold,e.sfnn_l2_revive_contribution_threshold],[0.02,0.01]);
         assert!(!e.sfnn_l1_revive && !e.sfnn_l2_revive);
         args.epoch_settings_json=None;
         for v in [0.0,-1.0,1.01,f64::NAN] {
-            args.sfnn_l1_revive_threshold=v;
+            args.sfnn_l1_revive_contribution_threshold=v;
             assert!(args.validate_arch_flags().is_err());
+        }
+    }
+
+    #[test]
+    fn removed_revival_options_have_migration_errors() {
+        for key in ["sfnn_l1_revive_zero","sfnn_l2_revive_zero","sfnn_l1_revive_threshold",
+            "sfnn_l1_revive_zero_threshold","sfnn_l2_revive_threshold","sfnn_l2_revive_zero_threshold"] {
+            for value in [serde_json::json!(false),serde_json::Value::Null,serde_json::json!(0.99)] {
+                let err=bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),key,&value,&mut Vec::new()).unwrap_err();
+                assert!(err.contains("was removed") && err.contains("0.01"));
+            }
+            assert!(validate_epoch_setting(key,&serde_json::json!({"epoch9":true})).unwrap_err().contains("was removed"));
         }
     }
 
@@ -35361,7 +35379,7 @@ mod tests {
         assert!(!frozen.sfnn_l2_revive);
         assert!(!frozen.sfnn_l2_revive_zero);
         let mut zero=frozen.clone();zero.sfnn_l2_revive_zero=true;
-        assert!(zero.validate_arch_flags().is_ok());
+        assert!(zero.validate_arch_flags().unwrap_err().contains("were removed"));
         zero.sfnn_bn_l2=false;assert!(zero.validate_arch_flags().is_err());
         let mut revive=frozen.clone();revive.sfnn_l2_revive=true;
         assert!(revive.validate_arch_flags().is_ok());

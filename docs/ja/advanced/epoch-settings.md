@@ -85,21 +85,19 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 [Grid search](grid-search.md) / [English](../../en/advanced/epoch-settings.md)
 ## epoch開始時のunit再初期化
 
-`sfnn_l1_revive`, `sfnn_l1_revive_zero`, `sfnn_l2_revive`, `sfnn_l2_revive_zero`
+`sfnn_l1_revive`, `sfnn_l2_revive`
 は、そのepochでtrueなら最初のbatchの学習前に判定・処理します。単一のtrueは毎epoch適用されます。
 
 ```json
 {
   "sfnn_l1_revive": {"epoch3": true, "epoch4": false},
-  "sfnn_l1_revive_zero": {"epoch3": true, "epoch4": false},
-  "sfnn_l2_revive": {"epoch3": true, "epoch4": false},
-  "sfnn_l2_revive_zero": {"epoch3": true, "epoch4": false}
+  "sfnn_l2_revive": {"epoch3": true, "epoch4": false}
 }
 ```
 
-この例はepoch3だけに適用します。この4項目に限りepoch1を省略でき、最初の指定まではfalseです。epoch4:falseを省略するとepoch3以降の毎epochで適用します。
+この例はepoch3だけに適用します。この2項目に限りepoch1を省略でき、最初の指定まではfalseです。epoch4:falseを省略するとepoch3以降の毎epochで適用します。
 
-L1→L2の順に、その時点の重みを使って教師16batchで再判定します。全unitの無条件リセットではありません。既存の判定条件（bucket内1024局面以上・サンプル全件で定数）と初期化方式は変更していません。
+L1→L2の順に、その時点の重みを使って教師16batchで再判定します。bucket内1,024局面以上かつ相対貢献度が閾値未満のunitを選びます。詳細は[貢献度ベースの再初期化](l1-revive.md)を参照してください。
 
 epoch途中からresumeした場合は重複処理せず、次のepoch開始を待ちます。前epoch末尾からresumeする場合は実施します。保存前に中断して古いcheckpointへ戻った場合は再判定します。FT factorizer切り替えやBN QAT設定変更が同時にある場合は、それらの適用後に処理します。warmup epoch0はepoch1設定を使用します。
 

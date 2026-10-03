@@ -79,21 +79,19 @@ The teacher shuffle window uses the settings active at startup and remains fixed
 [Grid search](grid-search.md) / [日本語](../../ja/advanced/epoch-settings.md)
 ## Unit revival at epoch boundaries
 
-`sfnn_l1_revive`, `sfnn_l1_revive_zero`, `sfnn_l2_revive`, `sfnn_l2_revive_zero`
+`sfnn_l1_revive`, `sfnn_l2_revive`
 run before the first training batch of each epoch where enabled. A scalar true runs every epoch.
 
 ```json
 {
   "sfnn_l1_revive": {"epoch3": true, "epoch4": false},
-  "sfnn_l1_revive_zero": {"epoch3": true, "epoch4": false},
-  "sfnn_l2_revive": {"epoch3": true, "epoch4": false},
-  "sfnn_l2_revive_zero": {"epoch3": true, "epoch4": false}
+  "sfnn_l2_revive": {"epoch3": true, "epoch4": false}
 }
 ```
 
-This example applies only at epoch3. Only these four settings may omit epoch1; the default before the first entry is false. Omitting epoch4:false keeps revival enabled for all later epochs.
+This example applies only at epoch3. Only these two settings may omit epoch1; the default before the first entry is false. Omitting epoch4:false keeps revival enabled for all later epochs.
 
-L1 runs before L2, with fresh 16-teacher-batch calibration using current weights. This is not an unconditional reset of every unit. Existing eligibility criteria (at least 1024 positions per bucket, constant in every sampled position) and initialization are unchanged.
+L1 runs before L2, with fresh 16-teacher-batch calibration using current weights. Require at least 1,024 positions per bucket and relative contribution strictly below the threshold. See [contribution-based revival](l1-revive.md).
 
 Mid-epoch resume skips revival; resume from the previous epoch end performs it. Interruption before saving recalibrates when restarting from the old checkpoint. FT factorizer and BN QAT transitions are applied before revival. Warmup epoch0 uses epoch1 settings.
 

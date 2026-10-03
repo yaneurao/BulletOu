@@ -41,43 +41,10 @@ QAT is active from the start. Epoch1 updates BN statistics; before the first bat
 
 Later false values resume statistics updates. Resume resolves the resumed epoch; warmup epoch0 uses epoch1. Future settings do not affect earlier epochs. Frozen mode requires calibrated statistics and QAT enabled. BN L2 effective clipping and restore-time L2 revival require frozen mode and cannot remain enabled during statistics-updating training. Worker mode does not support epoch schedules. User settings files are not automatically rewritten.
 
-## L2 revival at epoch start
+## L2 revival at epoch boundaries
 
-For non-BN L1, see the separate [L1 revival feature](l1-revive.md).
-
-**L2 revival also supports non-BN training.** Neither BN nor QAT is required in that mode: the ordinary L2 bias supplies the new activation shift. Per-layer QAT is supported too.
-When enabling both non-BN L1 and L2 revival, L1 runs first; L2 is calibrated using the resulting network.
-
-For always-zero units, use the independent `--sfnn-l2-revive-zero` (JSON `"sfnn_l2_revive_zero": true`, default false). It can be combined with upper revival:
-
-```json
-"sfnn_l2_revive": true,
-"sfnn_l2_revive_zero": true
-```
-
-The same prerequisites and 16-batch calibration below apply: at least 1,024 positions in a bucket, with zero-output fraction at least `sfnn_l2_revive_zero_threshold` (default 0.99). Zero **upper-saturation rate** alone does not qualify. Glorot input initialization, bias adjustment (BN reset when BN is enabled), outgoing ±1/64 and selected optimizer reset are the same as upper revival. Approximate the old contribution as zero, then subtract the new mean contribution from L3 bias. This is not exact function preservation.
-
-Compare with `--grid sfnn_l2_revive_zero false true`. Both kinds share one calibration pass when enabled. Completion markers apply within an epoch; the next enabled epoch recalibrates. See [epoch settings](epoch-settings.md).
-
-`--sfnn-l2-revive` (JSON `"sfnn_l2_revive": true`, default false) calibrates and revives constant-upper L2 units before the first batch of every enabled epoch. Epoch maps may omit epoch1 (defaults to false). When BN is enabled, calibrated frozen L2 BN QAT is required. Non-BN scratch training is allowed. Worker, ordinary NNUE, compact L1, axes/pairs, residual count gates and legacy L2/L3 factorizers remain unsupported.
-
-```json
-"sfnn_bn_l2": true,
-"sfnn_bn_qat": true,
-"sfnn_bn_qat_freeze_stats": true,
-"sfnn_l2_revive": true
-```
-
-Compare with `--grid sfnn_l2_revive false true` using the same `initial_state` in common settings.
-
-- Calibration independently reads 16 teacher batches from the restored position, without shuffling. The training cursor/shuffle is unchanged. Validation data and target labels are not used for calibration.
-- Units reaching the upper clamp in at least `sfnn_l2_revive_threshold` (default 0.99) of observed positions in their bucket, with at least 1,024 positions, qualify. Unseen/underrepresented buckets are skipped. Use 1.0 for the previous strict criterion. See [threshold settings](l1-revive.md) for epoch maps and grid search.
-- Move the constant contribution into L3 bias; Glorot-uniform initialize incoming weights (seed 20260926); center the mean calibration preactivation at 0.5 using L2 bias without BN, or BN beta with scale one when BN is enabled. Start the outgoing connection at the original sign times 1/64 and compensate its mean contribution in L3 bias.
-- Reset selected moments and synchronize Lookahead slow state. Do not reset other units or FT/L1. `sfnn_l2_revive` alone does not reset always-zero units.
-- Completion flags are saved, but each enabled new epoch recalibrates. Mid-epoch checkpoint resumes do not repeat revival. Checkpoint and nn.bin formats are unchanged.
-- `l2-revive.csv` records per-bucket/unit counts, upper/lower hits and selection. Existing audits are preserved with numbered filenames. Interruption before a new checkpoint is saved causes recalibration from the original checkpoint on restart.
-
-This intentionally changes the function slightly; it is not an exact equivalence transformation or a guarantee of improved strength. Temporary GPU proxy/workspace and CPU calibration inputs are released before training.
+L2 now uses contribution-based selection, without separate upper/zero criteria.
+See [L1/L2 revival](l1-revive.md) for options, equations, mean compensation and support restrictions.
 
 ## Effective L2 weight bounds for BN-QAT fine tuning
 

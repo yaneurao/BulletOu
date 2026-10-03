@@ -1,71 +1,69 @@
-# L1の定数unitをepoch開始時に再初期化する
-
-BNなしのcuda-cpp SFNNで使用できます。両方ともデフォルトはfalseです。
+# L1・L2の低貢献unitをepoch開始時に再初期化する
 
 ```json
 "sfnn_l1_revive": true,
-"sfnn_l1_revive_zero": true
+"sfnn_l2_revive": true,
+"sfnn_l1_revive_contribution_threshold": 0.01,
+"sfnn_l2_revive_contribution_threshold": 0.01
 ```
 
-- `sfnn_l1_revive`: 通常枝・二乗枝の**両方が1になる割合が閾値以上**のunitを対象にします。
-- `sfnn_l1_revive_zero`: 両枝が**同時に0になる割合が閾値以上**のunitを対象にします。上限到達率の低さとは異なります。
-- L1 skip出力は対象外です。二乗枝だけが飽和しているunitも対象外です。
+有効化の既定はfalse、閾値の既定は0.01です。閾値だけでは有効になりません。
+閾値は有限の `(0, 1]`。同じ層・bucket内の最大貢献度を1とし、**閾値未満**を選びます。
+0.01なら1%未満であり、1%ちょうどは対象外です。飽和率・棋力への貢献割合ではありません。
 
-CLIは `--sfnn-l1-revive` / `--sfnn-l1-revive-zero`。grid searchでは
-`--grid sfnn_l1_revive false true` / `--grid sfnn_l1_revive_zero false true` です。
-同じ`initial_state`を共通設定に指定して比較できます。scratch開始にも対応します。
+## 指標
 
-## 判定と適用タイミング
+$$U_i=\mathbb E[|h_i-\bar h_i|]\sum_j|w_{ji}|,\qquad R_i=U_i/\max_j U_j$$
 
-trueのepochの最初のbatchを学習する前に、その時点の教師読み出し位置から16batchを推論します。
-検証セットではなく教師を使用し、学習の読み出し位置は進めません。校正時のshuffleは無効です。
-学習のsample weightが0の局面は判定から除外します。
-量子化proxyの両枝を調べ、bucket内に1,024局面以上あり、指定割合以上で条件を満たした場合に対象にします。
-これは有限サンプルでの判定であり、全局面での定数性の証明ではありません。
+教師サンプルの実測平均と平均絶対偏差（MAD）を用います。EMAや分散の近似ではありません。
+L1は通常枝と二乗枝それぞれのUを合算します。枝間の打ち消しは考慮せず、skipは除外します。
+L2はL3への接続重みを使用します。出力と後段重みはいずれも量子化GPU proxyで測ります。
+全unitのUが0のbucketではRを全て0とします。そのbucketに十分な局面があれば全unitが対象です。
+通常枝0・二乗枝1のような混合定数、出力一定0、後段の量子化重み0も検出できます。
 
-各種類の処理済み情報はstate.bin/weights.binに保存します。対象0件でも処理済みとなります。
-次のepoch開始時には改めて判定します。epoch途中のcheckpointからresumeすると、そのepochでは再実行しません。
-4つのrevive設定はepoch別指定にも対応します。指定開始前はfalse、指定後は次の指定まで値を引き継ぎます。
-`"sfnn_l1_revive": {"epoch3": true, "epoch4": false}`ならepoch3だけです。
-単一のtrueなら全epoch（warmup epoch0を含む）で判定します。詳しくは[epoch設定](epoch-settings.md)。
-処理後のcheckpoint保存前に中断した場合は、元checkpointから再判定します。
+## 校正・タイミング
 
-判定内容は学習出力フォルダの`l1-revive.csv`に記録します。既存ファイルは上書きせず連番にします。
-
-## 何を変更するか
-
-### 閾値（L1/L2共通の指定方法）
+trueの各epochの開始時（warmup epoch0を含む）に、その時点の教師位置から16batchを読みます。
+shuffleなし、sample weightが0の局面は除外。bucket内1,024局面未満なら処理しません。
+検証セットや正解評価値は使わず、学習の読み出し位置も進めません。
+MAD用の出力をCPU RAMに一時保持します。64unit×約100万局面なら約256MiBです。追加VRAMは不要です。
+L1とL2を両方指定するとL1を先に処理し、変更後のネットワークでL2を測定します。
+有限サンプルでの推定であり、全局面での定数性・低貢献を保証しません。
 
 ```json
-"sfnn_l1_revive_threshold": 0.99,
-"sfnn_l1_revive_zero_threshold": 0.99,
-"sfnn_l2_revive_threshold": 0.99,
-"sfnn_l2_revive_zero_threshold": 0.99
+"sfnn_l1_revive": {"epoch3": true, "epoch4": false},
+"sfnn_l2_revive": {"epoch3": true, "epoch4": false},
+"sfnn_l1_revive_contribution_threshold": {"epoch1": 0.01, "epoch9": 0.02}
 ```
 
-すべてデフォルト0.99、範囲は0より大きく1以下です。1.0なら従来の全件一致です。
-閾値だけでは有効化されず、対応するrevive/revive_zeroのON/OFFに従います。
-`{"epoch1": 1.0, "epoch9": 0.99}`のepoch別指定にも対応します（epoch1必須）。
-gridでは `--grid sfnn_l1_revive_threshold 0.99 1.0` のように指定します。
-非常に低い閾値で両条件を満たす場合は、有効な上限側を優先します。
+有効化は最初の指定までfalse、閾値のepoch指定はepoch1必須です。
+処理済み情報をcheckpointに保存し、epoch途中のresumeでは再処理しません。次の有効epochでは再判定します。
+校正後のcheckpoint保存前に中断すると、保存元から再実行されます。
 
-100%未満のunitをリセットすると、条件を満たさない局面では出力が変わります。
-完全等価ではありません。対象unitの実測割合・閾値をstdoutに出し、非定数なら黄色のWARNINGを出します。
-判定CSVにも閾値を保存します。既存CSV・checkpointは書き換えません。
+```powershell
+python .\grid_search.py --settings-file settings.json --output-folder results `
+  --grid sfnn_l1_revive true --grid sfnn_l1_revive_contribution_threshold 0.005 0.01 0.02
+```
 
-1. 上限側では両枝からL2への定数寄与をL2のbiasに足します。ゼロ側では足しません。
-2. 対象unitのL1有効重みをGlorot一様分布で再初期化し、校正入力での平均preactivationが0.5になるようbiasを設定します。
-3. 対象の両枝からL2への重みを、元の符号を保った±1/64にします（元が0なら+）。L2 QATでもゼロに丸められず、接続が量子化境界を越えるのを待たずにL1へ勾配を伝えられます。
-4. 変更箇所のoptimizer momentをリセットし、Lookahead slow側も独立に補償します。
+## リセットと平均補償
 
-L1 shared自体は変更せず、対象bucketの個別重みで差し引きます。他bucket/unit、FT、L3はリセットしません。
-対象があるときだけ、同じ教師16batchをリセット後の量子化proxyでもう一度推論し、通常枝・二乗枝それぞれの新しい出力平均を測ります。L2のbiasから「新しい接続重み×枝の平均」を差し引きます。Lookahead slowのbiasも独立に補償します。
-学習の読み出し位置は進めず、大量の教師入力を保持しません。追加の16batch推論はリセット時だけです。
-L2 reviveと同じく微小接続＋平均補償方式です。L2 preactivationの平均を補償するもので、各局面の出力や最終出力の平均まで保存するものではありません。旧unitが100%定数でも完全等価ではありません。
-再初期化後に再び定数化しない保証や、棋力向上の保証もありません。A/B比較用の機能です。
+旧unitの**各枝の実測平均×元の後段重み**を後段biasへ移します。0または1への決め打ちはしません。
+入力重みをGlorot一様初期化し、校正入力で平均preactivationが0.5となるようbiasを調整します。
+L1 sharedは保持し、個別重みで差し引きます。後段接続は元の符号を持つ±1/64から再学習します。
+新しい接続による平均寄与を後段biasから差し引きます。L1では同じ教師16batchを再推論して新しい各枝の平均を測ります。
+L2では保持した校正入力から新出力の平均を求めます。Lookahead slowも別の接続重みで補償し、対象のmomentをリセットします。
+これは推定した平均の補償であり、局面ごとの等価性・精度・棋力維持を保証しません。
 
-対応範囲: dense L1、L1 factorizer none/shared、BNなし、通常学習または層別QAT、standalone/grid search。
-BN、axis/pair、residual count gate、compact L1、旧L2/L3 factorizer、worker trialは未対応でエラーにします。
-nn.binの推論形式は変更しません。既存checkpointに処理済み情報がなければ未処理として読み込みます。
+`l1-revive.csv` / `l2-revive.csv`に局面数・上限/ゼロ回数・U・相対貢献度R・選択結果・閾値を保存します。
+Rと閾値のCSV値は0～1、stdoutは%です。既存監査ファイルは上書きせず連番にします。
 
-[L2の上限・ゼロrevive](batch-normalization.md)もBNなしに対応しています。4項目を同時にtrueにした場合は、L1を処理した後のネットワークでL2を校正・処理します。
+## 対応範囲・移行
+
+cuda-cppのdense SFNN、L1 factorizer none/shared、通常学習または層別QAT、standalone/grid searchに対応。
+L1はBNなしのみ。L2でBNを使用する場合は校正済みL2 BN・BN QAT・統計固定が必要です。
+worker、通常NNUE、compact L1、axis/pair、residual count gate、旧L2/L3 factorizerは未対応です。
+FTの貢献度リセットは今回追加していません。nn.bin/checkpoint形式は変更しません。
+
+`sfnn_l1_revive_zero` / `sfnn_l2_revive_zero`と、旧`revive_threshold` / `revive_zero_threshold`（各層）は廃止です。
+指定が残っていると移行エラーになります。旧0.99を新閾値へ転記せず、冒頭の0.01へ変更してください。
+古いcheckpointは読めますが、起動設定の旧項目は削除が必要です。

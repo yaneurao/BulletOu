@@ -10,12 +10,15 @@ pub struct Calibration {
     upper_threshold: f64,
     zero_threshold: f64,
     inputs: Vec<Vec<f32>>,
+    pub contribution: l1_revive::Contribution,
+    sums: Vec<f64>,
 }
 impl Calibration {
     pub fn new(input: usize, width: usize, groups: usize) -> Self {
         Self { input, width, counts: vec![0; groups], upper: vec![0; groups*width],
             lower: vec![0; groups*width], upper_threshold: 0.99, zero_threshold: 0.99,
-            inputs: vec![Vec::new(); groups] }
+            inputs: vec![Vec::new(); groups], contribution:l1_revive::Contribution::new(width,groups),
+            sums:vec![0.0;groups*width] }
     }
     pub fn set_thresholds(&mut self, upper: f64, zero: f64) -> Result<()> {
         if [upper,zero].iter().any(|v| !v.is_finite() || *v<=0.0 || *v>1.0) {
@@ -33,15 +36,25 @@ impl Calibration {
         enabled && n>=1024 && self.lower[i] as f64/n as f64>=self.zero_threshold
     }
     pub fn add(&mut self, buckets: &[i32], x: &[f32], y: &[f32]) -> Result<()> {
+        self.add_masked(buckets,x,y,None)
+    }
+    pub fn add_masked(&mut self, buckets: &[i32], x: &[f32], y: &[f32], weights:Option<&[f32]>) -> Result<()> {
         expect_len("revive inputs",buckets.len()*self.input,x.len())?;
         expect_len("revive outputs",buckets.len()*self.width,y.len())?;
+        if let Some(w)=weights {
+            expect_len("L2 revival sample weights",buckets.len(),w.len())?;
+            if w.iter().any(|v|!v.is_finite() || *v<0.0) {return Err(CudaCppError::message("invalid L2 revival sample weight"));}
+        }
         if x.iter().chain(y).any(|v| !v.is_finite()) || buckets.iter().any(|&b| b<0 || b as usize>=self.counts.len()) {
             return Err(CudaCppError::message("invalid L2 revival calibration"));
         }
         for (row,&b) in buckets.iter().enumerate() {
+            if weights.is_some_and(|w|w[row]==0.0) {continue;}
             let b=b as usize; self.counts[b]+=1;
+            self.contribution.add(b,&y[row*self.width..(row+1)*self.width]);
             self.inputs[b].extend_from_slice(&x[row*self.input..(row+1)*self.input]);
             for u in 0..self.width {
+                self.sums[b*self.width+u]+=y[row*self.width+u] as f64;
                 self.upper[b*self.width+u]+=usize::from(y[row*self.width+u]>=1.0);
                 self.lower[b*self.width+u]+=usize::from(y[row*self.width+u]<=0.0);
             }
@@ -52,6 +65,9 @@ impl Calibration {
         self.candidates_for(true, false)
     }
     pub fn candidates_for(&self, upper: bool, zero: bool) -> Vec<usize> {
+        if !self.contribution.relative.is_empty() {
+            return if upper || zero {self.contribution.selected(&self.counts,self.width)} else {Vec::new()};
+        }
         self.upper.iter().enumerate().filter_map(|(i,_)| {
             (self.is_upper(i,upper) || self.is_zero(i,zero)).then_some(i)
         }).collect()
@@ -121,7 +137,7 @@ impl SfnnTrainStepRunner {
                     +((beta*8128.0).round()/8128.0) as f64; v.clamp(0.0,1.0)
             }).sum::<f64>()/count as f64;
             let v=if out[i]<0.0 {-1.0/64.0} else {1.0/64.0};
-            let old_activation=if c.is_upper(i,upper) {1.0} else {0.0};
+            let old_activation=(c.sums[i]/count as f64) as f32;
             ob[g]+=old_activation*out[i]-v*mean_y as f32;
             obs.slow_params[g]+=old_activation*os.slow_params[i]-v*mean_y as f32;
             out[i]=v;os.slow_params[i]=v;os.momentum[i]=0.0;os.velocity[i]=0.0;
@@ -157,6 +173,26 @@ impl SfnnTrainStepRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_contribution_preserves_empirical_mean_not_upper_or_zero() {
+        let ctx=Context::new(0).unwrap();let s=crate::tests::tiny_sfnn_shape();
+        let mut host=crate::tests::tiny_sfnn_weights(s);
+        host.l1fw=None;host.l1fb=None;host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,1024,1).unwrap();
+        let mut c=Calibration::new(s.l2_in(),s.l2_size,s.num_stacks);
+        for i in 0..1024 {
+            let mut y=vec![(i%2) as f32;s.l2_size];y[0]=0.75;
+            c.add(&[0],&vec![0.0;s.l2_in()],&y).unwrap();
+        }
+        let old=r.read_weights(&ctx).unwrap();
+        c.contribution.finish(&old.l3w,1,1,0.01).unwrap();
+        assert_eq!(c.candidates_for(true,false),vec![0]);
+        assert_eq!(r.revive_l2_selected(&ctx,&c,true,false).unwrap(),vec![0]);
+        let new=r.read_weights(&ctx).unwrap();
+        assert!((new.l3b[0]-old.l3b[0]-0.75*old.l3w[0]+0.5*new.l3w[0]).abs()<1e-6);
+        assert_eq!(old.l0w,new.l0w);assert_eq!(old.l1w,new.l1w);
+        assert!(r.revive_l2_selected(&ctx,&c,true,false).unwrap().is_empty());
+    }
     #[test]
     fn configurable_thresholds_and_zero_classification() {
         let mut c=Calibration::new(1,4,1);

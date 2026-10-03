@@ -1,6 +1,59 @@
 //! Restore-time revival of constant L1 branch pairs (not the skip output).
 use super::*;
 
+/// Exact empirical MAD, not an EMA or a variance approximation. CPU-only storage.
+pub struct Contribution {
+    width: usize,
+    values: Vec<Vec<f32>>,
+    pub means: Vec<f64>,
+    pub utility: Vec<f64>,
+    pub relative: Vec<f64>,
+    pub threshold: f64,
+}
+impl Contribution {
+    pub fn new(width:usize, groups:usize) -> Self {
+        Self {width,values:vec![Vec::new();groups],means:vec![0.0;width*groups],
+            utility:Vec::new(),relative:Vec::new(),threshold:0.01}
+    }
+    pub fn add(&mut self,b:usize,y:&[f32]) { self.values[b].extend_from_slice(y); }
+    /// Weights are [bucket, downstream unit, branch]; branches are square then normal for L1.
+    pub fn finish(&mut self,w:&[f32],out:usize,branches:usize,threshold:f64) -> Result<()> {
+        if !threshold.is_finite() || threshold<=0.0 || threshold>1.0 {
+            return Err(CudaCppError::message("revive contribution threshold must be finite and in (0, 1]"));
+        }
+        expect_len("revive outgoing weights",self.values.len()*out*self.width,w.len())?;
+        if w.iter().any(|x|!x.is_finite()) || branches==0 || self.width%branches!=0 {
+            return Err(CudaCppError::message("invalid contribution weights or branch layout"));
+        }
+        let units=self.width/branches;
+        self.utility=vec![0.0;self.values.len()*units];
+        self.relative=self.utility.clone();self.threshold=threshold;
+        for (b,ys) in self.values.iter().enumerate() {
+            let n=ys.len()/self.width;
+            if n==0 {continue;}
+            let mean=&mut self.means[b*self.width..(b+1)*self.width];
+            mean.fill(0.0);
+            for row in ys.chunks_exact(self.width) {for (m,&y) in mean.iter_mut().zip(row) {*m+=y as f64;}}
+            for m in mean.iter_mut() {*m/=n as f64;}
+            for col in 0..self.width {
+                let mad=ys.chunks_exact(self.width).map(|row|(row[col] as f64-mean[col]).abs()).sum::<f64>()/n as f64;
+                let norm=(0..out).map(|j|w[(b*out+j)*self.width+col].abs() as f64).sum::<f64>();
+                self.utility[b*units+col%units]+=mad*norm;
+            }
+            let max=self.utility[b*units..(b+1)*units].iter().copied().fold(0.0,f64::max);
+            if max>0.0 {for i in b*units..(b+1)*units {self.relative[i]=self.utility[i]/max;}}
+        }
+        if self.utility.iter().chain(&self.relative).any(|v|!v.is_finite()) {
+            return Err(CudaCppError::message("non-finite revival contribution"));
+        }
+        self.values.iter_mut().for_each(|v|*v=Vec::new());
+        Ok(())
+    }
+    pub fn selected(&self,counts:&[usize],units:usize) -> Vec<usize> {
+        (0..self.relative.len()).filter(|&i|counts[i/units]>=1024 && self.relative[i]<self.threshold).collect()
+    }
+}
+
 pub struct Calibration {
     pub input: usize,
     pub width: usize,
@@ -11,13 +64,15 @@ pub struct Calibration {
     zero_threshold: f64,
     sums: Vec<f64>,
     branch_sums: Vec<f64>,
+    pub contribution: Contribution,
 }
 
 impl Calibration {
     pub fn new(input: usize, width: usize, groups: usize) -> Self {
         Self { input, width, counts: vec![0; groups], upper: vec![0; groups*width],
             lower: vec![0; groups*width], upper_threshold: 0.99, zero_threshold: 0.99,
-            sums: vec![0.0; groups*input], branch_sums: vec![0.0; groups*2*width] }
+            sums: vec![0.0; groups*input], branch_sums: vec![0.0; groups*2*width],
+            contribution:Contribution::new(2*width,groups) }
     }
     pub fn set_thresholds(&mut self, upper: f64, zero: f64) -> Result<()> {
         if [upper,zero].iter().any(|v| !v.is_finite() || *v<=0.0 || *v>1.0) {
@@ -55,6 +110,7 @@ impl Calibration {
             if weights.is_some_and(|w|w[row]==0.0) { continue; }
             let b=bucket as usize;
             self.counts[b]+=1;
+            self.contribution.add(b,&y[row*2*self.width..(row+1)*2*self.width]);
             for j in 0..self.input { self.sums[b*self.input+j]+=x[row*self.input+j] as f64; }
             for u in 0..self.width {
                 let square=y[row*2*self.width+u];
@@ -68,6 +124,9 @@ impl Calibration {
         Ok(())
     }
     pub fn candidates_for(&self, upper: bool, zero: bool) -> Vec<usize> {
+        if !self.contribution.relative.is_empty() {
+            return if upper || zero {self.contribution.selected(&self.counts,self.width)} else {Vec::new()};
+        }
         (0..self.upper.len()).filter(|&i| {
             self.is_upper(i,upper) || self.is_zero(i,zero)
         }).collect()
@@ -116,7 +175,6 @@ impl SfnnTrainStepRunner {
         for &id in &ids {
             let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
             let out=bucket*s.l1_out()+u;
-            let constant=if c.is_upper(id,upper) {1.0} else {0.0};
             let mut rng=0x9e3779b97f4a7c15u64 ^ id as u64;
             let mut mean=0.0f64;
             for j in 0..s.ft_size {
@@ -136,6 +194,7 @@ impl SfnnTrainStepRunner {
             for j in 0..s.l2_size {
                 let row=bucket*s.l2_size+j;
                 for col in [u,s.l1_hidden+u] {
+                    let constant=(c.branch_sums[bucket*2*s.l1_hidden+col]/c.counts[bucket] as f64) as f32;
                     let i=row*s.l2_in()+col;
                     b2[row]+=constant*w2[i];
                     obs.slow_params[row]+=constant*os.slow_params[i];
@@ -201,6 +260,54 @@ impl SfnnTrainStepRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn contribution_mad_normalization_and_strict_boundary() {
+        let mut c=Contribution::new(4,2);
+        for i in 0..1024 {
+            // Both branches of unit 0 are constant, but one is 0 and one is 1.
+            c.add(0,&[1.0,(i%2) as f32,0.0,(i%2) as f32]);
+            c.add(1,&[0.0,1.0,0.0,1.0]);
+        }
+        c.finish(&[1.0;8],1,2,0.01).unwrap();
+        assert_eq!(c.utility,vec![0.0,1.0,0.0,0.0]);
+        assert_eq!(c.relative,vec![0.0,1.0,0.0,0.0]);
+        assert_eq!(c.selected(&[1024,1024],2),vec![0,2,3]);
+        assert_eq!(c.selected(&[1024,1023],2),vec![0]);
+        c.relative=vec![0.009999,0.01,0.010001,0.0];
+        assert_eq!(c.selected(&[1024,1024],2),vec![0,3]);
+    }
+    #[test]
+    fn contribution_uses_outgoing_weights_and_rejects_invalid_values() {
+        let mut c=Contribution::new(3,1);
+        c.add(0,&[0.0,0.0,0.25]);c.add(0,&[1.0,1.0,0.75]);
+        c.finish(&[0.0,-2.0,1.0],1,1,0.01).unwrap();
+        assert_eq!(c.utility,vec![0.0,1.0,0.25]);
+        assert_eq!(c.means,vec![0.5;3]);
+        for bad in [0.0,-0.1,1.01,f64::NAN,f64::INFINITY] {
+            assert!(Contribution::new(1,1).finish(&[1.0],1,1,bad).is_err());
+        }
+    }
+    #[test]
+    fn gpu_contribution_mixed_constant_transfers_only_square_mean() {
+        let ctx=Context::new(0).unwrap();
+        let s=crate::tests::tiny_sfnn_shape();
+        let mut host=crate::tests::tiny_sfnn_weights(s);
+        host.l1fw=None;host.l1fb=None;host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,1024,1).unwrap();
+        let mut c=Calibration::new(s.ft_size,s.l1_hidden,s.num_stacks);
+        assert_eq!(s.l1_hidden,2);
+        for i in 0..1024 {c.add(&[0],&vec![0.0;s.ft_size],&[1.0,(i%2) as f32,0.0,(i%2) as f32]).unwrap();}
+        let old=r.read_weights(&ctx).unwrap();
+        c.contribution.finish(&old.l2w,s.l2_size,2,0.01).unwrap();
+        assert_eq!(c.candidates_for(true,false),vec![0]);
+        assert_eq!(r.revive_l1_selected(&ctx,&c,true,false).unwrap(),vec![0]);
+        let new=r.read_weights(&ctx).unwrap();
+        for j in 0..s.l2_size {
+            assert!((new.l2b[j]-old.l2b[j]-old.l2w[j*s.l2_in()]).abs()<1e-6);
+        }
+        assert_eq!(old.l0w,new.l0w);assert_eq!(old.l3w,new.l3w);
+        assert!(r.revive_l1_selected(&ctx,&c,true,false).unwrap().is_empty());
+    }
     #[test]
     fn configurable_thresholds_and_zero_classification() {
         let mut c=Calibration::new(1,4,1);
