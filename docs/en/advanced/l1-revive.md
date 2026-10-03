@@ -51,13 +51,13 @@ The output folder receives `l1-revive.csv` with per-bucket/unit counts and selec
 
 1. Transfer both constant upper-branch contributions to L2 bias (nothing to transfer for zero units).
 2. Glorot-uniform reinitialize the selected effective L1 input row; set bias to mean preactivation 0.5 on calibration inputs.
-3. Zero the two outgoing L2 columns. They remain trainable: incoming L1 gradients resume after those columns move from zero.
+3. Set both outgoing L2 columns to ±1/64, retaining each old sign (zero becomes positive). These connections survive L2 QAT, avoiding a wait for outgoing masters to cross the quantization threshold before upstream gradients can flow.
 4. Reset affected optimizer moments and independently compensate Lookahead slow weights.
 
 Shared L1 weights remain unchanged: compensate through the selected bucket's residual row. Other units, FT and L3 are not reset.
-Unlike L2 revival's small nonzero outgoing connection, L1 uses zero columns to avoid an immediate fresh-unit contribution.
-Bias transfer is algebraically equivalent where the original branches are constant, not a guarantee of exact quantized
-or unseen-position parity. Revival may saturate again and is not guaranteed to improve playing strength.
+If any units are selected, replay the same 16 teacher batches with the revived quantized proxy, measuring normal and squared branch means separately. Subtract each new connection times its branch mean from L2 bias; compensate Lookahead slow bias independently.
+The training cursor does not advance, and large teacher input arrays are not retained. This extra inference pass occurs only at revival.
+Like L2 revival, this is small-nonzero-connection plus mean compensation. It compensates mean L2 preactivation, not each position's output or mean final output. Even originally constant units are no longer pointwise-equivalent. Revival may saturate again and is not guaranteed to improve playing strength.
 
 Supported: dense L1, factorizer none/shared, non-BN training including per-layer QAT, standalone/grid search.
 BN, axis/pair, residual count gates, compact L1, legacy L2/L3 factorizers and worker trials are rejected explicitly.

@@ -10,13 +10,14 @@ pub struct Calibration {
     upper_threshold: f64,
     zero_threshold: f64,
     sums: Vec<f64>,
+    branch_sums: Vec<f64>,
 }
 
 impl Calibration {
     pub fn new(input: usize, width: usize, groups: usize) -> Self {
         Self { input, width, counts: vec![0; groups], upper: vec![0; groups*width],
             lower: vec![0; groups*width], upper_threshold: 0.99, zero_threshold: 0.99,
-            sums: vec![0.0; groups*input] }
+            sums: vec![0.0; groups*input], branch_sums: vec![0.0; groups*2*width] }
     }
     pub fn set_thresholds(&mut self, upper: f64, zero: f64) -> Result<()> {
         if [upper,zero].iter().any(|v| !v.is_finite() || *v<=0.0 || *v>1.0) {
@@ -58,6 +59,8 @@ impl Calibration {
             for u in 0..self.width {
                 let square=y[row*2*self.width+u];
                 let normal=y[row*2*self.width+self.width+u];
+                self.branch_sums[(b*2)*self.width+u]+=square as f64;
+                self.branch_sums[(b*2+1)*self.width+u]+=normal as f64;
                 self.upper[b*self.width+u]+=usize::from(square>=1.0 && normal>=1.0);
                 self.lower[b*self.width+u]+=usize::from(square<=0.0 && normal<=0.0);
             }
@@ -127,16 +130,17 @@ impl SfnnTrainStepRunner {
             let bias=0.5-mean as f32;
             b1[out]=bias-a*shared_b[u];
             reset(&mut bs,out,bias-a*slow_b[u]);
-            // Remove BOTH constant outgoing branches; trainable zero columns avoid
-            // an arbitrary initial perturbation. Incoming gradients resume once
-            // these columns move away from zero. Treat Lookahead independently.
+            // Quantization-visible connections allow immediate upstream gradients.
+            // The caller measures the new branches and compensates their means
+            // before training or saving. Treat Lookahead independently.
             for j in 0..s.l2_size {
                 let row=bucket*s.l2_size+j;
                 for col in [u,s.l1_hidden+u] {
                     let i=row*s.l2_in()+col;
                     b2[row]+=constant*w2[i];
                     obs.slow_params[row]+=constant*os.slow_params[i];
-                    w2[i]=0.0; reset(&mut os,i,0.0);
+                    let v=if w2[i]<0.0 {-1.0/64.0} else {1.0/64.0};
+                    w2[i]=v; reset(&mut os,i,v);
                 }
                 obs.momentum[row]=0.0; obs.velocity[row]=0.0;
             }
@@ -158,6 +162,39 @@ impl SfnnTrainStepRunner {
         self.layer_qat=Default::default();
         self.l1_revival_flags |= u8::from(upper) | (u8::from(zero)<<1);
         Ok(ids)
+    }
+
+    /// Subtract the measured new branch contributions at each L2 preactivation.
+    /// Call once after revival, using the same masked teacher sample and quantized proxy.
+    pub fn compensate_l1_revival_mean(&mut self, ctx:&Context, ids:&[usize], c:&Calibration) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let s=self.shape;
+        if c.width!=s.l1_hidden || c.counts.len()!=s.num_stacks
+            || ids.iter().any(|&i|i>=s.num_stacks*s.l1_hidden || c.counts[i/s.l1_hidden]==0) {
+            return Err(CudaCppError::message("invalid L1 revival mean calibration"));
+        }
+        let w=self.weights.l2w.download(ctx)?;
+        let slow_w=self.optimizer_states.l2w.slow_params.download(ctx)?;
+        let mut b=self.weights.l2b.download(ctx)?;
+        let mut slow_b=self.optimizer_states.l2b.slow_params.download(ctx)?;
+        for &id in ids {
+            let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
+            for col in [u,s.l1_hidden+u] {
+                let mean=(c.branch_sums[bucket*2*s.l1_hidden+col]/c.counts[bucket] as f64) as f32;
+                for j in 0..s.l2_size {
+                    let row=bucket*s.l2_size+j;
+                    b[row]-=w[row*s.l2_in()+col]*mean;
+                    slow_b[row]-=slow_w[row*s.l2_in()+col]*mean;
+                }
+            }
+        }
+        if b.iter().chain(&slow_b).any(|v|!v.is_finite()) {
+            return Err(CudaCppError::message("non-finite L1 revival mean compensation"));
+        }
+        self.weights.l2b.upload(ctx,&b)?;
+        self.optimizer_states.l2b.slow_params.upload(ctx,&slow_b)?;
+        self.layer_qat=Default::default();
+        Ok(())
     }
 }
 
@@ -186,7 +223,7 @@ mod tests {
         assert_eq!(c.candidates_for(true,false),vec![0]); // reported epoch9 case
     }
     #[test]
-    fn gpu_revival_preserves_outputs_shared_skip_and_slow_state() {
+    fn gpu_revival_mean_compensation_and_immediate_qat_gradient() {
         let ctx=Context::new(0).unwrap();
         let shape=crate::tests::tiny_sfnn_shape();
         for shared in [false,true] { for qat in [false,true] {
@@ -214,7 +251,7 @@ mod tests {
                     r.factorizer,r.factorizer_alpha,None,None,None).unwrap();
                 r.forward_workspace.output.download(&ctx).unwrap()
             };
-            let before=forward(&r);
+            forward(&r);
             let mut c=Calibration::new(4,2,2);
             c.add(&buckets,&r.forward_workspace.combined.download(&ctx).unwrap(),
                 &r.forward_workspace.l2_input.download(&ctx).unwrap()).unwrap();
@@ -227,8 +264,12 @@ mod tests {
             assert!(r.l1_revival_done() && !r.l1_zero_revival_done());
             c.lower[2]-=1; // near-zero selection must still compensate as zero, not one
             assert_eq!(r.revive_l1_selected(&ctx,&c,true,true).unwrap(),vec![2]);
-            let after=forward(&r);
-            assert!(before.iter().zip(after).all(|(a,b)|(a-b).abs()<1e-5));
+            r.prepare_l1_qat(&ctx,qat).unwrap();
+            forward(&r);
+            let mut means=Calibration::new(4,2,2);
+            means.add(&buckets,&r.forward_workspace.combined.download(&ctx).unwrap(),
+                &r.forward_workspace.l2_input.download(&ctx).unwrap()).unwrap();
+            r.compensate_l1_revival_mean(&ctx,&[0,2],&means).unwrap();
             let new=r.read_weights(&ctx).unwrap();
             assert_eq!(old.l0w,new.l0w); assert_eq!(old.l3w,new.l3w);
             assert_eq!(old.l1fw,new.l1fw); assert_eq!(old.l1fb,new.l1fb);
@@ -237,8 +278,23 @@ mod tests {
                 assert_eq!(&old.l1b[k*3+1..k*3+3],&new.l1b[k*3+1..k*3+3]);
             }
             let slow=r.optimizer_states.l2b.slow_params.download(&ctx).unwrap();
-            assert!((slow[0]-1.6).abs()<1e-6 && (slow[1]-1.6).abs()<1e-6);
-            assert_eq!(&slow[2..],&[0.1,0.1]);
+            for bucket in 0..2 {
+                for j in 0..shape.l2_size {
+                    let row=bucket*shape.l2_size+j;
+                    let mut correction=0.0;
+                    let mut old_constant=0.0;
+                    for col in [0,2] {
+                        let idx=row*shape.l2_in()+col;
+                        let v=if old.l2w[idx]<0.0 {-1.0/64.0} else {1.0/64.0};
+                        assert_eq!(new.l2w[idx],v);
+                        correction+=v*(means.branch_sums[bucket*4+col]/means.counts[bucket] as f64) as f32;
+                        if bucket==0 { old_constant+=old.l2w[idx]; }
+                    }
+                    assert!((new.l2b[row]-(old.l2b[row]+old_constant-correction)).abs()<1e-6);
+                    let expected_slow=if bucket==0 {1.6} else {0.1};
+                    assert!((slow[row]-(expected_slow-correction)).abs()<1e-6);
+                }
+            }
             let m=r.optimizer_states.l1w.momentum.download(&ctx).unwrap();
             for k in 0..2 { assert_eq!(&m[k*12..k*12+4],&[0.0;4]); assert_eq!(&m[k*12+4..k*12+12],&[0.25;8]); }
             assert_eq!(new.l1_revival_flags,3);
@@ -255,7 +311,12 @@ mod tests {
                         ..Default::default() },ScalarLossKind::SigmoidPow {pow_exp:2.0},1.0,
                     SfnnTrainStepHostBatch {stm_indices:&stm,nstm_indices:&nstm,buckets:&buckets,
                         targets:&targets,entry_weights:&entry_weights,batch_size:2048,max_active:1},
-                    true,true,SfnnLayerLrMultipliers {qat_l1:qat,..Default::default()},None).unwrap();
+                    true,true,SfnnLayerLrMultipliers {qat_l1:qat,qat_l2:qat,qat_l3:qat,..Default::default()},None).unwrap();
+                if step==1 {
+                    let first=r.read_weights(&ctx).unwrap();
+                    assert!(first.l1w[..4].iter().zip(&new.l1w[..4]).any(|(a,b)|a!=b),
+                        "revived L1 must update on the first step, including with L2 QAT");
+                }
             }
             let trained=r.read_weights(&ctx).unwrap();
             assert!(trained.l2w.chunks_exact(4).any(|row|row[0]!=0.0 || row[2]!=0.0));

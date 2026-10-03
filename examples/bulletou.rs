@@ -17575,16 +17575,20 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     calibration.set_thresholds(args.sfnn_l1_revive_threshold,args.sfnn_l1_revive_zero_threshold).map_err(|e|e.to_string())?;
     eprintln!("  [L1 REVIVE] teacher calibration: 16 batches, min 1024 positions/bucket, upper={upper} zero={zero}, upper_threshold={} zero_threshold={}; learning cursor unchanged",
         args.sfnn_l1_revive_threshold,args.sfnn_l1_revive_zero_threshold);
-    for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
-        let fast=teacher.batch;
-        let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
-        let stm=strip(&fast.stm);let nstm=strip(&fast.nstm);
-        let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch {stm_indices:&stm,nstm_indices:&nstm,
-            buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
-        sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
-        calibration.add_masked(&fast.buckets,&workspace.combined.download(ctx).map_err(|e|e.to_string())?,
-            &workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,Some(&fast.weights)).map_err(|e|e.to_string())
-    })?;
+    let measure = |calibration: &mut l1_revive::Calibration| -> std::result::Result<(),String> {
+        for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
+            let fast=teacher.batch;
+            let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
+            let stm=strip(&fast.stm);let nstm=strip(&fast.nstm);
+            let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch {stm_indices:&stm,nstm_indices:&nstm,
+                buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
+            sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
+            calibration.add_masked(&fast.buckets,&workspace.combined.download(ctx).map_err(|e|e.to_string())?,
+                &workspace.l2_input.download(ctx).map_err(|e|e.to_string())?,Some(&fast.weights)).map_err(|e|e.to_string())
+        })?;
+        Ok(())
+    };
+    measure(&mut calibration)?;
     let candidates=calibration.candidates_for(upper,zero);
     let mut report=String::from("bucket,unit,positions,both_upper_hits,both_zero_hits,selected,upper_threshold,zero_threshold\n");
     for i in 0..calibration.upper.len() {
@@ -17604,7 +17608,15 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     }).ok_or_else(||"too many L1 revival audit files".to_string())??;
     std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
     let ids=runner.revive_l1_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
-    eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, zero outgoing L2 columns, L2 bias compensation, selected moments reset; audit={}",ids.len(),path.display());
+    if !ids.is_empty() {
+        eprintln!("  [L1 REVIVE] mean compensation: replay same 16 teacher batches with new quantized branches; learning cursor unchanged");
+        runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
+        let mut means=l1_revive::Calibration::new(shape.ft_size,shape.l1_hidden,shape.num_stacks);
+        measure(&mut means)?;
+        if means.counts!=calibration.counts { return Err("L1 revival replay bucket counts changed".into()); }
+        runner.compensate_l1_revival_mean(ctx,&ids,&means).map_err(|e|e.to_string())?;
+    }
+    eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, outgoing L2 +/-1/64, per-branch mean bias compensation (approximate, not pointwise-equivalent), selected moments reset; audit={}",ids.len(),path.display());
     for i in ids {
         let is_upper=calibration.is_upper(i,upper);
         let n=calibration.counts[i/shape.l1_hidden];

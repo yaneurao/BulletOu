@@ -209,6 +209,10 @@ mod tests {
             l1.add(&buckets,&workspace.combined.download(&ctx).unwrap(),&workspace.l2_input.download(&ctx).unwrap()).unwrap();
             assert_eq!(r.revive_l1_selected(&ctx,&l1,true,true).unwrap(),vec![0,2]);
             forward(&r);
+            let mut means=l1_revive::Calibration::new(shape.ft_size,shape.l1_hidden,shape.num_stacks);
+            means.add(&buckets,&workspace.combined.download(&ctx).unwrap(),&workspace.l2_input.download(&ctx).unwrap()).unwrap();
+            r.compensate_l1_revival_mean(&ctx,&[0,2],&means).unwrap();
+            forward(&r);
             let mut c=Calibration::new(shape.l2_in(),shape.l2_size,shape.num_stacks);
             c.add(&buckets,&workspace.l2_input.download(&ctx).unwrap(),&workspace.l2.download(&ctx).unwrap()).unwrap();
             assert_eq!(c.candidates_for(true,true),vec![0,1]);
