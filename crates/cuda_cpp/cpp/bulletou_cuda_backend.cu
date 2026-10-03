@@ -5584,36 +5584,39 @@ __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float*
     dx[j]=sum;
 }
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
+template<int Stacks>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
     float* dw,float* db,float* dfw,float* dfb,size_t batch,size_t width,size_t outputs,
     size_t stacks,float alpha,bool input_major) {
     size_t lane=threadIdx.x%32,out=blockIdx.z*8+threadIdx.x/32,in=blockIdx.x*32+lane;
+    if(out>=outputs || in>width)return;
     size_t begin=blockIdx.y*256,end=min(batch,begin+256);
-    float ws[16]={},bs[16]={};
+    // One extra input column represents the bias. Keeping a second bucket
+    // accumulator array in every lane wastes registers for 31/32 lanes.
+    const bool bias=in==width;
+    float ws[Stacks]={};
     for(size_t row=begin;row<end;++row) {
         int bucket=buckets[row];
-        float grad=out<outputs?dy[row*outputs+out]:0;
-        float x=in<width?inputs[row*width+in]:0;
+        float grad=dy[row*outputs+out];
+        float x=bias?1.0f:inputs[row*width+in];
         #pragma unroll
-        for(int s=0;s<16;++s) {
+        for(int s=0;s<Stacks;++s) {
             if(bucket==s && s<stacks) {
                 ws[s]+=grad*x;
-                if(in==0)bs[s]+=grad;
             }
         }
     }
-    if(out>=outputs || in>=width)return;
-    float shared_w=0,shared_b=0;
+    float shared_w=0;
     #pragma unroll
-    for(int s=0;s<16;++s) {
+    for(int s=0;s<Stacks;++s) {
         if(s<stacks) {
-            if(ws[s]!=0)atomicAdd(dw+(s*outputs+out)*width+in,ws[s]);
-            shared_w+=ws[s];shared_b+=bs[s];
-            if(in==0 && bs[s]!=0)atomicAdd(db+s*outputs+out,bs[s]);
+            if(ws[s]!=0)atomicAdd(bias?db+s*outputs+out:dw+(s*outputs+out)*width+in,ws[s]);
+            shared_w+=ws[s];
         }
     }
-    if(dfw && shared_w!=0)atomicAdd(dfw+(input_major?in*outputs+out:out*width+in),alpha*shared_w);
-    if(dfb && in==0 && shared_b!=0)atomicAdd(dfb+out,alpha*shared_b);
+    if(bias) {
+        if(dfb && shared_w!=0)atomicAdd(dfb+out,alpha*shared_w);
+    } else if(dfw && shared_w!=0)atomicAdd(dfw+(input_major?in*outputs+out:out*width+in),alpha*shared_w);
 }
 int launch_sfnn_dense_param_reduce_tiled(
     BulletOuCudaCppContext* ctx,
@@ -5660,12 +5663,26 @@ int launch_sfnn_dense_param_reduce_tiled(
     // coalesced kernel also applies to ordinary/QAT L1 with no axis terms.
     if((bn_l1 || compact_l1) && output_dim<=16 && num_stacks<=16 &&
         has_axis==0 && use_crelu_gradient==0 && !bn_use_reference()) {
-        dim3 grid(static_cast<unsigned>((input_dim+31)/32),static_cast<unsigned>((batch+255)/256),
+        dim3 grid(static_cast<unsigned>((input_dim+1+31)/32),static_cast<unsigned>((batch+255)/256),
             static_cast<unsigned>((output_dim+7)/8));
-        bn_l1_param_reduce<<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
-            weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
-            has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
-            shared_alpha,shared_weight_input_major!=0);
+        // Keep only the actual small bucket set in registers. The previous
+        // 16-bucket accumulator paid for unused buckets on every input row.
+        if (num_stacks<=8) {
+            bn_l1_param_reduce<8><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                shared_alpha,shared_weight_input_major!=0);
+        } else if (num_stacks==9) {
+            bn_l1_param_reduce<9><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                shared_alpha,shared_weight_input_major!=0);
+        } else {
+            bn_l1_param_reduce<16><<<grid,256,0,ctx->stream>>>(inputs,output_gradients,buckets,
+                weight_gradients,bias_gradients,has_shared?shared_weight_gradients:nullptr,
+                has_shared?shared_bias_gradients:nullptr,batch,input_dim,output_dim,num_stacks,
+                shared_alpha,shared_weight_input_major!=0);
+        }
         return check_kernel_launch(label);
     }
     if (num_stacks <= SFNN_DENSE_REDUCE_ACCUM_MAX_STACKS) {

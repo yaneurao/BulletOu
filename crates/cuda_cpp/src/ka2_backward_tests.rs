@@ -8,17 +8,17 @@ fn ka2_parallel_backward_matches_cpu_with_qat_and_accumulation() {
     const BATCH: usize = 1031; // Partial row tile, skewed occurrence lists, empty features/bucket.
     let a: Vec<i32> = (0..BATCH).flat_map(|i| [0, 1 + (i % 23) as i32, -1]).collect();
     let b: Vec<i32> = (0..BATCH).flat_map(|i| [0, if i % 13 == 0 { 1789 } else { -1 }, 0]).collect();
-    let buckets: Vec<i32> = (0..BATCH).map(|i| (i % 7) as i32).collect();
     let targets: Vec<f32> = (0..BATCH).map(|i| 0.1 + (i % 9) as f32 * 0.1).collect();
     let ew: Vec<f32> = (0..BATCH).map(|i| if i % 5 == 0 { 0.0 } else { 1.0 }).collect();
-    for (ft, skip) in [(1026, false), (2048, true)] {
+    for (ft, hidden, skip, stacks) in [(1026, 8, false, 8), (1024, 7, true, 9), (2048, 8, true, 16)] {
+        let buckets: Vec<i32> = (0..BATCH).map(|i| (i % (stacks - 1)) as i32).collect();
         let shape = SfnnForwardShape {
             input_size: 1791,
             ft_size: ft,
-            l1_hidden: 8,
+            l1_hidden: hidden,
             l1_skip: skip,
             l2_size: 4,
-            num_stacks: 8,
+            num_stacks: stacks,
             ..tiny_sfnn_shape()
         };
         // All masters are exactly representable at export precision. Thus the
