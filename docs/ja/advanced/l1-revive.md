@@ -54,8 +54,14 @@ L1 sharedは保持し、個別重みで差し引きます。後段接続は元�
 L2では保持した校正入力から新出力の平均を求めます。Lookahead slowも別の接続重みで補償し、対象のmomentをリセットします。
 これは推定した平均の補償であり、局面ごとの等価性・精度・棋力維持を保証しません。
 
-`l1-revive.csv` / `l2-revive.csv`に局面数・上限/ゼロ回数・U・相対貢献度R・選択結果・閾値を保存します。
-Rと閾値のCSV値は0～1、stdoutは%です。既存監査ファイルは上書きせず連番にします。
+FT/L1/L2の判定記録は、学習出力フォルダの`revive.csv`にまとめて追記します。
+先頭列は`epoch,run,layer`で、`run`は同epoch内の実行番号（1から開始）です。
+同じepoch開始処理で行うFT→L1→L2には同じ番号が付き、同epochを再実行すると次の番号になります。
+続く列は`bucket,unit,pair,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold`です。
+FTは`pair`、L1/L2は`unit`を使用し、該当しない項目は空欄です。
+対象が0個でも判定結果を記録します。`selected`はリセット対象の選択結果で、完了保証ではありません（重み変更前に記録します）。
+既存行は上書き・削除しません。旧`ft-revive*.csv` / `l1-revive*.csv` / `l2-revive*.csv`はそのまま残し、自動統合はしません。
+Rと閾値のCSV値は0～1、stdoutは%です。
 
 ## 対応範囲・移行
 
@@ -108,7 +114,7 @@ L1の両視点への接続は元の符号の±1/64とし、L1 shared分は個別
 対象のmomentum/velocityは0、Lookaheadのslow側も別の接続重みで補償します。
 **平均の近似補償であり、局面ごとの出力・棋力が維持される保証はありません。**
 
-処理順はFT→L1→L2です。監査は`ft-revive.csv`（既存時は連番）に保存されます。
+処理順はFT→L1→L2です。監査は学習出力フォルダの共通`revive.csv`に`layer=FT`として追記されます。
 貢献度と閾値はCSVで0〜1、stdoutで%です。以前のepoch9検証セットの測定とは局面・GPU proxyが異なるため、選択個数は一致するとは限りません。
 対応はnon-BN dense SFNN、L1 none/shared/axis、FT factorizer on/off、層別QAT、standalone/grid searchです。
 FTのL1への新接続も、sharedとaxisを合算した実効接続が±1/64になるよう個別重みで補償します。

@@ -58,6 +58,10 @@ mod progress_train;
 mod export_nn16;
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[path = "bulletou/revival_audit.rs"]
+mod revival_audit;
+
+#[cfg(feature = "cuda-cpp-backend")]
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -17563,15 +17567,16 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
     if !(args.sfnn_ft_revive || args.sfnn_l1_revive || args.sfnn_l1_revive_zero || args.sfnn_l2_revive || args.sfnn_l2_revive_zero) { return Ok(()); }
     ctx.synchronize().map_err(|e|e.to_string())?;
     runner.begin_revival_epoch();
-    eprintln!("  [REVIVE] epoch={epoch} START: teacher calibration; only qualifying units are reset");
+    let audit=revival_audit::RevivalAudit::new(&args.output_dir(),epoch)?;
+    eprintln!("  [REVIVE] epoch={epoch} run={} START: teacher calibration; only qualifying units are reset; audit={}",audit.run,audit.path.display());
     if args.sfnn_ft_revive {
-        run_sfnn_ft_revival(args,feature_kind,ctx,runner,config)?;
+        run_sfnn_ft_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
     if args.sfnn_l1_revive || args.sfnn_l1_revive_zero {
-        run_sfnn_l1_revival(args,feature_kind,ctx,runner,config)?;
+        run_sfnn_l1_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
     if args.sfnn_l2_revive || args.sfnn_l2_revive_zero {
-        run_sfnn_l2_revival(args,feature_kind,ctx,runner,config)?;
+        run_sfnn_l2_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
     eprintln!("  [REVIVE] epoch={epoch} END");
     Ok(())
@@ -17579,7 +17584,7 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
-    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>, audit:&revival_audit::RevivalAudit) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
     if runner.batch_norm.is_some() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1() {
         return Err("FT revival requires non-BN dense SFNN, L1 none/shared/axis and no residual count gates".into());
@@ -17608,19 +17613,14 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     c.finish(&proxy.l1w.download(ctx).map_err(|e|e.to_string())?,shape.l1_out()).map_err(|e|e.to_string())?;
     let ids=c.selected(args.sfnn_ft_revive_contribution_threshold).map_err(|e|e.to_string())?;
     let pairs=shape.ft_size/2;
-    let mut report=String::from("bucket,pair,positions,contribution,relative_contribution,selected,contribution_threshold\n");
+    let mut rows=Vec::new();
     for b in 0..shape.num_stacks {for i in 0..pairs {
-        report.push_str(&format!("{b},{i},{},{:.10},{:.10},{},{}\n",c.counts[b],c.utility[b*pairs+i],c.relative[b*pairs+i],ids.contains(&i),args.sfnn_ft_revive_contribution_threshold));
+        rows.push(revival_audit::Row {bucket:b,unit:None,pair:Some(i),positions:c.counts[b],
+            upper_hits:None,zero_hits:None,contribution:c.utility[b*pairs+i],relative_contribution:c.relative[b*pairs+i],
+            selected:ids.contains(&i),threshold:args.sfnn_ft_revive_contribution_threshold});
     }}
-    std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
-    let (path,mut out)=(0..10000).find_map(|i| {
-        let path=args.output_dir().join(if i==0 {"ft-revive.csv".into()} else {format!("ft-revive-{i}.csv")});
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(f)=>Some(Ok((path,f))),Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>None,
-            Err(e)=>Some(Err(e.to_string()))
-        }
-    }).ok_or_else(||"too many FT revival audits".to_string())??;
-    std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
+    audit.append("FT",rows)?;
+    let path=&audit.path;
     if c.counts.iter().any(|&n|n<1024) {
         eprintln!("{}",paint(&format!("  WARNING: FT revival skipped: under-sampled bucket(s), counts={:?}; shared FT cannot be judged safely",c.counts),ConsoleColor::BoldYellow));
     }
@@ -17640,7 +17640,7 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
-    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>, audit:&revival_audit::RevivalAudit) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
     let upper=args.sfnn_l1_revive && !runner.l1_revival_done();
     let zero=false;
@@ -17676,23 +17676,17 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     calibration.contribution.finish(&proxy.l2w.download(ctx).map_err(|e|e.to_string())?,
         shape.l2_size, 2, args.sfnn_l1_revive_contribution_threshold).map_err(|e|e.to_string())?;
     let candidates=calibration.candidates_for(upper,zero);
-    let mut report=String::from("bucket,unit,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold\n");
+    let mut rows=Vec::new();
     for i in 0..calibration.upper.len() {
         let b=i/shape.l1_hidden;
-        report.push_str(&format!("{b},{},{},{},{},{:.10},{:.10},{},{}\n",i%shape.l1_hidden,calibration.counts[b],calibration.upper[i],calibration.lower[i],
-            calibration.contribution.utility[i],calibration.contribution.relative[i],candidates.contains(&i),args.sfnn_l1_revive_contribution_threshold));
+        rows.push(revival_audit::Row {bucket:b,unit:Some(i%shape.l1_hidden),pair:None,positions:calibration.counts[b],
+            upper_hits:Some(calibration.upper[i]),zero_hits:Some(calibration.lower[i]),
+            contribution:calibration.contribution.utility[i],relative_contribution:calibration.contribution.relative[i],
+            selected:candidates.contains(&i),threshold:args.sfnn_l1_revive_contribution_threshold});
     }
     // Persist the audit before mutating weights. Never touch the source checkpoint.
-    std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
-    let (path,mut out)=(0..10000).find_map(|i| {
-        let path=args.output_dir().join(if i==0 {"l1-revive.csv".into()} else {format!("l1-revive-{i}.csv")});
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file)=>Some(Ok((path,file))),
-            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>None,
-            Err(e)=>Some(Err(format!("{}: {e}",path.display())))
-        }
-    }).ok_or_else(||"too many L1 revival audit files".to_string())??;
-    std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
+    audit.append("L1",rows)?;
+    let path=&audit.path;
     let ids=runner.revive_l1_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
     if !ids.is_empty() {
         eprintln!("  [L1 REVIVE] mean compensation: replay same 16 teacher batches with new quantized branches; learning cursor unchanged");
@@ -17714,7 +17708,7 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
-    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>) -> Result<(),String> {
+    runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>, audit:&revival_audit::RevivalAudit) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
     let upper=args.sfnn_l2_revive && !runner.l2_revival_done();
     let zero=false;
@@ -17746,23 +17740,17 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     calibration.contribution.finish(&proxy.l3w.download(ctx).map_err(|e|e.to_string())?,
         1, 1, args.sfnn_l2_revive_contribution_threshold).map_err(|e|e.to_string())?;
     let candidates=calibration.candidates_for(upper,zero);
-    let mut report=String::from("bucket,unit,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold\n");
+    let mut rows=Vec::new();
     for i in 0..calibration.upper.len() {
         let b=i/shape.l2_size;
-        report.push_str(&format!("{b},{},{},{},{},{:.10},{:.10},{},{}\n",i%shape.l2_size,calibration.counts[b],calibration.upper[i],calibration.lower[i],
-            calibration.contribution.utility[i],calibration.contribution.relative[i],candidates.contains(&i),args.sfnn_l2_revive_contribution_threshold));
+        rows.push(revival_audit::Row {bucket:b,unit:Some(i%shape.l2_size),pair:None,positions:calibration.counts[b],
+            upper_hits:Some(calibration.upper[i]),zero_hits:Some(calibration.lower[i]),
+            contribution:calibration.contribution.utility[i],relative_contribution:calibration.contribution.relative[i],
+            selected:candidates.contains(&i),threshold:args.sfnn_l2_revive_contribution_threshold});
     }
     // Persist the audit before mutating weights. Never touch the source checkpoint.
-    std::fs::create_dir_all(args.output_dir()).map_err(|e|e.to_string())?;
-    let (path,mut out)=(0..10000).find_map(|i| {
-        let path=args.output_dir().join(if i==0 {"l2-revive.csv".into()} else {format!("l2-revive-{i}.csv")});
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file)=>Some(Ok((path,file))),
-            Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>None,
-            Err(e)=>Some(Err(format!("{}: {e}",path.display())))
-        }
-    }).ok_or_else(||"too many L2 revival audit files".to_string())??;
-    std::io::Write::write_all(&mut out,report.as_bytes()).map_err(|e|e.to_string())?;
+    audit.append("L2",rows)?;
+    let path=&audit.path;
     let ids=runner.revive_l2_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
     eprintln!("  [L2 REVIVE] complete: {} units; Glorot inputs, L3=+/-1/64, bias compensation, selected moments reset; audit={}",ids.len(),path.display());
     for i in ids {

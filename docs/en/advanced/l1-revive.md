@@ -51,8 +51,14 @@ Restart outgoing connections at the old sign times 1/64, then subtract their new
 For L1, replay the same 16 batches after resetting to measure new branch means; L2 uses retained calibration inputs.
 Compensate Lookahead slow connections separately and reset affected moments. This is approximate mean compensation, not pointwise equivalence or a guarantee of accuracy/strength preservation.
 
-`l1-revive.csv` / `l2-revive.csv` record counts, upper/zero hits, U, relative score R, selection and threshold.
-CSV R/threshold values are fractions (0..1); stdout uses percentages. Numbered audit files preserve previous records.
+FT/L1/L2 audits append to one `revive.csv` in the training output directory.
+The first columns are `epoch,run,layer`. `run` starts at 1 within each epoch;
+FT/L1/L2 share the same number in one epoch-start invocation, and rerunning that epoch uses the next number.
+Remaining columns are `bucket,unit,pair,positions,upper_hits,zero_hits,contribution,relative_contribution,selected,contribution_threshold`.
+FT uses `pair`; L1/L2 use `unit`. Inapplicable fields are blank.
+An audit is written even when no units are selected. `selected` records the decision, not successful completion: the audit is persisted before modifying weights.
+Existing rows are never overwritten or deleted. Legacy `ft-revive*.csv`, `l1-revive*.csv`, and `l2-revive*.csv` are retained without automatic migration.
+CSV R/threshold values are fractions (0..1); stdout uses percentages.
 
 ## Support and migration
 
@@ -101,7 +107,7 @@ Transfer the measured old mean to L1 bias, replay the same teacher sample a thir
 and subtract the new mean contribution. Reset affected moments and compensate Lookahead separately.
 This is approximate mean compensation, NOT pointwise-equivalent or guaranteed to preserve strength.
 
-Order: FT, then L1, then L2. Audit: ft-revive.csv (numbered to avoid overwrites), fractions in CSV,
+Order: FT, then L1, then L2. Audit: the shared `revive.csv` in the training output directory (`layer=FT`), fractions in CSV,
 percentages on stdout. Counts may differ from offline validation-set integer nn.bin analysis.
 Supports non-BN dense SFNN, L1 none/shared/axis, FT factorizer on/off, per-layer QAT, standalone/grid.
 FT outgoing residuals compensate both shared and axis terms so effective new connections are signed 1/64.
