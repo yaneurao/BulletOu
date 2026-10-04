@@ -17578,6 +17578,10 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
     if args.sfnn_l2_revive || args.sfnn_l2_revive_zero {
         run_sfnn_l2_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
+    match audit.append_summary() {
+        Ok(path) => eprintln!("  [REVIVE SUMMARY] {}",path.display()),
+        Err(error) => eprintln!("{}",paint(&format!("  WARNING: could not write revival summary: {error}; training continues"),ConsoleColor::BoldYellow)),
+    }
     eprintln!("  [REVIVE] epoch={epoch} END");
     Ok(())
 }
@@ -17634,6 +17638,7 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
         eprintln!("{}",paint("  WARNING: FT revival compensates the measured mean, not pointwise outputs; accuracy can change.",ConsoleColor::BoldYellow));
     }
     eprintln!("  [FT REVIVE] complete: {}/{} pairs; quantization-visible FT initialization, bias=0.5, virtual columns=0, outgoing +/-1/64, mean compensation, selected optimizer moments reset; audit={}",ids.len(),pairs,path.display());
+    audit.complete_layer("FT",ids.len())?;
     for i in ids {eprintln!("  [FT REVIVE] pair={i} units={i},{} max_bucket_contribution={:.6}%",i+pairs,100.0*(0..shape.num_stacks).map(|b|c.relative[b*pairs+i]).fold(0.0,f64::max));}
     Ok(())
 }
@@ -17697,6 +17702,7 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
         runner.compensate_l1_revival_mean(ctx,&ids,&means).map_err(|e|e.to_string())?;
     }
     eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, outgoing L2 +/-1/64, per-branch mean bias compensation (approximate, not pointwise-equivalent), selected moments reset; audit={}",ids.len(),path.display());
+    audit.complete_layer("L1",ids.len())?;
     for i in ids {
         eprintln!("  [L1 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
             i/shape.l1_hidden,i%shape.l1_hidden,calibration.contribution.utility[i],
@@ -17753,6 +17759,7 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     let path=&audit.path;
     let ids=runner.revive_l2_selected(ctx,&calibration,upper,zero).map_err(|e|e.to_string())?;
     eprintln!("  [L2 REVIVE] complete: {} units; Glorot inputs, L3=+/-1/64, bias compensation, selected moments reset; audit={}",ids.len(),path.display());
+    audit.complete_layer("L2",ids.len())?;
     for i in ids {
         eprintln!("  [L2 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
             i/shape.l2_size,i%shape.l2_size,calibration.contribution.utility[i],

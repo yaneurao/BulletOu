@@ -60,6 +60,32 @@ An audit is written even when no units are selected. `selected` records the deci
 Existing rows are never overwritten or deleted. Legacy `ft-revive*.csv`, `l1-revive*.csv`, and `l2-revive*.csv` are retained without automatic migration.
 CSV R/threshold values are fractions (0..1); stdout uses percentages.
 
+### Per-epoch summary
+
+After all enabled layers successfully finish revival at epoch start, append one row to
+`revive-summary.csv` in the training output directory. `epoch,run` matches the detailed audit;
+reruns never remove earlier rows. No row is emitted when all layers are disabled.
+Columns for `ft_`, `l1_`, then `l2_` have these suffixes:
+
+| Suffix | Meaning |
+| --- | --- |
+| `eligible` | Eligible count, excluding insufficiently sampled buckets |
+| `revived` | Count successfully reset, including mean compensation |
+| `revive_rate` | `revived / eligible` |
+| `mean_relative_contribution` | Mean pre-reset relative contribution of eligible targets |
+| `contribution_threshold` | Applied threshold |
+
+FT counts unique shared pairs. Its mean is the mean across pairs of each pair's maximum
+relative contribution over buckets. FT has zero eligible pairs unless every bucket has
+at least 1,024 positions. L1/L2 count bucket-specific units in sufficiently sampled buckets;
+their mean is an unweighted unit average. L1 combines its two branches into one unit.
+L1 is measured after FT revival, L2 after L1 revival. Disabled/unmeasured layers are blank.
+With zero eligible targets, counts are zero and rate/mean are blank. Fractions and thresholds
+use ten decimal places. Relative contribution is not a fraction of playing strength.
+Uses existing calibration results without extra inference. Failed revival emits no completion row.
+Summary write errors produce a yellow WARNING and do not stop training.
+Old detailed audits are not backfilled because `selected` does not prove successful completion.
+
 ## Support and migration
 
 Supports cuda-cpp dense SFNN, L1 none/shared/axis, ordinary/per-layer-QAT training, standalone/grid.

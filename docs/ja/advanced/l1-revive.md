@@ -63,6 +63,30 @@ FTは`pair`、L1/L2は`unit`を使用し、該当しない項目は空欄です�
 既存行は上書き・削除しません。旧`ft-revive*.csv` / `l1-revive*.csv` / `l2-revive*.csv`はそのまま残し、自動統合はしません。
 Rと閾値のCSV値は0～1、stdoutは%です。
 
+### epochごとの集計
+
+epoch開始時の有効な層の処理がすべて正常完了すると、学習出力フォルダの
+`revive-summary.csv`へ1行追記します。`epoch,run`は詳細CSVと共通で、再実行でも過去の行は消しません。
+全層無効なら行は出力しません。各層の列は`ft_`、`l1_`、`l2_`の順で以下を出力します。
+
+| 接尾辞 | 意味 |
+| --- | --- |
+| `eligible` | サンプル不足を除いた判定対象数 |
+| `revived` | リセットと平均補償まで正常完了した数 |
+| `revive_rate` | `revived / eligible` |
+| `mean_relative_contribution` | リセット前の判定対象の平均相対貢献度 |
+| `contribution_threshold` | 使用した閾値 |
+
+FTは共有ペア数で重複を除去。各ペアの相対貢献度のbucket最大値を取り、そのペア平均を出します。
+全bucketで1,024局面以上なければFTの判定対象数は0です。
+L1/L2は1,024局面以上のbucketのunit数で、平均は局面数で重み付けしないunit単純平均です。
+L1の通常枝・二乗枝は合わせて1unit。L1はFT処理後、L2はL1処理後の判定結果です。
+無効・未判定の層は空欄。対象0なら数は0、率と平均は空欄。
+率・平均・閾値は0～1の小数10桁。平均は最大unitとの相対値であり、棋力への貢献割合ではありません。
+追加推論はせず、既存の校正結果を集計します。処理途中の失敗は完了行にしません。
+集計CSVの書き込み失敗は黄色のWARNINGを出して学習を継続します。
+旧詳細CSVからの自動補完はしません（`selected`だけでは完了を保証できないため）。
+
 ## 対応範囲・移行
 
 cuda-cppのdense SFNN、L1 factorizer none/shared/axis、通常学習または層別QAT、standalone/grid searchに対応。

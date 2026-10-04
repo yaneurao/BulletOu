@@ -1,4 +1,6 @@
 //! Append-only, epoch-scoped audit shared by FT/L1/L2 revival.
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -9,6 +11,24 @@ pub struct RevivalAudit {
     pub path: PathBuf,
     pub epoch: usize,
     pub run: usize,
+    summaries: RefCell<BTreeMap<String, LayerSummary>>,
+}
+
+struct LayerSummary {
+    eligible: usize,
+    mean: Option<f64>,
+    threshold: f64,
+    revived: Option<usize>,
+}
+
+fn summary_header() -> String {
+    let mut header = "epoch,run".to_string();
+    for layer in ["ft", "l1", "l2"] {
+        for field in ["eligible", "revived", "revive_rate", "mean_relative_contribution", "contribution_threshold"] {
+            header.push_str(&format!(",{layer}_{field}"));
+        }
+    }
+    header
 }
 
 pub struct Row {
@@ -67,7 +87,7 @@ impl RevivalAudit {
             Err(e) => return Err(format!("{}: {e}", path.display())),
         }
         let run = max_run.checked_add(1).ok_or("revival run number overflow")?;
-        Ok(Self { path, epoch, run })
+        Ok(Self { path, epoch, run, summaries: RefCell::new(BTreeMap::new()) })
     }
 
     // Each layer persists its selection before mutating weights, as before.
@@ -75,6 +95,29 @@ impl RevivalAudit {
     pub fn append(&self, layer: &str, rows: impl IntoIterator<Item = Row>) -> Result<(), String> {
         assert!(matches!(layer, "FT" | "L1" | "L2"));
         let mut report = String::new();
+        let rows: Vec<_> = rows.into_iter().collect();
+        let threshold = rows.first().map(|r| r.threshold).unwrap_or(0.0);
+        let mut values = Vec::new();
+        if layer == "FT" {
+            // The shared pair is eligible only when EVERY bucket is sampled.
+            // Its decision score is the maximum relative contribution over buckets.
+            if !rows.is_empty() && rows.iter().all(|r| r.positions >= 1024) {
+                let mut pairs = BTreeMap::<usize, f64>::new();
+                for row in &rows {
+                    let value = pairs.entry(row.pair.expect("FT pair")).or_default();
+                    *value = value.max(row.relative_contribution);
+                }
+                values.extend(pairs.into_values());
+            }
+        } else {
+            values.extend(rows.iter().filter(|r| r.positions >= 1024).map(|r| r.relative_contribution));
+        }
+        let summary = LayerSummary {
+            eligible: values.len(),
+            mean: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
+            threshold,
+            revived: None,
+        };
         let optional = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_default();
         for row in rows {
             report.push_str(&format!(
@@ -113,7 +156,63 @@ impl RevivalAudit {
             file.write_all(report.as_bytes())?;
             file.flush()
         };
-        write().map_err(|e| format!("{}: {e}", self.path.display()))
+        write().map_err(|e| format!("{}: {e}", self.path.display()))?;
+        self.summaries.borrow_mut().insert(layer.to_string(), summary);
+        Ok(())
+    }
+
+    /// Called only after the reset AND mean compensation have succeeded.
+    pub fn complete_layer(&self, layer: &str, revived: usize) -> Result<(), String> {
+        let mut summaries = self.summaries.borrow_mut();
+        let summary = summaries.get_mut(layer).ok_or("missing revival calibration summary")?;
+        if revived > summary.eligible {
+            return Err("revived count exceeds eligible count".into());
+        }
+        summary.revived = Some(revived);
+        Ok(())
+    }
+
+    pub fn append_summary(&self) -> Result<PathBuf, String> {
+        let path = self.path.with_file_name("revive-summary.csv");
+        let header = summary_header();
+        let summaries = self.summaries.borrow();
+        let mut record = format!("{},{}", self.epoch, self.run);
+        for layer in ["FT", "L1", "L2"] {
+            if let Some(s) = summaries.get(layer) {
+                let revived = s.revived.ok_or("revival summary requested before successful completion")?;
+                let rate =
+                    if s.eligible == 0 { String::new() } else { format!("{:.10}", revived as f64 / s.eligible as f64) };
+                let mean = s.mean.map(|v| format!("{v:.10}")).unwrap_or_default();
+                record.push_str(&format!(",{},{},{rate},{mean},{:.10}", s.eligible, revived, s.threshold));
+            } else {
+                record.push_str(",,,,,");
+            }
+        }
+        let write = || -> Result<(), String> {
+            fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            let mut file =
+                OpenOptions::new().create(true).append(true).read(true).open(&path).map_err(|e| e.to_string())?;
+            if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+                writeln!(file, "{header}").map_err(|e| e.to_string())?;
+            } else {
+                let mut existing = String::new();
+                BufReader::new(&file).read_line(&mut existing).map_err(|e| e.to_string())?;
+                if existing.trim_end() != header {
+                    return Err("unexpected summary header; existing file was not modified".into());
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+                let mut last = [0];
+                file.read_exact(&mut last).map_err(|e| e.to_string())?;
+                if last[0] != b'\n' {
+                    writeln!(file).map_err(|e| e.to_string())?;
+                }
+            }
+            writeln!(file, "{record}").map_err(|e| e.to_string())?;
+            file.flush().map_err(|e| e.to_string())
+        };
+        write().map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
     }
 }
 
@@ -149,6 +248,82 @@ mod tests {
             threshold: 0.01,
         }
     }
+    #[test]
+    fn unified_audit_summary_counts_completed_units_and_excludes_small_buckets() {
+        let t = Temp::new();
+        let a = RevivalAudit::new(&t.0, 3).unwrap();
+        let mut x = row(false);
+        x.relative_contribution = 0.2;
+        let mut y = row(false);
+        y.unit = Some(4);
+        y.relative_contribution = 0.6;
+        let mut excluded = row(false);
+        excluded.positions = 1023;
+        a.append("L1", [x, y, excluded]).unwrap();
+        assert!(a.append_summary().is_err());
+        assert!(!t.0.join("revive-summary.csv").exists());
+        a.complete_layer("L1", 1).unwrap();
+        let path = a.append_summary().unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let fields: Vec<_> = original.lines().nth(1).unwrap().split(',').collect();
+        assert_eq!(fields.len(), 17);
+        assert_eq!(&fields[2..7], &["", "", "", "", ""]);
+        assert_eq!(&fields[7..12], &["2", "1", "0.5000000000", "0.4000000000", "0.0100000000"]);
+        assert_eq!(&fields[12..17], &["", "", "", "", ""]);
+        let retry = RevivalAudit::new(&t.0, 3).unwrap();
+        retry.append("L2", [row(false)]).unwrap();
+        retry.complete_layer("L2", 0).unwrap();
+        fs::write(&path, original.trim_end()).unwrap();
+        retry.append_summary().unwrap();
+        let result = fs::read_to_string(&path).unwrap();
+        assert!(result.starts_with(&original));
+        assert!(result.lines().nth(2).unwrap().starts_with("3,2,"));
+        assert_eq!(result.lines().count(), 3);
+    }
+
+    #[test]
+    fn unified_audit_summary_ft_uses_unique_pairs_and_max_bucket_contribution() {
+        let t = Temp::new();
+        for epoch in [1, 2] {
+            let a = RevivalAudit::new(&t.0, epoch).unwrap();
+            let mut rows = Vec::new();
+            for bucket in 0..2 {
+                for pair in 0..2 {
+                    let mut r = row(true);
+                    r.bucket = bucket;
+                    r.pair = Some(pair);
+                    r.relative_contribution = if pair == 0 { 0.1 + bucket as f64 * 0.2 } else { 0.7 };
+                    if epoch == 2 && bucket == 1 {
+                        r.positions = 100;
+                    }
+                    rows.push(r);
+                }
+            }
+            a.append("FT", rows).unwrap();
+            a.complete_layer("FT", if epoch == 1 { 1 } else { 0 }).unwrap();
+            let path = a.append_summary().unwrap();
+            let text = fs::read_to_string(path).unwrap();
+            let fields: Vec<_> = text.lines().last().unwrap().split(',').collect();
+            if epoch == 1 {
+                assert_eq!(&fields[2..7], &["2", "1", "0.5000000000", "0.5000000000", "0.0100000000"]);
+            } else {
+                assert_eq!(&fields[2..7], &["0", "0", "", "", "0.0100000000"]);
+            }
+        }
+    }
+
+    #[test]
+    fn unified_audit_summary_preserves_incompatible_file() {
+        let t = Temp::new();
+        let a = RevivalAudit::new(&t.0, 1).unwrap();
+        a.append("L1", [row(false)]).unwrap();
+        a.complete_layer("L1", 0).unwrap();
+        let path = t.0.join("revive-summary.csv");
+        fs::write(&path, "manual,header\nkeep,this\n").unwrap();
+        assert!(a.append_summary().is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "manual,header\nkeep,this\n");
+    }
+
     #[test]
     fn unified_audit_appends_all_layers_and_numbers_per_epoch() {
         let t = Temp::new();
