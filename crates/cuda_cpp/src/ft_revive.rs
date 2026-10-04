@@ -92,11 +92,10 @@ impl SfnnTrainStepRunner {
         let mut w=self.weights.l0w.download(ctx)?;
         let mut state=self.optimizer_states.l0w.download(ctx)?;
         let bound=(6.0/(base_inputs+s.ft_size) as f32).sqrt().max(1.0/127.0);
+        let mut rng=self.revival_rng;
         for &id in ids {for col in [id,id+pairs] {
-            let mut rng=0x9e3779b97f4a7c15u64 ^ col as u64;
             for row in 0..s.input_size {
-                rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;
-                let v=if row<base_inputs {((2.0*((rng>>40) as f32/16777216.0)-1.0)*bound*127.0).round()/127.0} else {0.0};
+                let v=if row<base_inputs {(rng.signed_uniform()*bound*127.0).round()/127.0} else {0.0};
                 let i=row*s.ft_size+col;w[i]=v;reset(&mut state,i,v);
             }
         }}
@@ -124,6 +123,7 @@ impl SfnnTrainStepRunner {
         for (buf,st,v,h) in [(&self.weights.l1w,&self.optimizer_states.l1w,&w,&ws),(&self.weights.l1b,&self.optimizer_states.l1b,&b,&bs)] {
             buf.upload(ctx,v)?;st.upload(ctx,v.len(),RangerParamHostState{momentum:&h.momentum,velocity:&h.velocity,slow_params:&h.slow_params})?;
         }
+        self.revival_rng=rng;
         self.forward_workspace.invalidate_l1_qat();self.layer_qat=Default::default();
         Ok(())
     }
@@ -177,6 +177,17 @@ impl SfnnTrainStepRunner {
             assert!((after.l1b[row]-expected).abs()<1e-6);
         }
         assert_eq!(old.l2w,after.l2w);assert_eq!(old.l3w,after.l3w);
+        let snapshot=r.snapshot_device(&ctx).unwrap();
+        r.revive_ft(&ctx,&c,&[],s.input_size).unwrap();
+        assert_eq!(r.revival_rng,after.revival_rng);
+        r.begin_revival_epoch();
+        r.revive_ft(&ctx,&c,&[0],s.input_size).unwrap();
+        let second=r.read_weights(&ctx).unwrap();
+        assert_ne!(after.l0w,second.l0w);
+        r.copy_state_from_device(&ctx,&snapshot).unwrap();
+        r.begin_revival_epoch();
+        r.revive_ft(&ctx,&c,&[0],s.input_size).unwrap();
+        assert_eq!(second,r.read_weights(&ctx).unwrap());
     }
     #[test] fn pair_mad_and_all_bucket_guard() {
         let mut c=Calibration::new(4,2);

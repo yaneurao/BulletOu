@@ -7,6 +7,7 @@ pub mod l2_revive;
 pub mod l1_revive;
 pub mod ft_revive;
 mod revive_common;
+pub mod revival_rng;
 pub mod ft_factorizer_switch;
 pub mod l1_factorizer_switch;
 
@@ -6020,6 +6021,7 @@ impl<'a> SfnnTrainStepHostBatch<'a> {
 pub struct SfnnTrainWeightsReadback {
     pub l1_revival_flags: u8,
     pub l2_revival_flags: u8,
+    pub revival_rng: revival_rng::RevivalRng,
     pub batch_norm: batch_norm::NetworkState,
     pub l0w: Vec<f32>,
     pub l0b: Vec<f32>,
@@ -6144,6 +6146,7 @@ impl SfnnTrainStepUploadSlot {
 pub struct SfnnTrainStepRunner {
     pub l1_revival_flags: u8,
     pub l2_revival_flags: u8,
+    pub revival_rng: revival_rng::RevivalRng,
     layer_qat: layer_qat::State,
     bn_qat: Option<bn_qat::State>,
     pub batch_norm: Option<batch_norm::Network>,
@@ -6183,6 +6186,7 @@ pub struct SfnnTrainStepRunner {
 pub struct SfnnTrainStepRunnerSnapshot {
     pub l1_revival_flags: u8,
     pub l2_revival_flags: u8,
+    pub revival_rng: revival_rng::RevivalRng,
     pub batch_norm: batch_norm::NetworkState,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
@@ -6541,6 +6545,7 @@ impl SfnnTrainStepRunner {
             layer_qat: Default::default(),
             l1_revival_flags: 0,
             l2_revival_flags: 0,
+            revival_rng: Default::default(),
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
             pending_gradient_batches: 0,
             experimental_output_centers: if std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER").as_deref() == Ok("gpu")
@@ -7093,6 +7098,7 @@ impl SfnnTrainStepRunner {
         Ok(SfnnTrainStepRunnerSnapshot {
             l1_revival_flags: self.l1_revival_flags,
             l2_revival_flags: self.l2_revival_flags,
+            revival_rng: self.revival_rng,
             batch_norm: self.read_batch_norm_state(ctx)?,
             weights: self.weights.try_clone_device(ctx)?,
             optimizer_states: self.optimizer_states.try_clone_device(ctx, self.shape)?,
@@ -7105,6 +7111,7 @@ impl SfnnTrainStepRunner {
         self.layer_qat.invalidate();
         self.l1_revival_flags = src.l1_revival_flags;
         self.l2_revival_flags = src.l2_revival_flags;
+        self.revival_rng = src.revival_rng;
         self.restore_batch_norm(ctx,&src.batch_norm)?;
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
@@ -7722,6 +7729,7 @@ impl SfnnTrainStepRunner {
         Ok(SfnnTrainWeightsReadback {
             l1_revival_flags: self.l1_revival_flags,
             l2_revival_flags: self.l2_revival_flags,
+            revival_rng: self.revival_rng,
             batch_norm: self.read_batch_norm_state(ctx)?,
             l0w: self.weights.l0w.download(ctx)?,
             l0b: self.weights.l0b.download(ctx)?,

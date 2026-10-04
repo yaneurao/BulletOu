@@ -60,6 +60,20 @@ An audit is written even when no units are selected. `selected` records the deci
 Existing rows are never overwritten or deleted. Legacy `ft-revive*.csv`, `l1-revive*.csv`, and `l2-revive*.csv` are retained without automatic migration.
 CSV R/threshold values are fractions (0..1); stdout uses percentages.
 
+### Revival randomness and reproducibility
+
+FT/L1/L2 share a persistent revival-only random stream in the runner. A fixed seed initializes
+the stream once for a fresh run, never per unit, layer, or epoch. Repeated revival consumes
+new draws; an empty selection consumes none. Changing layer order or selected targets changes
+subsequent draw assignments. Full training checkpoints (`state.bin`, etc.) and in-memory
+snapshots preserve the state losslessly; resume continues from that saved state. Identical
+saved state and draw order reproduce the same random values. `nn.bin` does not store this state.
+Legacy checkpoints without the record start at the fixed seed and save the state thereafter.
+Restarting from an older checkpoint rolls back the stream together with the weights.
+Glorot bounds, bias compensation and signed 1/64 outgoing connections are unchanged; scratch
+initialization options such as `sfnn_init_l1_glorot` do not control revival initialization.
+Quantization-visible outgoing connections do not guarantee nonzero gradients in every case.
+
 ### Per-epoch summary
 
 After all enabled layers successfully finish revival at epoch start, append one row to

@@ -166,14 +166,13 @@ impl SfnnTrainStepRunner {
         let mut obs=self.optimizer_states.l2b.download(ctx)?;
         let common=revive_common::Common::read(self,ctx)?;
         let bound=(6.0/(s.ft_size+s.l1_hidden) as f32).sqrt();
+        let mut rng=self.revival_rng;
         for &id in &ids {
             let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
             let out=bucket*s.l1_out()+u;
-            let mut rng=0x9e3779b97f4a7c15u64 ^ id as u64;
             let mut mean=0.0f64;
             for j in 0..s.ft_size {
-                rng^=rng<<13; rng^=rng>>7; rng^=rng<<17;
-                let value=(2.0*((rng>>40) as f32/16777216.0)-1.0)*bound;
+                let value=rng.signed_uniform()*bound;
                 mean+=value as f64*c.sums[bucket*s.ft_size+j]/c.counts[bucket] as f64;
                 let i=out*s.ft_size+j;
                 w1[i]=value-common.weight(bucket,u,j,false);
@@ -214,6 +213,7 @@ impl SfnnTrainStepRunner {
         self.forward_workspace.invalidate_l1_qat();
         self.layer_qat=Default::default();
         self.l1_revival_flags |= u8::from(upper) | (u8::from(zero)<<1);
+        self.revival_rng=rng;
         Ok(ids)
     }
 
@@ -301,6 +301,17 @@ mod tests {
         }
         assert_eq!(old.l0w,new.l0w);assert_eq!(old.l3w,new.l3w);
         assert!(r.revive_l1_selected(&ctx,&c,true,false).unwrap().is_empty());
+        assert_eq!(r.revival_rng,new.revival_rng); // no-op does not consume the stream
+        let snapshot=r.snapshot_device(&ctx).unwrap();
+        r.begin_revival_epoch();
+        assert_eq!(r.revival_rng,new.revival_rng); // epoch boundary never reseeds
+        r.revive_l1_selected(&ctx,&c,true,false).unwrap();
+        let second=r.read_weights(&ctx).unwrap();
+        assert_ne!(new.l1w,second.l1w);
+        r.copy_state_from_device(&ctx,&snapshot).unwrap();
+        r.begin_revival_epoch();
+        r.revive_l1_selected(&ctx,&c,true,false).unwrap();
+        assert_eq!(second,r.read_weights(&ctx).unwrap());
     }
     #[test]
     fn configurable_thresholds_and_zero_classification() {

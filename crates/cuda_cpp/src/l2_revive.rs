@@ -119,13 +119,12 @@ impl SfnnTrainStepRunner {
         let mut out=self.weights.l3w.download(ctx)?;let mut ob=self.weights.l3b.download(ctx)?;
         let mut ws=self.optimizer_states.l2w.download(ctx)?;let mut bs=self.optimizer_states.l2b.download(ctx)?;
         let mut os=self.optimizer_states.l3w.download(ctx)?;let mut obs=self.optimizer_states.l3b.download(ctx)?;
-        let mut rng=20260926u64;
+        let mut rng=self.revival_rng;
         let bound=(6.0/(s.l2_in()+s.l2_size) as f32).sqrt();
         for &i in &ids {
             let g=i/s.l2_size;let start=i*s.l2_in();
             for k in 0..s.l2_in() {
-                rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;
-                w[start+k]=(2.0*((rng>>40) as f32/16777216.0)-1.0)*bound;
+                w[start+k]=rng.signed_uniform()*bound;
                 ws.momentum[start+k]=0.0;ws.velocity[start+k]=0.0;ws.slow_params[start+k]=w[start+k];
             }
             let rows=&c.inputs[g];let count=c.counts[g];
@@ -165,6 +164,7 @@ impl SfnnTrainStepRunner {
             *layer=batch_norm::Layer::from_state(ctx,&state)?;
         }
         self.l2_revival_flags |= u8::from(upper) | (u8::from(zero)<<1);
+        self.revival_rng=rng;
         self.layer_qat=Default::default();
         Ok(ids)
     }
@@ -283,6 +283,16 @@ mod tests {
             let snapshot=r.snapshot_device(&ctx).unwrap();r.l2_revival_flags=0;
             r.copy_state_from_device(&ctx,&snapshot).unwrap();
             assert!(r.revive_l2_selected(&ctx,&c,true,true).unwrap().is_empty());
+            assert_eq!(r.revival_rng,new.revival_rng);
+            r.begin_revival_epoch();
+            r.revive_l2_selected(&ctx,&c,true,true).unwrap();
+            let second=r.read_weights(&ctx).unwrap();
+            assert_ne!(new.l2w,second.l2w);
+            r.copy_state_from_device(&ctx,&snapshot).unwrap();
+            r.begin_revival_epoch();
+            r.revive_l2_selected(&ctx,&c,true,true).unwrap();
+            assert_eq!(second,r.read_weights(&ctx).unwrap());
+            r.copy_state_from_device(&ctx,&snapshot).unwrap();
             let targets=vec![0.1;2048];let weights=vec![1.0;2048];
             for step in 1..=3 {
                 r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
