@@ -41,7 +41,7 @@ checkpoints/.../
 
 ## 5.2 checkpointを掃除するとき
 
-checkpointは大きくなりやすいので、古い保存点を削除してもかまいません。resumeに必要なのは、親フォルダ直下の `resume-config.txt` と、残したい最新checkpointフォルダの中にある3つのファイルです。
+checkpointは大きくなりやすいので、古い保存点を削除してもかまいません。resumeに必要なのは、親フォルダ直下の `resume-config.txt` と、残したい最新checkpointフォルダの中の再開用ファイルです。
 
 ```text
 checkpoints/.../
@@ -50,6 +50,7 @@ checkpoints/.../
     state.bin
     learn.log
     dataloader_pos.txt
+    epoch_superbatches.txt
 ```
 
 | ファイル / フォルダ | resumeに必要か | 説明 |
@@ -58,6 +59,7 @@ checkpoints/.../
 | `0074/dataloader_pos.txt` | 必要 | 教師データをどこまで読んだかの位置 |
 | `0074/learn.log` | 必要 | そのcheckpointが正常に保存完了したことを判定するためのメタ情報 |
 | `resume-config.txt` | 必要 | 同じ学習条件かどうかを確認するための設定記録 |
+| `0074/epoch_superbatches.txt` | 保持推奨 | 保存時のepoch長。sb数変更後の完了判定に使用。旧checkpointでは同フォルダの`bulletou-settings.json`を保持してください |
 | `0074/nn.bin` | 不要 | やねうら王で使うための量子化済み評価関数。resumeには使いません |
 | `summary-learn.csv` | 不要 | これまでの検証結果を見るための通算ログ。resume自体には使いません |
 | 古い `0001/`〜`0073/` | 不要 | `0074` から再開するなら削除できます |

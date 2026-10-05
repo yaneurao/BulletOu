@@ -4111,6 +4111,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
+    "superbatches",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "ft_factorizer",
@@ -4148,6 +4149,9 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
             }
             continue;
         }
+        if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
+            return Err(format!("superbatches.{name} must be a positive integer"));
+        }
         let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
@@ -4181,6 +4185,35 @@ fn epoch_setting_value(value: &serde_json::Value, epoch: usize) -> Result<&serde
         .ok_or_else(|| format!("epoch schedule has no value at epoch {epoch}"))
 }
 
+const CHECKPOINT_EPOCH_SUPERBATCHES_NAME: &str = "epoch_superbatches.txt";
+
+// Read just the epoch length, avoiding recursive startup/resume resolution.
+fn configured_epoch_superbatches(args: &Args, epoch: usize) -> usize {
+    if epoch == 0 { return args.warmup_sb; }
+    args.epoch_settings_json.as_ref()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .and_then(|settings| settings.get("superbatches")
+            .and_then(|value| epoch_setting_value(value, epoch).ok())
+            .and_then(|value| value.as_u64()).and_then(|n| usize::try_from(n).ok()))
+        .unwrap_or(args.superbatches.unwrap_or(1))
+}
+
+fn saved_epoch_superbatches(dir: &std::path::Path, epoch: usize) -> Option<usize> {
+    if let Ok(text) = std::fs::read_to_string(dir.join(CHECKPOINT_EPOCH_SUPERBATCHES_NAME)) {
+        if let Ok(n) = text.trim().parse::<usize>() { return Some(n); }
+    }
+    // Older checkpoints already preserve the settings used at save time.
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("bulletou-settings.json")).ok()?).ok()?;
+    let value = if epoch == 0 {
+        settings.get("warmup_sb").or_else(|| settings.get("warmup-sb"))?
+    } else {
+        settings.get("superbatches")?
+    };
+    let value = if value.is_object() { epoch_setting_value(value, epoch.max(1)).ok()? } else { value };
+    usize::try_from(value.as_u64()?).ok()
+}
+
 /// Shared by startup validation and schedule construction; inspect saved progress,
 /// never rows from an interrupted, unsaved epoch in the top-level summary.
 fn production_resume_start(args: &Args) -> (usize, usize, bool) {
@@ -4192,8 +4225,10 @@ fn production_resume_start(args: &Args) -> (usize, usize, bool) {
     };
     let teacher_changed = read_latest_saved_teacher(&output)
         .is_some_and(|prev| prev.trim() != resolve_teacher_for_log(&args.teacher).trim());
-    let epoch_sbs = if epoch == 0 { args.warmup_sb } else { args.superbatches.unwrap_or(1) };
-    if !teacher_changed && sb < epoch_sbs {
+    let epoch_sbs = configured_epoch_superbatches(args, epoch);
+    let saved_sbs = latest_complete_checkpoint_dir_raw(&output)
+        .and_then(|dir| saved_epoch_superbatches(&dir, epoch)).unwrap_or(epoch_sbs);
+    if !teacher_changed && sb < saved_sbs && sb < epoch_sbs {
         (epoch, sb + 1, true)
     } else {
         (epoch.saturating_add(1).max(1), 1, false)
@@ -4230,7 +4265,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(superbatches, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
@@ -20270,6 +20305,11 @@ fn write_cuda_cpp_direct_checkpoint_metadata_files(
     .map_err(|err| format!("failed to write {}: {err}", dir.join("dataloader_pos.txt").display()))?;
     write_build_info_file(dir)
         .map_err(|err| format!("failed to write {}: {err}", dir.join(BUILD_INFO_NAME).display()))?;
+    if args.cuda_cpp_train_steps.is_none() && args.lr_schedule != LrScheduleKind::Plateau {
+        let path = dir.join(CHECKPOINT_EPOCH_SUPERBATCHES_NAME);
+        std::fs::write(&path, format!("{}\n", configured_epoch_superbatches(args, log.epoch)))
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
     if let Some(settings_file) = args.settings_file.as_ref() {
         std::fs::copy(settings_file, dir.join("bulletou-settings.json")).map_err(|err| {
             format!(
@@ -25368,11 +25408,9 @@ impl CudaCppRunSchedule {
     }
 
     fn epoch_superbatches(&self, epoch: usize) -> usize {
-        if epoch == 0 {
-            self.chunks.iter().filter(|c| c.epoch == 0).map(|c| c.superbatch).max().unwrap_or(0)
-        } else {
-            self.superbatches_per_epoch
-        }
+        let end = self.chunks.partition_point(|chunk| chunk.epoch <= epoch);
+        end.checked_sub(1).and_then(|i| self.chunks.get(i)).filter(|chunk| chunk.epoch == epoch)
+            .map(|chunk| chunk.superbatch).unwrap_or(if epoch == 0 { 0 } else { self.superbatches_per_epoch })
     }
     fn lr_for_step(&self, args: &Args, step_index: usize, batch_size: usize) -> f32 {
         if self.production && (args.epoch_settings_json.is_some() || args.warmup_sb > 0) {
@@ -25380,7 +25418,7 @@ impl CudaCppRunSchedule {
                 let epoch_step = (progress.superbatch - 1) * progress.batches_per_superbatch
                     + progress.batch_in_superbatch - 1;
                 return cuda_cpp_epoch_lr(args, progress.epoch, epoch_step, batch_size,
-                    (self.superbatches_per_epoch as u64) * progress.batches_per_superbatch as u64 * batch_size as u64,
+                    (progress.superbatches_per_epoch as u64) * progress.batches_per_superbatch as u64 * batch_size as u64,
                     self.lr_step_gamma, effective_lr_step_positions(args, progress.batches_per_superbatch),
                     progress.batches_per_superbatch);
             }
@@ -25798,16 +25836,8 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         .ok_or_else(|| "--backend cuda-cpp production schedule requires --max-epochs".to_string())?
         .max(1);
     let batches_per_superbatch = effective_batches_per_superbatch(args)?;
-    let total_steps = max_epochs
-        .checked_mul(superbatches)
-        .and_then(|v| v.checked_mul(batches_per_superbatch))
-        .ok_or_else(|| {
-            format!(
-                "cuda-cpp schedule step count overflow: max_epochs={max_epochs}, superbatches={superbatches}, batches_per_superbatch={batches_per_superbatch}"
-            )
-        })?;
-    if total_steps == 0 {
-        return Err("--backend cuda-cpp production schedule resolved to zero train steps".to_string());
+    if superbatches == 0 {
+        return Err("--superbatches must be positive".into());
     }
     let (lr_step_gamma, _) = effective_lr_step_gamma(args, batches_per_superbatch)?;
     let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
@@ -25866,9 +25896,9 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
         quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
     let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
-        let superbatches = if epoch == 0 { args.warmup_sb } else { superbatches };
         let epoch_args = args_at_epoch(args, epoch)?;
         let args = &epoch_args;
+        let superbatches = configured_epoch_superbatches(args, epoch);
         let batches_per_superbatch = effective_batches_per_superbatch(args)?;
         let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
         let lr_step_positions = effective_lr_step_positions(args, batches_per_superbatch);
@@ -30259,6 +30289,111 @@ mod tests {
             assert_eq!(schedule.chunks.len(), 2);
             assert!(schedule.chunks.iter().all(|c| c.save_checkpoint));
         }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn resume_uses_saved_epoch_length_after_superbatches_change() {
+        let tmp = std::env::temp_dir().join(format!("bulletou-saved-epoch-length-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let checkpoint = tmp.join("0024");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        let mut args = Args::try_parse_from(["bulletou", "--teacher", "teacher.psv", "--arch", "SFNN_halfka2_128_8_32_k3k3",
+            "--superbatches", "64", "--save-rate", "0", "--max-epochs", "25", "--batch-size", "64", "--positions-per-superbatch", "128",
+            "--lr", "0.1", "--lr-min", "0.01", "--resume", "--output", tmp.to_str().unwrap()]).unwrap();
+        std::fs::write(checkpoint.join("state.bin"), b"state").unwrap();
+        std::fs::write(checkpoint.join("dataloader_pos.txt"), "1024,0\n").unwrap();
+        let progress = |epoch, sb| std::fs::write(checkpoint.join("learn.log"), format!(
+            "{LEARN_LOG_HEADER}\nSFNN_HALFKA2, {epoch}, {sb},1,-,-,-,-,0.1,0.01,1,1024,teacher.psv\n").replace(", ", ",")).unwrap();
+        // Regression: 16/16 was a completed epoch even after increasing to 64.
+        std::fs::write(checkpoint.join("bulletou-settings.json"), r#"{"superbatches":16}"#).unwrap();
+        progress(24, 16);
+        assert_eq!(production_resume_start(&args), (25, 1, false));
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(schedule.total_steps, 128);
+        assert_eq!(schedule.chunks[0].epoch, 25);
+        assert_eq!(schedule.chunks[0].superbatch, 64);
+        assert_eq!(schedule.lr_position_offset, 0);
+        // Mid-epoch resumes still continue, unless the new length has been reached.
+        progress(24, 8);
+        assert_eq!(production_resume_start(&args), (24, 9, true));
+        args.superbatches = Some(4);
+        assert_eq!(production_resume_start(&args), (25, 1, false));
+        args.superbatches = Some(64);
+        // Resolve the historical schedule at the checkpoint epoch, not epoch1.
+        std::fs::write(checkpoint.join("bulletou-settings.json"), r#"{"superbatches":{"epoch1":4,"epoch10":16}}"#).unwrap();
+        progress(24, 16);
+        assert_eq!(production_resume_start(&args), (25, 1, false));
+        // New saves record effective values, even without a settings-file.
+        let mut saved_args = args.clone();
+        saved_args.superbatches = Some(16);
+        write_cuda_cpp_direct_checkpoint_metadata_files(&checkpoint, &saved_args, CudaCppCheckpointLog {
+            epoch: 24, superbatch: 16, curr_batch: 2, prior_positions: 0, train_steps: 2, test_metrics: None,
+            lr_start: 0.1, lr_end: 0.01,
+            dataloader_pos: bulletou_lib::value::TeacherDataloaderPos { byte_offset: 1024, plies: 0 },
+        }).unwrap();
+        assert_eq!(std::fs::read_to_string(checkpoint.join(CHECKPOINT_EPOCH_SUPERBATCHES_NAME)).unwrap(), "16\n");
+        std::fs::write(checkpoint.join("bulletou-settings.json"), r#"{"superbatches":64}"#).unwrap();
+        assert_eq!(production_resume_start(&args), (25, 1, false));
+        // Changing epoch0 length must not reopen a completed warmup either.
+        progress(0, 2);
+        std::fs::write(checkpoint.join(CHECKPOINT_EPOCH_SUPERBATCHES_NAME), "2\n").unwrap();
+        args.warmup_sb = 8;
+        assert_eq!(production_resume_start(&args), (1, 1, false));
+        // Checkpoints with neither form of saved settings keep legacy behavior.
+        std::fs::remove_file(checkpoint.join(CHECKPOINT_EPOCH_SUPERBATCHES_NAME)).unwrap();
+        std::fs::remove_file(checkpoint.join("bulletou-settings.json")).unwrap();
+        progress(24, 16);
+        assert_eq!(production_resume_start(&args), (24, 17, true));
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn superbatches_epoch_schedule_controls_steps_progress_lr_and_resume() {
+        let tmp = std::env::temp_dir().join(format!("bulletou-superbatches-epoch-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("settings.json");
+        std::fs::write(&path, serde_json::json!({
+            "teacher": "teacher.psv", "arch": "SFNN_halfka2_128_8_32_k3k3", "output": tmp,
+            "superbatches": {"epoch1":64,"epoch10":324}, "max_epochs":11,
+            "batch_size":64,"positions_per_superbatch":128,"save_rate":0,"lr_schedule":"cos",
+            "lr":0.1,"lr_min":0.01,"resume":true
+        }).to_string()).unwrap();
+        let raw = vec![OsString::from("bulletou"), OsString::from("--settings-file"), path.clone().into_os_string()];
+        let args = Args::try_parse_from(expand_settings_file_args(raw.clone()).unwrap()).unwrap();
+        assert_eq!(args_at_epoch(&args,9).unwrap().superbatches,Some(64));
+        assert_eq!(args_at_epoch(&args,10).unwrap().superbatches,Some(324));
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(schedule.total_steps,(64*9+324*2)*2);
+        assert_eq!(schedule.epoch_superbatches(9),64);
+        assert_eq!(schedule.epoch_superbatches(10),324);
+        let progress = schedule.progress_for_step(64*9*2+1).unwrap();
+        assert_eq!((progress.epoch,progress.superbatch,progress.superbatches_per_epoch),(10,1,324));
+        let active = args_at_epoch(&args,10).unwrap();
+        let chunk = &schedule.chunks[9];
+        assert!((schedule.lr_for_step(&active,chunk.cumulative_steps-1,64)-chunk.lr_end).abs()<1e-6);
+        let checkpoint = tmp.join("0009");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("state.bin"),b"state").unwrap();
+        std::fs::write(checkpoint.join("dataloader_pos.txt"),"1024,0\n").unwrap();
+        std::fs::write(checkpoint.join("learn.log"),format!("{LEARN_LOG_HEADER}\nSFNN_HALFKA2,9,64,2,-,-,-,-,0.1,0.01,1,1024,teacher.psv\n")).unwrap();
+        std::fs::copy(&path,checkpoint.join("bulletou-settings.json")).unwrap();
+        assert_eq!(production_resume_start(&args),(10,1,false));
+        assert_eq!(starting_epoch_settings(&args).unwrap().superbatches,Some(324));
+        let resumed = cuda_cpp_run_schedule(&args).unwrap();
+        assert_eq!(resumed.total_steps,324*2*2);
+        assert_eq!(resumed.chunks[0].epoch,10);
+        assert_eq!(resumed.lr_position_offset,0);
+        let mut overrides=raw;
+        overrides.extend([OsString::from("--superbatches"),OsString::from("32")]);
+        let override_args=Args::try_parse_from(expand_settings_file_args(overrides).unwrap()).unwrap();
+        assert_eq!(args_at_epoch(&override_args,10).unwrap().superbatches,Some(32));
+        for value in [serde_json::json!(0),serde_json::json!(-1),serde_json::json!(1.5),serde_json::json!(true)] {
+            assert!(validate_epoch_setting("superbatches",&serde_json::json!({"epoch1":64,"epoch10":value})).is_err());
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]

@@ -41,6 +41,21 @@ SFNNの通常学習・`grid_search.py` の共通設定JSONでは、途中epoch�
 - 設定は起動時に読み込み、実行中のJSON編集は反映しません。
 - epoch開始時に `[epoch settings]` で有効値を表示します。`grid_summary.csv` の条件列も各epochの値です。checkpointの `bulletou-settings.json` は元のスケジュールを保存します。
 
+## epochごとのsuperbatch数
+
+```json
+"superbatches": {"epoch1": 64, "epoch10": 324}
+```
+
+epoch 1～9は64sb、epoch 10以降は324sbです。`epoch1`必須で、値は正の整数です。
+各epochの学習量・進捗の分母・LR周期・epoch終了時の保存判定に反映します。
+独立warmupのepoch 0は従来どおり`warmup_sb`を使います。CLIの`--superbatches 32`はスケジュール全体を上書きします。
+
+再開時は保存時点のsb数でepochの完了を判定します。16sbで完了したepoch 24の後に64sbへ変更しても、
+epoch 25のsb1から開始します。途中保存なら次のsbから再開します（変更後のsb数をすでに終えていれば次のepochへ進みます）。
+新しいcheckpointは実際に使ったsb数を`epoch_superbatches.txt`へ保存します。
+旧checkpointはそのフォルダ内の`bulletou-settings.json`を使い、どちらもなければ現在の設定で判定します。
+
 ## 対応項目
 
 ### FT factorizerを途中epochからOFFにする

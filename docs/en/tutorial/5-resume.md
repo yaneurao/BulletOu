@@ -50,6 +50,7 @@ checkpoints/.../
     state.bin
     learn.log
     dataloader_pos.txt
+    epoch_superbatches.txt
 ```
 
 | File / folder | Needed for resume? | Meaning |
@@ -58,6 +59,7 @@ checkpoints/.../
 | `0074/dataloader_pos.txt` | yes | Where the teacher loader should continue |
 | `0074/learn.log` | yes | Metadata used to treat the checkpoint as fully saved |
 | `resume-config.txt` | yes | Training-control signature used by auto-resume |
+| `0074/epoch_superbatches.txt` | Keep | Saved epoch length for correct completion checks after changing SB counts. For older checkpoints, keep their local `bulletou-settings.json` instead |
 | `0074/nn.bin` | no | Quantized network for the engine. Resume does not use it |
 | `summary-learn.csv` | no | Cumulative validation log. Useful to keep, but not required for resume |
 | old `0001/` ... `0073/` | no | Safe to delete if you only need to resume from `0074` |

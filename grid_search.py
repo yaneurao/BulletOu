@@ -209,6 +209,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
+    "superbatches",
     "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
@@ -247,7 +248,10 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
         for name, item in value.items():
             if not re.fullmatch(r"epoch[1-9][0-9]*", name):
                 raise ValueError(f"{key}: invalid epoch key {name!r}")
-            if key == "sfnn_l1_factorizer":
+            if key == "superbatches":
+                if type(item) is not int or item < 1:
+                    raise ValueError(f"{key}.{name} must be a positive integer")
+            elif key == "sfnn_l1_factorizer":
                 if item not in ("axis", "shared"):
                     raise ValueError(f"{key}.{name} must be axis/shared")
             elif revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
@@ -496,7 +500,7 @@ def is_complete(directory: Path, trial: dict, state: dict, rows=None) -> bool:
         rows = log_rows(directory)
     epoch = trial["settings"]["max_epochs"]
     group = [r for r in rows if int(r["epoch"]) == epoch]
-    target = (epoch, epoch_settings(trial, epoch, group)["superbatches"])
+    target = (epoch, resolve_epoch_settings(epoch_settings(trial, epoch, group), epoch, historical=True)["superbatches"])
     last = next((r for r in reversed(rows) if (int(r["epoch"]), int(r["superbatch"])) == target), None)
     # A saved final row can recover completion after a runner interruption just
     # after the child finished, before grid-state.json was updated.
@@ -617,7 +621,8 @@ def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
     for epoch in sorted({int(r["epoch"]) for r in rows}):
         group = [r for r in rows if int(r["epoch"]) == epoch]
         settings = epoch_settings(trial, epoch, group)
-        if int(group[-1]["superbatch"]) == (settings.get("warmup_sb", 0) if epoch == 0 else settings["superbatches"]):
+        resolved = resolve_epoch_settings(settings, epoch, historical=True)
+        if int(group[-1]["superbatch"]) == (resolved.get("warmup_sb", 0) if epoch == 0 else resolved["superbatches"]):
             trial.setdefault("epoch_settings", {})[str(epoch)] = {
                 "rows_digest": rows_digest(group), "settings": copy.deepcopy(settings),
             }
@@ -803,7 +808,8 @@ def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, int
 
     def closed_rows(rows):
         return [r for r in rows if int(r["superbatch"]) == (
-            trial["settings"].get("warmup_sb", 0) if int(r["epoch"]) == 0 else trial["settings"]["superbatches"])]
+            trial["settings"].get("warmup_sb", 0) if int(r["epoch"]) == 0 else
+            resolve_epoch_settings(trial["settings"], int(r["epoch"]))["superbatches"])]
 
     previous = closed_rows(log_rows(directory))
 
@@ -1033,7 +1039,7 @@ def main(argv=None) -> int:
                 rows = log_rows(directory)
                 last = rows[-1] if rows else {}
                 reached_end = (last.get("epoch") == str(trial["settings"]["max_epochs"])
-                               and last.get("superbatch") == str(trial["settings"]["superbatches"]))
+                               and last.get("superbatch") == str(resolve_epoch_settings(trial["settings"], trial["settings"]["max_epochs"])["superbatches"]))
                 status = "done" if code == 0 and reached_end else "failed"
                 atomic_json(state_path, {"status": status, "exit_code": code,
                                        "elapsed_seconds": round(old_elapsed + elapsed, 3)})

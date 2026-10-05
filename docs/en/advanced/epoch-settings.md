@@ -96,3 +96,18 @@ Order is FT, L1, L2, with fresh 16-teacher-batch calibration using current weigh
 Mid-epoch resume skips revival; resume from the previous epoch end performs it. Interruption before saving recalibrates when restarting from the old checkpoint. FT factorizer and BN QAT transitions are applied before revival. Warmup epoch0 uses epoch1 settings.
 
 L1 requires non-BN training; L2 supports non-BN or calibrated frozen-statistics BN QAT. Worker trials remain unsupported. Numbered audit CSVs and [REVIVE] epoch=N START/END messages record each pass.
+
+## Superbatches per epoch
+
+```json
+"superbatches": {"epoch1": 64, "epoch10": 324}
+```
+
+Epochs 1–9 use 64 SB; epoch 10 onward uses 324 SB. `epoch1` is required and all values must be positive integers.
+Training length, progress totals, LR periods and epoch-end checkpoint boundaries follow each epoch's value.
+Independent warmup epoch 0 still uses `warmup_sb`. CLI `--superbatches 32` overrides the entire schedule.
+
+Resume checks completion against the epoch length recorded at save time. Increasing from 16 to 64 SB after
+completing epoch 24 starts epoch 25 at SB 1. Mid-epoch checkpoints continue at the next SB, unless the new SB
+limit has already been reached. New checkpoints record the effective length in `epoch_superbatches.txt`.
+Older checkpoints use their local `bulletou-settings.json`; if neither exists, current settings are used.

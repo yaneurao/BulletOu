@@ -15,6 +15,39 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_superbatches_epoch_schedule_and_completion(self):
+        schedule = {"epoch1": 64, "epoch10": 324}
+        self.assertEqual(grid.resolve_epoch_settings({"superbatches": schedule}, 9)["superbatches"], 64)
+        self.assertEqual(grid.resolve_epoch_settings({"superbatches": schedule}, 10)["superbatches"], 324)
+        for bad in [0, -1, 1.5, True]:
+            with self.assertRaises(ValueError):
+                grid.resolve_epoch_settings({"superbatches": {"epoch1": 64, "epoch10": bad}}, 1)
+        settings = {**self.common, "superbatches": schedule, "max_epochs": 10}
+        grid.check_settings(settings)
+        trial = {"settings": settings}
+        rows = [{"epoch": "10", "superbatch": "324"}]
+        self.assertTrue(grid.is_complete(self.output, trial, {"status": "done"}, rows))
+        self.assertFalse(grid.is_complete(self.output, trial, {"status": "done"}, [{"epoch": "10", "superbatch": "64"}]))
+        grid.atomic_json(self.settings_path, settings)
+        plan = self.plan([])
+        self.assertEqual(plan["trials"][0]["settings"]["superbatches"], schedule)
+        overridden = self.plan(["--superbatches", "32"])
+        self.assertEqual(overridden["trials"][0]["settings"]["superbatches"], 32)
+
+    def test_superbatches_schedule_report_and_saved_epoch_history(self):
+        grid.atomic_json(self.settings_path, {**self.common, "superbatches": {"epoch1": 4, "epoch2": 8}})
+        plan = self.plan([])
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        self.summary(directory, [self.metrics(epoch=1, sb=4), self.metrics(epoch=2, sb=8)])
+        grid.remember_completed_epoch_settings(directory, trial)
+        self.assertEqual(set(trial["epoch_settings"]), {"1", "2"})
+        trial["settings"]["superbatches"] = 16
+        _, report = grid.summarize(self.output, plan)
+        old = [r for r in report if r["trial"] == trial["id"]]
+        self.assertEqual([r["superbatches"] for r in old], [4, 8])
+        self.assertTrue(all(r["status"] == "done" for r in old))
+
     def test_historical_removed_revival_schedules_remain_reportable(self):
         settings = {"sfnn_l1_revive_zero": {"epoch5": True, "epoch6": False},
                     "sfnn_l2_revive_zero": {"epoch9": True},
