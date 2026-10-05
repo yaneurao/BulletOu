@@ -16,12 +16,13 @@ pub struct RevivalAudit {
 
 struct LayerSummary {
     eligible: usize,
+    reset_candidates: usize,
     mean: Option<f64>,
     threshold: f64,
     revived: Option<usize>,
 }
 
-fn summary_header() -> String {
+fn legacy_summary_header() -> String {
     let mut header = "epoch,run".to_string();
     for layer in ["ft", "l1", "l2"] {
         for field in ["eligible", "revived", "revive_rate", "mean_relative_contribution", "contribution_threshold"] {
@@ -29,6 +30,81 @@ fn summary_header() -> String {
         }
     }
     header
+}
+
+fn previous_summary_header() -> String {
+    format!("{},ft_reset_candidates,l1_reset_candidates,l2_reset_candidates", legacy_summary_header())
+}
+
+fn summary_header() -> String {
+    let mut header = "epoch,run".to_string();
+    for layer in ["ft", "l1", "l2"] {
+        for field in ["eligible", "reset_candidates", "reset_candidate_rate", "mean_relative_contribution", "contribution_threshold"] {
+            header.push_str(&format!(",{layer}_{field}"));
+        }
+    }
+    header.push_str(",ft_revived,l1_revived,l2_revived");
+    header
+}
+
+// Rearrange previous schemas without guessing unknown historical candidate counts.
+// Replace only after the complete upgraded file has been flushed successfully.
+fn upgrade_summary(path: &Path) -> Result<(), String> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    if existing.is_empty() { return Ok(()); }
+    let mut lines = existing.lines();
+    let header = lines.next().unwrap();
+    if header == summary_header() { return Ok(()); }
+    let previous = header == previous_summary_header();
+    if !previous && header != legacy_summary_header() {
+        return Err("unexpected summary header; existing file was not modified".into());
+    }
+    let mut upgraded = format!("{}\n", summary_header());
+    for line in lines {
+        if line.is_empty() { continue; }
+        let old: Vec<_> = line.split(',').collect();
+        if old.len() != if previous { 20 } else { 17 } {
+            return Err("invalid legacy summary record; existing file was not modified".into());
+        }
+        let mut fields: Vec<String> = old[..17].iter().map(|v| v.to_string()).collect();
+        for (layer, base) in [2, 7, 12].into_iter().enumerate() {
+            // Actual reset counts were inside each layer's block in both old schemas.
+            fields.push(old[base + 1].to_string());
+            let candidates = if previous { old[17 + layer] } else { "" };
+            fields[base + 1] = candidates.to_string();
+            fields[base + 2] = if candidates.is_empty() {
+                String::new()
+            } else {
+                let eligible: usize = old[base].parse().map_err(|_| "invalid legacy eligible count")?;
+                let count: usize = candidates.parse().map_err(|_| "invalid legacy candidate count")?;
+                if count > eligible { return Err("legacy candidate count exceeds eligible count".into()); }
+                if eligible == 0 { String::new() } else { format!("{:.10}", count as f64 / eligible as f64) }
+            };
+        }
+        upgraded.push_str(&fields.join(","));
+        upgraded.push('\n');
+    }
+    let temporary = path.with_extension(format!("csv.upgrade-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos()));
+    let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary).map_err(|e| e.to_string())?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(upgraded.as_bytes())?;
+        file.sync_all()
+    })();
+    drop(file);
+    if let Err(e) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(e.to_string());
+    }
+    if let Err(e) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 pub struct Row {
@@ -91,13 +167,15 @@ impl RevivalAudit {
     }
 
     // Each layer persists its selection before mutating weights, as before.
-    // One RevivalAudit is shared by all enabled layers in an epoch invocation.
+    // One RevivalAudit is shared by all measured layers in an epoch invocation.
     pub fn append(&self, layer: &str, rows: impl IntoIterator<Item = Row>) -> Result<(), String> {
         assert!(matches!(layer, "FT" | "L1" | "L2"));
         let mut report = String::new();
         let rows: Vec<_> = rows.into_iter().collect();
         let threshold = rows.first().map(|r| r.threshold).unwrap_or(0.0);
         let mut values = Vec::new();
+        let mut selected_pairs = std::collections::BTreeSet::new();
+        let mut reset_candidates = 0;
         if layer == "FT" {
             // The shared pair is eligible only when EVERY bucket is sampled.
             // Its decision score is the maximum relative contribution over buckets.
@@ -106,14 +184,18 @@ impl RevivalAudit {
                 for row in &rows {
                     let value = pairs.entry(row.pair.expect("FT pair")).or_default();
                     *value = value.max(row.relative_contribution);
+                    if row.selected { selected_pairs.insert(row.pair.unwrap()); }
                 }
                 values.extend(pairs.into_values());
+                reset_candidates = selected_pairs.len();
             }
         } else {
             values.extend(rows.iter().filter(|r| r.positions >= 1024).map(|r| r.relative_contribution));
+            reset_candidates = rows.iter().filter(|r| r.positions >= 1024 && r.selected).count();
         }
         let summary = LayerSummary {
             eligible: values.len(),
+            reset_candidates,
             mean: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
             threshold,
             revived: None,
@@ -161,7 +243,7 @@ impl RevivalAudit {
         Ok(())
     }
 
-    /// Called only after the reset AND mean compensation have succeeded.
+    /// Called after measurement only, or after reset AND mean compensation succeed.
     pub fn complete_layer(&self, layer: &str, revived: usize) -> Result<(), String> {
         let mut summaries = self.summaries.borrow_mut();
         let summary = summaries.get_mut(layer).ok_or("missing revival calibration summary")?;
@@ -179,16 +261,23 @@ impl RevivalAudit {
         let mut record = format!("{},{}", self.epoch, self.run);
         for layer in ["FT", "L1", "L2"] {
             if let Some(s) = summaries.get(layer) {
-                let revived = s.revived.ok_or("revival summary requested before successful completion")?;
+                s.revived.ok_or("revival summary requested before successful completion")?;
                 let rate =
-                    if s.eligible == 0 { String::new() } else { format!("{:.10}", revived as f64 / s.eligible as f64) };
+                    if s.eligible == 0 { String::new() } else { format!("{:.10}", s.reset_candidates as f64 / s.eligible as f64) };
                 let mean = s.mean.map(|v| format!("{v:.10}")).unwrap_or_default();
-                record.push_str(&format!(",{},{},{rate},{mean},{:.10}", s.eligible, revived, s.threshold));
+                record.push_str(&format!(",{},{},{rate},{mean},{:.10}", s.eligible, s.reset_candidates, s.threshold));
             } else {
                 record.push_str(",,,,,");
             }
         }
+        for layer in ["FT", "L1", "L2"] {
+            record.push(',');
+            if let Some(s) = summaries.get(layer) {
+                record.push_str(&s.revived.ok_or("revival summary requested before successful completion")?.to_string());
+            }
+        }
         let write = || -> Result<(), String> {
+            upgrade_summary(&path)?;
             fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
             let mut file =
                 OpenOptions::new().create(true).append(true).read(true).open(&path).map_err(|e| e.to_string())?;
@@ -254,6 +343,7 @@ mod tests {
         let a = RevivalAudit::new(&t.0, 3).unwrap();
         let mut x = row(false);
         x.relative_contribution = 0.2;
+        x.selected = true;
         let mut y = row(false);
         y.unit = Some(4);
         y.relative_contribution = 0.6;
@@ -266,7 +356,7 @@ mod tests {
         let path = a.append_summary().unwrap();
         let original = fs::read_to_string(&path).unwrap();
         let fields: Vec<_> = original.lines().nth(1).unwrap().split(',').collect();
-        assert_eq!(fields.len(), 17);
+        assert_eq!(fields.len(), 20);
         assert_eq!(&fields[2..7], &["", "", "", "", ""]);
         assert_eq!(&fields[7..12], &["2", "1", "0.5000000000", "0.4000000000", "0.0100000000"]);
         assert_eq!(&fields[12..17], &["", "", "", "", ""]);
@@ -292,6 +382,7 @@ mod tests {
                     let mut r = row(true);
                     r.bucket = bucket;
                     r.pair = Some(pair);
+                    r.selected = pair == 0;
                     r.relative_contribution = if pair == 0 { 0.1 + bucket as f64 * 0.2 } else { 0.7 };
                     if epoch == 2 && bucket == 1 {
                         r.positions = 100;
@@ -306,10 +397,102 @@ mod tests {
             let fields: Vec<_> = text.lines().last().unwrap().split(',').collect();
             if epoch == 1 {
                 assert_eq!(&fields[2..7], &["2", "1", "0.5000000000", "0.5000000000", "0.0100000000"]);
+                assert_eq!(fields[17], "1");
             } else {
                 assert_eq!(&fields[2..7], &["0", "0", "", "", "0.0100000000"]);
+                assert_eq!(fields[17], "0");
             }
         }
+    }
+
+    #[test]
+    fn measurement_only_counts_candidates_without_reporting_resets() {
+        let t = Temp::new();
+        let a = RevivalAudit::new(&t.0, 1).unwrap();
+        let mut selected = row(false);
+        selected.selected = true;
+        let mut small = row(false);
+        small.positions = 1023;
+        small.selected = true;
+        a.append("L2", [selected, small, row(false)]).unwrap();
+        a.complete_layer("L2", 0).unwrap();
+        let mut pairs = Vec::new();
+        for bucket in 0..2 {
+            let mut r = row(true);
+            r.bucket = bucket;
+            r.selected = true;
+            pairs.push(r);
+        }
+        a.append("FT", pairs).unwrap();
+        a.complete_layer("FT", 0).unwrap();
+        let text = fs::read_to_string(a.append_summary().unwrap()).unwrap();
+        let fields: Vec<_> = text.lines().nth(1).unwrap().split(',').collect();
+        assert_eq!(fields[3], "1");
+        assert_eq!(fields[13], "1");
+        assert_eq!(fields[14], "0.5000000000");
+        assert_eq!(&fields[17..], &["0", "", "0"]);
+    }
+
+    #[test]
+    fn legacy_summary_is_extended_with_unknown_historical_candidates() {
+        let t = Temp::new();
+        fs::create_dir_all(&t.0).unwrap();
+        let path = t.0.join("revive-summary.csv");
+        let old_record = "1,1,2,1,0.5000000000,0.4000000000,0.0100000000,,,,,,,,,,";
+        assert_eq!(old_record.split(',').count(), 17);
+        fs::write(&path, format!("{}\n{old_record}", legacy_summary_header())).unwrap();
+        let a = RevivalAudit::new(&t.0, 2).unwrap();
+        a.append("L1", [row(false)]).unwrap();
+        a.complete_layer("L1", 0).unwrap();
+        a.append_summary().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().next().unwrap(), summary_header());
+        let historical: Vec<_> = text.lines().nth(1).unwrap().split(',').collect();
+        assert_eq!(&historical[2..7], &["2", "", "", "0.4000000000", "0.0100000000"]);
+        assert_eq!(&historical[17..], &["1", "", ""]);
+        assert_eq!(text.lines().count(), 3);
+        assert_eq!(fs::read_dir(&t.0).unwrap().count(), 2);
+        let malformed = format!("{}\n1,1", legacy_summary_header());
+        fs::write(&path, &malformed).unwrap();
+        assert!(a.append_summary().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn previous_summary_moves_actual_resets_to_the_end_and_keeps_candidates() {
+        let t = Temp::new();
+        fs::create_dir_all(&t.0).unwrap();
+        let path = t.0.join("revive-summary.csv");
+        let old = "1,1,4,0,0.0000000000,0.2,0.01,2,1,0.5000000000,0.4,0.01,0,0,,,0.01,2,1,0";
+        fs::write(&path, format!("{}\n{old}", previous_summary_header())).unwrap();
+        upgrade_summary(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().next().unwrap(), summary_header());
+        let fields: Vec<_> = text.lines().nth(1).unwrap().split(',').collect();
+        assert_eq!(&fields[2..7], &["4", "2", "0.5000000000", "0.2", "0.01"]);
+        assert_eq!(&fields[7..12], &["2", "1", "0.5000000000", "0.4", "0.01"]);
+        assert_eq!(&fields[12..17], &["0", "0", "", "", "0.01"]);
+        assert_eq!(&fields[17..], &["0", "1", "0"]);
+        upgrade_summary(&path).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), text);
+    }
+
+    #[test]
+    fn measurement_columns_are_identical_with_or_without_resets() {
+        let t = Temp::new();
+        for (epoch, revived) in [(1, 0), (2, 1)] {
+            let a = RevivalAudit::new(&t.0, epoch).unwrap();
+            let mut candidate = row(false);
+            candidate.selected = true;
+            a.append("L2", [candidate, row(false)]).unwrap();
+            a.complete_layer("L2", revived).unwrap();
+            a.append_summary().unwrap();
+        }
+        let text = fs::read_to_string(t.0.join("revive-summary.csv")).unwrap();
+        let rows: Vec<Vec<_>> = text.lines().skip(1).map(|line| line.split(',').collect()).collect();
+        assert_eq!(&rows[0][2..17], &rows[1][2..17]);
+        assert_eq!(rows[0][19], "0");
+        assert_eq!(rows[1][19], "1");
     }
 
     #[test]

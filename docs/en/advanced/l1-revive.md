@@ -74,29 +74,48 @@ Glorot bounds, bias compensation and signed 1/64 outgoing connections are unchan
 initialization options such as `sfnn_init_l1_glorot` do not control revival initialization.
 Quantization-visible outgoing connections do not guarantee nonzero gradients in every case.
 
+Explicit threshold input also records measurement-only layers in `revive.csv`: `selected=true`
+means the unit/pair would qualify if revival were enabled; it does not indicate an actual reset.
+
 ### Per-epoch summary
 
-After all enabled layers successfully finish revival at epoch start, append one row to
+After all requested layers successfully finish measurement/revival at epoch start, append one row to
 `revive-summary.csv` in the training output directory. `epoch,run` matches the detailed audit;
-reruns never remove earlier rows. No row is emitted when all layers are disabled.
+reruns never remove earlier rows. Explicitly supplying a layer's `revive_contribution_threshold`
+via CLI, settings JSON or an epoch schedule measures that layer even with `revive=false`,
+including an explicit `0.01`. A disabled layer with no explicit threshold is not measured;
+no row is emitted if no layer is measured. Enabled revival still uses the default `0.01`
+when the threshold is omitted.
 Columns for `ft_`, `l1_`, then `l2_` have these suffixes:
 
 | Suffix | Meaning |
 | --- | --- |
 | `eligible` | Eligible count, excluding insufficiently sampled buckets |
-| `revived` | Count successfully reset, including mean compensation |
-| `revive_rate` | `revived / eligible` |
+| `reset_candidates` | Qualifying candidate count, independent of whether reset is enabled |
+| `reset_candidate_rate` | `reset_candidates / eligible` |
 | `mean_relative_contribution` | Mean pre-reset relative contribution of eligible targets |
 | `contribution_threshold` | Applied threshold |
+
+The final three columns are `ft_revived,l1_revived,l2_revived`: successful actual reset counts,
+including mean compensation. Measurement-only layers have zero; unmeasured layers are blank.
+Each layer's measurement columns do not depend on whether that layer is actually reset
+(although resetting an upstream layer can affect subsequent downstream measurements).
+Previous schemas are rearranged while retaining historical rows: actual resets move to the end,
+recorded candidate counts move into the layer blocks, and candidate rates are recalculated.
+Unknown historical candidate counts and rates remain blank.
 
 FT counts unique shared pairs. Its mean is the mean across pairs of each pair's maximum
 relative contribution over buckets. FT has zero eligible pairs unless every bucket has
 at least 1,024 positions. L1/L2 count bucket-specific units in sufficiently sampled buckets;
 their mean is an unweighted unit average. L1 combines its two branches into one unit.
-L1 is measured after FT revival, L2 after L1 revival. Disabled/unmeasured layers are blank.
-With zero eligible targets, counts are zero and rate/mean are blank. Fractions and thresholds
+L1 is measured after FT revival, L2 after L1 revival. Unmeasured layers are blank.
+With zero eligible targets, counts (including candidates) are zero and rate/mean are blank. Fractions and thresholds
 use ten decimal places. Relative contribution is not a fraction of playing strength.
-Uses existing calibration results without extra inference. Failed revival emits no completion row.
+Summary aggregation reuses calibration results. Measuring a disabled layer adds 16 teacher batches
+of calibration (two passes for FT mean/MAD), without changing weights, optimizer state, revival RNG
+or the learning cursor. Measurement has the same support restrictions as revival. Processing order
+is FT, L1, L2 using current weights: downstream candidates can differ if disabled upstream layers
+are also enabled and reset. Failed measurement/revival emits no completion row.
 Summary write errors produce a yellow WARNING and do not stop training.
 Old detailed audits are not backfilled because `selected` does not prove successful completion.
 
