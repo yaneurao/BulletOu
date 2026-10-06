@@ -1266,12 +1266,51 @@ class GridSearchTests(unittest.TestCase):
                          "  batches_per_update: saved=1, requested=4")
         self.assertIn("saved=null, requested=<not specified>", grid.settings_diff({"x": None}, {}))
 
-    def test_extension_rejects_changed_condition_and_shrink(self):
+    def test_resume_shortens_unfinished_epoch_budget_and_retains_original_settings(self):
+        argv, old = self.saved_scale_grid()
+        for trial in old["trials"]:
+            directory = grid.trial_dir(self.output, trial)
+            trial["settings"]["max_epochs"] = 100
+            grid.atomic_json(directory / "bulletou-settings.json", trial["settings"])
+            grid.atomic_json(directory / "grid-state.json", {"status": "interrupted"})
+        grid.atomic_json(self.output / grid.MANIFEST, old)
+        originals = {p: p.read_bytes() for t in old["trials"]
+                     for p in grid.trial_dir(self.output, t).rglob("*") if p.is_file()}
+
+        def resumed(command, directory, cwd, trial_id):
+            self.assertIn("--resume", command)
+            self.assertEqual(grid.read_json(Path(command[2]))["max_epochs"], 3)
+            self.summary(directory, [self.metrics(epoch=1), self.metrics(epoch=2, checkpoint="0002"),
+                                     self.metrics(epoch=3)])
+            return 0, 1.0
+
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child", side_effect=resumed) as child, redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*argv, "--resume", "--epochs", "3"]), 0)
+        self.assertEqual(child.call_count, 3)
+        merged = grid.read_json(self.output / grid.MANIFEST)
+        for trial in merged["trials"]:
+            self.assertEqual(trial["settings"]["max_epochs"], 3)
+            self.assertEqual(trial["initial_settings"]["max_epochs"], 100)
+            self.assertEqual(trial["epoch_settings"]["2"]["settings"]["max_epochs"], 100)
+        for path, original in originals.items():
+            if path.name not in ("summary-learn.csv", "grid-state.json"):
+                self.assertEqual(path.read_bytes(), original)
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child") as child, redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*argv, "--resume", "--epochs", "3"]), 0)
+        child.assert_not_called()
+
+    def test_resume_shortened_completed_target_skips_training_and_preserves_files(self):
+        argv, old = self.saved_scale_grid()
+        before = {p: p.read_bytes() for t in old["trials"]
+                  for p in grid.trial_dir(self.output, t).rglob("*") if p.is_file()}
+        with patch.object(grid, "preflight_exe"), patch.object(grid, "run_child") as child, redirect_stdout(io.StringIO()):
+            self.assertEqual(grid.main([*argv, "--resume", "--epochs", "1"]), 0)
+        child.assert_not_called()
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_resume_factorizer_change_preserves_manifest_during_planning(self):
         argv, old = self.saved_scale_grid()
         before = (self.output / grid.MANIFEST).read_bytes()
-        for arguments in ([*argv, "--resume", "--epochs", "1"],):
-            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
-                grid.main(arguments)
         grid.atomic_json(self.settings_path, {**self.common, "sfnn_ft_factorizer": False})
         requested = grid.make_plan(grid.parse_args([*argv, "--epochs", "7"]))
         merged, _ = grid.plan_resume(self.output, old, requested)

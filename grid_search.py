@@ -683,8 +683,6 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
                 + settings_diff({k: trial["settings"].get(k, defaults.get(k)) for k in incompatible},
                                 {k: candidate["settings"].get(k, defaults.get(k)) for k in incompatible})
                 + "\nUse a new grid root for a different network layout. Nothing was overwritten.")
-        if new < old:
-            raise ValueError(f"cannot reduce trial {trial['id']} max_epochs from {old} to {new}; use --epochs {old} or higher")
         directory = trial_dir(root, trial)
         check_trial_settings_file(directory, trial)
         updated = {**candidate["settings"], "output": trial["settings"]["output"], "tag": trial["settings"]["tag"]}

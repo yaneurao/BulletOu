@@ -20,7 +20,7 @@ python .\grid_search.py `
   --lrs 0.0001 0.0002
 ```
 
-Each condition trains for one epoch of 32 SB. The source JSON is not modified. Precedence is common JSON < CLI overrides < explicit `--grid superbatches ...`. With both `--max-epochs` and `--epochs`, the former sets the training endpoint and the latter selects report epochs; report epochs beyond the endpoint are rejected. Without `--max-epochs`, `--epochs` retains its existing train-through-maximum behavior. Overrides also apply on `--resume`, but cannot reduce the total epoch budget. Repeat the arguments on resume to retain the overrides.
+Each condition trains for one epoch of 32 SB. The source JSON is not modified. Precedence is common JSON < CLI overrides < explicit `--grid superbatches ...`. With both `--max-epochs` and `--epochs`, the former sets the training endpoint and the latter selects report epochs; report epochs beyond the endpoint are rejected. Without `--max-epochs`, `--epochs` retains its existing train-through-maximum behavior. Overrides also apply on `--resume`, including shortening the training endpoint. Saved checkpoints and original settings are retained. Repeat the arguments on resume to retain the overrides.
 
 ## Verbose saturation diagnostics
 
@@ -253,7 +253,7 @@ python .\grid_search.py `
 - Existing report epochs are preserved and every newly added epoch is included in the same `grid_summary.csv`. With the original epochs 1–5, `--epochs 10` reports 1–10 on extension.
 - Unselected 1800 retains its original budget and results. It is not launched and does not get fictitious rows for epochs 6–10.
 - If an extended condition has no usable checkpoint, its previous result is archived and training restarts from the original initial state through the target epoch. Extending five to ten without a checkpoint therefore trains epochs 1–10 again.
-- Repeat the same `--resume --epochs 10` command after interruption. Once complete, it skips completed conditions instead of adding more epochs. Reducing the target is rejected.
+- Repeat the same `--resume --epochs 10` command after interruption. Once complete, it skips completed conditions instead of adding more epochs. The target can also be shortened. If the shortened target epoch is already complete, training is skipped; saved checkpoints and original settings are retained.
 - Add `--dry-run` to inspect mapped trials, existing folders and target epochs without writing files or starting training.
 
 Stop any runner already using this grid before executing the extension. The output root remains protected by an exclusive file lock.
