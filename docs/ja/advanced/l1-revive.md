@@ -82,6 +82,8 @@ Rと閾値のCSV値は0～1、stdoutは%です。
 
 ### epochごとの集計
 
+SFNNの学習起動時に、reviveやthresholdの指定にかかわらずヘッダーだけのファイルを作成します。既存の行は保持します。
+
 epoch開始時に判定する層の処理がすべて正常完了すると、学習出力フォルダの
 `revive-summary.csv`へ1行追記します。`epoch,run`は詳細CSVと共通で、再実行でも過去の行は消しません。
 各層の`revive_contribution_threshold`をCLI・設定JSON・epoch別設定で明示指定すると、

@@ -79,6 +79,8 @@ means the unit/pair would qualify if revival were enabled; it does not indicate 
 
 ### Per-epoch summary
 
+At SFNN training startup, a header-only file is created regardless of revival or threshold settings. Existing rows are preserved.
+
 After all requested layers successfully finish measurement/revival at epoch start, append one row to
 `revive-summary.csv` in the training output directory. `epoch,run` matches the detailed audit;
 reruns never remove earlier rows. Explicitly supplying a layer's `revive_contribution_threshold`

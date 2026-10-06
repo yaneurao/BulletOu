@@ -17856,6 +17856,10 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<(), String> {
+    if let Err(e) = revival_audit::ensure_summary_header(&args.output_dir()) {
+        eprintln!("warning: failed to initialize revive-summary.csv: {e}");
+    }
+
     use bulletou_cuda_cpp::{
         Context, RAdamUpdateParams, RangerUpdateParams, SfnnTrainStepHostBatch, SfnnTrainStepRunner,
     };

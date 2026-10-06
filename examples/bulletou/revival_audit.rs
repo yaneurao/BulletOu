@@ -107,6 +107,38 @@ fn upgrade_summary(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// Shared by startup and row appends so both use the same schema migration.
+fn open_summary_file(path: &Path) -> Result<File, String> {
+    let header = summary_header();
+    upgrade_summary(path)?;
+    fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let mut file =
+        OpenOptions::new().create(true).append(true).read(true).open(path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
+        writeln!(file, "{header}").map_err(|e| e.to_string())?;
+    } else {
+        let mut existing = String::new();
+        BufReader::new(&file).read_line(&mut existing).map_err(|e| e.to_string())?;
+        if existing.trim_end() != header {
+            return Err("unexpected summary header; existing file was not modified".into());
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+        let mut last = [0];
+        file.read_exact(&mut last).map_err(|e| e.to_string())?;
+        if last[0] != b'\n' {
+            writeln!(file).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(file)
+}
+
+pub fn ensure_summary_header(output_dir: &Path) -> Result<(), String> {
+    let path = output_dir.join("revive-summary.csv");
+    let mut file = open_summary_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    file.flush().map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub struct Row {
     pub bucket: usize,
     pub unit: Option<usize>,
@@ -256,7 +288,6 @@ impl RevivalAudit {
 
     pub fn append_summary(&self) -> Result<PathBuf, String> {
         let path = self.path.with_file_name("revive-summary.csv");
-        let header = summary_header();
         let summaries = self.summaries.borrow();
         let mut record = format!("{},{}", self.epoch, self.run);
         for layer in ["FT", "L1", "L2"] {
@@ -277,26 +308,7 @@ impl RevivalAudit {
             }
         }
         let write = || -> Result<(), String> {
-            upgrade_summary(&path)?;
-            fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-            let mut file =
-                OpenOptions::new().create(true).append(true).read(true).open(&path).map_err(|e| e.to_string())?;
-            if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
-                writeln!(file, "{header}").map_err(|e| e.to_string())?;
-            } else {
-                let mut existing = String::new();
-                BufReader::new(&file).read_line(&mut existing).map_err(|e| e.to_string())?;
-                if existing.trim_end() != header {
-                    return Err("unexpected summary header; existing file was not modified".into());
-                }
-                use std::io::{Read, Seek, SeekFrom};
-                file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
-                let mut last = [0];
-                file.read_exact(&mut last).map_err(|e| e.to_string())?;
-                if last[0] != b'\n' {
-                    writeln!(file).map_err(|e| e.to_string())?;
-                }
-            }
+            let mut file = open_summary_file(&path)?;
             writeln!(file, "{record}").map_err(|e| e.to_string())?;
             file.flush().map_err(|e| e.to_string())
         };
@@ -323,6 +335,43 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn startup_summary_header_is_created_once_and_preserves_records() {
+        let t = Temp::new();
+        ensure_summary_header(&t.0).unwrap();
+        let path = t.0.join("revive-summary.csv");
+        let header_only = format!("{}\n", summary_header());
+        assert_eq!(fs::read_to_string(&path).unwrap(), header_only);
+        assert!(!t.0.join("revive.csv").exists());
+        ensure_summary_header(&t.0).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), header_only);
+
+        let a = RevivalAudit::new(&t.0, 1).unwrap();
+        a.append("L2", [row(false)]).unwrap();
+        a.complete_layer("L2", 0).unwrap();
+        a.append_summary().unwrap();
+        let with_record = fs::read_to_string(&path).unwrap();
+        assert_eq!(with_record.lines().count(), 2);
+        ensure_summary_header(&t.0).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), with_record);
+    }
+
+    #[test]
+    fn startup_summary_initializes_empty_file_and_upgrades_legacy_header() {
+        let t = Temp::new();
+        fs::create_dir_all(&t.0).unwrap();
+        let path = t.0.join("revive-summary.csv");
+        fs::write(&path, "").unwrap();
+        ensure_summary_header(&t.0).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", summary_header()));
+        fs::write(&path, format!("{}\n", legacy_summary_header())).unwrap();
+        ensure_summary_header(&t.0).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{}\n", summary_header()));
+        fs::write(&path, "unexpected,header\n").unwrap();
+        assert!(ensure_summary_header(&t.0).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "unexpected,header\n");
+    }
+
     fn row(ft: bool) -> Row {
         Row {
             bucket: 2,
