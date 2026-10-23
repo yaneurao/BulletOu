@@ -7544,6 +7544,33 @@ int launch_nnue_backward_kernels(
 
 #include "bn_qat.cuh"
 
+// Gradient of strength * KL(Bernoulli(fp32) || Bernoulli(qat)).
+// FP32 is a detached teacher. Keep reported task loss unchanged.
+__global__ void qat_consistency_kernel(const float* student, const float* teacher,
+    const float* entries, float* gradient, float strength, float scale, float offset, size_t n) {
+    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || entries[i] == 0.0f) return;
+    const float p = loss_sigmoid(student[i] * scale - offset);
+    const float t = loss_sigmoid(teacher[i] * scale - offset);
+    gradient[i] += strength * entries[i] * (p - t) * scale / static_cast<float>(n);
+}
+extern "C" int bulletou_qat_consistency(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* student, BulletOuCudaCppF32Buffer* teacher,
+    BulletOuCudaCppF32Buffer* entries, BulletOuCudaCppF32Buffer* gradient,
+    float strength, float scale, float offset, size_t n) {
+    if (!ctx || !n || !std::isfinite(strength) || strength < 0.0f || !std::isfinite(scale) || scale <= 0.0f
+        || !std::isfinite(offset) || validate_buffer(ctx, student, n, "QAT consistency student")
+        || validate_buffer(ctx, teacher, n, "QAT consistency teacher")
+        || validate_buffer(ctx, entries, n, "QAT consistency mask")
+        || validate_buffer(ctx, gradient, n, "QAT consistency gradient")) return -1;
+    if (set_context_device(ctx) != 0) return -1;
+    int blocks = 0;
+    if (block_count_1d(n, 256, &blocks, "QAT consistency") != 0) return -1;
+    qat_consistency_kernel<<<blocks,256,0,ctx->stream>>>(student->ptr,teacher->ptr,entries->ptr,gradient->ptr,
+        strength,scale,offset,n);
+    return check_kernel_launch("QAT consistency");
+}
+
 template<int KIND> __global__ void layer_qat_vector_kernel(const float* src,float* dst,size_t n) {
     size_t j=blockIdx.x*blockDim.x+threadIdx.x;
     if(j>=n)return;

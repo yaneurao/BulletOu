@@ -84,6 +84,40 @@ CUDA SFNNでは次を個別に指定できます。すべてデフォルトOFF�
 
 grid searchでは、例えば `--grid sfnn_qat_ft false true --grid sfnn_qat_l2 false true --grid sfnn_qat_l3 false true` で8条件を比較できます。全層を一度にONにするなら各値を `true` だけにします。既存のL1指定は独立です。
 
+### FP32との予測差を抑えるQAT補助学習
+
+全層QATでも、FP32の`acc`と量子化後の`qacc`に差が残る場合があります。
+`sfnn_qat_consistency`を指定すると、同じ**学習局面**をFP32の元の重みでも評価し、
+その予測確率を補助教師としてQAT側に近づけます。検証局面は使いません。
+
+```json
+"sfnn_qat_ft": true,
+"sfnn_qat_l1": true,
+"sfnn_qat_l2": true,
+"sfnn_qat_l3": true,
+"sfnn_qat_consistency": 0.5
+```
+
+CLIは`--sfnn-qat-consistency 0.5`です。既定値は`0`（無効）。有限の非負値を指定します。
+係数は補助lossの強さで、例の`0.5`が最適値だと確認されたわけではありません。
+BNなしSFNNで少なくとも1層のQATが必要です。全層量子化の`qacc`との差を狙う場合は全層QATと併用します。
+
+補助項は`strength * KL(Bernoulli(p_fp32) || Bernoulli(p_qat))`です。
+FP32側はstop-gradientで、補助教師からは逆伝播しません。通常の教師lossに、この項の出力勾配を加えます。
+両側で通常lossと同じsigmoid scale（WinRateModelならoffsetも）を使用し、
+entry weight・除外maskを適用してbatchサイズで割ります。bpuの平均化も既存処理に従います。
+表示・集計するlossは従来の教師lossで、補助項は含めません。
+
+通常・アップロード並列化・profiling・勾配蓄積に対応します。
+`"sfnn_qat_consistency": {"epoch1": 0, "epoch10": 0.5}`のようなepoch設定や、
+grid searchの`--grid sfnn_qat_consistency 0 0.5`による比較もできます。resume時に変更可能です。
+
+有効時はbatchごとにFP32 forwardが1回増えます。中間バッファを再利用し、追加保持するのは
+`batch_size * 4` byteの予測値だけです（FP32 forward内部の通常scratchは別）。最初から0なら追加forwardも予測値バッファの確保もありません。有効化後は予測値バッファを再利用のため保持します。
+checkpoint・nn.bin形式と評価指標は変えません。
+これは精度改善のための実験オプションです。同じcheckpointから係数0とのA/Bを行い、
+差が縮むことだけでなく、**qaccそのものが上がりqlossが改善すること**を確認してください。
+
 ### 保存済みのnn.binを計測する
 
 ```powershell

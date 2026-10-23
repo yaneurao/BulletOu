@@ -49,7 +49,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
 }
 COMMON_COLUMNS = (
     "sfnn_ft_factorizer",
-    "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3",
+    "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_qat_consistency",
     "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
     "sfnn_init_ft_glorot", "sfnn_init_ft_shared_zero", "sfnn_init_l2_glorot", "sfnn_init_l3_glorot",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -218,7 +218,7 @@ EPOCH_SETTING_KEYS = {
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_qat_consistency", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -295,6 +295,9 @@ def check_settings(settings: dict) -> None:
             raise ValueError(f"{key} must be specified in common settings")
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
+    consistency = settings.get("sfnn_qat_consistency", 0)
+    if type(consistency) not in (float, int) or not math.isfinite(consistency) or consistency < 0:
+        raise ValueError("sfnn_qat_consistency must be finite and non-negative")
     warmup = settings.get("warmup_sb", 0)
     for key in ("sfnn_ft_revive_contribution_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
         value = settings.get(key, 0.01)
