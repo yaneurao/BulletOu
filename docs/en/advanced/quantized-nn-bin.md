@@ -72,33 +72,6 @@ Extra VRAM is `4 * stacks * L1_outputs * (FT_width + 1)` bytes: about 0.25 MiB f
 but proportional to the number of buckets for larger architectures. OFF allocates no QAT scratch.
 Training overhead and accuracy improvements are not yet established by a full training benchmark.
 
-### QAT consistency with an FP32 teacher
-
-For residual FP32/quantized prediction differences, `--sfnn-qat-consistency 0.5`
-(or JSON `"sfnn_qat_consistency": 0.5`) adds a detached FP32 teacher on the same
-**training batch**. Validation data is never used. Default `0` disables it;
-the strength must be finite and non-negative. Requires non-BN SFNN and at least
-one QAT layer. Enable all four layer QAT flags when targeting all-layer `qacc`.
-The example strength is experimental, not an established optimum.
-
-The auxiliary objective is `strength * KL(Bernoulli(p_fp32) || Bernoulli(p_qat))`.
-Only the QAT branch receives its gradient. Both probabilities use the task loss's
-sigmoid scale (and offset for WinRateModel). Entry weights/masks and batch-size
-normalization apply; existing bpu gradient averaging remains in effect.
-Reported training/validation losses retain their original task-only definitions.
-
-Normal, pipelined, profiled and accumulated updates are supported. Epoch settings
-such as `"sfnn_qat_consistency": {"epoch1": 0, "epoch10": 0.5}` are supported,
-as is `--grid sfnn_qat_consistency 0 0.5`. The strength can change on resume.
-
-When enabled, each batch adds one FP32 forward. Activation buffers are reused;
-only `batch_size * 4` bytes of teacher predictions are retained, apart from the
-FP32 forward's ordinary internal scratch. Starting with zero adds neither the forward nor the
-prediction buffer. Once allocated, the small prediction buffer is cached for reuse. Checkpoint/export formats and metric definitions are unchanged.
-Compare against strength zero from identical checkpoints, data, LR and bpu.
-An absolute improvement in qacc/qloss matters; a smaller gap alone is insufficient.
-Full training accuracy gains and throughput overhead require an A/B experiment.
-
 ### Evaluate a saved nn.bin
 
 ```powershell

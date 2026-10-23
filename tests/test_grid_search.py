@@ -15,17 +15,6 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
-    def test_qat_consistency_grid_and_epoch_schedule(self):
-        plan=self.plan(["--grid","sfnn_qat_consistency","0","0.5"])
-        self.assertEqual({t["settings"]["sfnn_qat_consistency"] for t in plan["trials"]},{0,0.5})
-        settings={**self.common,"sfnn_qat_l1":True,"sfnn_qat_consistency":{"epoch1":0,"epoch3":0.5}}
-        grid.check_settings(settings)
-        self.assertEqual(grid.resolve_epoch_settings(settings,2)["sfnn_qat_consistency"],0)
-        self.assertEqual(grid.resolve_epoch_settings(settings,3)["sfnn_qat_consistency"],0.5)
-        for bad in [-1,True,float("nan"),float("inf")]:
-            with self.subTest(bad=bad),self.assertRaises(ValueError):
-                grid.check_settings({**self.common,"sfnn_qat_consistency":bad})
-
     def test_superbatches_epoch_schedule_and_completion(self):
         schedule = {"epoch1": 64, "epoch10": 324}
         self.assertEqual(grid.resolve_epoch_settings({"superbatches": schedule}, 9)["superbatches"], 64)

@@ -10,7 +10,7 @@ pub(crate) struct State {
 }
 
 pub(crate) fn enabled(lr: SfnnLayerLrMultipliers) -> bool {
-    lr.qat_ft || lr.qat_l2 || lr.qat_l3 || lr.qat_consistency > 0.0
+    lr.qat_ft || lr.qat_l2 || lr.qat_l3
 }
 
 #[cfg(test)]
@@ -224,7 +224,7 @@ mod tests {
             assert!(r.read_loss(&ctx).unwrap().mean.is_finite());
             let before = r.weights.l0w.download(&ctx).unwrap();
             let fail: Result<()> =
-                step(&mut r, &ctx, params, lr, false, None, batch, ScalarLossKind::BceWithLogits, 1.0, |_, _| Err(CudaCppError::message("test failure")));
+                step(&mut r, &ctx, params, lr, false, None, |_, _| Err(CudaCppError::message("test failure")));
             assert!(fail.is_err());
             assert_eq!(r.weights.l0w.download(&ctx).unwrap(), before);
         }
@@ -349,9 +349,6 @@ pub(crate) fn step<T>(
     lr: SfnnLayerLrMultipliers,
     update: bool,
     dirty: Option<&[i32]>,
-    batch: SfnnTrainStepHostBatch<'_>,
-    loss_kind: ScalarLossKind,
-    output_inv_scale: f32,
     run: impl FnOnce(&mut SfnnTrainStepRunner, SfnnLayerLrMultipliers) -> Result<T>,
 ) -> Result<T> {
     if r.batch_norm.is_some() {
@@ -371,7 +368,6 @@ pub(crate) fn step<T>(
     }
     let mut q = std::mem::take(&mut r.layer_qat);
     let result = (|| {
-        qat_consistency::prepare(r, ctx, batch, lr, loss_kind, output_inv_scale)?;
         let signature = (lr.qat_ft, lr.qat_l2, lr.qat_l3, vr, r.factorizer_alpha.ft.to_bits());
         // Masters are unchanged within a gradient-accumulation group. Never
         // reuse across an update or restore (both reset pending batches).
@@ -399,7 +395,7 @@ pub(crate) fn step<T>(
             q.signature = Some(signature);
         }
         q.swap(&mut r.weights);
-        let inner = SfnnLayerLrMultipliers { qat_ft: false, qat_l2: false, qat_l3: false, qat_consistency: 0.0, ..lr };
+        let inner = SfnnLayerLrMultipliers { qat_ft: false, qat_l2: false, qat_l3: false, ..lr };
         let value = run(r, inner);
         // Restore masters even after a failed forward/backward; optimizers and
         // serialization never see fake-quantized tensors.
@@ -411,6 +407,5 @@ pub(crate) fn step<T>(
         Ok(value)
     })();
     r.layer_qat = q;
-    qat_consistency::clear(r);
     result
 }

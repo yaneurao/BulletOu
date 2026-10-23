@@ -78,7 +78,6 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 | `batches_per_update` | 1更新あたりの累積batch数 |
 | `ft_factorizer` / `sfnn_ft_factorizer` | 非BN SFNN HalfKA2でON→OFFへ自動fold |
 | `sfnn_qat_l1` | L1 QATの有効・無効 |
-| `sfnn_qat_consistency` | FP32→QATの補助KL強度（0で無効、BNなし・QAT有効時） |
 | `sfnn_bn_qat` | BN QATの有効・無効（BN層は最初から有効化。例：`{"epoch1":false,"epoch6":true}`） |
 | `sfnn_freeze_l1` | L1の固定・解除 |
 | `sfnn_l1_lr_mult` | L1の学習率倍率 |

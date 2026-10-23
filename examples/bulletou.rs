@@ -4120,7 +4120,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_qat_consistency", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4267,7 +4267,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(superbatches, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
-            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_qat_consistency, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -5372,11 +5372,6 @@ struct Args {
     #[arg(long)]
     sfnn_qat_l3: bool,
 
-    /// Non-BN QAT auxiliary KL strength: match detached FP32 predictions on
-    /// the same training batch. 0 disables; adds one FP32 forward when enabled.
-    #[arg(long, default_value = "0.0")]
-    sfnn_qat_consistency: f32,
-
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
     /// term before each update and does not change the reported value loss.
@@ -5805,13 +5800,6 @@ impl Args {
             if self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some() {
                 return Err("--sfnn-qat-l1 supports dense L1 only (not grouped/common-shard L1)".to_string());
             }
-        }
-        if !self.sfnn_qat_consistency.is_finite() || self.sfnn_qat_consistency < 0.0 {
-            return Err("--sfnn-qat-consistency must be finite and non-negative".into());
-        }
-        if self.sfnn_qat_consistency > 0.0 && (!self.non_bn_layer_qat()
-            || !(self.sfnn_qat_ft || self.effective_sfnn_qat_l1() || self.sfnn_qat_l2 || self.sfnn_qat_l3)) {
-            return Err("--sfnn-qat-consistency requires non-BN SFNN with at least one QAT layer enabled".into());
         }
         if self.sfnn_qat_ft || self.sfnn_qat_l2 || self.sfnn_qat_l3 {
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
@@ -25620,8 +25608,6 @@ fn cuda_cpp_should_profile_sfnn_diagnostics(args: &Args, progress: Option<CudaCp
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn print_sfnn_qat_mode(args: &Args) {
-    print_startup_kv("QAT consistency", format!("strength={} (0=off); detached FP32 teacher on training batches; extra forward when enabled",
-        args.sfnn_qat_consistency));
     print_startup_kv("FT saturation guard", &format!("strength={}, rate={}, patience={} training batches; mean over batch x 2 views x FT units; history resets on restore",
         args.sfnn_ft_saturation_penalty, args.sfnn_ft_saturation_rate, args.sfnn_ft_saturation_patience));
     print_startup_kv("L1 effective weight clip", if args.sfnn_l1_effective_weight_clip {
@@ -25670,7 +25656,6 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         qat_ft: args.sfnn_qat_ft && args.non_bn_layer_qat(),
         qat_l2: args.sfnn_qat_l2 && args.non_bn_layer_qat(),
         qat_l3: args.sfnn_qat_l3 && args.non_bn_layer_qat(),
-        qat_consistency: args.sfnn_qat_consistency,
         qat_ft_virtual_rows: if args.ft_factorizer && args.eval_type() == EvalType::SfnnHalfka2 {
             bulletou_lib::game::inputs::PIECE_INPUTS
         } else { 0 },
@@ -26358,7 +26343,6 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_qat_ft={}", args.sfnn_qat_ft && args.non_bn_layer_qat()),
         format!("sfnn_qat_l2={}", args.sfnn_qat_l2 && args.non_bn_layer_qat()),
         format!("sfnn_qat_l3={}", args.sfnn_qat_l3 && args.non_bn_layer_qat()),
-        format!("sfnn_qat_consistency={:.9}", args.sfnn_qat_consistency),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
         format!("sfnn_bn_affine_lr_multiplier={}", args.sfnn_bn_affine_lr_multiplier),
         format!("sfnn_ft_lr_mult={}", args.sfnn_ft_lr_mult),
@@ -26646,12 +26630,12 @@ fn resume_signature_for_match(signature: &str) -> String {
     // Retired experimental option: retain resume access to existing checkpoints,
     // but never accept it as a current CLI/JSON training option.
     let signature = resume_signature_without_line(&signature, "sfnn_l1_saturation_backward_alpha=");
+    let signature = resume_signature_without_line(&signature, "sfnn_qat_consistency=");
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_ft=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l2=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l3=");
-    let signature = resume_signature_without_line(&signature, "sfnn_qat_consistency=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_affine_lr_multiplier=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_lr_mult=");
@@ -35334,30 +35318,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "cuda-cpp-backend")]
-    fn qat_consistency_cli_json_schedule_validation_and_resume() {
+    fn removed_qat_consistency_rejects_settings_but_preserves_checkpoint_resume() {
         let base=["bulletou","--arch","SFNN_halfka2_2304_15_64_progress8","--teacher","/dev/null"];
-        let off=Args::try_parse_from(base).unwrap();
+        let args=Args::try_parse_from(base).unwrap();
+        assert!(Args::try_parse_from(base.into_iter().chain(["--sfnn-qat-consistency","0.5"])).is_err());
         let mut argv:Vec<std::ffi::OsString>=base.into_iter().map(Into::into).collect();
         bulletou_settings_json_value_to_args(std::path::Path::new("settings.json"),"sfnn_qat_consistency",
             &serde_json::json!(0.5),&mut argv).unwrap();
-        argv.push("--sfnn-qat-l1".into());
-        let on=Args::try_parse_from(argv).unwrap();
-        assert!(on.validate_arch_flags().is_ok());
-        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&on,None).qat_consistency,0.5);
-        assert!(resume_signature_matches(&resume_signature(&off),&on));
-        for bad in [-1.0,f32::NAN,f32::INFINITY] {
-            let mut invalid=on.clone(); invalid.sfnn_qat_consistency=bad;
-            assert!(invalid.validate_arch_flags().is_err());
-        }
-        let mut invalid=on.clone(); invalid.sfnn_qat_l1=false;
-        assert!(invalid.validate_arch_flags().is_err());
-        invalid=on.clone(); invalid.sfnn_bn_ft=true;
-        assert!(invalid.validate_arch_flags().is_err());
-        let mut scheduled=on.clone();
-        scheduled.epoch_settings_json=Some(serde_json::json!({"sfnn_qat_consistency":{"epoch1":0.0,"epoch3":0.5}}).to_string());
-        assert_eq!(args_at_epoch(&scheduled,1).unwrap().sfnn_qat_consistency,0.0);
-        assert_eq!(args_at_epoch(&scheduled,3).unwrap().sfnn_qat_consistency,0.5);
+        assert!(Args::try_parse_from(argv).is_err());
+        let old_signature=format!("{}sfnn_qat_consistency=0.500000000\n",resume_signature(&args));
+        assert!(resume_signature_matches(&old_signature,&args));
     }
 
     #[test]

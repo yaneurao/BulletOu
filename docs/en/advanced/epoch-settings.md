@@ -59,7 +59,6 @@ Grid search accepts the schedule in its common JSON. Remove any explicit `--grid
 | `batches_per_update` | Accumulation batches per update |
 | `ft_factorizer` / `sfnn_ft_factorizer` | Non-BN SFNN HalfKA2 ON→OFF automatic fold |
 | `sfnn_qat_l1` | Enable/disable L1 QAT |
-| `sfnn_qat_consistency` | FP32-to-QAT auxiliary KL strength (0 disables; non-BN with QAT) |
 | `sfnn_bn_qat` | Enable/disable BN QAT; enable BN layers from startup, e.g. `{"epoch1":false,"epoch6":true}` |
 | `sfnn_freeze_l1` | Freeze/unfreeze L1 |
 | `sfnn_l1_lr_mult` | L1 LR multiplier |

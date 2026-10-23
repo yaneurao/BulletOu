@@ -3,7 +3,6 @@ use std::{error, ffi::CStr, fmt, os::raw::c_char, ptr::NonNull};
 pub mod batch_norm;
 mod bn_qat;
 mod layer_qat;
-mod qat_consistency;
 pub mod l2_revive;
 pub mod l1_revive;
 pub mod ft_revive;
@@ -6149,7 +6148,6 @@ pub struct SfnnTrainStepRunner {
     pub l2_revival_flags: u8,
     pub revival_rng: revival_rng::RevivalRng,
     layer_qat: layer_qat::State,
-    qat_consistency: qat_consistency::State,
     bn_qat: Option<bn_qat::State>,
     pub batch_norm: Option<batch_norm::Network>,
     experimental_output_centers: Option<(F32Buffer, F32Buffer)>,
@@ -6275,8 +6273,6 @@ pub struct SfnnLayerLrMultipliers {
     pub qat_l2: bool,
     pub qat_l3: bool,
     pub qat_ft_virtual_rows: usize,
-    /// Strength of stop-gradient FP32 -> QAT Bernoulli KL on training batches.
-    pub qat_consistency: f32,
 }
 
 impl Default for SfnnLayerLrMultipliers {
@@ -6304,16 +6300,12 @@ impl Default for SfnnLayerLrMultipliers {
             qat_l2: false,
             qat_l3: false,
             qat_ft_virtual_rows: 0,
-            qat_consistency: 0.0,
         }
     }
 }
 
 impl SfnnLayerLrMultipliers {
     pub fn validate(self) -> Result<()> {
-        if !self.qat_consistency.is_finite() || self.qat_consistency < 0.0 {
-            return Err(CudaCppError::message("QAT consistency strength must be finite and non-negative"));
-        }
         if !self.ft_saturation_penalty.is_finite() || self.ft_saturation_penalty < 0.0
             || !self.ft_saturation_rate.is_finite() || self.ft_saturation_rate <= 0.0 || self.ft_saturation_rate > 1.0
             || self.ft_saturation_patience == 0 || self.ft_saturation_patience > i32::MAX as usize {
@@ -6551,7 +6543,6 @@ impl SfnnTrainStepRunner {
             batch_norm: None,
             bn_qat: None,
             layer_qat: Default::default(),
-            qat_consistency: Default::default(),
             l1_revival_flags: 0,
             l2_revival_flags: 0,
             revival_rng: Default::default(),
@@ -7274,7 +7265,7 @@ impl SfnnTrainStepRunner {
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
         if layer_qat::enabled(lr_multipliers) {
-            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,batch,loss_kind,output_inv_scale,|r,lr|
+            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
                 r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
                     ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr,dirty_buckets));
         }
@@ -7325,7 +7316,6 @@ impl SfnnTrainStepRunner {
             &self.loss_workspace,
             finalize_loss,
         )?;
-        qat_consistency::apply(self, ctx, &self.entry_weights)?;
         sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
             ctx,
             &self.device_batch,
@@ -7455,7 +7445,7 @@ impl SfnnTrainStepRunner {
         dirty_buckets: Option<&[i32]>,
     ) -> Result<()> {
         if layer_qat::enabled(lr_multipliers) {
-            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,batch,loss_kind,output_inv_scale,|r,lr|
+            return layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
                 r.step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
                     ctx,upload_ctx,params,loss_kind,output_inv_scale,batch,finalize_loss,false,lr,dirty_buckets));
         }
@@ -7512,7 +7502,6 @@ impl SfnnTrainStepRunner {
                 &self.loss_workspace,
                 finalize_loss,
             )?;
-            qat_consistency::apply(self, ctx, &slot.entry_weights)?;
             sfnn_backward_train_device_with_factorizer_alpha_and_axis_confidences(
                 ctx,
                 &slot.device_batch,
@@ -7603,7 +7592,7 @@ impl SfnnTrainStepRunner {
     ) -> Result<SfnnTrainStepProfile> {
         if layer_qat::enabled(lr_multipliers) {
             let start=Event::new(ctx)?; let stop=Event::new(ctx)?; start.record(ctx)?;
-            let mut p=layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,batch,loss_kind,output_inv_scale,|r,lr|
+            let mut p=layer_qat::step(self,ctx,params,lr_multipliers,update_weights,dirty_buckets,|r,lr|
                 r.step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
                     ctx,params,loss_kind,output_inv_scale,batch,false,lr,dirty_buckets))?;
             stop.record(ctx)?; stop.synchronize()?;
@@ -7671,7 +7660,6 @@ impl SfnnTrainStepRunner {
             &self.entry_weights,
             &self.loss_workspace,
         )?;
-        qat_consistency::apply(self, ctx, &self.entry_weights)?;
         after_loss.record(ctx)?;
         let ft_guard = ft_saturation_guard::prepare(self, ctx, lr_multipliers, None)?;
         let backward_stages = sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
