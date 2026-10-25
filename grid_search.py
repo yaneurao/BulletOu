@@ -252,8 +252,8 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
                 if type(item) is not int or item < 1:
                     raise ValueError(f"{key}.{name} must be a positive integer")
             elif key == "sfnn_l1_factorizer":
-                if item not in ("axis", "shared"):
-                    raise ValueError(f"{key}.{name} must be axis/shared")
+                if item not in ("axis", "shared", "pair"):
+                    raise ValueError(f"{key}.{name} must be axis/shared/pair")
             elif revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")

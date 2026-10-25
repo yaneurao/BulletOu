@@ -239,7 +239,10 @@ class GridSearchTests(unittest.TestCase):
         settings = {"sfnn_l1_factorizer": {"epoch1": "axis", "epoch5": "shared", "epoch8": "axis"}}
         for epoch, expected in [(0,"axis"),(1,"axis"),(4,"axis"),(5,"shared"),(7,"shared"),(8,"axis")]:
             self.assertEqual(grid.resolve_epoch_settings(settings,epoch)["sfnn_l1_factorizer"],expected)
-        for bad in [True, "pair", "none", 1]:
+        settings={"sfnn_l1_factorizer":{"epoch1":"pair","epoch5":"axis","epoch8":"shared","epoch9":"pair"}}
+        for epoch,expected in [(1,"pair"),(5,"axis"),(8,"shared"),(9,"pair")]:
+            self.assertEqual(grid.resolve_epoch_settings(settings,epoch)["sfnn_l1_factorizer"],expected)
+        for bad in [True, "none", 1]:
             with self.assertRaisesRegex(ValueError,"axis/shared"):
                 grid.resolve_epoch_settings({"sfnn_l1_factorizer":{"epoch1":bad}},1)
 

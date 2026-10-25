@@ -148,7 +148,7 @@ impl SfnnTrainStepRunner {
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
             || self.residual_count_gates_enabled || self.shape.has_compact_l1()
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
-            return Err(CudaCppError::message("L1 revival requires non-BN dense L1 (none/shared/axis), no residual count gates or legacy L2/L3 factorizers, and no pending gradients"));
+            return Err(CudaCppError::message("L1 revival requires non-BN dense L1 (none/shared/axis/pair), no residual count gates or legacy L2/L3 factorizers, and no pending gradients"));
         }
         let s=self.shape;
         if c.input!=s.ft_size || c.width!=s.l1_hidden || c.counts.len()!=s.num_stacks

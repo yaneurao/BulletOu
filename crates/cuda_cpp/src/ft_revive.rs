@@ -84,7 +84,7 @@ impl SfnnTrainStepRunner {
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some()
             || c.width!=s.ft_size || c.counts.len()!=s.num_stacks || base_inputs==0 || base_inputs>s.input_size
             || ids.iter().any(|&i|i>=pairs) || c.counts.iter().any(|&n|n<1024) {
-            return Err(CudaCppError::message("FT revival requires calibrated non-BN dense SFNN, L1 none/shared/axis, no residual count gates or pending gradients"));
+            return Err(CudaCppError::message("FT revival requires calibrated non-BN dense SFNN, L1 none/shared/axis/pair, no residual count gates or pending gradients"));
         }
         if ids.is_empty() {return Ok(());}
         let common=revive_common::Common::read(self,ctx)?;

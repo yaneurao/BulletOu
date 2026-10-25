@@ -123,9 +123,11 @@ Old detailed audits are not backfilled because `selected` does not prove success
 
 ## Support and migration
 
-Supports cuda-cpp dense SFNN, L1 none/shared/axis, ordinary/per-layer-QAT training, standalone/grid.
+Pair terms include their alpha/count multipliers when compensating residual weights; shared factor weights and optimizer states are preserved.
+
+Supports cuda-cpp dense SFNN, L1 none/shared/axis/pair, ordinary/per-layer-QAT training, standalone/grid.
 L1 requires non-BN; L2 with BN requires calibrated L2 BN, BN QAT and frozen statistics.
-Worker, ordinary NNUE, compact L1, pair, residual count gates and legacy L2/L3 factorizers remain unsupported.
+Worker, ordinary NNUE, compact L1, residual count gates and legacy L2/L3 factorizers remain unsupported.
 Axis revival retains shared/axis tensors and their optimizer states, subtracting their contribution
 from selected bucket-specific weights/biases. Master and Lookahead are compensated separately,
 including alpha and axis confidence. Unselected buckets are not reset through a common factor.
@@ -170,9 +172,9 @@ This is approximate mean compensation, NOT pointwise-equivalent or guaranteed to
 
 Order: FT, then L1, then L2. Audit: the shared `revive.csv` in the training output directory (`layer=FT`), fractions in CSV,
 percentages on stdout. Counts may differ from offline validation-set integer nn.bin analysis.
-Supports non-BN dense SFNN, L1 none/shared/axis, FT factorizer on/off, per-layer QAT, standalone/grid.
+Supports non-BN dense SFNN, L1 none/shared/axis/pair, FT factorizer on/off, per-layer QAT, standalone/grid.
 FT outgoing residuals compensate both shared and axis terms so effective new connections are signed 1/64.
-BN, compact L1, pair, residual count gates and worker trials are unsupported.
+BN, compact L1, residual count gates and worker trials are unsupported.
 
 ```powershell
 python .\grid_search.py --settings-file settings.json --output-folder results `

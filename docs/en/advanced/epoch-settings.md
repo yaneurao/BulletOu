@@ -1,22 +1,26 @@
 # Per-epoch settings
 
-## Switching L1 axis/shared factorization
+## Switching L1 shared/axis/pair factorization
 
 ```json
 "sfnn_l1_factorizer": {
-  "epoch1": "axis",
-  "epoch5": "shared",
-  "epoch8": "axis"
+  "epoch1": "pair",
+  "epoch5": "axis",
+  "epoch8": "shared",
+  "epoch9": "pair"
 }
 ```
 
-At epoch boundaries, axis-to-shared folds axis weights/biases into bucket base weights using current alpha/count coefficients. Lookahead slow weights receive the same transformation. Base/shared momentum, velocity and update steps survive; removed axis moments are discarded. Forward output is preserved apart from floating-point rounding, but subsequent optimizer dynamics are not equivalent.
-
-Shared-to-axis retains base/shared parameters and adds zero axis weights, biases and optimizer states. It does not restore previously removed axes or extract them from base weights.
+Switches run at epoch start in every direction between `shared`, `axis` and `pair`.
+Old axis/pair weights and biases are folded into each bucket using the current alpha/count coefficients.
+Lookahead slow weights are folded independently. Base/shared moments and optimizer steps survive;
+old axis/pair moments are discarded. All new axis/pair coordinates (including single axes on
+`pair -> axis`) start with zero weights, biases and moments. Removed factors are not reconstructed.
+Immediate forward outputs are preserved up to floating-point rounding; subsequent optimizer dynamics differ.
 
 Supported for non-BN dense cuda-cpp SFNN production training, including k3k3, progress8 and combinations. Only existing architectural axes are used. Progress8 alone maps axes one-to-one to buckets, without cross-bucket sharing. BN/compact L1 and worker epoch schedules are unsupported. A zero residual gate with a nonzero axis coefficient raises an error instead of silently changing output.
 
-Checkpoint restore checks actual axis presence to apply each boundary once. Future axis settings do not allocate axes in earlier shared epochs. `[L1 FACTORIZER]` records the transition and optimizer policy.
+Checkpoint restore checks the saved axis/pair tensor layout to apply each boundary once. Future axis/pair settings do not allocate these terms in earlier shared epochs. `[L1 FACTORIZER]` records the transition and optimizer policy.
 
 Use the common JSON in grid search. An explicit `--grid sfnn_l1_factorizer shared` overrides the entire schedule; omit that grid axis to retain epoch switching.
 

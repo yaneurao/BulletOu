@@ -1,4 +1,4 @@
-//! Read-only L1 shared/axis terms for revival. Never reset shared optimizer state.
+//! Read-only L1 shared/axis/pair terms for revival. Never reset shared optimizer state.
 use super::*;
 
 pub(crate) struct Common {
@@ -36,6 +36,77 @@ pub(crate) struct Common {
         }
         assert!((pb[b*s.l1_out()+u]-(common.bias(b,u,false)*8128.0).round()/8128.0).abs()<1e-6);
         }}
+    }
+    #[test]
+    fn gpu_pair_revival_preserves_shared_terms_and_matches_quantized_proxy() {
+        let ctx=Context::new(0).unwrap();
+        let mut s=crate::tests::tiny_sfnn_shape();
+        s.num_stacks=32; s.factorizer_king_axis_dim=2; s.factorizer_hand_axis_dim=2;
+        let mut host=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        let w1=vec![0.0;s.num_stacks*s.l1_out()*s.ft_size]; let b1=vec![0.0;s.num_stacks*s.l1_out()];
+        let w2=vec![0.1;s.num_stacks*s.l2_size*s.l2_in()]; let b2=vec![0.02;s.num_stacks*s.l2_size];
+        let w3=vec![0.2;s.num_stacks*s.l2_size]; let b3=vec![0.03;s.num_stacks];
+        host.shape=s;host.l1w=&w1;host.l1b=&b1;host.l2w=&w2;host.l2b=&b2;host.l3w=&w3;host.l3b=&b3;
+        host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,1024,1).unwrap();
+        s.factorizer_progress_axis=true;s.factorizer_king_hand_pair=true;
+        s.factorizer_king_progress_pair=true;s.factorizer_hand_progress_pair=true;
+        let active=SfnnFactorizerActive { king_axis:true,hand_axis:true,progress_axis:true,
+            king_hand_pair:true,king_progress_pair:true,hand_progress_pair:true,..SfnnFactorizerActive::SHARED };
+        let alpha=SfnnFactorizerAlpha { shared:0.6,king_axis:0.7,hand_axis:0.8,progress_axis:0.9,pair:0.5,..SfnnFactorizerAlpha::ONE };
+        r.enable_l1_axes_zero(&ctx,s,active,alpha).unwrap();
+        let aw:Vec<f32>=(0..s.factorizer_axis_count()*s.ft_size*s.l1_out()).map(|i|((i%11) as f32-5.0)/128.0).collect();
+        let ab:Vec<f32>=(0..s.factorizer_axis_count()*s.l1_out()).map(|i|i as f32/8128.0).collect();
+        r.weights.l1axw.as_ref().unwrap().upload(&ctx,&aw).unwrap();
+        r.weights.l1axb.as_ref().unwrap().upload(&ctx,&ab).unwrap();
+        r.optimizer_states.l1axw.as_ref().unwrap().slow_params.fill(&ctx,0.03).unwrap();
+        r.optimizer_states.l1axb.as_ref().unwrap().slow_params.fill(&ctx,0.04).unwrap();
+        r.optimizer_states.l1axw.as_ref().unwrap().momentum.fill(&ctx,0.123).unwrap();
+        r.optimizer_states.l1axw.as_ref().unwrap().velocity.fill(&ctx,0.456).unwrap();
+        let confidence:Vec<f32>=(0..s.factorizer_axis_count()).map(|i|0.2+0.01*i as f32).collect();
+        r.set_factorizer_axis_confidences(&ctx,Some(&confidence)).unwrap();
+        let common=Common::read(&r,&ctx).unwrap();
+        let proxy_shape=SfnnForwardShape {factorizer_king_axis_dim:0,factorizer_hand_axis_dim:0,
+            factorizer_progress_axis:false,factorizer_king_hand_pair:false,factorizer_king_progress_pair:false,
+            factorizer_hand_progress_pair:false,..s};
+        let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,proxy_shape).unwrap();
+        r.build_quantized_proxy(&ctx,s.input_size,0,&proxy).unwrap();
+        let pw=proxy.l1w.download(&ctx).unwrap();let pb=proxy.l1b.download(&ctx).unwrap();
+        for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
+            for j in 0..s.ft_size {
+                let expected=(64.0*common.weight(bucket,u,j,false)).round().clamp(-128.0,127.0)/64.0;
+                assert!((pw[(bucket*s.l1_out()+u)*s.ft_size+j]-expected).abs()<1e-6);
+            }
+            assert!((pb[bucket*s.l1_out()+u]-(common.bias(bucket,u,false)*8128.0).round()/8128.0).abs()<1e-6);
+        }}
+        let old=r.read_weights(&ctx).unwrap();let old_opt=r.read_optimizer_states(&ctx).unwrap();
+        let mut c=l1_revive::Calibration::new(s.ft_size,s.l1_hidden,s.num_stacks);
+        c.counts.fill(1024);c.contribution.relative=vec![1.0;s.num_stacks*s.l1_hidden];c.contribution.relative[0]=0.0;
+        assert_eq!(r.revive_l1_selected(&ctx,&c,true,false).unwrap(),vec![0]);
+        let reset=r.read_weights(&ctx).unwrap();let opt=r.read_optimizer_states(&ctx).unwrap();
+        assert_eq!(&old.l1w[s.l1_out()*s.ft_size..],&reset.l1w[s.l1_out()*s.ft_size..]);
+        for j in 0..s.ft_size {
+            assert!((reset.l1w[j]+common.weight(0,0,j,false)-opt.l1w.slow_params[j]-common.weight(0,0,j,true)).abs()<1e-6);
+        }
+        assert!((reset.l1b[0]+common.bias(0,0,false)-0.5).abs()<1e-6);
+        assert!((opt.l1b.slow_params[0]+common.bias(0,0,true)-0.5).abs()<1e-6);
+        let mut ft=ft_revive::Calibration::new(s.ft_size,s.num_stacks);ft.counts.fill(1024);ft.means.fill(0.25);
+        r.revive_ft(&ctx,&ft,&[0],s.input_size).unwrap();
+        ft.means.fill(0.4);r.compensate_ft_revival_mean(&ctx,&[0],&ft).unwrap();
+        let reset=r.read_weights(&ctx).unwrap();let opt=r.read_optimizer_states(&ctx).unwrap();
+        for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {for j in [0,s.ft_size/2] {
+            let i=(bucket*s.l1_out()+u)*s.ft_size+j;
+            let fast=reset.l1w[i]+common.weight(bucket,u,j,false);
+            let slow=opt.l1w.slow_params[i]+common.weight(bucket,u,j,true);
+            assert!((fast.abs()-1.0/64.0).abs()<1e-6);assert!((fast-slow).abs()<1e-6);
+        }}}
+        let mut c=l2_revive::Calibration::new(s.l2_in(),s.l2_size,s.num_stacks);
+        c.counts.fill(1024);c.contribution.relative=vec![1.0;s.num_stacks*s.l2_size];c.contribution.relative[0]=0.0;
+        assert_eq!(r.revive_l2_selected(&ctx,&c,true,false).unwrap(),vec![0]);
+        let new=r.read_weights(&ctx).unwrap();let opt=r.read_optimizer_states(&ctx).unwrap();
+        assert_eq!(old.l1axw,new.l1axw);assert_eq!(old.l1axb,new.l1axb);assert_eq!(old.l1fw,new.l1fw);assert_eq!(old.l1fb,new.l1fb);
+        assert_eq!(old_opt.l1axw,opt.l1axw);assert_eq!(old_opt.l1axb,opt.l1axb);
+        assert_eq!(old_opt.l1fw,opt.l1fw);assert_eq!(old_opt.l1fb,opt.l1fb);
     }
     #[test]
     fn gpu_axis_revival_preserves_shared_axes_and_other_bucket() {
@@ -93,9 +164,6 @@ pub(crate) struct Common {
 impl Common {
     pub fn read(r:&SfnnTrainStepRunner,ctx:&Context)->Result<Self> {
         let s=r.shape;let f=r.factorizer;let a=r.factorizer_alpha;
-        if f.king_hand_pair || f.king_progress_pair || f.hand_progress_pair {
-            return Err(CudaCppError::message("revival supports L1 none/shared/axis, not pair"));
-        }
         let (w,b,sw,sb)=if f.shared {
             (r.weights.l1fw.as_ref().unwrap().download(ctx)?,r.weights.l1fb.as_ref().unwrap().download(ctx)?,
              r.optimizer_states.l1fw.as_ref().unwrap().slow_params.download(ctx)?,r.optimizer_states.l1fb.as_ref().unwrap().slow_params.download(ctx)?)
@@ -117,6 +185,18 @@ impl Common {
             let k=s.factorizer_king_axis_dim;let h=s.factorizer_hand_axis_dim;
             if f.king_axis && k>0 {add(king/k,a.king_axis);add(k+king%k,a.king_axis);}
             if f.hand_axis && h>0 {add(2*k+hand/h,a.hand_axis);add(2*k+h+hand%h,a.hand_axis);}
+            let mut offset=s.factorizer_base_axis_count();
+            if f.king_hand_pair && s.factorizer_king_hand_pair {
+                add(offset+hand*s.factorizer_king_bucket_count()+king,a.pair);
+            }
+            offset+=s.factorizer_king_hand_pair_count();
+            if f.king_progress_pair && s.factorizer_king_progress_pair {
+                add(offset+(bucket%progress)*s.factorizer_king_bucket_count()+king,a.pair);
+            }
+            offset+=s.factorizer_king_progress_pair_count();
+            if f.hand_progress_pair && s.factorizer_hand_progress_pair {
+                add(offset+(bucket%progress)*s.factorizer_hand_bucket_count()+hand,a.pair);
+            }
             if f.progress_axis && s.factorizer_progress_axis && progress>1 {
                 add(s.factorizer_base_axis_count()+s.factorizer_pair_count()+bucket%progress,a.progress_axis);
             }
