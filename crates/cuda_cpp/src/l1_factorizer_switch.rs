@@ -4,7 +4,7 @@ use super::*;
 pub fn fold_axes(shape: SfnnForwardShape, w: &mut [f32], b: &mut [f32],
     aw: &[f32], ab: &[f32], coefficients: &[Vec<(usize, f32)>]) -> Result<()> {
     let n = shape.l1_out();
-    expect_len("L1 fold weights", shape.num_stacks * shape.ft_size * n, w.len())?;
+    expect_len("L1 fold weights", shape.l1w_len()?, w.len())?;
     expect_len("L1 fold bias", shape.num_stacks * n, b.len())?;
     expect_len("L1 fold axes", shape.factorizer_axis_count()*shape.ft_size*n, aw.len())?;
     expect_len("L1 fold axis bias", shape.factorizer_axis_count()*n, ab.len())?;
@@ -16,8 +16,9 @@ pub fn fold_axes(shape: SfnnForwardShape, w: &mut [f32], b: &mut [f32],
             }
             for u in 0..n {
                 b[stack*n+u] += c*ab[axis*n+u];
-                for i in 0..shape.ft_size {
-                    w[(stack*n+u)*shape.ft_size+i] += c*aw[(axis*shape.ft_size+i)*n+u];
+                for local in 0..revive_common::row_width(shape) {
+                    let i=revive_common::input_column(shape,u,local);
+                    w[(stack*n+u)*revive_common::row_width(shape)+local] += c*aw[(axis*shape.ft_size+i)*n+u];
                 }
             }
         }
@@ -30,9 +31,9 @@ pub fn fold_axes(shape: SfnnForwardShape, w: &mut [f32], b: &mut [f32],
 
 impl SfnnTrainStepRunner {
     pub fn fold_l1_axes_to_shared(&mut self, ctx: &Context, coefficients: &[Vec<(usize, f32)>]) -> Result<()> {
-        if self.pending_gradient_batches != 0 || self.batch_norm.is_some() || self.shape.has_compact_l1()
+        if self.pending_gradient_batches != 0 || self.batch_norm.is_some()
             || !self.factorizer.shared {
-            return Err(CudaCppError::message("L1 axis fold requires non-BN dense shared L1 at an optimizer-update boundary"));
+            return Err(CudaCppError::message("L1 axis fold requires non-BN shared L1 at an optimizer-update boundary"));
         }
         if !self.factorizer.any_axis() { return Ok(()); }
         ctx.synchronize()?;
@@ -69,8 +70,8 @@ impl SfnnTrainStepRunner {
         expected.factorizer_king_progress_pair=shape.factorizer_king_progress_pair;
         expected.factorizer_hand_progress_pair=shape.factorizer_hand_progress_pair;
         if expected!=shape || !active.shared || self.pending_gradient_batches!=0
-            || self.batch_norm.is_some() || shape.has_compact_l1() {
-            return Err(CudaCppError::message("L1 switch requires compatible non-BN dense shared/axis/pair at an update boundary"));
+            || self.batch_norm.is_some() {
+            return Err(CudaCppError::message("L1 switch requires compatible non-BN shared/axis/pair at an update boundary"));
         }
         active.validate_for_shape(shape)?;
         alpha.validate()?;
@@ -109,9 +110,9 @@ impl SfnnTrainStepRunner {
 
     pub fn enable_l1_axes_zero(&mut self, ctx: &Context, shape: SfnnForwardShape,
         active: SfnnFactorizerActive, alpha: SfnnFactorizerAlpha) -> Result<()> {
-        if self.pending_gradient_batches != 0 || self.batch_norm.is_some() || self.shape.has_compact_l1()
+        if self.pending_gradient_batches != 0 || self.batch_norm.is_some()
             || self.factorizer != SfnnFactorizerActive::SHARED || self.weights.l1axw.is_some() {
-            return Err(CudaCppError::message("L1 axis enable requires non-BN dense shared L1 at an optimizer-update boundary"));
+            return Err(CudaCppError::message("L1 axis enable requires non-BN shared L1 at an optimizer-update boundary"));
         }
         let mut expected = self.shape;
         expected.factorizer_progress_axis = shape.factorizer_progress_axis;
@@ -271,4 +272,77 @@ mod tests {
         }
     }
 
+}
+
+
+// Alpha changes are epoch-boundary operations. Expand only the temporary base
+// used for coordinate rebasing; training and checkpoint tensors stay compact.
+pub(super) fn rebase_compact_shared(
+    ctx: &Context,
+    shape: SfnnForwardShape,
+    base: &F32Buffer,
+    state: &RangerParamState,
+    shared: &F32Buffer,
+    shared_state: &RangerParamState,
+    gates: Option<&F32Buffer>,
+    old: f32,
+    new: f32,
+) -> Result<()> {
+    shared_rebase_ratio(old, new)?;
+    if old == new {
+        return Ok(());
+    }
+    let expand = |v: Vec<f32>| {
+        let mut dense = vec![0.0; shape.num_stacks * shape.l1_out() * shape.ft_size];
+        for b in 0..shape.num_stacks {
+            for u in 0..shape.l1_out() {
+                for local in 0..revive_common::row_width(shape) {
+                    let i = revive_common::input_column(shape, u, local);
+                    dense[(b * shape.l1_out() + u) * shape.ft_size + i] =
+                        v[(b * shape.l1_out() + u) * revive_common::row_width(shape) + local];
+                }
+            }
+        }
+        dense
+    };
+    let weights = expand(base.download(ctx)?);
+    let temp = F32Buffer::from_host(ctx, &weights)?;
+    let ts = RangerParamState::from_host_weights(ctx, &weights)?;
+    ts.slow_params.upload(ctx, &expand(state.slow_params.download(ctx)?))?;
+    ts.momentum.upload(ctx, &expand(state.momentum.download(ctx)?))?;
+    ts.velocity.upload(ctx, &expand(state.velocity.download(ctx)?))?;
+    rebase_shared_device(
+        ctx,
+        &temp,
+        &ts,
+        shared,
+        shared_state,
+        gates,
+        weights.len(),
+        shared.len(),
+        0,
+        shape.ft_size,
+        shape.l1_out(),
+        old,
+        new,
+    )?;
+    for (dst, src) in [
+        (base, &temp),
+        (&state.slow_params, &ts.slow_params),
+        (&state.momentum, &ts.momentum),
+        (&state.velocity, &ts.velocity),
+    ] {
+        let dense = src.download(ctx)?;
+        let mut packed = Vec::with_capacity(shape.l1w_len()?);
+        for b in 0..shape.num_stacks {
+            for u in 0..shape.l1_out() {
+                for local in 0..revive_common::row_width(shape) {
+                    let i = revive_common::input_column(shape, u, local);
+                    packed.push(dense[(b * shape.l1_out() + u) * shape.ft_size + i]);
+                }
+            }
+        }
+        dst.upload(ctx, &packed)?;
+    }
+    Ok(())
 }

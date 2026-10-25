@@ -1,6 +1,36 @@
 //! Read-only L1 shared/axis/pair terms for revival. Never reset shared optimizer state.
 use super::*;
 
+// Compact rows contain only their actual connections; proxy/export uses dense rows.
+pub(crate) fn row_width(s: SfnnForwardShape) -> usize {
+    if s.has_common_shard_l1() { s.l1_common_shard_input() }
+    else if s.has_grouped_l1() { s.l1_group_input() } else { s.ft_size }
+}
+
+pub(crate) fn input_column(s: SfnnForwardShape, output: usize, local: usize) -> usize {
+    if s.has_common_shard_l1() {
+        if local<s.l1_common_size { local }
+        else { local+(output/s.l1_group_output())*s.l1_shard_size }
+    } else if s.has_grouped_l1() {
+        (output/s.l1_group_output())*s.l1_group_input()+local
+    } else { local }
+}
+
+pub(crate) fn weight_index(s: SfnnForwardShape, bucket: usize, output: usize, column: usize) -> Option<usize> {
+    let local=if s.has_common_shard_l1() {
+        if column<s.l1_common_size { column } else {
+            let start=s.l1_common_size+(output/s.l1_group_output())*s.l1_shard_size;
+            if column<start || column>=start+s.l1_shard_size { return None; }
+            s.l1_common_size+column-start
+        }
+    } else if s.has_grouped_l1() {
+        let start=(output/s.l1_group_output())*s.l1_group_input();
+        if column<start || column>=start+s.l1_group_input() { return None; }
+        column-start
+    } else { column };
+    Some((bucket*s.l1_out()+output)*row_width(s)+local)
+}
+
 pub(crate) struct Common {
     shape: SfnnForwardShape,
     shared_alpha: f32,

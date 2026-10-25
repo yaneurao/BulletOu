@@ -34,7 +34,7 @@ This switch also applies to `NNUE_halfkp` architectures. Inputs without an FT fa
 
 `--sfnn-factorizer` controls **L1 sharing only**, independently of the FT.
 L2 and L3 contain only per-bucket weights and biases: no shared, axis, or pair terms.
-Compact-L1 architectures do not use this L1 sharing either.
+Compact L1 (grouped/common-shard) supports explicitly selected `sfnn_l1_factorizer` values `shared`, `axis`, and `pair`. The default remains disabled for compact architectures. Only connected coordinates contribute or receive gradients. Epoch switching, L1 QAT, revive, checkpoint restore, and nn.bin export are supported.
 
 | HalfKA2 with dense L1: options | FT sharing | L1 sharing |
 |---|---|---|
@@ -537,7 +537,7 @@ Disable it explicitly when you want to load the count file only for statistics o
 | `9K` | Use 90% of the bucket-specific residual |
 | Very large count | `gate_stack` approaches 1 |
 
-This gate and residual decay apply only to dense L1 with an active factorizer, not to L2, L3, or compact L1.
+This gate and residual decay apply to L1 with an active factorizer (dense or compact), not to L2 or L3.
 `residual_params_per_bucket` counts only L1 weights and biases. For FT=1024 and L1 output=8, it is `1024 × 8 + 8 = 8,200`.
 
 ### Count-aware residual decay

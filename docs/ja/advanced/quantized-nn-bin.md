@@ -21,7 +21,7 @@
 ### L1のQATをON/OFFで比較する
 
 QAT（Quantization-Aware Training、量子化を考慮した学習）は、丸めた重みでの出力を改善するように学習する方法です。
-SFNNの通常のdense L1では、学習コマンドに `--sfnn-qat-l1` を追加して試せます。**デフォルトはOFF**です。
+SFNNのdense・grouped/common-shard L1では、学習コマンドに `--sfnn-qat-l1` を追加して試せます。**デフォルトはOFF**です。
 JSON設定なら、既存の `bulletou-settings.json` のトップレベルに次の項目を追加します。
 
 ```json
@@ -29,7 +29,7 @@ JSON設定なら、既存の `bulletou-settings.json` のトップレベルに�
 ```
 
 `false` または省略で従来の学習です。通常学習・worker・profilingの各経路で有効です。
-grouped/common-shard L1（`g...` / `c..._s...`）は対象外で、指定するとエラーになります。
+grouped/common-shard L1でも接続構造を保ち、共有項をfoldしてから量子化します。
 
 `sfnn_qat_l1` の対象は **L1のweightとbiasだけ**です。ほかの層も以下の個別指定で有効化できます。活性値の整数演算は模擬しません。
 shared / axis / pair / count gateを使っている場合は、それらを足し合わせた実効重み `W` に対して、次の計算をします。

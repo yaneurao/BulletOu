@@ -100,8 +100,8 @@ impl SfnnTrainStepRunner {
         if !upper && !zero { return Ok(Vec::new()); }
         if self.pending_gradient_batches!=0
             || self.residual_count_gates_enabled
-            || self.shape.has_compact_l1() || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
-            return Err(CudaCppError::message("L2 revival requires dense L1 (none/shared/axis/pair), no legacy L2/L3 factorizer or residual gates, and no pending gradients"));
+            || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
+            return Err(CudaCppError::message("L2 revival requires SFNN L1 (none/shared/axis/pair), no legacy L2/L3 factorizer or residual gates, and no pending gradients"));
         }
         if self.batch_norm.is_some() && (!self.bn_qat.as_ref().is_some_and(|q|q.freeze_stats)
             || self.batch_norm.as_ref().unwrap().layers[2].is_none()) {

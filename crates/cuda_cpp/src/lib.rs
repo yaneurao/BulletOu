@@ -1375,9 +1375,6 @@ impl SfnnForwardHostWeights<'_> {
         expect_len("sfnn l1b", checked_product("sfnn l1b", &[shape.num_stacks, shape.l1_out()])?, self.l1b.len())?;
         match (self.l1fw, self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message("SFNN compact L1 does not support factorized L1 weights"));
-                }
                 expect_len("sfnn l1fw", checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, l1fw.len())?;
                 expect_len("sfnn l1fb", shape.l1_out(), l1fb.len())?;
             }
@@ -1387,9 +1384,6 @@ impl SfnnForwardHostWeights<'_> {
         }
         match (self.l1axw, self.l1axb) {
             (Some(l1axw), Some(l1axb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message("SFNN compact L1 does not support axis-factorized L1 weights"));
-                }
                 let axes = shape.factorizer_axis_count();
                 if axes == 0 {
                     return Err(CudaCppError::message("SFNN axis-factorized L1 weights require at least one axis"));
@@ -1718,9 +1712,6 @@ impl SfnnForwardDeviceWeights {
         )?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message("device SFNN compact L1 does not support factorized L1 weights"));
-                }
                 expect_len(
                     "device sfnn l1fw",
                     checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
@@ -1734,11 +1725,6 @@ impl SfnnForwardDeviceWeights {
         }
         match (&self.l1axw, &self.l1axb) {
             (Some(l1axw), Some(l1axb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message(
-                        "device SFNN compact L1 does not support axis-factorized L1 weights",
-                    ));
-                }
                 let axes = shape.factorizer_axis_count();
                 if axes == 0 {
                     return Err(CudaCppError::message(
@@ -2083,7 +2069,7 @@ fn sfnn_forward_device_with_factorizer_impl(
         };
     let (l1axw, l1axb, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
         (Some(l1axw), Some(l1axb)) if factorizer.any_axis() => (l1axw.as_ptr(), l1axb.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
+        (None, None) if factorizer.any_axis() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
@@ -2112,7 +2098,7 @@ fn sfnn_forward_device_with_factorizer_impl(
     };
     let (l1fw, l1fb, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
         (Some(l1fw), Some(l1fb)) if factorizer.shared => (l1fw.as_ptr(), l1fb.as_ptr(), 1),
-        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+        (None, None) if factorizer.shared => {
             return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), std::ptr::null_mut(), 0),
@@ -2229,9 +2215,6 @@ fn sfnn_build_quantized_proxy_device_impl(
     factorizer_alpha.validate()?;
     let shape = weights.shape;
     let proxy_shape = proxy_weights.shape;
-    if shape.has_compact_l1() {
-        return Err(CudaCppError::message("SFNN quantized GPU proxy currently supports only dense L1 source weights"));
-    }
     if proxy_shape.input_size != base_input_size
         || proxy_shape.ft_size != shape.ft_size
         || proxy_shape.l1_hidden != shape.l1_hidden
@@ -3631,7 +3614,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     }
     let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
         (Some(l1fw), Some(_)) if factorizer.shared => (l1fw.as_ptr(), 1),
-        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+        (None, None) if factorizer.shared => {
             return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
@@ -3639,7 +3622,7 @@ fn sfnn_backward_train_profile_device_with_factorizer_alpha_impl(
     };
     let (l1axw, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
         (Some(l1axw), Some(_)) if factorizer.any_axis() => (l1axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
+        (None, None) if factorizer.any_axis() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
@@ -3827,7 +3810,7 @@ fn sfnn_backward_device_impl(
     }
     let (l1fw, has_l1f) = match (&weights.l1fw, &weights.l1fb) {
         (Some(l1fw), Some(_)) if factorizer.shared => (l1fw.as_ptr(), 1),
-        (None, None) if factorizer.shared && !shape.has_compact_l1() => {
+        (None, None) if factorizer.shared => {
             return Err(CudaCppError::message("SFNN shared factorizer is active but L1 shared tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
@@ -3835,7 +3818,7 @@ fn sfnn_backward_device_impl(
     };
     let (l1axw, has_l1ax) = match (&weights.l1axw, &weights.l1axb) {
         (Some(l1axw), Some(_)) if factorizer.any_axis() => (l1axw.as_ptr(), 1),
-        (None, None) if factorizer.any_axis() && !shape.has_compact_l1() => {
+        (None, None) if factorizer.any_axis() => {
             return Err(CudaCppError::message("SFNN axis factorizer is active but L1 axis tensors are missing"));
         }
         (Some(_), Some(_)) | (None, None) => (std::ptr::null_mut(), 0),
@@ -5064,11 +5047,6 @@ impl SfnnRangerOptimizerStates {
         let (l1fw, l1fb) = match (states.l1fw, states.l1fb) {
             (Some(l1fw), Some(l1fb)) => (
                 {
-                    if shape.has_compact_l1() {
-                        return Err(CudaCppError::message(
-                            "SFNN compact L1 does not support factorized optimizer state",
-                        ));
-                    }
                     Some(RangerParamState::from_host_state(
                         ctx,
                         checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?,
@@ -5083,11 +5061,6 @@ impl SfnnRangerOptimizerStates {
         };
         let (l1axw, l1axb) = match (states.l1axw, states.l1axb) {
             (Some(l1axw), Some(l1axb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message(
-                        "SFNN compact L1 does not support axis-factorized optimizer state",
-                    ));
-                }
                 if axis_count == 0 {
                     return Err(CudaCppError::message(
                         "SFNN axis-factorized optimizer state requires at least one axis",
@@ -5307,9 +5280,6 @@ impl SfnnRangerOptimizerStates {
         self.l1b.validate(shape.num_stacks * shape.l1_out(), "optimizer sfnn l1b")?;
         match (&self.l1fw, &self.l1fb) {
             (Some(l1fw), Some(l1fb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message("SFNN compact L1 does not support factorized optimizer state"));
-                }
                 l1fw.validate(checked_product("sfnn l1fw", &[shape.ft_size, shape.l1_out()])?, "optimizer sfnn l1fw")?;
                 l1fb.validate(shape.l1_out(), "optimizer sfnn l1fb")?;
             }
@@ -5319,11 +5289,6 @@ impl SfnnRangerOptimizerStates {
         }
         match (&self.l1axw, &self.l1axb) {
             (Some(l1axw), Some(l1axb)) => {
-                if shape.has_compact_l1() {
-                    return Err(CudaCppError::message(
-                        "SFNN compact L1 does not support axis-factorized optimizer state",
-                    ));
-                }
                 let axes = shape.factorizer_axis_count();
                 if axes == 0 {
                     return Err(CudaCppError::message(
@@ -6397,8 +6362,6 @@ impl SfnnTrainStepRunner {
         if !enabled {
             self.forward_workspace.qat_l1 = None;
             self.forward_workspace.qat_l1_active.set(false);
-        } else if self.shape.has_compact_l1() {
-            return Err(CudaCppError::message("L1 QAT supports dense SFNN L1 only (not grouped/common-shard L1)"));
         } else if self.forward_workspace.qat_l1.is_none() {
             self.forward_workspace.qat_l1 = Some(SfnnL1Qat {
                 weights: F32Buffer::new(ctx, self.shape.l1w_len()?)?,
@@ -6675,7 +6638,7 @@ impl SfnnTrainStepRunner {
         if axes == 0 {
             return Ok(());
         }
-        if !self.shape.has_compact_l1() {
+        {
             Self::scale_optional_axis_rows(
                 ctx,
                 self.weights.l1axw.as_ref(),
@@ -6707,7 +6670,7 @@ impl SfnnTrainStepRunner {
         if axes == 0 {
             return Ok(());
         }
-        if !self.shape.has_compact_l1() {
+        {
             Self::scale_optional_axis_optimizer_rows(
                 ctx,
                 self.optimizer_states.l1axw.as_ref(),
@@ -6764,7 +6727,7 @@ impl SfnnTrainStepRunner {
         if stacks == 0 {
             return Ok(());
         }
-        if !self.shape.has_compact_l1() && gate_l1 {
+        if gate_l1 {
             Self::scale_optional_axis_rows(
                 ctx,
                 Some(&self.weights.l1w),
@@ -6806,7 +6769,7 @@ impl SfnnTrainStepRunner {
         if stacks == 0 {
             return Ok(());
         }
-        if !self.shape.has_compact_l1() && gate_l1 {
+        if gate_l1 {
             Self::scale_optional_axis_optimizer_rows(
                 ctx,
                 Some(&self.optimizer_states.l1w),
@@ -6922,21 +6885,26 @@ impl SfnnTrainStepRunner {
         if let (Some(w), Some(b), Some(ws), Some(bs)) =
             (self.weights.l1fw.as_ref(), self.weights.l1fb.as_ref(), l1w_state, l1b_state)
         {
-            rebase_shared_device(
-                ctx,
-                &self.weights.l1w,
-                &self.optimizer_states.l1w,
-                w,
-                ws,
-                gates,
-                self.weights.l1w.len(),
-                w.len(),
-                0,
-                self.shape.ft_size,
-                self.shape.l1_out(),
-                old_shared,
-                new_shared,
-            )?;
+            if self.shape.has_compact_l1() {
+                l1_factorizer_switch::rebase_compact_shared(ctx,self.shape,&self.weights.l1w,
+                    &self.optimizer_states.l1w,w,ws,gates,old_shared,new_shared)?;
+            } else {
+                rebase_shared_device(
+                    ctx,
+                    &self.weights.l1w,
+                    &self.optimizer_states.l1w,
+                    w,
+                    ws,
+                    gates,
+                    self.weights.l1w.len(),
+                    w.len(),
+                    0,
+                    self.shape.ft_size,
+                    self.shape.l1_out(),
+                    old_shared,
+                    new_shared,
+                )?;
+            }
             rebase_shared_device(
                 ctx,
                 &self.weights.l1b,
@@ -8015,8 +7983,7 @@ impl SfnnTrainStepRunner {
         let dirty_buckets = dirty_update.map(|(buckets, _)| buckets);
         let dirty_count = dirty_update.map(|(_, count)| count).unwrap_or(0);
 
-        if !self.shape.has_compact_l1()
-            && self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
             && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight) != 0.0
         {
             sfnn_add_residual_count_decay_gradients_device(
@@ -8116,8 +8083,7 @@ impl SfnnTrainStepRunner {
         let dirty_buckets = dirty_update.map(|(buckets, _)| buckets);
         let dirty_count = dirty_update.map(|(_, count)| count).unwrap_or(0);
 
-        if !self.shape.has_compact_l1()
-            && self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
+        if self.layer_has_active_factorizer(SfnnUpdateLayer::L1)
             && lr_multipliers.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight) != 0.0
         {
             sfnn_apply_residual_count_gates_to_gradients_device(
@@ -12522,3 +12488,6 @@ mod tests {
         assert!(abs_diff <= tolerance, "{name}: expected {expected}, got {actual}, abs_diff={abs_diff}");
     }
 }
+
+#[cfg(test)]
+mod compact_revive_tests;

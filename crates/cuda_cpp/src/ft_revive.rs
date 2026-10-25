@@ -80,11 +80,11 @@ impl SfnnTrainStepRunner {
     pub fn revive_ft(&mut self,ctx:&Context,c:&Calibration,ids:&[usize],base_inputs:usize)->Result<()> {
         let s=self.shape;let pairs=s.ft_size/2;
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
-            || self.residual_count_gates_enabled || s.has_compact_l1()
+            || self.residual_count_gates_enabled
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some()
             || c.width!=s.ft_size || c.counts.len()!=s.num_stacks || base_inputs==0 || base_inputs>s.input_size
             || ids.iter().any(|&i|i>=pairs) || c.counts.iter().any(|&n|n<1024) {
-            return Err(CudaCppError::message("FT revival requires calibrated non-BN dense SFNN, L1 none/shared/axis/pair, no residual count gates or pending gradients"));
+            return Err(CudaCppError::message("FT revival requires calibrated non-BN SFNN, L1 none/shared/axis/pair, no residual count gates or pending gradients"));
         }
         if ids.is_empty() {return Ok(());}
         let common=revive_common::Common::read(self,ctx)?;
@@ -110,15 +110,17 @@ impl SfnnTrainStepRunner {
         let mut ws=self.optimizer_states.l1w.download(ctx)?;let mut bs=self.optimizer_states.l1b.download(ctx)?;
         for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
             let row=bucket*s.l1_out()+u;
+            let mut touched=false;
             for &id in ids {for col in [id,id+pairs] {
-                let i=row*s.ft_size+col;
+                let Some(i)=revive_common::weight_index(s,bucket,u,col) else {continue;};
+                touched=true;
                 let old=w[i]+common.weight(bucket,u,col,false);let old_slow=ws.slow_params[i]+common.weight(bucket,u,col,true);
                 let mean=c.means[bucket*s.ft_size+col] as f32;
                 b[row]+=old*mean;bs.slow_params[row]+=old_slow*mean;
                 let v=if old<0.0 {-1.0/64.0} else {1.0/64.0};
                 w[i]=v-common.weight(bucket,u,col,false);reset(&mut ws,i,v-common.weight(bucket,u,col,true));
             }}
-            bs.momentum[row]=0.0;bs.velocity[row]=0.0;
+            if touched { bs.momentum[row]=0.0;bs.velocity[row]=0.0; }
         }}
         for (buf,st,v,h) in [(&self.weights.l1w,&self.optimizer_states.l1w,&w,&ws),(&self.weights.l1b,&self.optimizer_states.l1b,&b,&bs)] {
             buf.upload(ctx,v)?;st.upload(ctx,v.len(),RangerParamHostState{momentum:&h.momentum,velocity:&h.velocity,slow_params:&h.slow_params})?;
@@ -139,7 +141,7 @@ impl SfnnTrainStepRunner {
         for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
             let row=bucket*s.l1_out()+u;
             for &id in ids {for col in [id,id+s.ft_size/2] {
-                let i=row*s.ft_size+col;let m=c.means[bucket*s.ft_size+col] as f32;
+                let Some(i)=revive_common::weight_index(s,bucket,u,col) else {continue;};let m=c.means[bucket*s.ft_size+col] as f32;
                 b[row]-=(w[i]+common.weight(bucket,u,col,false))*m;
                 sb[row]-=(sw[i]+common.weight(bucket,u,col,true))*m;
             }}

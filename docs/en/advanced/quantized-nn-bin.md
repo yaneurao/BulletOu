@@ -35,15 +35,15 @@ For an eight-condition grid use `--grid sfnn_qat_ft false true --grid sfnn_qat_l
 
 ### Compare L1 QAT on/off
 
-SFNN dense L1 supports optional quantization-aware training with `--sfnn-qat-l1`.
+SFNN dense and grouped/common-shard L1 support optional quantization-aware training with `--sfnn-qat-l1`.
 It is **off by default**. In the top level of `bulletou-settings.json`, use:
 
 ```json
 "sfnn_qat_l1": true
 ```
 
-`false` or omission preserves ordinary training. The normal, worker and profiling paths support it;
-grouped/common-shard L1 is rejected. This flag fake-quantizes **L1 weights and biases** only. Other layers have separate flags below; activation integer arithmetic is not emulated.
+`false` or omission preserves ordinary training. The normal, worker and profiling paths support it.
+Grouped/common-shard L1 preserves structural zeros and folds shared terms before quantization. This flag fake-quantizes **L1 weights and biases** only. Other layers have separate flags below; activation integer arithmetic is not emulated.
 Factorizers and count gates are folded before quantization:
 
 ```text

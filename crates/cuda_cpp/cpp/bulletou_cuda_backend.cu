@@ -1393,6 +1393,20 @@ __global__ void sfnn_build_quantized_proxy_vector_kernel(
     dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_bias(src[tid],bn,0,tid), scale, qmin, qmax, precise);
 }
 
+// Return the compact base coordinate, or SIZE_MAX for a structural zero.
+__device__ size_t sfnn_l1_coordinate(size_t stack, size_t out, size_t in,
+    size_t inputs, size_t outputs, size_t groups, size_t common, size_t shard) {
+    if (groups == 1 && common == 0 && shard == 0) return (stack*outputs+out)*inputs+in;
+    const bool cs=common!=0 || shard!=0;
+    const size_t width=cs?common+shard:inputs/groups;
+    const size_t group=out/(outputs/groups);
+    if (cs && in<common) return (stack*outputs+out)*width+in;
+    const size_t start=cs?common+group*shard:group*width;
+    const size_t count=cs?shard:width;
+    if(in<start || in>=start+count) return SIZE_MAX;
+    return (stack*outputs+out)*width+(cs?common:0)+in-start;
+}
+
 __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     const float* weights,
     const float* shared_weights,
@@ -1419,24 +1433,33 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale, BnConfig bn={}, bool precise=false) {
+    float scale, BnConfig bn={}, bool precise=false,
+    size_t compact_groups=1, size_t common_size=0, size_t shard_size=0, bool compact_output=false) {
     const size_t weight_cell_count = input_dim * output_dim;
-    const size_t total = num_stacks * weight_cell_count;
+    const bool cs=common_size!=0 || shard_size!=0;
+    const size_t row_width=compact_output ? (cs?common_size+shard_size:input_dim/compact_groups) : input_dim;
+    const size_t total = num_stacks * output_dim * row_width;
     const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
 
-    const size_t stack = tid / weight_cell_count;
-    const size_t cell = tid - stack * weight_cell_count;
-    const size_t out_col = cell / input_dim;
-    const size_t in_col = cell - out_col * input_dim;
+    const size_t stack = tid / (output_dim*row_width);
+    const size_t out_col = (tid / row_width) % output_dim;
+    const size_t local = tid % row_width;
+    const size_t group = out_col/(output_dim/compact_groups);
+    const size_t in_col = compact_output
+        ? (cs ? (local<common_size ? local : local+group*shard_size) : local+group*row_width)
+        : local;
+    const size_t cell=out_col*input_dim+in_col;
+    const size_t source=sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,compact_groups,common_size,shard_size);
+    if(source==SIZE_MAX) {dst[tid]=0.0f; return;}
     const size_t factorizer_cell = shared_weight_input_major != 0
         ? in_col * output_dim + out_col
         : cell;
 
     const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
-    float value = residual_gate * weights[tid];
+    float value = residual_gate * weights[source];
     if (has_shared != 0) {
         value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(shared_alpha,shared_weights[factorizer_cell])) : value+shared_alpha*shared_weights[factorizer_cell];
     }
@@ -1691,7 +1714,8 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     float progress_axis_alpha,
     float pair_alpha,
     const float* residual_count_gates,
-    const float* factorizer_axis_confidences) {
+    const float* factorizer_axis_confidences,
+    size_t groups=1, size_t common=0, size_t shard=0) {
     constexpr unsigned int WARP = 32;
     constexpr unsigned int WARPS_PER_BLOCK = 8;
     const unsigned int lane = threadIdx.x & (WARP - 1U);
@@ -1751,7 +1775,9 @@ __global__ void sfnn_stacked_l1_warp_kernel(
     float sum = 0.0f;
     for (size_t in_col = lane; in_col < input_dim; in_col += WARP) {
         const float input_value = input[input_base + in_col];
-        float weight = residual_gate * weights[stack_base + in_col];
+        const size_t coordinate=sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
+        if(coordinate==SIZE_MAX) continue;
+        float weight = residual_gate * weights[coordinate];
         if (has_shared != 0) {
             weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
         }
@@ -3613,7 +3639,8 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
-    int accumulate_factorizer_gradients) {
+    int accumulate_factorizer_gradients,
+    size_t groups=1, size_t common=0, size_t shard=0) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
@@ -3662,7 +3689,8 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 float grad = output_gradients[sample * output_dim + out_col];
                 if (grad != 0.0f) {
-                    const size_t weight_idx = stack_base + out_col * input_dim + in_col;
+                    const size_t weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
+                    if(weight_idx==SIZE_MAX) continue;
                     float weight = qat_weights != nullptr ? qat_weights[weight_idx] : residual_gate * weights[weight_idx];
                     if (qat_weights == nullptr && has_shared != 0) {
                         weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
@@ -3723,9 +3751,10 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             }
             float output_gradient = output_gradients[sample * output_dim + out_col];
             float input_value = inputs[sample * input_dim + in_col];
-            if (output_gradient != 0.0f && input_value != 0.0f) {
+            if (output_gradient != 0.0f && input_value != 0.0f &&
+                sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard)!=SIZE_MAX) {
                 float grad = output_gradient * input_value;
-                size_t weight_idx = stack * output_dim * input_dim + out_col * input_dim + in_col;
+                size_t weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
                 atomicAdd(&weight_gradients[weight_idx], grad);
                 if (accumulate_factorizer_gradients != 0 && has_shared != 0) {
                     size_t shared_weight_idx = in_col * output_dim + out_col;
@@ -5232,9 +5261,6 @@ int launch_sfnn_forward_kernels(
     const size_t l2_in = l1_hidden * 2;
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
-    if ((grouped_l1 || common_shard_l1) && (has_l1f != 0 || has_l1ax != 0)) {
-        return fail_message("SFNN compact L1 does not support factorized L1");
-    }
 
     const float* effective_l0w = l0w;
     size_t effective_input_size = input_size;
@@ -5276,7 +5302,7 @@ int launch_sfnn_forward_kernels(
         if(!fused) bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
         if(check_kernel_launch("BN FT activation"))return -1;
     }
-    if (common_shard_l1) {
+    if (common_shard_l1 && !has_l1f && !has_l1ax) {
         const size_t group_output = l1_out / l1_group_count;
         if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_common_shard_l1_kernel") != 0) {
             return -1;
@@ -5298,7 +5324,7 @@ int launch_sfnn_forward_kernels(
         if (check_kernel_launch("sfnn_common_shard_l1_kernel launch") != 0) {
             return -1;
         }
-    } else if (grouped_l1) {
+    } else if (grouped_l1 && !has_l1f && !has_l1ax) {
         const size_t group_input = ft_size / l1_group_count;
         const size_t group_output = l1_out / l1_group_count;
         if (block_count_1d(batch * l1_out, threads, &blocks, "sfnn_grouped_l1_kernel") != 0) {
@@ -5358,7 +5384,7 @@ int launch_sfnn_forward_kernels(
             factorizer_progress_axis_alpha,
             factorizer_pair_alpha,
             residual_count_gates,
-            factorizer_axis_confidences);
+            factorizer_axis_confidences, l1_group_count, l1_common_size, l1_shard_size);
         if (check_kernel_launch("sfnn_stacked_l1_warp_kernel launch") != 0) {
             return -1;
         }
@@ -6466,9 +6492,6 @@ int launch_sfnn_backward_kernels(
         (num_stacks <= SFNN_DENSE_REDUCE_MAX_FAST_STACKS &&
          has_l1ax == 0 && has_l2ax == 0 && has_l3ax == 0 &&
          use_king_axis == 0 && use_hand_axis == 0);
-    if ((grouped_l1 || common_shard_l1) && (has_l1f != 0 || has_l1ax != 0)) {
-        return fail_message("SFNN compact L1 does not support factorized L1");
-    }
     constexpr int threads = 256;
     int blocks = 0;
     SfnnBackwardProfileEvents profile;
@@ -6809,7 +6832,7 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
-    if (common_shard_l1) {
+    if (common_shard_l1 && !has_l1f && !has_l1ax && !qat_l1w) {
         const size_t group_output = l1_out / l1_group_count;
         const size_t row_input = l1_common_size + l1_shard_size;
         size_t l1_threads = std::max(batch * ft_size, batch * l1_out * row_input);
@@ -6836,7 +6859,7 @@ int launch_sfnn_backward_kernels(
         if (check_kernel_launch("sfnn_common_shard_l1_backward_kernel launch") != 0) {
             return -1;
         }
-    } else if (grouped_l1) {
+    } else if (grouped_l1 && !has_l1f && !has_l1ax && !qat_l1w) {
         const size_t group_input = ft_size / l1_group_count;
         const size_t group_output = l1_out / l1_group_count;
         size_t l1_threads = std::max(batch * ft_size, batch * ft_size * group_output);
@@ -6862,8 +6885,9 @@ int launch_sfnn_backward_kernels(
         if (check_kernel_launch("sfnn_grouped_l1_backward_kernel launch") != 0) {
             return -1;
         }
-    } else if (has_l1f != 0 || has_l1ax != 0) {
-        const bool reduce_l1_params = dense_param_reduce_fast_path;
+    } else if (common_shard_l1 || grouped_l1 || has_l1f != 0 || has_l1ax != 0) {
+        const bool compact=common_shard_l1 || grouped_l1;
+        const bool reduce_l1_params = !compact && dense_param_reduce_fast_path;
         size_t l1_threads = reduce_l1_params ? batch * ft_size : std::max(batch * ft_size, batch * ft_size * l1_out);
         if (!reduce_l1_params) {
             l1_threads = std::max(l1_threads, batch * l1_out);
@@ -6871,7 +6895,7 @@ int launch_sfnn_backward_kernels(
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_factorized_l1_backward_kernel") != 0) {
             return -1;
         }
-        const bool compact_input_fast=(ctx->bn[1].params || ft_size >= 1024) && !bn_use_reference() &&
+        const bool compact_input_fast=!compact && (ctx->bn[1].params || ft_size >= 1024) && !bn_use_reference() &&
             reduce_l1_params && (has_l1ax==0 || qat_l1w) &&
             (!residual_count_gates || qat_l1w) && (l1_out==8 || l1_out==9);
         if(compact_input_fast) {
@@ -6916,11 +6940,11 @@ int launch_sfnn_backward_kernels(
             residual_count_gates,
             factorizer_axis_confidences,
             reduce_l1_params ? 0 : 1,
-            0);
+            compact ? 1 : 0, l1_group_count, l1_common_size, l1_shard_size);
         if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
             return -1;
         }
-        if (!reduce_l1_params) {
+        if (!reduce_l1_params && !compact) {
             if (launch_sfnn_fold_stacked_param_gradients_to_factorizers(
                     ctx,
                     l1w_gradients,
@@ -8794,9 +8818,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     if (set_context_device(ctx) != 0) {
         return -1;
     }
-    if (l1_group_count != 1 || l1_common_size != 0 || l1_shard_size != 0) {
-        return fail_message("sfnn quantized GPU proxy currently supports only dense L1 source weights");
-    }
     if (src_input_size == 0 || dst_input_size == 0 || ft_size == 0 || l2_size == 0 || num_stacks == 0) {
         return fail_message("sfnn quantized GPU proxy dimensions must be non-zero");
     }
@@ -8834,6 +8855,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
     const size_t src_l0w_len = src_input_size * ft_size;
     const size_t dst_l0w_len = dst_input_size * ft_size;
     const size_t l1w_len = num_stacks * l1_out * ft_size;
+    const size_t src_l1w_len = sfnn_l1w_len_for_shape(ft_size,l1_hidden,l1_skip,num_stacks,
+        l1_group_count,l1_common_size,l1_shard_size);
     const size_t l1b_len = num_stacks * l1_out;
     const size_t l2w_len = num_stacks * l2_size * l2_in;
     const size_t l2b_len = num_stacks * l2_size;
@@ -8844,7 +8867,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
 
     if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l0w), src_l0w_len, "sfnn proxy src l0w") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l0b), ft_size, "sfnn proxy src l0b") != 0 ||
-        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1w), l1w_len, "sfnn proxy src l1w") != 0 ||
+        validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1w), src_l1w_len, "sfnn proxy src l1w") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l1b), l1b_len, "sfnn proxy src l1b") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2w), l2w_len, "sfnn proxy src l2w") != 0 ||
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(src_l2b), l2b_len, "sfnn proxy src l2b") != 0 ||
@@ -8970,7 +8993,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_build_quantized_proxy_device(
         factorizer_pair_alpha,
         residual_count_gates_ptr,
         factorizer_axis_confidences_ptr,
-        qb, ctx->bn[1], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params);
+        qb, ctx->bn[1], ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params,
+        l1_group_count, l1_common_size, l1_shard_size);
     if (check_kernel_launch("sfnn_build_quantized_proxy_l1w_kernel launch") != 0) return -1;
 
     if (block_count_1d(l1b_len, threads, &blocks, "sfnn proxy l1b") != 0) return -1;
@@ -9244,9 +9268,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         return -1;
     }
     if (has_l1f != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1fw/l1fb");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0 ||
             validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fb), l1_out, "sfnn l1fb") != 0) {
             return -1;
@@ -9255,9 +9276,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         return fail_message("sfnn l1fw/l1fb must be null when has_l1f is false");
     }
     if (has_l1ax != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1axw/l1axb");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1axw), axis_count * ft_size * l1_out, "sfnn l1axw") != 0 ||
             validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1axb), axis_count * l1_out, "sfnn l1axb") != 0) {
             return -1;
@@ -9317,9 +9335,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
         return fail_message("L1 QAT requires both weight and bias scratch buffers");
     }
     if (qat_l1w != nullptr) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("L1 QAT supports dense SFNN L1 only");
-        }
         if (validate_buffer(ctx, qat_l1w, l1w_len, "QAT L1 weights") != 0 ||
             validate_buffer(ctx, qat_l1b, num_stacks * l1_out, "QAT L1 bias") != 0) return -1;
         if (refresh_qat_l1 != 0) {
@@ -9335,7 +9350,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
                 factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha,
-                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 64.0f);
+                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 64.0f, {}, false,
+                l1_group_count, l1_common_size, l1_shard_size, true);
             if (check_kernel_launch("QAT L1 weights launch") != 0) return -1;
             if (block_count_1d(num_stacks * l1_out, threads, &blocks, "QAT L1 bias") != 0) return -1;
             sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
@@ -10125,7 +10141,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
-    if (qat_l1w != nullptr && (grouped_l1 || common_shard_l1 ||
+    if (qat_l1w != nullptr && (
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(qat_l1w), l1w_len, "QAT L1 backward weights") != 0)) {
         return fail_message("invalid L1 QAT backward buffer/shape");
     }
@@ -10189,9 +10205,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         return -1;
     }
     if (has_l1f != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1fw");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0) {
             return -1;
         }
@@ -10199,9 +10212,6 @@ extern "C" int bulletou_cuda_cpp_sfnn_backward_device(
         return fail_message("sfnn l1fw must be null when has_l1f is false");
     }
     if (has_l1ax != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1axw");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1axw), axis_count * ft_size * l1_out, "sfnn l1axw") != 0) {
             return -1;
         }
@@ -10444,7 +10454,7 @@ int sfnn_backward_train_device_impl(
         sfnn_l1w_len_for_shape(ft_size, l1_hidden, l1_skip, num_stacks, l1_group_count, l1_common_size, l1_shard_size);
     const bool common_shard_l1 = sfnn_is_common_shard_l1_shape(l1_common_size, l1_shard_size);
     const bool grouped_l1 = !common_shard_l1 && sfnn_is_grouped_l1_shape(l1_group_count);
-    if (qat_l1w != nullptr && (grouped_l1 || common_shard_l1 ||
+    if (qat_l1w != nullptr && (
         validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(qat_l1w), l1w_len, "QAT L1 backward weights") != 0)) {
         return fail_message("invalid L1 QAT backward buffer/shape");
     }
@@ -10506,9 +10516,6 @@ int sfnn_backward_train_device_impl(
         return -1;
     }
     if (has_l1f != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1fw");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1fw), ft_size * l1_out, "sfnn l1fw") != 0) {
             return -1;
         }
@@ -10516,9 +10523,6 @@ int sfnn_backward_train_device_impl(
         return fail_message("sfnn l1fw must be null when has_l1f is false");
     }
     if (has_l1ax != 0) {
-        if (grouped_l1 || common_shard_l1) {
-            return fail_message("sfnn compact L1 does not support l1axw");
-        }
         if (validate_buffer(ctx, const_cast<BulletOuCudaCppF32Buffer*>(l1axw), axis_count * ft_size * l1_out, "sfnn l1axw") != 0) {
             return -1;
         }

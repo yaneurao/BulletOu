@@ -146,9 +146,9 @@ impl SfnnTrainStepRunner {
         let zero=zero && !self.l1_zero_revival_done();
         if !upper && !zero { return Ok(Vec::new()); }
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
-            || self.residual_count_gates_enabled || self.shape.has_compact_l1()
+            || self.residual_count_gates_enabled
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some() {
-            return Err(CudaCppError::message("L1 revival requires non-BN dense L1 (none/shared/axis/pair), no residual count gates or legacy L2/L3 factorizers, and no pending gradients"));
+            return Err(CudaCppError::message("L1 revival requires non-BN L1 (none/shared/axis/pair), no residual count gates or legacy L2/L3 factorizers, and no pending gradients"));
         }
         let s=self.shape;
         if c.input!=s.ft_size || c.width!=s.l1_hidden || c.counts.len()!=s.num_stacks
@@ -165,16 +165,22 @@ impl SfnnTrainStepRunner {
         let mut os=self.optimizer_states.l2w.download(ctx)?;
         let mut obs=self.optimizer_states.l2b.download(ctx)?;
         let common=revive_common::Common::read(self,ctx)?;
-        let bound=(6.0/(s.ft_size+s.l1_hidden) as f32).sqrt();
+        let inputs=revive_common::row_width(s);
         let mut rng=self.revival_rng;
         for &id in &ids {
             let bucket=id/s.l1_hidden; let u=id%s.l1_hidden;
             let out=bucket*s.l1_out()+u;
+            let hidden=if s.has_compact_l1() {
+                let group=u/s.l1_group_output();
+                s.l1_hidden.min((group+1)*s.l1_group_output())-group*s.l1_group_output()
+            } else {s.l1_hidden};
+            let bound=(6.0/(inputs+hidden) as f32).sqrt();
             let mut mean=0.0f64;
-            for j in 0..s.ft_size {
+            for local in 0..inputs {
+                let j=revive_common::input_column(s,u,local);
                 let value=rng.signed_uniform()*bound;
                 mean+=value as f64*c.sums[bucket*s.ft_size+j]/c.counts[bucket] as f64;
-                let i=out*s.ft_size+j;
+                let i=out*inputs+local;
                 w1[i]=value-common.weight(bucket,u,j,false);
                 reset(&mut ws,i,value-common.weight(bucket,u,j,true));
             }

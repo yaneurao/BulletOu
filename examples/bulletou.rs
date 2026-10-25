@@ -4280,10 +4280,10 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         if !resolved.ft_factorizer { resolved.ft_factorizer_alpha = 1.0; }
     }
     if schedules.contains_key("sfnn_l1_factorizer") && (resolved.backend != BackendKind::CudaCpp
-        || !resolved.eval_type().uses_layerstack() || resolved.arch().has_compact_sfnn_l1()
+        || !resolved.eval_type().uses_layerstack()
         || resolved.sfnn_factorized == Some(false)
         || resolved.sfnn_bn_ft || resolved.sfnn_bn_l1 || resolved.sfnn_bn_l2) {
-        return Err("sfnn_l1_factorizer epoch schedule requires non-BN dense cuda-cpp SFNN".into());
+        return Err("sfnn_l1_factorizer epoch schedule requires non-BN cuda-cpp SFNN".into());
     }
     if !resolved.lr.is_finite() || !resolved.lr_min.is_finite() || resolved.lr <= 0.0
         || resolved.lr_min <= 0.0 || resolved.lr_min > resolved.lr || resolved.batches_per_update == 0 {
@@ -4351,10 +4351,11 @@ fn expand_settings_file_args(raw_args: Vec<std::ffi::OsString>) -> Result<Vec<st
 }
 
 fn effective_sfnn_factorizer_spec(args: &Args) -> SfnnFactorizerSpec {
-    if !args.resolved_eval_type().is_some_and(EvalType::uses_layerstack) {
+    if args.sfnn_factorizer.is_none() && args.sfnn_factorized.is_none()
+        && args.train_arch().and_then(TrainArch::nnue_arch).is_some_and(|a|a.has_compact_sfnn_l1()) {
         return SfnnFactorizerSpec::NONE;
     }
-    if args.train_arch().and_then(TrainArch::nnue_arch).is_some_and(|arch| arch.has_compact_sfnn_l1()) {
+    if !args.resolved_eval_type().is_some_and(EvalType::uses_layerstack) {
         return SfnnFactorizerSpec::NONE;
     }
     let Some(layerstack) = args.effective_layerstack() else {
@@ -4369,18 +4370,18 @@ fn effective_sfnn_factorized_stack(args: &Args) -> bool {
 }
 
 fn effective_sfnn_factorized_l1(args: &Args) -> bool {
-    let Some(arch) = args.train_arch().and_then(TrainArch::nnue_arch) else {
+    let Some(_) = args.train_arch().and_then(TrainArch::nnue_arch) else {
         return false;
     };
-    effective_sfnn_factorizer_spec(args).shared && !arch.has_compact_sfnn_l1()
+    effective_sfnn_factorizer_spec(args).shared
 }
 
 fn effective_sfnn_axis_factorized_l1(args: &Args) -> bool {
-    let Some(arch) = args.train_arch().and_then(TrainArch::nnue_arch) else {
+    let Some(_) = args.train_arch().and_then(TrainArch::nnue_arch) else {
         return false;
     };
     let spec = effective_sfnn_factorizer_spec(args);
-    spec.any_axis() && !arch.has_compact_sfnn_l1()
+    spec.any_axis()
 }
 
 fn parse_ft_factorizer_alpha(raw: &str) -> Result<f32, String> {
@@ -5251,7 +5252,7 @@ struct Args {
     /// Select `--sfnn-factorizer shared`. Dense L1 shared weights start from
     /// uniform [-0.01, 0.01] (or zero with --sfnn-init-l1-shared-zero),
     /// with zero bias, and are folded into each bucket
-    /// when saving nn.bin. L2/L3 have no factorizer. Compact L1 has no sharing.
+    /// when saving nn.bin. L2/L3 have no factorizer. Compact L1 sharing requires explicit selection.
     #[arg(
         long = "sfnn-factorized",
         alias = "sfnn-factorized-l1",
@@ -5668,9 +5669,8 @@ impl Args {
             return Err("FT/L1 revival currently supports non-BN SFNN only".into());
         }
         if self.sfnn_ft_revival_requested() || self.sfnn_l1_revival_requested() || self.sfnn_l2_revival_requested() {
-            if self.backend!=BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
-                || self.arch().sfnn_l1_group_count()!=1 || self.arch().sfnn_l1_common_size.is_some() {
-                return Err("FT/L1/L2 revival requires cuda-cpp dense SFNN with L1 factorizer none/shared/axis/pair".into());
+            if self.backend!=BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
+                return Err("FT/L1/L2 revival requires cuda-cpp SFNN with L1 factorizer none/shared/axis/pair".into());
             }
         }
         if self.sfnn_bn_l2_effective_weight_clip &&
@@ -5794,9 +5794,6 @@ impl Args {
         if self.effective_sfnn_qat_l1() {
             if !self.eval_type().uses_layerstack() {
                 return Err("--sfnn-qat-l1 requires an SFNN arch".to_string());
-            }
-            if self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some() {
-                return Err("--sfnn-qat-l1 supports dense L1 only (not grouped/common-shard L1)".to_string());
             }
         }
         if self.sfnn_qat_ft || self.sfnn_qat_l2 || self.sfnn_qat_l3 {
@@ -9938,13 +9935,13 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
     let use_axis = factorizer.any_axis();
     let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
     let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
-        factorizer.shared && !compact_l1,
+        factorizer.shared && (!compact_l1 || weights.l1fw.is_some()),
         "l1f",
         weights.l1fw.as_deref(),
         weights.l1fb.as_deref(),
     )?;
     let (l1axw, l1axb) = cuda_cpp_sfnn_active_factorizer_pair(
-        use_axis && !compact_l1,
+        use_axis && (!compact_l1 || weights.l1axw.is_some()),
         "l1ax",
         weights.l1axw.as_deref(),
         weights.l1axb.as_deref(),
@@ -9967,12 +9964,6 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
         cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l3ax", weights.l3axw.as_deref(), weights.l3axb.as_deref())?;
 
     let mut l1w_for_export = if compact_l1 {
-        if l1fw.is_some() {
-            return Err("SFNN compact L1 cannot be quantized with factorized shared L1 weights".to_string());
-        }
-        if l1axw.is_some() {
-            return Err("SFNN compact L1 cannot be quantized with axis-factorized L1 weights".to_string());
-        }
         expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &weights.l1w)?
     } else {
         weights.l1w.clone()
@@ -9995,7 +9986,7 @@ fn quantized_sfnn_weights_from_cuda_cpp_readback(
         &mut l3b_for_export,
         residual_count_gates.as_deref(),
     )?;
-    if !compact_l1 {
+    {
         fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
             shape,
             &mut l1w_for_export,
@@ -16725,29 +16716,13 @@ fn sfnn_residual_params_per_bucket(shape: bulletou_cuda_cpp::SfnnForwardShape) -
     if shape.num_stacks == 0 {
         return Err("SFNN shape has zero stacks".to_string());
     }
-    let (l1w, l1b) = if shape.has_compact_l1() {
-        (0usize, 0usize)
-    } else {
-        (cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks, shape.l1_out())
-    };
+    let (l1w, l1b) = (cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks, shape.l1_out());
     l1w.checked_add(l1b).ok_or_else(|| "SFNN residual parameter count overflow".to_string())
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn sfnn_factorizer_axis_term_params(shape: bulletou_cuda_cpp::SfnnForwardShape) -> Result<usize, String> {
-    let mut params = 0usize;
-    if !shape.has_compact_l1() {
-        params = params
-            .checked_add(
-                shape
-                    .ft_size
-                    .checked_mul(shape.l1_out())
-                    .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L1 weight".to_string())?,
-            )
-            .and_then(|v| v.checked_add(shape.l1_out()))
-            .ok_or_else(|| "SFNN factorizer axis parameter count overflow at L1".to_string())?;
-    }
-    Ok(params)
+    sfnn_residual_params_per_bucket(shape)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -17025,7 +17000,9 @@ fn apply_cuda_cpp_sfnn_residual_count_gates_to_stacked_weights(
     }
 
     let l1_out = shape.l1_out();
-    let l1w_stride = cuda_cpp_sfnn_l1w_len_for_shape(shape)? / shape.num_stacks;
+    let compact_stride=cuda_cpp_sfnn_l1w_len_for_shape(shape)?/shape.num_stacks;
+    let dense_stride=shape.ft_size*shape.l1_out();
+    let l1w_stride=if l1w.len()==dense_stride*shape.num_stacks {dense_stride} else {compact_stride};
     let l2w_stride =
         shape.l2_size.checked_mul(shape.l2_in()).ok_or_else(|| "SFNN L2 residual gate stride overflow".to_string())?;
     let l3w_stride = shape.l2_size;
@@ -17658,8 +17635,8 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
 fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bulletou_cuda_cpp::Context,
     runner:&mut bulletou_cuda_cpp::SfnnTrainStepRunner, config:&bulletou_lib::value::SfnnTeacherBatchConfig<'_>, audit:&revival_audit::RevivalAudit) -> Result<(),String> {
     use bulletou_cuda_cpp::*;
-    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1() {
-        return Err("FT revival requires non-BN dense SFNN, L1 none/shared/axis/pair and no residual count gates".into());
+    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled {
+        return Err("FT revival requires non-BN SFNN, L1 none/shared/axis/pair and no residual count gates".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -17725,9 +17702,9 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     if !upper && !zero && args.sfnn_l1_revive_contribution_threshold.is_none() {
         eprintln!("  [L1 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
-    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+    if runner.batch_norm.is_some() || runner.residual_count_gates_enabled
         || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
-        return Err("--sfnn-l1-revive requires non-BN dense L1, no residual count gates, and no legacy L2/L3 factorizers".into());
+        return Err("--sfnn-l1-revive requires non-BN L1, no residual count gates, and no legacy L2/L3 factorizers".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -17799,9 +17776,9 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     if !upper && !zero && args.sfnn_l2_revive_contribution_threshold.is_none() {
         eprintln!("  [L2 REVIVE] skipped: checkpoint already calibrated/revived");return Ok(());
     }
-    if runner.residual_count_gates_enabled || runner.shape.has_compact_l1()
+    if runner.residual_count_gates_enabled
         || runner.weights.l2fw.is_some() || runner.weights.l3fw.is_some() {
-        return Err("--sfnn-l2-revive requires dense L1, no residual count gates, and no legacy L2/L3 factorizers".into());
+        return Err("--sfnn-l2-revive requires SFNN L1, no residual count gates, and no legacy L2/L3 factorizers".into());
     }
     let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
@@ -20584,6 +20561,36 @@ fn cuda_cpp_halfkp_weights_for_cpu_validation(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn compact_l1_dense_shape(mut shape: bulletou_cuda_cpp::SfnnForwardShape) -> bulletou_cuda_cpp::SfnnForwardShape {
+    shape.l1_group_count = 1;
+    shape.l1_common_size = 0;
+    shape.l1_shard_size = 0;
+    shape
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn compact_l1_pack(shape: bulletou_cuda_cpp::SfnnForwardShape, dense: &[f32]) -> Vec<f32> {
+    let width = if shape.has_common_shard_l1() {
+        shape.l1_common_size + shape.l1_shard_size
+    } else {
+        shape.ft_size / shape.l1_group_count()
+    };
+    let mut packed = Vec::with_capacity(shape.num_stacks * shape.l1_out() * width);
+    for row in 0..shape.num_stacks * shape.l1_out() {
+        let group = (row % shape.l1_out()) / (shape.l1_out() / shape.l1_group_count());
+        for local in 0..width {
+            let input = if shape.has_common_shard_l1() {
+                if local < shape.l1_common_size { local } else { local + group * shape.l1_shard_size }
+            } else {
+                group * width + local
+            };
+            packed.push(dense[row * shape.ft_size + input]);
+        }
+    }
+    packed
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     l1w: &mut [f32],
@@ -20592,6 +20599,15 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     l1fb: Option<&[f32]>,
     alpha: f32,
 ) -> Result<(), String> {
+    if shape.has_compact_l1() {
+        let expanded=l1w.len()==shape.num_stacks*shape.l1_out()*shape.ft_size;
+        let mut dense=if expanded {l1w.to_vec()} else {expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,l1w)?};
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(compact_l1_dense_shape(shape), &mut dense, l1b, l1fw, l1fb, alpha)?;
+        let packed=compact_l1_pack(shape,&dense);
+        if expanded {l1w.copy_from_slice(&expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,&packed)?);} else {l1w.copy_from_slice(&packed);}
+        return Ok(());
+    }
+
     let l1_out = shape.l1_out();
     let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
     let expected_l1b = shape.num_stacks * l1_out;
@@ -20603,9 +20619,6 @@ fn fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
     }
     match (l1fw, l1fb) {
         (Some(shared_w), Some(shared_b)) => {
-            if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
-                return Err("SFNN compact L1 does not support factorized shared L1 weights".to_string());
-            }
             let expected_l1fw = shape.ft_size * l1_out;
             if shared_w.len() != expected_l1fw {
                 return Err(format!("SFNN l1fw length mismatch: got {}, expected {expected_l1fw}", shared_w.len()));
@@ -21085,6 +21098,15 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
     alpha: SfnnFactorizerAlphaSpec,
     factorizer_axis_confidences: Option<&[f32]>,
 ) -> Result<(), String> {
+    if shape.has_compact_l1() {
+        let expanded=l1w.len()==shape.num_stacks*shape.l1_out()*shape.ft_size;
+        let mut dense=if expanded {l1w.to_vec()} else {expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,l1w)?};
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(compact_l1_dense_shape(shape), &mut dense, l1b, l1axw, l1axb, factorizer, alpha, factorizer_axis_confidences)?;
+        let packed=compact_l1_pack(shape,&dense);
+        if expanded {l1w.copy_from_slice(&expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,&packed)?);} else {l1w.copy_from_slice(&packed);}
+        return Ok(());
+    }
+
     let l1_out = shape.l1_out();
     let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
     let expected_l1b = shape.num_stacks * l1_out;
@@ -21096,9 +21118,6 @@ fn fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(
     }
     match (l1axw, l1axb) {
         (Some(axis_w), Some(axis_b)) => {
-            if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
-                return Err("SFNN compact L1 does not support axis-factorized L1 weights".to_string());
-            }
             let axis_count = shape.factorizer_axis_count();
             if let Some(confidences) = factorizer_axis_confidences {
                 if confidences.len() != axis_count {
@@ -22084,6 +22103,51 @@ fn shared_rebase_state(state: &mut CudaCppRangerGroupState) -> SharedRebaseState
     (&mut state.momentum, &mut state.velocity, &mut state.slow_params)
 }
 
+#[cfg(feature = "cuda-cpp-backend")]
+fn rebase_compact_shared_host(
+    shape: bulletou_cuda_cpp::SfnnForwardShape,
+    base: &mut [f32],
+    common: &mut [f32],
+    base_state: Option<SharedRebaseState<'_>>,
+    common_state: Option<SharedRebaseState<'_>>,
+    gates: Option<&[f32]>,
+    old: f32,
+    new: f32,
+) -> Result<(), String> {
+    if old == new {
+        return Ok(());
+    }
+    let mut dense = expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, base)?;
+    let mut states = base_state
+        .as_ref()
+        .map(|(m, v, s)| -> Result<_, String> {
+            Ok((
+                expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, m)?,
+                expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, v)?,
+                expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, s)?,
+            ))
+        })
+        .transpose()?;
+    rebase_shared_host(
+        &mut dense,
+        common,
+        states.as_mut().map(|(m, v, s)| (m.as_mut_slice(), v.as_mut_slice(), s.as_mut_slice())),
+        common_state,
+        shape.ft_size,
+        shape.l1_out(),
+        gates,
+        old,
+        new,
+    )?;
+    base.copy_from_slice(&compact_l1_pack(shape, &dense));
+    if let (Some((m, v, s)), Some((dm, dv, ds))) = (base_state, states) {
+        m.copy_from_slice(&compact_l1_pack(shape, &dm));
+        v.copy_from_slice(&compact_l1_pack(shape, &dv));
+        s.copy_from_slice(&compact_l1_pack(shape, &ds));
+    }
+    Ok(())
+}
+
 /// In-place host counterpart of the CUDA shared rebase, used before upload.
 #[cfg(feature = "cuda-cpp-backend")]
 fn rebase_shared_host(
@@ -22217,6 +22281,9 @@ fn rebase_loaded_sfnn_shared(
                 } else {
                     (None, None)
                 };
+                if !is_bias && shape.has_compact_l1() {
+                    rebase_compact_shared_host(shape,base,common,bs,cs,gates.as_deref(),old[1],new[1])?;
+                } else {
                 rebase_shared_host(
                     base,
                     common,
@@ -22228,6 +22295,7 @@ fn rebase_loaded_sfnn_shared(
                     old[1],
                     new[1],
                 )?;
+                }
             }
         }
     }
@@ -22443,7 +22511,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     let wants_l1f = effective_sfnn_factorized_l1(args);
     let wants_l1ax = effective_sfnn_axis_factorized_l1(args);
     let mut created_factorizers = CudaCppSfnnCreatedFactorizers::default();
-    if wants_l1f && weights.l1fw.is_none() && !weights.shape.has_compact_l1() {
+    if wants_l1f && weights.l1fw.is_none() {
         eprintln!(
             "  WARN: loaded SFNN state {} has no L1 shared stack factorizer tensors; adding zero-initialized l1f terms",
             path.display()
@@ -22453,7 +22521,7 @@ fn load_cuda_cpp_sfnn_initial_state(
         created_factorizers.shared_l1 = true;
     }
     let axis_count = weights.shape.factorizer_axis_count();
-    if wants_l1ax && weights.l1axw.is_none() && !weights.shape.has_compact_l1() {
+    if wants_l1ax && weights.l1axw.is_none() {
         eprintln!(
             "  WARN: loaded SFNN state {} has no L1 axis factorizer tensors; adding zero-initialized l1ax terms",
             path.display()
@@ -22467,18 +22535,6 @@ fn load_cuda_cpp_sfnn_initial_state(
             "  WARN: loaded SFNN state {} has axis factorizer tensors without progress-axis tail; appended zero-initialized progress-axis terms",
             path.display()
         );
-    }
-    if weights.l1fw.is_some() && weights.shape.has_compact_l1() {
-        return Err(format!(
-            "loaded SFNN state {} contains l1fw/l1fb factorized-L1 weights, but compact L1 architectures cannot use them",
-            path.display()
-        ));
-    }
-    if weights.l1axw.is_some() && weights.shape.has_compact_l1() {
-        return Err(format!(
-            "loaded SFNN state {} contains l1axw/l1axb axis-factorized L1 weights, but compact L1 architectures cannot use them",
-            path.display()
-        ));
     }
     let keep_optimizer_state_on_factorizer_change = args.sfnn_keep_optimizer_state_on_factorizer_change;
     // New factorizer coordinates reset the optimizer during migration; do not
@@ -23221,8 +23277,13 @@ fn extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(
     l1fw: &mut [f32],
     l1fb: &mut [f32],
 ) -> Result<(), String> {
-    if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
-        return Err("SFNN compact L1 does not support shared L1 factorizer extraction".to_string());
+    if shape.has_compact_l1() {
+        let expanded=l1w.len()==shape.num_stacks*shape.l1_out()*shape.ft_size;
+        let mut dense=if expanded {l1w.to_vec()} else {expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,l1w)?};
+        extract_cuda_cpp_sfnn_l1_shared_from_stacked_l1(compact_l1_dense_shape(shape), &mut dense, l1b, l1fw, l1fb)?;
+        let packed=compact_l1_pack(shape,&dense);
+        if expanded {l1w.copy_from_slice(&expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,&packed)?);} else {l1w.copy_from_slice(&packed);}
+        return Ok(());
     }
     let l1_out = shape.l1_out();
     let expected_l1w = cuda_cpp_sfnn_l1w_len_for_shape(shape)?;
@@ -23323,8 +23384,13 @@ fn extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(
     l1axb: &mut [f32],
     factorizer: SfnnFactorizerSpec,
 ) -> Result<(), String> {
-    if cuda_cpp_sfnn_is_compact_l1_shape(shape) {
-        return Err("SFNN compact L1 does not support axis L1 factorizer extraction".to_string());
+    if shape.has_compact_l1() {
+        let expanded=l1w.len()==shape.num_stacks*shape.l1_out()*shape.ft_size;
+        let mut dense=if expanded {l1w.to_vec()} else {expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,l1w)?};
+        extract_cuda_cpp_sfnn_l1_axis_from_stacked_l1(compact_l1_dense_shape(shape), &mut dense, l1b, l1axw, l1axb, factorizer)?;
+        let packed=compact_l1_pack(shape,&dense);
+        if expanded {l1w.copy_from_slice(&expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,&packed)?);} else {l1w.copy_from_slice(&packed);}
+        return Ok(());
     }
     let l1_out = shape.l1_out();
     extract_cuda_cpp_sfnn_axis_row_major_from_stacks(shape, l1b, l1_out, l1axb, factorizer, "SFNN l1axb")?;
@@ -24868,13 +24934,13 @@ fn write_cuda_cpp_sfnn_nn_bin_format(
     let use_axis = factorizer.any_axis();
     let compact_l1 = cuda_cpp_sfnn_is_compact_l1_shape(shape);
     let (l1fw, l1fb) = cuda_cpp_sfnn_active_factorizer_pair(
-        factorizer.shared && !compact_l1,
+        factorizer.shared && (!compact_l1 || weights.l1fw.is_some()),
         "l1f",
         weights.l1fw.as_deref(),
         weights.l1fb.as_deref(),
     )?;
     let (l1axw, l1axb) = cuda_cpp_sfnn_active_factorizer_pair(
-        use_axis && !compact_l1,
+        use_axis && (!compact_l1 || weights.l1axw.is_some()),
         "l1ax",
         weights.l1axw.as_deref(),
         weights.l1axb.as_deref(),
@@ -24896,12 +24962,6 @@ fn write_cuda_cpp_sfnn_nn_bin_format(
     let (l3axw, l3axb) =
         cuda_cpp_sfnn_active_factorizer_pair(use_axis, "l3ax", weights.l3axw.as_deref(), weights.l3axb.as_deref())?;
     let mut l1w_for_export = if compact_l1 {
-        if l1fw.is_some() {
-            return Err("SFNN compact L1 cannot be exported with factorized shared L1 weights".to_string());
-        }
-        if l1axw.is_some() {
-            return Err("SFNN compact L1 cannot be exported with axis-factorized L1 weights".to_string());
-        }
         expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape, &weights.l1w)?
     } else {
         weights.l1w.clone()
@@ -24924,7 +24984,7 @@ fn write_cuda_cpp_sfnn_nn_bin_format(
         &mut l3b_for_export,
         residual_count_gates,
     )?;
-    if !compact_l1 {
+    {
         fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
             shape,
             &mut l1w_for_export,
@@ -32712,7 +32772,7 @@ mod tests {
 
     #[test]
     fn l1_factorizer_epoch_switch_settings() {
-        for arch in ["SFNN_ka2_32_1_2_k3k3", "SFNN_ka2_32_1_2_progress8", "SFNN_ka2_32_1_2_k3k3_progress8"] {
+        for arch in ["SFNN_ka2_32_1_2_k3k3", "SFNN_ka2_32_1_2_progress8", "SFNN_ka2_32_1_2_k3k3_progress8", "SFNN_ka2_192_2_2_c64_s64x2_k3k3", "SFNN_ka2_128_2_2_c0_s64x2_k3k3_progress8"] {
             let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
                 "--arch", arch, "--superbatches", "1", "--max-epochs", "10"]).unwrap();
             args.epoch_settings_json = Some(serde_json::json!({"sfnn_l1_factorizer": {
@@ -32739,7 +32799,7 @@ mod tests {
     #[test]
     fn l1_factorizer_scheduled_host_restore_roundtrip() {
         for source_mode in ["axis","pair"] {
-        for arch in ["SFNN_ka2_32_1_2_k3k3", "SFNN_ka2_32_1_2_progress8", "SFNN_ka2_32_1_2_k3k3_progress8"] {
+        for arch in ["SFNN_ka2_32_1_2_k3k3", "SFNN_ka2_32_1_2_progress8", "SFNN_ka2_32_1_2_k3k3_progress8", "SFNN_ka2_192_2_2_c64_s64x2_k3k3", "SFNN_ka2_128_2_2_c0_s64x2_k3k3_progress8"] {
             let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null","--arch",arch]).unwrap();
             args.epoch_settings_json=Some(serde_json::json!({"sfnn_l1_factorizer":{"epoch1":source_mode,"epoch5":"shared","epoch8":source_mode}}).to_string());
             let axis=args_at_epoch(&args,1).unwrap(); let shared=args_at_epoch(&args,5).unwrap();
@@ -32834,6 +32894,20 @@ mod tests {
         for epoch in [5,8,9] {
             assert_eq!(initial_signature,resume_signature(&args_at_epoch(&args,epoch).unwrap()));
         }
+    }
+
+    #[test]
+    fn compact_revival_cli_accepts_actual_common_shard_arch() {
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_halfka2_3072_15_64_c1024_s1024x2_k3k3",
+            "--sfnn-ft-revive","--sfnn-l1-revive","--sfnn-l2-revive","--sfnn-qat-ft","--sfnn-qat-l2","--sfnn-qat-l3"]).unwrap();
+        assert!(args.validate_arch_flags().is_ok());
+        let mut qat=args.clone();qat.sfnn_qat_l1=true;
+        assert!(qat.validate_arch_flags().is_ok());
+        let mut scheduled=args.clone();scheduled.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_l1_factorizer":{"epoch1":"pair","epoch99":"shared"}}).to_string());
+        assert!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,1).unwrap()).king_axis);
+        assert_eq!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,99).unwrap()),SfnnFactorizerSpec::SHARED);
     }
 
     #[test]
@@ -32962,7 +33036,9 @@ mod tests {
     fn revival_measurement_gpu_preserves_weights_optimizer_and_rng() {
         use bulletou_cuda_cpp::{Context, SfnnTrainStepRunner};
         use bulletou_lib::value::SfnnTeacherBatchConfig;
-        for pair in [false,true] {
+        for mode in 0..4 {
+        let pair=mode==1 || mode==3;
+        let compact=mode>=2;
         let directory = std::env::temp_dir().join(format!("revival-measurement-gpu-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&directory).unwrap();
@@ -32977,7 +33053,7 @@ mod tests {
         game.push(0);
         std::fs::write(&teacher, game.repeat(256)).unwrap();
         let mut args = Args::try_parse_from(["bulletou", "--teacher", teacher.to_str().unwrap(),
-            "--arch", if pair {"SFNN_halfka2_128_8_32_hand4_k3k3"} else {"SFNN_halfka2_128_8_32_k3k3"},
+            "--arch", if compact {"SFNN_halfka2_192_8_32_c64_s64x2_k3k3"} else if pair {"SFNN_halfka2_128_8_32_hand4_k3k3"} else {"SFNN_halfka2_128_8_32_k3k3"},
             "--sfnn-factorizer", if pair {"pair"} else {"none"},
             "--sfnn-ft-factorizer", "false", "--output", directory.to_str().unwrap()]).unwrap();
         let feature = CudaCppSfnnFeatureKind::Halfka2;
@@ -33031,6 +33107,15 @@ mod tests {
         assert_eq!(fields[13], fields[19]);
         assert_eq!(fields[13], "32");
         assert_ne!(runner.read_weights(&ctx).unwrap().l2w, before.l2w);
+        if compact {
+            args.sfnn_l1_revive=true;
+            args.sfnn_ft_revive=true;
+            run_sfnn_epoch_revival(&args,feature,&ctx,&mut runner,&config,4).unwrap();
+            let summary=std::fs::read_to_string(directory.join("revive-summary.csv")).unwrap();
+            let fields:Vec<_>=summary.lines().last().unwrap().split(',').collect();
+            assert_eq!(fields[18],"8");
+            assert_eq!(runner.read_weights(&ctx).unwrap().l1w.len(),weights.l1w.len());
+        }
         std::fs::remove_dir_all(directory).unwrap();
         }
     }
@@ -33526,7 +33611,7 @@ mod tests {
             "--sfnn-factorized",
         ])
         .unwrap();
-        assert!(!effective_sfnn_factorized_l1(&args));
+        assert!(effective_sfnn_factorized_l1(&args));
         assert!(args.validate_arch_flags().is_ok());
     }
 
@@ -33662,6 +33747,28 @@ mod tests {
             None,
         )
         .unwrap();
+        let inactive=std::fs::read(&path).unwrap();
+        let mut active=weights.clone();
+        active.l1fw=Some(vec![0.125;shape.ft_size*shape.l1_out()]);
+        active.l1fb=Some(vec![0.25;shape.l1_out()]);
+        active.l1axw=Some(vec![0.03125;shape.factorizer_axis_count()*shape.ft_size*shape.l1_out()]);
+        active.l1axb=Some(vec![0.0625;shape.factorizer_axis_count()*shape.l1_out()]);
+        write_cuda_cpp_sfnn_nn_bin(&path,feature_kind,shape,&active,factorizer,
+            SfnnFactorizerAlphaSpec::ONE,None,None,None).unwrap();
+        let active_bytes=std::fs::read(&path).unwrap();
+        assert_eq!(inactive.len(),active_bytes.len());
+        assert_ne!(inactive,active_bytes);
+        // Expanded export tensors must retain disconnected zero coordinates.
+        let mut dense=expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(shape,&active.l1w).unwrap();
+        let mut bias=active.l1b.clone();
+        fold_cuda_cpp_sfnn_l1f_into_stacked_l1(shape,&mut dense,&mut bias,
+            active.l1fw.as_deref(),active.l1fb.as_deref(),1.0).unwrap();
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(shape,&mut dense,&mut bias,
+            active.l1axw.as_deref(),active.l1axb.as_deref(),factorizer,SfnnFactorizerAlphaSpec::ONE,None).unwrap();
+        for bucket in 0..shape.num_stacks {for out in 0..shape.l1_out() {for col in 0..shape.ft_size {
+            let connected=col<2 || col==2+out;
+            assert_eq!(dense[(bucket*shape.l1_out()+out)*shape.ft_size+col],if connected {0.1875} else {0.0});
+        }}}
         let metadata = std::fs::metadata(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(metadata.len() > 0);
@@ -35440,7 +35547,8 @@ mod tests {
         for arch in ["NNUE_halfkp_256x2_32_32", "SFNN_halfka2_4096_7_64_c0_s1024x4_k3k3"] {
             let args =
                 Args::try_parse_from(["bulletou", "--arch", arch, "--teacher", "/dev/null", "--sfnn-qat-l1"]).unwrap();
-            assert!(args.validate_arch_flags().unwrap_err().contains("--sfnn-qat-l1"));
+            if arch.starts_with("NNUE") {assert!(args.validate_arch_flags().unwrap_err().contains("--sfnn-qat-l1"));}
+            else {assert!(args.validate_arch_flags().is_ok());}
         }
     }
 

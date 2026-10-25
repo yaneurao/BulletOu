@@ -34,7 +34,7 @@ FT factorizerはデフォルトで有効です。`--ft-factorizer false` を指�
 
 `--sfnn-factorizer` が設定するのは**L1の共有だけ**です。FTとは独立しています。
 L2・L3はbucketごとの個別重み・biasだけを持ち、shared・axis・pairのいずれも適用しません。
-compact L1のarchitectureでは、このL1共有も無効です。
+compact L1（grouped/common-shard）も、`sfnn_l1_factorizer`に`shared`・`axis`・`pair`を明示指定するとL1共有を使えます。省略時は従来どおり無効です。共有項は接続のある座標だけに加算し、接続のない座標には勾配を流しません。epoch切替・L1 QAT・revive・checkpoint再開・nn.bin出力にも対応します。
 
 | dense L1のHalfKA2での指定 | FTの共有 | L1の共有 |
 |---|---|---|
@@ -531,7 +531,7 @@ gate_stack = count_stack / (count_stack + K)
 | `9K` | bucket 固有 residual を 90% 使う |
 | 十分大きい count | `gate_stack` は 1 に近づく |
 
-このgateとresidual decayの対象は、factorizerが有効なdense L1だけです。L2・L3およびcompact L1には適用しません。
+このgateとresidual decayの対象は、factorizerが有効なL1（dense・compact）です。L2・L3には適用しません。
 `residual_params_per_bucket` もL1のweightとbiasだけを数えます。たとえばFT=1024、L1出力=8なら `1024 × 8 + 8 = 8,200` です。
 
 ### residual count decay

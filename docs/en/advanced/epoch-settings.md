@@ -18,7 +18,7 @@ old axis/pair moments are discarded. All new axis/pair coordinates (including si
 `pair -> axis`) start with zero weights, biases and moments. Removed factors are not reconstructed.
 Immediate forward outputs are preserved up to floating-point rounding; subsequent optimizer dynamics differ.
 
-Supported for non-BN dense cuda-cpp SFNN production training, including k3k3, progress8 and combinations. Only existing architectural axes are used. Progress8 alone maps axes one-to-one to buckets, without cross-bucket sharing. BN/compact L1 and worker epoch schedules are unsupported. A zero residual gate with a nonzero axis coefficient raises an error instead of silently changing output.
+Supported for non-BN cuda-cpp SFNN production training with dense or grouped/common-shard L1, including L1 QAT and revive. k3k3, progress8 and their combinations are supported. Only existing architectural axes are used. Progress8 alone maps axes one-to-one to buckets, without cross-bucket sharing. BN and worker epoch schedules are unsupported. A zero residual gate with a nonzero axis coefficient raises an error instead of silently changing output.
 
 Checkpoint restore checks the saved axis/pair tensor layout to apply each boundary once. Future axis/pair settings do not allocate these terms in earlier shared epochs. `[L1 FACTORIZER]` records the transition and optimizer policy.
 

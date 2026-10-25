@@ -19,7 +19,7 @@ Lookaheadのslow重みも独立にfoldします。base/sharedのmomentum・veloc
 新しいaxis座標をゼロにします。過去に削除した成分の復活や、個別重みからの再推定はしません。
 浮動小数点の丸めを除き直後のforwardは維持しますが、切替後の更新則まで等価にはなりません。
 
-非BN・dense L1のcuda-cpp SFNN通常学習に対応します。k3k3、progress8、複合archとも、そのarchに存在する軸だけを使います。progress8のみでは軸とbucketが一対一なので、bucket間共有の効果はありません。BN/compact L1およびworkerのepochスケジュールは未対応です。count gateが0で非ゼロ係数のaxisをfoldできない場合は、出力を黙って変えず停止します。
+非BNのcuda-cpp SFNN通常学習に対応します。dense・grouped/common-shard L1とも対応し、L1 QATやreviveと併用できます。k3k3、progress8、複合archとも、そのarchに存在する軸だけを使います。progress8のみでは軸とbucketが一対一なので、bucket間共有の効果はありません。BNおよびworkerのepochスケジュールは未対応です。count gateが0で非ゼロ係数のaxisをfoldできない場合は、出力を黙って変えず停止します。
 
 checkpoint再開でも保存済みaxis/pairのテンソル配置に応じて必要な変換だけを行います。将来のaxis/pair指定で初期epochにそれらを先行確保しません。`[L1 FACTORIZER]`に切替方向・optimizerの扱いを表示します。
 
