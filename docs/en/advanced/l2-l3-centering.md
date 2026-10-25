@@ -99,7 +99,7 @@ Initialization is independently selectable per layer for cuda-cpp SFNN scratch t
 }
 ```
 
-Glorot half-width is `sqrt(6 / (fan_in + fan_out)) * nnue_pytorch_init_scale`. FT uses base feature count and FT width; dense L1 includes its skip output, if any; L2 uses denominator `2*H1 + H2`; L3 uses `H2 + 1`. Bucket count is not included. L2/L3 also apply their existing per-layer initialization scales. Bias initialization is unchanged.
+Glorot half-width is `sqrt(6 / (fan_in + fan_out)) * nnue_pytorch_init_scale`. FT uses base feature count and FT width; L1 uses actual connectivity, including skip outputs: compact fan-in is common+shard width, with fan-out equal to all outputs for common inputs or group outputs for shard inputs; L2 uses denominator `2*H1 + H2`; L3 uses `H2 + 1`. Bucket count is not included. L2/L3 also apply their existing per-layer initialization scales. Bias initialization is unchanged.
 
 With FT shared-zero false, initialize shared rows using the selected FT method and shared-row fan-in, with a separate random seed. Base FT random weights are unchanged. Without FT factorization, shared initialization has no effect. L1 shared-zero false retains uniform ±0.01. FT shared was already zero-initialized, so its default remains true.
 

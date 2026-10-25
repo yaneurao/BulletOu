@@ -102,7 +102,7 @@ python .\grid_search.py `
 }
 ```
 
-Glorot半幅は `sqrt(6 / (fan_in + fan_out))` に `nnue_pytorch_init_scale` を掛けます。FT本体は特徴数とFT幅、L1はdense入力/出力数（skip出力を含む）、L2は `2*H1 + H2`、L3は `H2 + 1` を分母に使います。bucket数は掛けません。L2/L3は既存の層別初期化scaleも掛けます。biasは従来の設定のままです。
+Glorot半幅は `sqrt(6 / (fan_in + fan_out))` に `nnue_pytorch_init_scale` を掛けます。FT本体は特徴数とFT幅、L1は実際の接続数（skip出力を含む。compactではfan_inがcommon+shard幅、fan_outがcommon入力では全出力数、shard入力ではgroup内出力数）、L2は `2*H1 + H2`、L3は `H2 + 1` を分母に使います。bucket数は掛けません。L2/L3は既存の層別初期化scaleも掛けます。biasは従来の設定のままです。
 
 FT sharedをfalseにすると、同じFT初期化方式をshared行数のfan-inで適用し、別seedの乱数で初期化します。FT本体の乱数は変わりません。FT factorizerが無効ならshared指定は作用しません。L1 sharedのfalseは従来の一様乱数±0.01です。FT sharedは従来からゼロだったため、既定値trueを維持しています。
 

@@ -5222,7 +5222,7 @@ struct Args {
     #[arg(long)]
     sfnn_init_l3_glorot: bool,
 
-    /// Glorot-uniform dense L1 bucket weights at scratch initialization only.
+    /// Glorot-uniform L1 bucket weights using actual connectivity (scratch only).
     /// Default off; shared weights and biases are controlled separately.
     #[arg(long)]
     sfnn_init_l1_glorot: bool,
@@ -5701,9 +5701,8 @@ impl Args {
             return Err("SFNN initialization options require --backend cuda-cpp and an SFNN arch".into());
         }
         if (self.sfnn_init_l1_glorot || self.sfnn_init_l1_shared_zero)
-            && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
-                || self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()) {
-            return Err("L1 initialization options require --backend cuda-cpp and a dense SFNN L1 arch".into());
+            && (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()) {
+            return Err("L1 initialization options require --backend cuda-cpp and an SFNN arch".into());
         }
         if self.sfnn_l1_effective_weight_clip {
             let spec = effective_sfnn_factorizer_spec(self);
@@ -21947,6 +21946,22 @@ fn expand_cuda_cpp_sfnn_grouped_l1w_for_dense_export(
     Ok(dense)
 }
 
+// Glorot uses physical connectivity. Common inputs reach every output;
+// private inputs reach only the outputs of their own group (including skip).
+#[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_l1_glorot_half_widths(shape: bulletou_cuda_cpp::SfnnForwardShape, scale: f32) -> (f32, f32) {
+    let fan_in = if shape.has_common_shard_l1() {
+        shape.l1_common_shard_input()
+    } else if shape.has_grouped_l1() {
+        shape.l1_group_input()
+    } else {
+        shape.ft_size
+    };
+    let common = scale * (6.0 / (fan_in + shape.l1_out()) as f32).sqrt();
+    let private = scale * (6.0 / (fan_in + shape.l1_group_output()) as f32).sqrt();
+    (common, private)
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn build_sfnn_initial_weights_for_cuda_cpp(
     args: &Args,
@@ -22017,15 +22032,23 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         "L2={} +/-{:.9}, L3={} +/-{:.9}; scratch weights only; biases unchanged",
         if args.sfnn_init_l2_glorot { "Glorot" } else { "legacy" }, l2_weight_bound,
         if args.sfnn_init_l3_glorot { "Glorot" } else { "legacy" }, l3_bound));
-    let l1_weight_bound = if args.sfnn_init_l1_glorot {
-        init_scale * (6.0 / (ft_size + l1_out) as f32).sqrt()
-    } else { l1_bound };
+    let (l1_common_bound, l1_weight_bound) = if args.sfnn_init_l1_glorot {
+        sfnn_l1_glorot_half_widths(shape, init_scale)
+    } else { (l1_bound, l1_bound) };
     print_startup_kv("SFNN L1 init", format!(
-        "bucket={} uniform +/-{:.9}; shared={}; shared bias=zero; scratch only (loaded tensors preserved)",
-        if args.sfnn_init_l1_glorot { "Glorot" } else { "legacy" }, l1_weight_bound,
+        "bucket={} uniform +/-{:.9}; common-input +/-{:.9}; shared={}; shared bias=zero; scratch only (loaded tensors preserved)",
+        if args.sfnn_init_l1_glorot { "Glorot" } else { "legacy" }, l1_weight_bound, l1_common_bound,
         if !effective_sfnn_factorized_l1(args) { "disabled" }
         else if args.sfnn_init_l1_shared_zero { "zero" } else { "uniform[-0.01,0.01]" }));
-    let l1w = cuda_cpp_tatara_uniform_abs_init(cuda_cpp_sfnn_l1w_len_for_shape(shape)?, 0x5f11_e003, l1_weight_bound);
+    let mut l1w = cuda_cpp_tatara_uniform_abs_init(cuda_cpp_sfnn_l1w_len_for_shape(shape)?, 0x5f11_e003, l1_weight_bound);
+    if args.sfnn_init_l1_glorot && shape.l1_common_size > 0 && l1_weight_bound > 0.0 {
+        let row_input=shape.l1_common_shard_input();
+        for row in l1w.chunks_exact_mut(row_input) {
+            for value in &mut row[..shape.l1_common_size] {
+                *value *= l1_common_bound / l1_weight_bound;
+            }
+        }
+    }
     let l1b = cuda_cpp_sfnn_stacked_hidden_bias_init(l1_out, num_stacks, 0x5f11_e004, l1_bound, args.sfnn_init_bias);
     let l2w = cuda_cpp_tatara_uniform_abs_init(num_stacks * l2_size * l2_in, 0x5f11_e005, l2_weight_bound);
     let l2b = cuda_cpp_sfnn_stacked_hidden_bias_init(l2_size, num_stacks, 0x5f11_e006, l2_bound, args.sfnn_init_bias);
@@ -35668,6 +35691,86 @@ mod tests {
         for invalid in [-1.0, f32::NAN, f32::INFINITY] {
             enabled.sfnn_norm_loss_strength = invalid;
             assert!(enabled.validate_cuda_cpp_backend_options().is_err());
+        }
+    }
+
+    #[test]
+    fn compact_l1_initialization_accepts_qat_factorizer_and_revival_schedules() {
+        let mut args = Args::try_parse_from([
+            "bulletou",
+            "--backend",
+            "cuda-cpp",
+            "--teacher",
+            "/dev/null",
+            "--arch",
+            "SFNN_halfka2_3072_15_64_c1024_s1024x2_k3k3",
+            "--sfnn-init-ft-glorot",
+            "--sfnn-init-l1-glorot",
+            "--sfnn-init-l2-glorot",
+            "--sfnn-init-l3-glorot",
+            "--sfnn-init-l1-shared-zero",
+            "--sfnn-qat-ft",
+            "--sfnn-qat-l1",
+            "--sfnn-qat-l2",
+            "--sfnn-qat-l3",
+        ])
+        .unwrap();
+        args.epoch_settings_json = Some(
+            serde_json::json!({
+                "sfnn_l1_factorizer":{"epoch1":"axis","epoch99":"shared"},
+                "ft_factorizer":{"epoch1":true,"epoch8":false},
+                "sfnn_ft_revive":{"epoch1":false,"epoch4":true,"epoch5":false},
+                "sfnn_l1_revive":{"epoch1":false,"epoch4":true,"epoch5":false},
+                "sfnn_l2_revive":{"epoch1":false,"epoch4":true,"epoch5":false}
+            })
+            .to_string(),
+        );
+        for epoch in [1, 4, 5, 8, 99] {
+            args_at_epoch(&args, epoch).unwrap().validate_arch_flags().unwrap();
+        }
+    }
+
+    #[test]
+    fn compact_l1_glorot_uses_connected_fans_and_preserves_other_layers() {
+        for arch in ["SFNN_ka2_192_2_2_c64_s64x2_k3k3", "SFNN_ka2_128_2_2_c0_s64x2_k3k3"] {
+            let mut args = Args::try_parse_from([
+                "bulletou",
+                "--backend",
+                "cuda-cpp",
+                "--teacher",
+                "/dev/null",
+                "--arch",
+                arch,
+                "--sfnn-l1-factorizer",
+                "axis",
+            ])
+            .unwrap();
+            let legacy = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+            args.sfnn_init_l1_glorot = true;
+            args.sfnn_init_l1_shared_zero = true;
+            args.nnue_pytorch_init_scale = 0.75;
+            args.validate_arch_flags().unwrap();
+            let w = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+            let shape = w.shape;
+            let width = shape.l1_common_shard_input();
+            let common = 0.75 * (6.0 / (width + shape.l1_out()) as f32).sqrt();
+            let private = 0.75 * (6.0 / (width + shape.l1_group_output()) as f32).sqrt();
+            assert_eq!(sfnn_l1_glorot_half_widths(shape, 0.75), (common, private));
+            assert_eq!(w.l1w.len(), shape.num_stacks * shape.l1_out() * width);
+            for (i, (&old, &new)) in legacy.l1w.iter().zip(&w.l1w).enumerate() {
+                let bound = if i % width < shape.l1_common_size { common } else { private };
+                assert!(new.abs() <= bound);
+                assert!((old / 0.01 - new / bound).abs() < 1e-6);
+            }
+            assert!(w.l1fw.as_ref().unwrap().iter().all(|x| *x == 0.0));
+            // Changing only the two L1 flags must leave all other layers intact.
+            args.sfnn_init_l1_glorot = false;
+            args.sfnn_init_l1_shared_zero = false;
+            let control = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+            assert_eq!(w.l0w, control.l0w);
+            assert_eq!(w.l1b, control.l1b);
+            assert_eq!(w.l2w, control.l2w);
+            assert_eq!(w.l3w, control.l3w);
         }
     }
 
