@@ -3602,6 +3602,7 @@ __global__ void sfnn_common_shard_l1_backward_kernel(
     }
 }
 
+template<bool Compact>
 __global__ void sfnn_factorized_l1_backward_kernel(
     const float* inputs,
     const float* output_gradients,
@@ -3689,8 +3690,13 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             for (size_t out_col = 0; out_col < output_dim; ++out_col) {
                 float grad = output_gradients[sample * output_dim + out_col];
                 if (grad != 0.0f) {
-                    const size_t weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
-                    if(weight_idx==SIZE_MAX) continue;
+                    size_t weight_idx;
+                    if constexpr (Compact) {
+                        weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
+                        if (weight_idx == SIZE_MAX) continue;
+                    } else {
+                        weight_idx = stack_base + out_col * input_dim + in_col;
+                    }
                     float weight = qat_weights != nullptr ? qat_weights[weight_idx] : residual_gate * weights[weight_idx];
                     if (qat_weights == nullptr && has_shared != 0) {
                         weight += shared_alpha * shared_weights[in_col * output_dim + out_col];
@@ -3751,10 +3757,14 @@ __global__ void sfnn_factorized_l1_backward_kernel(
             }
             float output_gradient = output_gradients[sample * output_dim + out_col];
             float input_value = inputs[sample * input_dim + in_col];
-            if (output_gradient != 0.0f && input_value != 0.0f &&
-                sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard)!=SIZE_MAX) {
+            size_t weight_idx;
+            if constexpr (Compact) {
+                weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
+            } else {
+                weight_idx = (stack * output_dim + out_col) * input_dim + in_col;
+            }
+            if (output_gradient != 0.0f && input_value != 0.0f && weight_idx != SIZE_MAX) {
                 float grad = output_gradient * input_value;
-                size_t weight_idx = sfnn_l1_coordinate(stack,out_col,in_col,input_dim,output_dim,groups,common,shard);
                 atomicAdd(&weight_gradients[weight_idx], grad);
                 if (accumulate_factorizer_gradients != 0 && has_shared != 0) {
                     size_t shared_weight_idx = in_col * output_dim + out_col;
@@ -5710,7 +5720,7 @@ int launch_sfnn_dense_param_reduce_tiled(
     if (batch == 0 || input_dim == 0 || output_dim == 0 || num_stacks == 0) {
         return 0;
     }
-    const bool compact_l1 = input_dim >= 1024 && (output_dim == 8 || output_dim == 9);
+    const bool compact_l1 = input_dim >= 1024 && (output_dim == 8 || output_dim == 9 || output_dim == 16);
     const bool bn_l1 = ctx->bn[1].params && input_dim >= 32 &&
         output_dim >= ctx->bn[1].width && output_dim <= ctx->bn[1].width + 1;
     // This is an affine-gradient reduction, not a BN operation. The same
@@ -6897,50 +6907,56 @@ int launch_sfnn_backward_kernels(
         }
         const bool compact_input_fast=!compact && (ctx->bn[1].params || ft_size >= 1024) && !bn_use_reference() &&
             reduce_l1_params && (has_l1ax==0 || qat_l1w) &&
-            (!residual_count_gates || qat_l1w) && (l1_out==8 || l1_out==9);
+            (!residual_count_gates || qat_l1w) && (l1_out==8 || l1_out==9 || l1_out==16);
         if(compact_input_fast) {
             const float* effective = qat_l1w ? qat_l1w : l1w;
             const float* shared = !qat_l1w && has_l1f ? l1fw : nullptr;
             if(l1_out==8)bn_l1_input_gradient<8><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
-            else bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
-        } else sfnn_factorized_l1_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-            combined,
-            l1_gradients,
-            l1w,
-            qat_l1w,
-            l1fw,
-            l1axw,
-            buckets,
-            combined_gradients,
-            l1w_gradients,
-            l1b_gradients,
-            l1fw_gradients,
-            l1fb_gradients,
-            l1axw_gradients,
-            l1axb_gradients,
-            batch,
-            ft_size,
-            l1_out,
-            num_stacks,
-            factorizer_king_axis_dim,
-            factorizer_hand_axis_dim,
-            has_l1f,
-            has_l1ax,
-            use_king_axis,
-            use_hand_axis,
-            use_progress_axis,
-            use_king_hand_pair,
-            use_king_progress_pair,
-            use_hand_progress_pair,
-            factorizer_shared_alpha,
-            factorizer_king_axis_alpha,
-            factorizer_hand_axis_alpha,
-            factorizer_progress_axis_alpha,
-            factorizer_pair_alpha,
-            residual_count_gates,
-            factorizer_axis_confidences,
-            reduce_l1_params ? 0 : 1,
-            compact ? 1 : 0, l1_group_count, l1_common_size, l1_shard_size);
+            else if(l1_out==9)bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+            else bn_l1_input_gradient<16><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
+        } else {
+#define LAUNCH_L1_BACKWARD(is_compact) sfnn_factorized_l1_backward_kernel<is_compact><<<blocks, threads, 0, ctx->stream>>>( \
+            combined, \
+            l1_gradients, \
+            l1w, \
+            qat_l1w, \
+            l1fw, \
+            l1axw, \
+            buckets, \
+            combined_gradients, \
+            l1w_gradients, \
+            l1b_gradients, \
+            l1fw_gradients, \
+            l1fb_gradients, \
+            l1axw_gradients, \
+            l1axb_gradients, \
+            batch, \
+            ft_size, \
+            l1_out, \
+            num_stacks, \
+            factorizer_king_axis_dim, \
+            factorizer_hand_axis_dim, \
+            has_l1f, \
+            has_l1ax, \
+            use_king_axis, \
+            use_hand_axis, \
+            use_progress_axis, \
+            use_king_hand_pair, \
+            use_king_progress_pair, \
+            use_hand_progress_pair, \
+            factorizer_shared_alpha, \
+            factorizer_king_axis_alpha, \
+            factorizer_hand_axis_alpha, \
+            factorizer_progress_axis_alpha, \
+            factorizer_pair_alpha, \
+            residual_count_gates, \
+            factorizer_axis_confidences, \
+            reduce_l1_params ? 0 : 1, \
+            compact ? 1 : 0, l1_group_count, l1_common_size, l1_shard_size)
+            if (compact) { LAUNCH_L1_BACKWARD(true); }
+            else { LAUNCH_L1_BACKWARD(false); }
+#undef LAUNCH_L1_BACKWARD
+        }
         if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
             return -1;
         }

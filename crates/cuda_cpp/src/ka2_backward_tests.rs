@@ -21,13 +21,15 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
     let indices: Vec<i32> = (0..N).map(|i| (i % 4) as i32).collect();
     let targets: Vec<f32> = (0..N).map(|i| (i % 11) as f32 / 10.0).collect();
     let entries: Vec<f32> = (0..N).map(|i| if i % 5 == 0 { 0.0 } else { 1.0 }).collect();
-    for (stacks, king, hand, progress, pairs) in
-        [(9, 3, 0, false, false), (8, 0, 0, true, false), (16, 2, 2, false, true)]
+    for (stacks, king, hand, progress, pairs, hidden) in
+        [(9, 3, 0, false, false, 7), (8, 0, 0, true, false, 7), (16, 2, 2, false, true, 7),
+         (8, 0, 0, true, false, 15), (9, 3, 0, false, false, 15),
+         (8, 0, 0, false, false, 15)]
     {
         let shape = SfnnForwardShape {
             input_size: 4,
             ft_size: 1024,
-            l1_hidden: 7,
+            l1_hidden: hidden,
             l1_skip: true,
             l2_size: 4,
             num_stacks: stacks,
@@ -40,13 +42,14 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
         let values = |n, scale| (0..n).map(|i| ((i * 17 % 101) as f32 - 50.0) * scale).collect::<Vec<_>>();
         let w0 = values(4 * 1024, 0.002);
         let b0 = vec![0.5; 1024];
-        let w1 = values(stacks * 1024 * 8, 0.0002);
-        let b1 = vec![0.25; stacks * 8];
-        let fw = values(1024 * 8, 0.0001);
-        let fb = vec![0.03; 8];
-        let aw = values(shape.factorizer_axis_count() * 1024 * 8, 0.0003);
-        let ab = values(shape.factorizer_axis_count() * 8, 0.0002);
-        let w2 = values(stacks * 14 * 4, 0.01);
+        let outputs = hidden + 1;
+        let w1 = values(stacks * 1024 * outputs, 0.0002);
+        let b1 = vec![0.25; stacks * outputs];
+        let fw = values(1024 * outputs, 0.0001);
+        let fb = vec![0.03; outputs];
+        let aw = values(shape.factorizer_axis_count() * 1024 * outputs, 0.0003);
+        let ab = values(shape.factorizer_axis_count() * outputs, 0.0002);
+        let w2 = values(stacks * hidden * 2 * 4, 0.01);
         let b2 = vec![0.3; stacks * 4];
         let w3 = values(stacks * 4, 0.1);
         let b3 = vec![0.0; stacks];
@@ -58,8 +61,8 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
             l1b: &b1,
             l1fw: Some(&fw),
             l1fb: Some(&fb),
-            l1axw: Some(&aw),
-            l1axb: Some(&ab),
+            l1axw: (king != 0 || hand != 0 || progress).then_some(&aw),
+            l1axb: (king != 0 || hand != 0 || progress).then_some(&ab),
             l2w: &w2,
             l2b: &b2,
             l3w: &w3,
@@ -100,9 +103,13 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
                     .unwrap();
                     let confidence: Vec<f32> =
                         (0..shape.factorizer_axis_count()).map(|i| 0.2 + (i % 5) as f32 * 0.15).collect();
-                    r.set_factorizer_axis_confidences(&ctx, Some(&confidence)).unwrap();
+                    if king != 0 || hand != 0 || progress {
+                        r.set_factorizer_axis_confidences(&ctx, Some(&confidence)).unwrap();
+                    }
                     let gates: Vec<f32> = (0..stacks).map(|i| if i == 0 { 0.0 } else { 0.6 }).collect();
-                    r.set_residual_count_gates_by_stack(&ctx, Some(&gates)).unwrap();
+                    if king != 0 || hand != 0 || progress {
+                        r.set_residual_count_gates_by_stack(&ctx, Some(&gates)).unwrap();
+                    }
                 }
                 let policy = SfnnLayerLrMultipliers { qat_l1: qat, ..Default::default() };
                 for micro in 1..=4 {
@@ -146,7 +153,9 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
                     ] {
                         let x = x.download(&ctx).unwrap();
                         let y = y.download(&ctx).unwrap();
-                        assert!(y.iter().any(|v| v.abs() > 1e-8), "vacuous axis gradient");
+                        if king != 0 || hand != 0 || progress {
+                            assert!(y.iter().any(|v| v.abs() > 1e-8), "vacuous axis gradient");
+                        }
                         for (&x, &y) in x.iter().zip(&y) {
                             assert!((x - y).abs() < 2e-6 + y.abs() * 3e-4, "axis {x} vs {y}");
                         }
