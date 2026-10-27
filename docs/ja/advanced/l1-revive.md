@@ -12,6 +12,11 @@
 0.01なら1%未満であり、1%ちょうどは対象外です。飽和率・棋力への貢献割合ではありません。
 
 
+
+## 初期学習のL1学習率抑制
+
+`"sfnn_l1_initial_lr_suppress_sb": 32` とすると、epoch 1の最初の32sbだけ、L1全体の学習率を `sfnn_l1_lr_mult` のさらに0.1倍にします。reviveの有無とは独立し、初期値の再設定は行いません。既定値は0（抑制なし）。epoch 1途中のcheckpointからresumeしても、sb番号に基づき残り期間を抑制します。独立warmupのepoch 0には適用しません。revive後の抑制期間と重なっても0.1倍は一度だけ適用します。cuda-cpp SFNNのproduction scheduleで使用でき、plateauとdirect stepsには対応しません。
+
 ## revive後のL1学習率抑制
 
 `"sfnn_l1_revive_lr_suppress_sb": 16` とすると、L1 reviveを有効にしたepochの開始後16sbの間、L1全体の学習率を `sfnn_l1_lr_mult` のさらに0.1倍にします。既定値は0（抑制なし）です。候補が0個の場合も、reviveを実行したepochでは抑制します。期間はepochをまたいでも継続し、途中のcheckpointからのresumeでも復元します。resume時はrevive・抑制期間・epochのsb数の設定を維持してください。epoch別指定も可能で、期間はrevive開始時の値を使います。cuda-cpp SFNNの通常のproduction scheduleで使用でき、plateauとdirect stepsには対応しません。

@@ -55,7 +55,7 @@ COMMON_COLUMNS = (
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
-    "sfnn_l1_revive", "sfnn_l1_revive_lr_suppress_sb",
+    "sfnn_l1_revive", "sfnn_l1_revive_lr_suppress_sb", "sfnn_l1_initial_lr_suppress_sb",
     "sfnn_ft_revive",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
@@ -298,6 +298,11 @@ def check_settings(settings: dict) -> None:
             raise ValueError(f"{key} must be specified in common settings")
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
+    initial_suppress_sb = settings.get("sfnn_l1_initial_lr_suppress_sb", 0)
+    if type(initial_suppress_sb) is not int or initial_suppress_sb < 0:
+        raise ValueError("sfnn_l1_initial_lr_suppress_sb must be a nonnegative integer")
+    if initial_suppress_sb and settings.get("lr_schedule", "step") == "plateau":
+        raise ValueError("sfnn_l1_initial_lr_suppress_sb does not support plateau LR")
     suppress_sb = settings.get("sfnn_l1_revive_lr_suppress_sb", 0)
     if type(suppress_sb) is not int or suppress_sb < 0:
         raise ValueError("sfnn_l1_revive_lr_suppress_sb must be a nonnegative integer")

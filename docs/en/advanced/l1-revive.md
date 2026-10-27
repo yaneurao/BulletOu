@@ -20,6 +20,11 @@ If every U in a bucket is zero, every R is zero and all units with sufficient co
 This includes mixed constants (normal=0, square=1), zero outputs, and zero quantized outgoing weights.
 
 
+
+## Initial L1 learning-rate suppression
+
+Set `"sfnn_l1_initial_lr_suppress_sb": 32` to multiply the L1 learning rate, including `sfnn_l1_lr_mult`, by 0.1 for the first 32 superbatches of epoch 1. It does not trigger revival; the default 0 disables it. Resuming within epoch 1 continues the remaining interval based on the saved superbatch. It does not apply to the independent warmup epoch 0. If it overlaps the post-revival suppression, the 0.1 multiplier applies only once. This requires cuda-cpp SFNN production training and does not support plateau or direct steps.
+
 ## L1 learning-rate suppression after revival
 
 Set `"sfnn_l1_revive_lr_suppress_sb": 16` to multiply the L1 learning rate (including `sfnn_l1_lr_mult`) by 0.1 for 16 superbatches after an enabled L1 revival. The default is 0 (disabled). Suppression also applies when revival finds no candidates. It carries across epochs and resumes from checkpoints; retain the same revival, duration and epoch-length settings when resuming. Epoch schedules are supported and the duration is taken from the revival epoch. This requires cuda-cpp SFNN production training and does not support plateau or direct steps.

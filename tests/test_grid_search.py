@@ -15,6 +15,17 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_l1_initial_lr_suppression_setting(self):
+        key = "sfnn_l1_initial_lr_suppress_sb"
+        grid.check_settings({**self.common, key: 32})
+        for bad in (-1, 1.5, True):
+            with self.assertRaises(ValueError):
+                grid.check_settings({**self.common, key: bad})
+        with self.assertRaises(ValueError):
+            grid.check_settings({**self.common, key: 32, "lr_schedule": "plateau"})
+        with self.assertRaises(ValueError):
+            grid.check_settings({**self.common, key: {"epoch1": 32}})
+
     def test_l1_revive_lr_suppression_setting(self):
         key = "sfnn_l1_revive_lr_suppress_sb"
         settings = {**self.common, key: {"epoch1": 0, "epoch2": 16}}

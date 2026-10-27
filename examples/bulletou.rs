@@ -4693,6 +4693,10 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     sfnn_l1_lr_mult: f32,
 
+    /// Multiply L1 learning rate by 0.1 for the first N superbatches of epoch 1.
+    #[arg(long, default_value_t = 0)]
+    sfnn_l1_initial_lr_suppress_sb: usize,
+
     /// SFNN FT master weights/biases LR multiplier; does not scale BN gamma/beta.
     #[arg(long, default_value = "1.0")]
     sfnn_ft_lr_mult: f32,
@@ -5789,10 +5793,10 @@ impl Args {
                 return Err("BN requires finite gamma/beta, epsilon>0 and 0<momentum<=1".into());
             }
         }
-        if self.sfnn_l1_revive_lr_suppress_sb > 0 &&
+        if (self.sfnn_l1_revive_lr_suppress_sb > 0 || self.sfnn_l1_initial_lr_suppress_sb > 0) &&
             (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() ||
              self.cuda_cpp_train_steps.is_some() || self.superbatches.is_none() || self.lr_schedule == LrScheduleKind::Plateau) {
-            return Err("sfnn_l1_revive_lr_suppress_sb requires cuda-cpp SFNN production training with step/geometric/cos LR".into());
+            return Err("L1 LR suppression requires cuda-cpp SFNN production training with step/geometric/cos LR".into());
         }
         if self.warmup_sb > 0 {
             if self.backend != BackendKind::CudaCpp || self.cuda_cpp_train_steps.is_some()
@@ -18972,7 +18976,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if let Some(progress) = progress_for_step {
             let key = (progress.epoch, progress.superbatch);
             if !l1_suppress_cache.is_some_and(|(e, sb, _)| (e, sb) == key) {
-                l1_suppress_cache = Some((key.0, key.1, l1_revival_lr_suppressed(base_args, key.0, key.1)?));
+                l1_suppress_cache = Some((key.0, key.1, l1_lr_suppressed(base_args, key.0, key.1)?));
             }
             if l1_suppress_cache.is_some_and(|(_, _, active)| active) { lr_multipliers.l1 *= 0.1; }
         }
@@ -25764,6 +25768,16 @@ fn print_sfnn_qat_mode(args: &Args) {
     );
 }
 
+// Both suppression windows use the same 0.1 multiplier: overlapping windows
+// must not compound. Epoch 0 is the independent warmup, not epoch 1.
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool, String> {
+    if epoch == 1 && superbatch > 0 && superbatch <= args.sfnn_l1_initial_lr_suppress_sb {
+        return Ok(true);
+    }
+    l1_revival_lr_suppressed(args, epoch, superbatch)
+}
+
 // Revival occurs at the start of an enabled epoch. Count complete superbatches
 // from the most recent enabled epoch, including across epoch boundaries; this
 // also reconstructs the remaining interval when resuming a saved superbatch.
@@ -26511,6 +26525,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_ft_saturation_rate={}", args.sfnn_ft_saturation_rate),
         format!("sfnn_ft_saturation_patience={}", args.sfnn_ft_saturation_patience),
         format!("sfnn_l1_lr_mult={:.9}", args.sfnn_l1_lr_mult),
+        format!("sfnn_l1_initial_lr_suppress_sb={}", args.sfnn_l1_initial_lr_suppress_sb),
         format!("sfnn_freeze_l1={}", args.sfnn_freeze_l1),
         format!("sfnn_update_scope={}", args.sfnn_update_scope.cli_name()),
         format!("test_teacher={test_teacher}"),
@@ -26764,7 +26779,8 @@ fn resume_signature_normalize_defaults(signature: &str) -> String {
     ensure_line_after(&mut out, "sfnn_norm_loss_strength=", "sfnn_saturation_penalty=", "sfnn_norm_loss_strength=0.000000000");
     ensure_line_after(&mut out, "sfnn_qat_l1=", "sfnn_saturation_threshold=", "sfnn_qat_l1=false");
     ensure_line_after(&mut out, "sfnn_l1_lr_mult=", "sfnn_qat_l1=", "sfnn_l1_lr_mult=1.000000000");
-    ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_lr_mult=", "sfnn_freeze_l1=false");
+    ensure_line_after(&mut out, "sfnn_l1_initial_lr_suppress_sb=", "sfnn_l1_lr_mult=", "sfnn_l1_initial_lr_suppress_sb=0");
+    ensure_line_after(&mut out, "sfnn_freeze_l1=", "sfnn_l1_initial_lr_suppress_sb=", "sfnn_freeze_l1=false");
     ensure_line_after(&mut out, "sfnn_update_scope=", "sfnn_freeze_l1=", "sfnn_update_scope=all");
 
     let mut normalized = out.join("\n");
@@ -32972,6 +32988,34 @@ mod tests {
             "sfnn_l1_factorizer":{"epoch1":"pair","epoch99":"shared"}}).to_string());
         assert!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,1).unwrap()).king_axis);
         assert_eq!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,99).unwrap()),SfnnFactorizerSpec::SHARED);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn l1_initial_suppression_boundaries_and_resume() {
+        let mut args = Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher", "/dev/null", "--backend", "cuda-cpp", "--superbatches", "64", "--max-epochs", "3",
+            "--sfnn-l1-initial-lr-suppress-sb", "32"]).unwrap();
+        assert!(args.validate_arch_flags().is_ok());
+        assert!(!l1_lr_suppressed(&args, 0, 1).unwrap());
+        assert!(l1_lr_suppressed(&args, 1, 1).unwrap());
+        assert!(l1_lr_suppressed(&args, 1, 17).unwrap()); // Resume from saved sb 16.
+        assert!(l1_lr_suppressed(&args, 1, 32).unwrap());
+        assert!(!l1_lr_suppressed(&args, 1, 33).unwrap());
+        assert!(!l1_lr_suppressed(&args, 2, 1).unwrap());
+        args.sfnn_l1_revive = true;
+        args.sfnn_l1_revive_lr_suppress_sb = 16;
+        assert!(l1_lr_suppressed(&args, 1, 1).unwrap());
+        assert!(l1_lr_suppressed(&args, 1, 32).unwrap());
+        assert!(!l1_lr_suppressed(&args, 1, 33).unwrap());
+        assert!(l1_lr_suppressed(&args, 2, 1).unwrap());
+        let mut zero = args.clone();
+        zero.sfnn_l1_initial_lr_suppress_sb = 0;
+        let old = resume_signature_without_line(&resume_signature(&zero), "sfnn_l1_initial_lr_suppress_sb=");
+        assert!(resume_signature_matches(&old, &zero));
+        assert!(!resume_signature_matches(&old, &args));
+        args.lr_schedule = LrScheduleKind::Plateau;
+        assert!(args.validate_arch_flags().is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
