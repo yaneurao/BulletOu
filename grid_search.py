@@ -55,7 +55,7 @@ COMMON_COLUMNS = (
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
-    "sfnn_l1_revive",
+    "sfnn_l1_revive", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_ft_revive",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
@@ -209,7 +209,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
-    "superbatches",
+    "superbatches", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
@@ -251,6 +251,9 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
             if key == "superbatches":
                 if type(item) is not int or item < 1:
                     raise ValueError(f"{key}.{name} must be a positive integer")
+            elif key == "sfnn_l1_revive_lr_suppress_sb":
+                if type(item) is not int or item < 0:
+                    raise ValueError(f"{key}.{name} must be a nonnegative integer")
             elif key == "sfnn_l1_factorizer":
                 if item not in ("axis", "shared", "pair"):
                     raise ValueError(f"{key}.{name} must be axis/shared/pair")
@@ -295,6 +298,11 @@ def check_settings(settings: dict) -> None:
             raise ValueError(f"{key} must be specified in common settings")
     for key in ("max_epochs", "superbatches"):
         positive_int(settings, key)
+    suppress_sb = settings.get("sfnn_l1_revive_lr_suppress_sb", 0)
+    if type(suppress_sb) is not int or suppress_sb < 0:
+        raise ValueError("sfnn_l1_revive_lr_suppress_sb must be a nonnegative integer")
+    if suppress_sb and settings.get("lr_schedule", "step") == "plateau":
+        raise ValueError("sfnn_l1_revive_lr_suppress_sb does not support plateau LR")
     warmup = settings.get("warmup_sb", 0)
     for key in ("sfnn_ft_revive_contribution_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
         value = settings.get(key, 0.01)

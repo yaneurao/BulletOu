@@ -19,6 +19,11 @@ L2 uses its outgoing L3 weight. Activations and outgoing weights come from the q
 If every U in a bucket is zero, every R is zero and all units with sufficient coverage qualify.
 This includes mixed constants (normal=0, square=1), zero outputs, and zero quantized outgoing weights.
 
+
+## L1 learning-rate suppression after revival
+
+Set `"sfnn_l1_revive_lr_suppress_sb": 16` to multiply the L1 learning rate (including `sfnn_l1_lr_mult`) by 0.1 for 16 superbatches after an enabled L1 revival. The default is 0 (disabled). Suppression also applies when revival finds no candidates. It carries across epochs and resumes from checkpoints; retain the same revival, duration and epoch-length settings when resuming. Epoch schedules are supported and the duration is taken from the revival epoch. This requires cuda-cpp SFNN production training and does not support plateau or direct steps.
+
 ## Calibration and timing
 
 Before the first batch of each enabled epoch (including warmup epoch0), read 16 unshuffled teacher batches

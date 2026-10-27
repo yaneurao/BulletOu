@@ -4111,7 +4111,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "superbatches",
+    "superbatches", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "ft_factorizer",
@@ -4148,6 +4148,9 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
                 return Err("sfnn_l1_factorizer epoch schedule supports axis/shared/pair values".into());
             }
             continue;
+        }
+        if key == "sfnn_l1_revive_lr_suppress_sb" && !v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()) {
+            return Err(format!("{key}.{name} must be a nonnegative integer"));
         }
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
             return Err(format!("superbatches.{name} must be a positive integer"));
@@ -4265,7 +4268,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(superbatches, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(superbatches, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
             lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
@@ -5421,6 +5424,9 @@ struct Args {
     /// Reset low-contribution L1 branch pairs at each enabled epoch boundary.
     #[arg(long)]
     sfnn_l1_revive: bool,
+    /// After L1 revival, multiply L1 learning rate by 0.1 for this many superbatches.
+    #[arg(long, default_value_t = 0)]
+    sfnn_l1_revive_lr_suppress_sb: usize,
     /// Reset low-contribution shared FT product pairs at each enabled epoch boundary.
     #[arg(long)]
     sfnn_ft_revive: bool,
@@ -5782,6 +5788,11 @@ impl Args {
                 || !self.sfnn_bn_momentum.is_finite() || self.sfnn_bn_momentum<=0.0 || self.sfnn_bn_momentum>1.0 {
                 return Err("BN requires finite gamma/beta, epsilon>0 and 0<momentum<=1".into());
             }
+        }
+        if self.sfnn_l1_revive_lr_suppress_sb > 0 &&
+            (self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() ||
+             self.cuda_cpp_train_steps.is_some() || self.superbatches.is_none() || self.lr_schedule == LrScheduleKind::Plateau) {
+            return Err("sfnn_l1_revive_lr_suppress_sb requires cuda-cpp SFNN production training with step/geometric/cos LR".into());
         }
         if self.warmup_sb > 0 {
             if self.backend != BackendKind::CudaCpp || self.cuda_cpp_train_steps.is_some()
@@ -17619,6 +17630,9 @@ fn run_sfnn_epoch_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&
     if args.sfnn_l1_revival_requested() {
         run_sfnn_l1_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
+    if args.sfnn_l1_revive && args.sfnn_l1_revive_lr_suppress_sb > 0 {
+        eprintln!("  [L1 REVIVE] L1 learning rate x 0.1 for {} superbatches", args.sfnn_l1_revive_lr_suppress_sb);
+    }
     if args.sfnn_l2_revival_requested() {
         run_sfnn_l2_revival(args,feature_kind,ctx,runner,config,&audit)?;
     }
@@ -18839,6 +18853,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut hard_progress_buckets = if frozen_progress_params.is_some() { vec![0; batch_size] } else { Vec::new() };
     let base_args = args;
     let mut epoch_args = args.clone();
+    let mut l1_suppress_cache: Option<(usize, usize, bool)> = None;
     let mut active_epoch = None;
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
@@ -18953,7 +18968,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let explicit_profile_step = seen_steps <= profile_steps;
         let diagnostic_profile_step =
             !explicit_profile_step && cuda_cpp_should_profile_sfnn_diagnostics(args, progress_for_step);
-        let lr_multipliers = cuda_cpp_sfnn_layer_lr_multipliers(args, progress_for_step);
+        let mut lr_multipliers = cuda_cpp_sfnn_layer_lr_multipliers(args, progress_for_step);
+        if let Some(progress) = progress_for_step {
+            let key = (progress.epoch, progress.superbatch);
+            if !l1_suppress_cache.is_some_and(|(e, sb, _)| (e, sb) == key) {
+                l1_suppress_cache = Some((key.0, key.1, l1_revival_lr_suppressed(base_args, key.0, key.1)?));
+            }
+            if l1_suppress_cache.is_some_and(|(_, _, active)| active) { lr_multipliers.l1 *= 0.1; }
+        }
         let buckets = if let Some(progress_params) = frozen_progress_params.as_ref() {
             if let Some(progress) = fast.progress.as_ref() {
                 prepare_cuda_cpp_sfnn_hard_progress_buckets(
@@ -25740,6 +25762,25 @@ fn print_sfnn_qat_mode(args: &Args) {
             "off"
         },
     );
+}
+
+// Revival occurs at the start of an enabled epoch. Count complete superbatches
+// from the most recent enabled epoch, including across epoch boundaries; this
+// also reconstructs the remaining interval when resuming a saved superbatch.
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_revival_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool, String> {
+    if args.sfnn_l1_revive_lr_suppress_sb == 0 && args.epoch_settings_json.is_none() { return Ok(false); }
+    let mut elapsed = superbatch.saturating_sub(1);
+    let mut e = epoch;
+    loop {
+        let at = args_at_epoch(args, e)?;
+        if at.sfnn_l1_revive {
+            return Ok(elapsed < at.sfnn_l1_revive_lr_suppress_sb);
+        }
+        if e == 0 || (e == 1 && args.warmup_sb == 0) { return Ok(false); }
+        e -= 1;
+        elapsed = elapsed.saturating_add(configured_epoch_superbatches(args, e));
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -32931,6 +32972,28 @@ mod tests {
             "sfnn_l1_factorizer":{"epoch1":"pair","epoch99":"shared"}}).to_string());
         assert!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,1).unwrap()).king_axis);
         assert_eq!(effective_sfnn_factorizer_spec(&args_at_epoch(&scheduled,99).unwrap()),SfnnFactorizerSpec::SHARED);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn l1_revival_lr_suppression_spans_epochs_and_resume() {
+        let mut args = Args::try_parse_from(["bulletou", "--arch", "SFNN_halfka2_128_8_32_k3k3",
+            "--teacher", "/dev/null", "--backend", "cuda-cpp", "--superbatches", "10", "--max-epochs", "5"]).unwrap();
+        assert_eq!(args.sfnn_l1_revive_lr_suppress_sb, 0);
+        args.epoch_settings_json = Some(serde_json::json!({
+            "sfnn_l1_revive": {"epoch2": true, "epoch3": false},
+            "sfnn_l1_revive_lr_suppress_sb": {"epoch1": 16, "epoch3": 0},
+            "superbatches": {"epoch1": 10, "epoch3": 12}
+        }).to_string());
+        assert!(!l1_revival_lr_suppressed(&args, 1, 1).unwrap());
+        assert!(l1_revival_lr_suppressed(&args, 2, 1).unwrap());
+        assert!(l1_revival_lr_suppressed(&args, 2, 10).unwrap());
+        assert!(l1_revival_lr_suppressed(&args, 3, 6).unwrap());
+        assert!(!l1_revival_lr_suppressed(&args, 3, 7).unwrap());
+        assert!(!l1_revival_lr_suppressed(&args, 4, 1).unwrap());
+        assert!(validate_epoch_setting("sfnn_l1_revive_lr_suppress_sb", &serde_json::json!({"epoch1": -1})).is_err());
+        assert!(validate_epoch_setting("sfnn_l1_revive_lr_suppress_sb", &serde_json::json!({"epoch1": 1.5})).is_err());
+        assert!(Args::try_parse_from(["bulletou", "--sfnn-l1-revive-lr-suppress-sb", "-1"]).is_err());
     }
 
     #[test]

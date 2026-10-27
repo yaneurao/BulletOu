@@ -15,6 +15,19 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_l1_revive_lr_suppression_setting(self):
+        key = "sfnn_l1_revive_lr_suppress_sb"
+        settings = {**self.common, key: {"epoch1": 0, "epoch2": 16}}
+        grid.check_settings(settings)
+        self.assertEqual(grid.resolve_epoch_settings(settings, 2)[key], 16)
+        for bad in (-1, 1.5, True):
+            with self.assertRaises(ValueError):
+                grid.check_settings({**self.common, key: bad})
+            with self.assertRaises(ValueError):
+                grid.resolve_epoch_settings({key: {"epoch1": bad}}, 1)
+        with self.assertRaises(ValueError):
+            grid.check_settings({**self.common, key: 16, "lr_schedule": "plateau"})
+
     def test_superbatches_epoch_schedule_and_completion(self):
         schedule = {"epoch1": 64, "epoch10": 324}
         self.assertEqual(grid.resolve_epoch_settings({"superbatches": schedule}, 9)["superbatches"], 64)
