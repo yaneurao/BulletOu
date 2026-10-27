@@ -130,6 +130,12 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
                         )
                         .unwrap();
                     }
+                    let fast_output = fast.forward_workspace.download_output(&ctx).unwrap();
+                    let reference_output = reference.forward_workspace.download_output(&ctx).unwrap();
+                    for (&x, &y) in fast_output.iter().zip(&reference_output) {
+                        assert!((x - y).abs() < 1e-6 + y.abs() * 1e-5,
+                            "forward stacks={stacks} qat={qat} shared={shared} micro={micro}: {x} vs {y}");
+                    }
                     let a = fast.backward_workspace.download(&ctx).unwrap();
                     let b = reference.backward_workspace.download(&ctx).unwrap();
                     // Include axis gradients: a double-counted BPU contribution must fail.

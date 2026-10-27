@@ -1684,6 +1684,36 @@ __global__ void sfnn_stacked_l1_kernel(
     output[tid] = sum;
 }
 
+// QAT has already folded L1 factorizer weights and biases. Avoid computing
+// axis IDs, residual gates and compact coordinates for this common dense path.
+__global__ void sfnn_dense_l1_plain_warp_kernel(
+    const float* input, const float* weights, const float* bias, const int* buckets,
+    float* output, size_t batch, size_t input_dim, size_t output_dim, size_t num_stacks) {
+    constexpr unsigned int WARP = 32;
+    constexpr unsigned int WARPS_PER_BLOCK = 8;
+    const unsigned int lane = threadIdx.x & (WARP - 1U);
+    const size_t warp_id = static_cast<size_t>(blockIdx.x) * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (warp_id >= batch * output_dim) return;
+    const size_t out_col = warp_id % output_dim;
+    const size_t sample = warp_id / output_dim;
+    const int bucket = buckets[sample];
+    if (bucket < 0 || static_cast<size_t>(bucket) >= num_stacks) {
+        if (lane == 0) output[warp_id] = 0.0f;
+        return;
+    }
+    const size_t stack = static_cast<size_t>(bucket);
+    const size_t input_base = sample * input_dim;
+    const size_t weight_base = (stack * output_dim + out_col) * input_dim;
+    float sum = 0.0f;
+    for (size_t in_col = lane; in_col < input_dim; in_col += WARP) {
+        sum += input[input_base + in_col] * weights[weight_base + in_col];
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    }
+    if (lane == 0) output[warp_id] = sum + bias[stack * output_dim + out_col];
+}
+
 __global__ void sfnn_stacked_l1_warp_kernel(
     const float* input,
     const float* weights,
@@ -5364,6 +5394,10 @@ int launch_sfnn_forward_kernels(
             return fail_message("sfnn_stacked_l1_warp_kernel grid overflow");
         }
         blocks = static_cast<int>((l1_warps + l1_warps_per_block - 1) / l1_warps_per_block);
+        if (!grouped_l1 && !common_shard_l1 && !has_l1f && !has_l1ax && !bn_use_reference()) {
+            sfnn_dense_l1_plain_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
+                combined, l1w, l1b, buckets, l1, batch, ft_size, l1_out, num_stacks);
+        } else {
         sfnn_stacked_l1_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
             combined,
             l1w,
@@ -5395,6 +5429,7 @@ int launch_sfnn_forward_kernels(
             factorizer_pair_alpha,
             residual_count_gates,
             factorizer_axis_confidences, l1_group_count, l1_common_size, l1_shard_size);
+        }
         if (check_kernel_launch("sfnn_stacked_l1_warp_kernel launch") != 0) {
             return -1;
         }
