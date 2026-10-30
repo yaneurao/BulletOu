@@ -40,6 +40,8 @@ pub use shogi_halfka_hm_hand_threat_defensive::ShogiHalfKaHmHandThreatDefensive;
 pub use shogi_halfka_hm_threat::ShogiHalfKaHmThreat;
 pub use shogi_halfka_hm1::{FEATURE_HASH_HALFKA_HM1, HALFKA_HM1_DIMENSIONS, ShogiHalfKaHm1};
 pub use shogi_halfka_hm2::{FEATURE_HASH_HALFKA_HM2, HALFKA_HM2_DIMENSIONS, ShogiHalfKaHm2};
+pub(crate) use shogi_halfka_hm1::fill_halfka_hm1_feature_indices_from_board;
+pub(crate) use shogi_halfka_hm2::fill_halfka_hm2_feature_indices_from_board;
 pub use shogi_halfkp::{
     FEATURE_HASH, HALFKP_DIMENSIONS, HALFKP_PIECE_INPUTS, MAX_ACTIVE_FEATURES as HALFKP_MAX_ACTIVE_FEATURES,
     ShogiHalfKP, ShogiHalfKPPieceFactorizer, fill_halfkp_feature_indices,

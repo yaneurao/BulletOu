@@ -124,6 +124,18 @@ fn halfka_hm1_index(king_sq_idx: usize, bp: usize) -> usize {
 // =============================================================================
 
 /// HalfKA_hm1 特徴量を (stm, nstm) ペアで列挙する。
+pub(crate) fn fill_halfka_hm1_feature_indices_from_board(
+    board: &ShogiBoard, stm: &mut [i32], nstm: &mut [i32],
+) -> (usize, usize) {
+    let mut count = 0usize;
+    map_halfka_hm1_features(board, |a, b| {
+        if count < stm.len() { stm[count] = a as i32; }
+        if count < nstm.len() { nstm[count] = b as i32; }
+        count += 1;
+    });
+    (count, count)
+}
+
 fn map_halfka_hm1_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     let stm = board.side_to_move;
     let nstm = stm.opponent();

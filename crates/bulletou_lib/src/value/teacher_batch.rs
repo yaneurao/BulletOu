@@ -16,6 +16,7 @@ use crate::{
             Factorised, HALFKP_MAX_ACTIVE_FEATURES, KP_MAX_ACTIVE, ShogiHalfKP, ShogiHalfKPPieceFactorizer,
             ShogiHalfKa2, SparseInputType, fill_halfka2_feature_indices_from_board, fill_halfkp_feature_indices,
             fill_ka2_feature_indices_from_board, fill_kp_feature_indices,
+            fill_halfka_hm1_feature_indices_from_board, fill_halfka_hm2_feature_indices_from_board,
         },
         outputs::{
             SHOGI_SFNN_PROGRESS_MAX_ACTIVE, ShogiProgressKPAbs, ShogiSfnnLayerStackBucket,
@@ -2682,6 +2683,11 @@ where
                             input_size,
                             max_active,
                         ),
+                        "halfkahm1" | "halfkahm2" => prepare_sfnn_fast_batch_from_board_features(
+                            input_label, batch, config, rayon_pool.as_ref(),
+                            if input_label == "halfkahm1" { fill_halfka_hm1_feature_indices_from_board }
+                            else { fill_halfka_hm2_feature_indices_from_board }, input_size, max_active,
+                        ),
                         "ka2" => prepare_sfnn_fast_batch_from_board_features(
                             input_label,
                             batch,
@@ -2797,6 +2803,11 @@ where
                 fill_halfka2_feature_indices_from_board,
                 input_size,
                 max_active,
+            ),
+            "halfkahm1" | "halfkahm2" => prepare_sfnn_fast_batch_from_board_features(
+                input_label, batch, config, rayon_pool.as_ref(),
+                if input_label == "halfkahm1" { fill_halfka_hm1_feature_indices_from_board }
+                else { fill_halfka_hm2_feature_indices_from_board }, input_size, max_active,
             ),
             "ka2" => prepare_sfnn_fast_batch_from_board_features(
                 input_label,
@@ -3185,6 +3196,78 @@ mod tests {
             bytes.extend_from_slice(psv.as_bytes());
         }
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn halfkahm_teacher_batches_use_fixed_progress_and_preserve_features() {
+        use crate::game::inputs::{ShogiHalfKaHm1, ShogiHalfKaHm2};
+        use crate::game::outputs::{ShogiSfnnHandBucketKind, ShogiSfnnKingBucketKind, ShogiSfnnProgressBucketKind};
+
+        fn check<I: SparseInputType<RequiredDataType = PackedSfenValue> + Send + Copy>(
+            input: I, label: &'static str, data: &[PackedSfenValue], path: &std::path::Path,
+        ) {
+            for queue_depth in [1, 2] {
+                for win_rate_model in [false, true] {
+                    let mut cfg = sfnn_config();
+                    cfg.teacher = path.to_str().unwrap();
+                    cfg.batch_size = data.len();
+                    cfg.threads = 2;
+                    cfg.queue_depth = queue_depth;
+                    cfg.lambda = 0.4;
+                    cfg.win_rate_model = win_rate_model;
+                    cfg.layerstack_bucket = ShogiSfnnLayerStackBucketKind::new(
+                        ShogiSfnnHandBucketKind::None, ShogiSfnnKingBucketKind::KingRank9,
+                        ShogiSfnnProgressBucketKind::Progress8,
+                    );
+                    let mut progress = ShogiSfnnProgressQ16Params::zero();
+                    progress.weights_q16.fill(65536);
+                    cfg.hard_progress_params = Some(progress.clone());
+                    let loader = MemoryDataLoader::new(Arc::from(data.to_vec()), data.len(), "reference");
+                    let generic = DefaultDataLoader::new(
+                        input, ShogiSfnnLayerStackBucket::new(cfg.layerstack_bucket),
+                        (|_, blend| blend) as fn(&PackedSfenValue, f32) -> f32,
+                        None, false, cfg.scale, cfg.score_drop_abs, loader,
+                    ).with_win_rate_model_target(cfg.win_rate_model, cfg.wrm_target);
+                    let reference = FastBatchHost::from(generic.prepare(data, cfg.threads, 1.0 - cfg.lambda));
+                    let mut got = None;
+                    for_each_sfnn_teacher_fast_batch(input, label, &cfg, 1, |batch| {
+                        got = Some(batch.batch);
+                        Ok::<(), String>(())
+                    }).unwrap();
+                    let got = got.unwrap();
+                    assert_eq!(got.stm, reference.stm);
+                    assert_eq!(got.nstm, reference.nstm);
+                    assert_eq!(got.weights, reference.weights);
+                    for (&a, &b) in got.targets.iter().zip(&reference.targets) {
+                        assert!((a-b).abs() < 1e-6, "target {a} vs {b}");
+                    }
+                    assert!(got.progress.is_none());
+                    for (sample, &bucket) in got.buckets.iter().enumerate() {
+                        let expected = cfg.layerstack_bucket.bucket_from_board_with_progress_params(
+                            &data[sample].decode(), Some(&progress));
+                        assert_eq!(bucket as usize, expected);
+                        assert_eq!(bucket % 8, 7, "positive progress weights must not silently use bucket 4");
+                    }
+                    cfg.hard_progress_params = None;
+                    let mut deferred = None;
+                    for_each_sfnn_teacher_fast_batch(input, label, &cfg, 1, |batch| {
+                        deferred = Some(batch.batch);
+                        Ok::<(), String>(())
+                    }).unwrap();
+                    assert!(deferred.unwrap().progress.is_some());
+                }
+            }
+        }
+        let path = tmp_teacher_path("halfkahm_progress", "pack");
+        write_tiny_pack(&path);
+        let loader = ShogiPackLoader::new(path.to_str().unwrap(), 1, |_| true).with_buffer_records(4);
+        let mut data = Vec::new();
+        loader.map_chunks(0, |chunk| { data.extend_from_slice(chunk); true });
+        assert_eq!(data.len(), 4);
+        check(ShogiHalfKaHm1, "halfkahm1", &data, &path);
+        check(ShogiHalfKaHm2, "halfkahm2", &data, &path);
+        // The pack loader prefetches on background threads; do not remove its
+        // tiny fixture while a reader may still hold it open.
     }
 
     #[test]
