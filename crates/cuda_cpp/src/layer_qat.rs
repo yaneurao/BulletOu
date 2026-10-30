@@ -104,6 +104,77 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn halfkahm2_all_layer_qat_matches_quantized_proxy_with_ft_factorizer() {
+        const BASE: usize = 73305;
+        const VR: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut w = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        w.l2fw = None;
+        w.l2fb = None;
+        w.l3fw = None;
+        w.l3fb = None;
+        w.shape.input_size = BASE + VR;
+        let ft: Vec<f32> = (0..w.shape.input_size * w.shape.ft_size).map(|i| 0.003 * ((i % 11) as f32 - 4.0)).collect();
+        w.l0w = &ft;
+        let mut r = SfnnTrainStepRunner::new(&ctx, w, 4, 1).unwrap();
+        r.factorizer_alpha.ft = 0.7;
+        let shape = SfnnForwardShape { input_size: BASE, ..w.shape };
+        let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, shape).unwrap();
+        r.build_quantized_proxy(&ctx, BASE, VR, &proxy).unwrap();
+        let hb = SfnnForwardHostBatch {
+            stm_indices: &[0, 1629, 1, 1630],
+            nstm_indices: &[2, 1631, 3, 1632],
+            buckets: &[0, 1, 0, 1],
+            batch_size: 4,
+            max_active: 1,
+        };
+        let batch = SfnnForwardDeviceBatch::from_host(&ctx, hb).unwrap();
+        let fw = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 4)).unwrap();
+        sfnn_forward_device(&ctx, &batch, &proxy, &fw).unwrap();
+        let expected = fw.download_output(&ctx).unwrap();
+        let lr = SfnnLayerLrMultipliers {
+            qat_ft: true,
+            qat_l1: true,
+            qat_l2: true,
+            qat_l3: true,
+            qat_ft_virtual_rows: VR,
+            ..Default::default()
+        };
+        r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+            &ctx,
+            RangerUpdateParams::default(),
+            ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+            1.0,
+            SfnnTrainStepHostBatch {
+                stm_indices: hb.stm_indices,
+                nstm_indices: hb.nstm_indices,
+                buckets: hb.buckets,
+                targets: &[0.2, 0.8, 0.3, 0.7],
+                entry_weights: &[1.0; 4],
+                batch_size: 4,
+                max_active: 1,
+            },
+            true,
+            false,
+            lr,
+            None,
+        )
+        .unwrap();
+        let actual = r.forward_workspace.download_output(&ctx).unwrap();
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 1e-6, "{a} vs {e}");
+        }
+        let g = r.backward_workspace.l0w_gradients.download(&ctx).unwrap();
+        assert!(g.iter().any(|v| v.abs() > 1e-10));
+        for piece in 0..4 {
+            for u in 0..w.shape.ft_size {
+                let sum: f32 = (0..45).map(|k| g[(k * VR + piece) * w.shape.ft_size + u]).sum();
+                assert!((g[(BASE + piece) * w.shape.ft_size + u] - 0.7 * sum).abs() < 1e-6);
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn selected_qat_rounding_and_ft_fold() {
         let ctx = Context::new(0).unwrap();
         let w = F32Buffer::from_host(&ctx, &[0.101, -0.205, 1.25, -1.5, 0.033, -0.071]).unwrap();

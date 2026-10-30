@@ -65,7 +65,7 @@ epoch 25のsb1から開始します。途中保存なら次のsbから再開し�
 
 ### FT factorizerを途中epochからOFFにする
 
-非BNの `SFNN_halfka2` では、次の指定でepoch 1～2をON、epoch 3以降をOFFにできます。正式名は`sfnn_ft_factorizer`、旧名`ft_factorizer`はaliasです。
+非BNの `SFNN_halfka2` / `SFNN_halfkahm2` では、次の指定でepoch 1～2をON、epoch 3以降をOFFにできます。正式名は`sfnn_ft_factorizer`、旧名`ft_factorizer`はaliasです。
 
 ```json
 "sfnn_ft_factorizer": {"epoch1": true, "epoch3": false}
@@ -81,7 +81,7 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 |---|---|
 | `lr`, `lr_min` | 学習率の開始値・下限値 |
 | `batches_per_update` | 1更新あたりの累積batch数 |
-| `ft_factorizer` / `sfnn_ft_factorizer` | 非BN SFNN HalfKA2でON→OFFへ自動fold |
+| `ft_factorizer` / `sfnn_ft_factorizer` | 非BN SFNN HalfKA2 / HalfKA_hm2でON→OFFへ自動fold |
 | `sfnn_qat_l1` | L1 QATの有効・無効 |
 | `sfnn_bn_qat` | BN QATの有効・無効（BN層は最初から有効化。例：`{"epoch1":false,"epoch6":true}`） |
 | `sfnn_freeze_l1` | L1の固定・解除 |

@@ -2015,7 +2015,7 @@ fn sfnn_forward_train_device_with_factorizer(
     )?;
     // Only single-batch updates may reuse the gradient buffer for folded weights.
     // Backward now adds to FT gradients, so discard those temporary weights first.
-    if weights.shape.input_size == 133_578 {
+    if matches!(weights.shape.input_size, 133_578 | 74_934) {
         if let Some(scratch) = folded_l0w_scratch { scratch.fill(ctx, 0.0)?; }
     }
     Ok(())
@@ -6861,9 +6861,9 @@ impl SfnnTrainStepRunner {
                 }
             }
         }
-        const BASE: usize = 131_949;
         const VIRTUAL: usize = 1_629;
-        if self.shape.input_size == BASE + VIRTUAL {
+        let base = match self.shape.input_size { 133_578 => Some(131_949), 74_934 => Some(73_305), _ => None };
+        if let Some(base) = base {
             rebase_shared_device(
                 ctx,
                 &self.weights.l0w,
@@ -6871,16 +6871,16 @@ impl SfnnTrainStepRunner {
                 &self.weights.l0w,
                 &self.optimizer_states.l0w,
                 None,
-                BASE * self.shape.ft_size,
+                base * self.shape.ft_size,
                 VIRTUAL * self.shape.ft_size,
-                BASE * self.shape.ft_size,
+                base * self.shape.ft_size,
                 0,
                 0,
                 old_ft,
                 new_ft,
             )?;
         } else if old_ft != new_ft {
-            return Err(CudaCppError::message("FT alpha requires SFNN HalfKA2 with FT factorization enabled"));
+            return Err(CudaCppError::message("FT alpha requires SFNN HalfKA2 or HalfKA_hm2 with FT factorization enabled"));
         }
         if let (Some(w), Some(b), Some(ws), Some(bs)) =
             (self.weights.l1fw.as_ref(), self.weights.l1fb.as_ref(), l1w_state, l1b_state)
@@ -10367,8 +10367,231 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_halfkahm2_ft_alpha_forward_gradients_and_quantization() {
+        const BASE: usize = 73305;
+        const VIRTUAL: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
+        weights.l2fw = None;
+        weights.l2fb = None;
+        weights.l3fw = None;
+        weights.l3fb = None;
+        weights.shape.input_size = BASE + VIRTUAL;
+        let shape = weights.shape;
+        let l0w: Vec<f32> =
+            (0..shape.input_size * shape.ft_size)
+                .map(|i| {
+                    if i < BASE * shape.ft_size { 0.01 * ((i % 9) as f32 - 4.0) } else { 0.03 * ((i % 7) as f32 - 3.0) }
+                })
+                .collect();
+        weights.l0w = &l0w;
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1629, 1, 1629, -1, -1],
+            nstm_indices: &[2, -1, -1, 3, 1630, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let device_weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let active = SfnnFactorizerActive::from_available(&device_weights);
+        let forward = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 2)).unwrap();
+        let backward = SfnnBackwardWorkspace::new(&ctx, SfnnBackwardWorkspaceLayout::new(shape, 2, 3)).unwrap();
+        let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(2)).unwrap();
+        let target = F32Buffer::from_host(&ctx, &[0.25, 0.75]).unwrap();
+        let ew = F32Buffer::from_host(&ctx, &[1.0, 1.0]).unwrap();
+        for alpha in [0.0, 0.5, 1.0, 2.0] {
+            let a = SfnnFactorizerAlpha { ft: alpha, ..SfnnFactorizerAlpha::ONE };
+            let folded: Vec<_> = (0..BASE * shape.ft_size)
+                .map(|i| l0w[i] + alpha * l0w[BASE * shape.ft_size + i % (VIRTUAL * shape.ft_size)])
+                .collect();
+            let folded_host = SfnnForwardHostWeights {
+                shape: SfnnForwardShape { input_size: BASE, ..shape },
+                l0w: &folded,
+                ..weights
+            };
+            sfnn_forward_device_with_factorizer_and_alpha(&ctx, &device_batch, &device_weights, &forward, active, a)
+                .unwrap();
+            assert_close_slice(
+                "FT scaled forward",
+                &forward.download_output(&ctx).unwrap(),
+                &tiny_sfnn_forward_cpu(batch, folded_host),
+                1e-6,
+            );
+            sfnn_forward_train_device_with_factorizer(
+                &ctx,
+                &device_batch,
+                &device_weights,
+                &forward,
+                active,
+                a,
+                Some(&backward.l0w_gradients),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_close_slice(
+                "FT pre-folded training forward",
+                &forward.download_output(&ctx).unwrap(),
+                &tiny_sfnn_forward_cpu(batch, folded_host),
+                1e-6,
+            );
+            scalar_loss_device_from_buffers(
+                &ctx,
+                ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                1.0,
+                2,
+                &forward.output,
+                &target,
+                &ew,
+                &loss,
+            )
+            .unwrap();
+            // Both the diagnostic and the production backward paths must scale
+            // only the virtual gradient, including repeated piece features.
+            for train in [false, true] {
+                if train {
+                    sfnn_backward_train_device_with_factorizer_and_alpha(
+                        &ctx,
+                        &device_batch,
+                        &device_weights,
+                        &forward,
+                        &loss,
+                        &backward,
+                        active,
+                        a,
+                    )
+                    .unwrap();
+                } else {
+                    sfnn_backward_device_with_factorizer_and_alpha(
+                        &ctx,
+                        &device_batch,
+                        &device_weights,
+                        &forward,
+                        &loss,
+                        &backward,
+                        active,
+                        a,
+                    )
+                    .unwrap();
+                }
+                let grad = backward.download(&ctx).unwrap().l0w_gradients;
+                let mut expected = vec![0.0; VIRTUAL * shape.ft_size];
+                for (i, g) in grad[..BASE * shape.ft_size].iter().enumerate() {
+                    expected[i % (VIRTUAL * shape.ft_size)] += alpha * g;
+                }
+                assert!(
+                    grad[..BASE * shape.ft_size].iter().any(|x| x.abs() > 1e-10),
+                    "must exercise a nonzero gradient"
+                );
+                assert_close_slice("FT shared gradient", &grad[BASE * shape.ft_size..], &expected, 1e-6);
+            }
+            let proxy_shape = SfnnForwardShape { input_size: BASE, ..shape };
+            let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, proxy_shape).unwrap();
+            sfnn_build_quantized_proxy_device(&ctx, BASE, VIRTUAL, &device_weights, &proxy, active, a, None, None)
+                .unwrap();
+            let expected: Vec<_> =
+                folded.iter().map(|x| (x * 127.0).round().clamp(-32768.0, 32767.0) / 127.0).collect();
+            assert_close_slice("FT quantization", &proxy.l0w.download(&ctx).unwrap(), &expected, 1e-6);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_shared_rebase_preserves_forward_and_optimizer() {
         const BASE: usize = 131949;
+        const VIRTUAL: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
+        weights.l2fw = None;
+        weights.l2fb = None;
+        weights.l3fw = None;
+        weights.l3fb = None;
+        weights.shape.input_size = BASE + VIRTUAL;
+        let l0w = vec![0.01; weights.shape.input_size * weights.shape.ft_size];
+        weights.l0w = &l0w;
+        let shape = weights.shape;
+        let mut runner = SfnnTrainStepRunner::new(&ctx, weights, 2, 3).unwrap();
+        let active = runner.factorizer;
+        let batch = SfnnForwardHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1],
+            buckets: &[0, 1],
+            batch_size: 2,
+            max_active: 3,
+        };
+        let device_batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let forward = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 2)).unwrap();
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.25])).unwrap();
+        runner
+            .optimizer_states
+            .l1fw
+            .as_ref()
+            .unwrap()
+            .momentum
+            .upload(&ctx, &vec![2.0; shape.ft_size * shape.l1_out()])
+            .unwrap();
+        runner
+            .optimizer_states
+            .l1fw
+            .as_ref()
+            .unwrap()
+            .velocity
+            .upload(&ctx, &vec![4.0; shape.ft_size * shape.l1_out()])
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        let expected = forward.download_output(&ctx).unwrap();
+        let old_l1_shared = runner.weights.l1fw.as_ref().unwrap().download(&ctx).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 1.0, 2.0, 1.0, 0.5).unwrap();
+        runner
+            .set_factorizer_config(active, SfnnFactorizerAlpha { ft: 2.0, shared: 0.5, ..SfnnFactorizerAlpha::ONE })
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("positive rebase forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+        assert_close_slice(
+            "shared weight ratio",
+            &runner.weights.l1fw.as_ref().unwrap().download(&ctx).unwrap(),
+            &old_l1_shared.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            1e-7,
+        );
+        let state = runner.read_optimizer_states(&ctx).unwrap();
+        assert!(state.l1fw.as_ref().unwrap().momentum.iter().all(|x| *x == 1.0));
+        assert!(state.l1fw.as_ref().unwrap().velocity.iter().all(|x| *x == 1.0));
+        assert_close_slice(
+            "shared slow ratio",
+            &state.l1fw.as_ref().unwrap().slow_params,
+            &old_l1_shared.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            1e-7,
+        );
+        let ft = runner.weights.l0w.download(&ctx).unwrap();
+        assert!((ft[BASE * shape.ft_size] - 0.005).abs() < 1e-7);
+
+        // Failure must leave FT as well as L1 unchanged.
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.0])).unwrap();
+        assert!(runner.rebase_shared_factorizer_terms(&ctx, 2.0, 1.0, 0.5, 0.0).is_err());
+        assert_eq!(ft, runner.weights.l0w.download(&ctx).unwrap());
+        runner.set_residual_count_gates_by_stack(&ctx, Some(&[0.5, 0.25])).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 2.0, 0.0, 0.5, 0.0).unwrap();
+        runner
+            .set_factorizer_config(active, SfnnFactorizerAlpha { ft: 0.0, shared: 0.0, ..SfnnFactorizerAlpha::ONE })
+            .unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("zero rebase forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+        let state = runner.read_optimizer_states(&ctx).unwrap();
+        assert!(state.l1w.momentum.iter().all(|x| *x == 0.0));
+        assert!(state.l1fw.as_ref().unwrap().slow_params.iter().all(|x| *x == 0.0));
+        // Dormant shared momentum/slow weights must not reappear on reactivation.
+        runner.weights.l1fw.as_ref().unwrap().upload(&ctx, &vec![99.0; shape.ft_size * shape.l1_out()]).unwrap();
+        runner.rebase_shared_factorizer_terms(&ctx, 0.0, 1.0, 0.0, 1.0).unwrap();
+        runner.set_factorizer_config(active, SfnnFactorizerAlpha::ONE).unwrap();
+        runner.forward_current_weights(&ctx, &device_batch, &forward).unwrap();
+        assert_close_slice("reactivated forward", &forward.download_output(&ctx).unwrap(), &expected, 1e-6);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_halfkahm2_shared_rebase_preserves_forward_and_optimizer() {
+        const BASE: usize = 73305;
         const VIRTUAL: usize = 1629;
         let ctx = Context::new(0).unwrap();
         let mut weights = tiny_sfnn_weights(tiny_sfnn_shape());
@@ -12424,10 +12647,10 @@ mod tests {
     }
 
     fn sfnn_factorized_virtual_feature_cpu(feature: usize, input_size: usize) -> Option<usize> {
-        const BASE_INPUT_SIZE: usize = 131_949;
         const PIECE_INPUTS: usize = 1_629;
-        if input_size == BASE_INPUT_SIZE + PIECE_INPUTS && feature < BASE_INPUT_SIZE {
-            Some(BASE_INPUT_SIZE + feature % PIECE_INPUTS)
+        let base = match input_size { 133_578 => 131_949, 74_934 => 73_305, _ => return None };
+        if feature < base {
+            Some(base + feature % PIECE_INPUTS)
         } else {
             None
         }

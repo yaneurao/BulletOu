@@ -45,7 +45,7 @@ Merge these fields into a complete training configuration. Values apply from the
 
 ### Disable the FT factorizer at an epoch boundary
 
-Non-BN `SFNN_halfka2` supports this one-way schedule (`ft_factorizer` is a legacy alias):
+Non-BN `SFNN_halfka2` and `SFNN_halfkahm2` support this one-way schedule (`ft_factorizer` is a legacy alias):
 
 ```json
 "sfnn_ft_factorizer": {"epoch1": true, "epoch3": false}
@@ -61,7 +61,7 @@ Grid search accepts the schedule in its common JSON. Remove any explicit `--grid
 |---|---|
 | `lr`, `lr_min` | LR start and lower limit |
 | `batches_per_update` | Accumulation batches per update |
-| `ft_factorizer` / `sfnn_ft_factorizer` | Non-BN SFNN HalfKA2 ON→OFF automatic fold |
+| `ft_factorizer` / `sfnn_ft_factorizer` | Non-BN SFNN HalfKA2 / HalfKA_hm2 ON→OFF automatic fold |
 | `sfnn_qat_l1` | Enable/disable L1 QAT |
 | `sfnn_bn_qat` | Enable/disable BN QAT; enable BN layers from startup, e.g. `{"epoch1":false,"epoch6":true}` |
 | `sfnn_freeze_l1` | Freeze/unfreeze L1 |

@@ -4276,9 +4276,9 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     if schedules.contains_key("ft_factorizer") {
-        if resolved.resolved_eval_type() != Some(EvalType::SfnnHalfka2)
+        if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
             || resolved.sfnn_bn_ft || resolved.sfnn_bn_l1 || resolved.sfnn_bn_l2 {
-            return Err("ft_factorizer epoch schedule currently requires non-BN SFNN_halfka2".into());
+            return Err("ft_factorizer epoch schedule currently requires non-BN SFNN_halfka2 or SFNN_halfkahm2".into());
         }
         if !resolved.ft_factorizer { resolved.ft_factorizer_alpha = 1.0; }
     }
@@ -5187,14 +5187,14 @@ struct Args {
     #[arg(long)]
     arch: Option<TrainArch>,
 
-    /// Enable FT piece-feature factorization for HalfKA2 / HalfKP training.
+    /// Enable FT piece-feature factorization for HalfKA2 / HalfKA_hm2 / HalfKP training.
     /// Default: enabled for those inputs. Independent of --sfnn-factorizer,
     /// which controls LayerStack L1 sharing. Checkpoints must use the same
     /// FT factorization setting when resuming or loading --initial-state.
     #[arg(long = "sfnn-ft-factorizer", visible_alias = "ft-factorizer", default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     ft_factorizer: bool,
 
-    /// Multiplier of FT shared piece weights (SFNN HalfKA2), default 1.
+    /// Multiplier of FT shared piece weights (SFNN HalfKA2 / HalfKA_hm2), default 1.
     /// Forward, gradients and export use the same coefficient. Range 0..=100.
     #[arg(long, default_value = "1.0", value_parser = parse_ft_factorizer_alpha)]
     ft_factorizer_alpha: f32,
@@ -5819,9 +5819,9 @@ impl Args {
             }
         }
         if self.ft_factorizer_alpha != 1.0
-            && (!self.ft_factorizer || self.resolved_eval_type() != Some(EvalType::SfnnHalfka2))
+            && (!self.ft_factorizer || !matches!(self.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm)))
         {
-            return Err("--ft-factorizer-alpha requires SFNN_halfka2 with FT factorization enabled".to_string());
+            return Err("--ft-factorizer-alpha requires SFNN_halfka2 or SFNN_halfkahm2 with FT factorization enabled".to_string());
         }
         if self.optimizer_weight_clip.is_some_and(|clip| !clip.is_finite() || clip < 0.0) {
             return Err("--optimizer-weight-clip must be finite and non-negative (0 disables clipping)".to_string());
@@ -13499,8 +13499,8 @@ impl CudaCppSfnnFeatureKind {
 
     fn virtual_rows(self) -> usize {
         match self {
-            Self::Halfka2 => bulletou_lib::game::inputs::PIECE_INPUTS,
-            Self::Halfka1hm | Self::Halfka2hm | Self::Ka2 => 0,
+            Self::Halfka2 | Self::Halfka2hm => bulletou_lib::game::inputs::PIECE_INPUTS,
+            Self::Halfka1hm | Self::Ka2 => 0,
         }
     }
 
@@ -22295,9 +22295,14 @@ fn rebase_loaded_sfnn_shared(
         return Err("cannot rebase L1 shared to zero with a zero residual gate; keep shared alpha positive".to_string());
     }
     if old[0] != new[0] {
-        let split = ShogiHalfKa2.num_inputs() * weights.shape.ft_size;
-        if weights.shape.input_size != ShogiHalfKa2.num_inputs() + bulletou_lib::game::inputs::PIECE_INPUTS {
-            return Err("FT alpha rebase requires SFNN HalfKA2 with shared piece rows".to_string());
+        let base = match args.resolved_eval_type() {
+            Some(EvalType::SfnnHalfka2) => ShogiHalfKa2.num_inputs(),
+            Some(EvalType::SfnnHalfka2hm) => ShogiHalfKaHm2.num_inputs(),
+            _ => return Err("FT alpha rebase requires SFNN HalfKA2 or HalfKA_hm2".to_string()),
+        };
+        let split = base * weights.shape.ft_size;
+        if weights.shape.input_size != base + bulletou_lib::game::inputs::PIECE_INPUTS {
+            return Err("FT alpha rebase requires shared piece rows".to_string());
         }
         let (base, common) = weights.l0w.split_at_mut(split);
         let (bs, cs) = if let Some(opt) = optimizer.as_mut() {
@@ -22514,10 +22519,10 @@ fn load_cuda_cpp_sfnn_initial_state(
     let width = args.arch().dims().0;
     if !args.ft_factorizer && virtual_rows > 0
         && weights_records.get("l0w").is_some_and(|w| w.len() == (base+virtual_rows)*width) {
-        if args.resolved_eval_type() != Some(EvalType::SfnnHalfka2)
+        if !matches!(args.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
             || args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2
             || weights_records.keys().any(|k| k.starts_with("bn_")) {
-            return Err("automatic FT factorizer ON -> OFF requires non-BN SFNN_halfka2".into());
+            return Err("automatic FT factorizer ON -> OFF requires non-BN SFNN_halfka2 or SFNN_halfkahm2".into());
         }
         let train = initial_sections.get("train").cloned().unwrap_or_default();
         let alpha = load_sfnn_shared_coefficients(&train)?.map_or(1.0, |v|v[0]);
@@ -25824,7 +25829,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
         qat_ft: args.sfnn_qat_ft && args.non_bn_layer_qat(),
         qat_l2: args.sfnn_qat_l2 && args.non_bn_layer_qat(),
         qat_l3: args.sfnn_qat_l3 && args.non_bn_layer_qat(),
-        qat_ft_virtual_rows: if args.ft_factorizer && args.eval_type() == EvalType::SfnnHalfka2 {
+        qat_ft_virtual_rows: if args.ft_factorizer && matches!(args.eval_type(), EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm) {
             bulletou_lib::game::inputs::PIECE_INPUTS
         } else { 0 },
         ..Default::default()
@@ -26834,7 +26839,7 @@ fn resume_signature_for_match(signature: &str) -> String {
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     let mut current = resume_signature_for_match(&resume_signature(args));
     let mut stored = resume_signature_for_match(stored);
-    if args.resolved_eval_type() == Some(EvalType::SfnnHalfka2) {
+    if matches!(args.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm)) {
         // The actual state layout is checked by the loader. ON -> OFF folds;
         // OFF -> ON still errors there. Epoch1's scalar need not match a later checkpoint.
         current = resume_signature_without_line(&current, "ft_factorizer=");
@@ -32833,6 +32838,25 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn halfkahm2_ft_factorizer_settings_and_shape() {
+        let mut args=Args::try_parse_from(["bulletou", "--arch", "SFNN_halfkahm2_2304_15_64_k9k9_progress8",
+            "--teacher", "/dev/null", "--backend", "cuda-cpp", "--superbatches", "1296", "--max-epochs", "30",
+            "--sfnn-qat-ft", "--ft-factorizer-alpha", "0.5"]).unwrap();
+        args.epoch_settings_json=Some(serde_json::json!({"ft_factorizer":{"epoch1":true,"epoch8":false}}).to_string());
+        let on=args_at_epoch(&args, 1).unwrap();
+        let off=args_at_epoch(&args, 8).unwrap();
+        let feature=CudaCppSfnnFeatureKind::Halfka2hm;
+        assert_eq!(feature.base_input_size(), 73_305);
+        assert_eq!(feature.virtual_rows(), 1_629);
+        assert_eq!(feature.input_size_for_args(&on), 74_934);
+        assert_eq!(feature.input_size_for_args(&off), 73_305);
+        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&on, None).qat_ft_virtual_rows, 1_629);
+        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&off, None).qat_ft_virtual_rows, 0);
+        assert_eq!(off.ft_factorizer_alpha, 1.0);
+    }
+
     #[test]
     fn ft_factorizer_epoch_switch_settings() {
         let mut args=Args::try_parse_from(["bulletou","--arch","SFNN_halfka2_128_8_32_k3k3",
@@ -33982,6 +34006,8 @@ mod tests {
             "/dev/null",
             "--backend",
             "cuda-cpp",
+            "--sfnn-ft-factorizer",
+            "false",
             "--cuda-cpp-train-steps",
             "1",
         ])

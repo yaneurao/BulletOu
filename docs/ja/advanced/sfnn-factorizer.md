@@ -12,13 +12,13 @@ L1の指定名は `--sfnn-l1-factorizer none/shared/axis/pair`（JSON: `sfnn_l1_
 
 ### 学習済みFT factorizerをOFFへ変換する
 
-通常学習・grid searchでは `"ft_factorizer": {"epoch1": true, "epoch3": false}` でepoch 3から自動foldしてOFFにできます（非BN SFNN HalfKA2のみ）。同じ設定でresumeでき、ONのcheckpointは復元時にfold、OFFのcheckpointはそのまま読み込みます。手動変換は不要です。詳細は[epoch別設定](epoch-settings.md#ft-factorizerを途中epochからoffにする)。以下のスクリプトは、独立した変換済みcheckpointを作りたい場合に使います。
+通常学習・grid searchでは `"ft_factorizer": {"epoch1": true, "epoch3": false}` でepoch 3から自動foldしてOFFにできます（非BN SFNN HalfKA2 / HalfKA_hm2のみ）。同じ設定でresumeでき、ONのcheckpointは復元時にfold、OFFのcheckpointはそのまま読み込みます。手動変換は不要です。詳細は[epoch別設定](epoch-settings.md#ft-factorizerを途中epochからoffにする)。以下のスクリプトは、独立した変換済みcheckpointを作りたい場合に使います。
 
 非BNの `SFNN_halfka2` checkpointは、`python convert_ft_factorizer_off.py --checkpoint <保存フォルダ> --output <新規フォルダ>` で変換できます（NumPyが必要）。元ファイルは変更せず、通常重みとLookahead slow重みの共通FT項を個別重みへfoldします。個別FTのmomentum/velocityとstepは維持し、共通FTのmomentum/velocityは破棄します。これはON時と等価なoptimizer更新ではありません。他層は変更しません。変換結果は全recordを検証します。
 
 追加学習では `--initial-state <新規フォルダ>/state.bin --initial-dataloader-pos <新規フォルダ>/dataloader_pos.txt --ft-factorizer false` を指定し、学習出力先も別にします。progress付きならコピーされた `progress.bin` を使えます。変換先には `nn.bin` をコピーしません。切り替え直後の実効重みは保存されるため、飽和率がその瞬間に下がる処理ではありません。
 
-`SFNN_halfka2` 系は、FT（入力特徴を最初のニューロン列へ変換する層）でも重みを共有します。
+`SFNN_halfka2` / `SFNN_halfkahm2` 系は、FT（入力特徴を最初のニューロン列へ変換する層）でも重みを共有します。
 玉位置を `k`、駒の種類・所属・位置などの特徴を `p` とすると、各FTニューロンに使う重みは次の形です。
 
 ```text
@@ -27,6 +27,8 @@ FTの実効重み[k, p] = 個別重み[k, p] + α_FT * 共通重み[p]
 
 同じ駒特徴の共通重みには、異なる玉位置の局面から勾配が集まります。
 個別重みは残るため、玉位置ごとの差も学習できます。共通重みは0で初期化し、`nn.bin` の書き出し時に個別重みへ足し込みます。
+
+`SFNN_halfkahm2` のFT共有行は1,629個で、73,305個の通常行の末尾に追加します。既存の共有行なしcheckpointをそのまま再開する場合は `"sfnn_ft_factorizer": false` を指定してください。
 
 FT factorizerはデフォルトで有効です。`--ft-factorizer false` を指定すると無効になり、共通重みの確保・加算・更新を行いません。
 正式名は `sfnn_ft_factorizer`（CLI: `--sfnn-ft-factorizer`）です。`ft_factorizer` / `--ft-factorizer` は互換aliasです。L1の正式名は `sfnn_l1_factorizer`、旧名 `sfnn_factorizer` はaliasです。gridの保存設定・CSV列も正式名に統一します。既存manifestは読み込み時に正規化し、trial番号・フォルダ名・過去の条件値は維持します。
@@ -63,7 +65,7 @@ L2・L3のfactorizerを含まないcheckpointから再開するか、新規学�
 
 ### FTとL1 sharedの強さ
 
-`SFNN_halfka2` では `--ft-factorizer-alpha` でFTの共通重みに掛ける係数を指定します。
+`SFNN_halfka2` / `SFNN_halfkahm2` では `--ft-factorizer-alpha` でFTの共通重みに掛ける係数を指定します。
 デフォルトは1.0、指定範囲は0～100です。L1 sharedは `--sfnn-l1-factorizer-alpha shared=...` で独立に指定します。
 
 ```powershell
@@ -91,7 +93,7 @@ FTのbiasは共有項ではないため、この係数は掛かりません。
 `sfnn_l1_factorizer_alpha: "all=0.5"` はL1のshared・axis・pairを指定するもので、FTには影響しません。
 FTの係数0は、共通重みの配列を残したまま寄与を0にします。
 `ft_factorizer: false` はその配列自体を作らない指定で、同じ意味ではありません。
-非デフォルトのFT係数はFT共有が有効な `SFNN_halfka2` 専用です。
+非デフォルトのFT係数はFT共有が有効な `SFNN_halfka2` / `SFNN_halfkahm2` 専用です。
 `NNUE_halfkp` などや `ft_factorizer: false` との組み合わせはエラーになります。
 
 ### αを変えて追加学習する場合のrebase

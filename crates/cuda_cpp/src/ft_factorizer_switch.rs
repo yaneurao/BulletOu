@@ -111,4 +111,45 @@ mod tests {
             true,true,lr,None).unwrap();
         assert!(r.forward_workspace.download_output(&ctx).unwrap().iter().all(|v|v.is_finite()));
     }
+    #[test]
+    #[ignore = "requires CUDA; tiny model, no teacher data"]
+    fn halfkahm2_gpu_fold_preserves_proxy_slow_and_base_moments_and_trains() {
+        const BASE: usize = 73305;
+        const VR: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut host = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        host.l2fw=None; host.l2fb=None; host.l3fw=None; host.l3fb=None;
+        host.shape.input_size=BASE+VR;
+        let ft:Vec<_>=(0..host.shape.input_size*host.shape.ft_size).map(|i|0.002*((i%11) as f32-4.)).collect();
+        host.l0w=&ft;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,4,2).unwrap();
+        r.factorizer_alpha.ft=0.5;
+        r.optimizer_states.l0w.momentum.fill(&ctx,0.123).unwrap();
+        r.optimizer_states.l0w.velocity.fill(&ctx,0.456).unwrap();
+        let mut slow:Vec<_>=ft.iter().map(|v|v*0.7).collect();
+        r.optimizer_states.l0w.slow_params.upload(&ctx,&slow).unwrap();
+        fold_rows(&mut slow,BASE,VR,host.shape.ft_size,0.5).unwrap();
+        let other=r.weights.l1w.download(&ctx).unwrap();
+        let shape=SfnnForwardShape { input_size:BASE,..host.shape };
+        let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,shape).unwrap();
+        r.build_quantized_proxy(&ctx,BASE,VR,&proxy).unwrap();
+        let before=proxy.l0w.download(&ctx).unwrap();
+        r.disable_ft_factorizer(&ctx,BASE,VR).unwrap();
+        assert_eq!(r.shape,shape);
+        assert_eq!(r.optimizer_states.l0w.slow_params.download(&ctx).unwrap(),slow);
+        assert!(r.optimizer_states.l0w.momentum.download(&ctx).unwrap().iter().all(|&v|v==0.123));
+        assert!(r.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|&v|v==0.456));
+        assert_eq!(r.weights.l1w.download(&ctx).unwrap(),other);
+        r.build_quantized_proxy(&ctx,BASE,VR,&proxy).unwrap();
+        assert_eq!(proxy.l0w.download(&ctx).unwrap(),before);
+        r.disable_ft_factorizer(&ctx,BASE,VR).unwrap(); // no double fold
+        let lr=SfnnLayerLrMultipliers {qat_ft:true,qat_l1:true,qat_l2:true,qat_l3:true,qat_ft_virtual_rows:0,..Default::default()};
+        r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+            &ctx,RangerUpdateParams::default(),ScalarLossKind::SigmoidPow{pow_exp:2.0},1.0,
+            SfnnTrainStepHostBatch {stm_indices:&[0,BASE as i32,1,BASE as i32+1,2,BASE as i32+2,3,BASE as i32+3],
+                nstm_indices:&[3,BASE as i32+3,2,BASE as i32+2,1,BASE as i32+1,0,BASE as i32],
+                buckets:&[0,1,0,1],targets:&[0.2,0.8,0.3,0.7],entry_weights:&[1.;4],batch_size:4,max_active:2},
+            true,true,lr,None).unwrap();
+        assert!(r.forward_workspace.download_output(&ctx).unwrap().iter().all(|v|v.is_finite()));
+    }
 }

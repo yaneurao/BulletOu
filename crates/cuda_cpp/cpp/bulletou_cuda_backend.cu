@@ -1019,6 +1019,7 @@ __global__ void dense_add_bias_kernel(
 }
 
 constexpr size_t SFNN_HALFKA2_BASE_INPUT_SIZE = 131949;
+constexpr size_t SFNN_HALFKA_HM2_BASE_INPUT_SIZE = 73305;
 constexpr size_t SFNN_KA2_INPUT_SIZE = 1791;
 constexpr size_t SFNN_HALFKA2_PIECE_INPUTS = 1629;
 constexpr size_t SFNN_HALFKA2_FACTORIZED_INPUT_SIZE = SFNN_HALFKA2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS;
@@ -1055,9 +1056,16 @@ size_t sfnn_l1w_len_for_shape(
     return num_stacks * l1_out * ft_size;
 }
 
+__host__ __device__ __forceinline__ size_t sfnn_ft_factorized_base(size_t input_size) {
+    if (input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE) return SFNN_HALFKA2_BASE_INPUT_SIZE;
+    if (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) return SFNN_HALFKA_HM2_BASE_INPUT_SIZE;
+    return 0;
+}
+
 __device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_size, size_t* out_feature) {
-    if (input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE && feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
-        *out_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + (feature % SFNN_HALFKA2_PIECE_INPUTS);
+    const size_t base = sfnn_ft_factorized_base(input_size);
+    if (base != 0 && feature < base) {
+        *out_feature = base + (feature % SFNN_HALFKA2_PIECE_INPUTS);
         return true;
     }
     return false;
@@ -1138,9 +1146,9 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
 __global__ void sfnn_fold_halfka2_l0w_kernel(
     const float* weights,
     float* folded_weights,
-    size_t ft_size, float ft_factorizer_alpha) {
+    size_t ft_size, float ft_factorizer_alpha, size_t base) {
     size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = SFNN_HALFKA2_BASE_INPUT_SIZE * ft_size;
+    const size_t total = base * ft_size;
     if (tid >= total) {
         return;
     }
@@ -1148,7 +1156,7 @@ __global__ void sfnn_fold_halfka2_l0w_kernel(
     const size_t feature = tid / ft_size;
     const size_t row = tid - feature * ft_size;
     const size_t piece = feature % SFNN_HALFKA2_PIECE_INPUTS;
-    const size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
+    const size_t virtual_feature = base + piece;
     folded_weights[tid] = weights[tid] + ft_factorizer_alpha * weights[virtual_feature * ft_size + row];
 }
 
@@ -4212,7 +4220,7 @@ __global__ void sfnn_ka2_gather_l0w_gradients_kernel(
 
 __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float* l0w_gradients,
-    size_t ft_size, float ft_factorizer_alpha) {
+    size_t ft_size, float ft_factorizer_alpha, size_t base) {
     size_t piece = blockIdx.x;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
     if (piece >= SFNN_HALFKA2_PIECE_INPUTS || row >= ft_size) {
@@ -4225,8 +4233,8 @@ __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
     float sum3 = 0.0f;
     size_t feature = piece;
     const size_t stride = SFNN_HALFKA2_PIECE_INPUTS;
-    const size_t unroll_end = SFNN_HALFKA2_BASE_INPUT_SIZE >= piece + 3 * stride
-        ? SFNN_HALFKA2_BASE_INPUT_SIZE - 3 * stride
+    const size_t unroll_end = base >= piece + 3 * stride
+        ? base - 3 * stride
         : piece;
     while (feature < unroll_end) {
         sum0 += l0w_gradients[feature * ft_size + row];
@@ -4235,12 +4243,12 @@ __global__ void sfnn_reduce_halfka2_virtual_l0w_gradients_kernel(
         sum3 += l0w_gradients[(feature + 3 * stride) * ft_size + row];
         feature += 4 * stride;
     }
-    while (feature < SFNN_HALFKA2_BASE_INPUT_SIZE) {
+    while (feature < base) {
         sum0 += l0w_gradients[feature * ft_size + row];
         feature += stride;
     }
     float sum = (sum0 + sum1) + (sum2 + sum3);
-    size_t virtual_feature = SFNN_HALFKA2_BASE_INPUT_SIZE + piece;
+    size_t virtual_feature = base + piece;
     l0w_gradients[virtual_feature * ft_size + row] = ft_factorizer_alpha * sum;
 }
 
@@ -5304,17 +5312,18 @@ int launch_sfnn_forward_kernels(
 
     const float* effective_l0w = l0w;
     size_t effective_input_size = input_size;
-    if (folded_l0w != nullptr && input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE) {
-        const size_t fold_len = SFNN_HALFKA2_BASE_INPUT_SIZE * ft_size;
+    const size_t factorized_ft_base = sfnn_ft_factorized_base(input_size);
+    if (folded_l0w != nullptr && factorized_ft_base != 0) {
+        const size_t fold_len = factorized_ft_base * ft_size;
         if (block_count_1d(fold_len, threads, &blocks, "sfnn_fold_halfka2_l0w_kernel") != 0) {
             return -1;
         }
-        sfnn_fold_halfka2_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w, folded_l0w, ft_size, ft_factorizer_alpha);
+        sfnn_fold_halfka2_l0w_kernel<<<blocks, threads, 0, ctx->stream>>>(l0w, folded_l0w, ft_size, ft_factorizer_alpha, factorized_ft_base);
         if (check_kernel_launch("sfnn_fold_halfka2_l0w_kernel launch") != 0) {
             return -1;
         }
         effective_l0w = folded_l0w;
-        effective_input_size = SFNN_HALFKA2_BASE_INPUT_SIZE;
+        effective_input_size = factorized_ft_base;
     }
 
     if (block_count_1d(batch * pairwise, threads, &blocks, "sfnn_sparse_l0_pairwise_concat_kernel") != 0) {
@@ -6372,10 +6381,8 @@ int launch_sfnn_inverse_index_l0_backward(
         if(check_kernel_launch("BN FT bias backward"))return -1;
     }
     size_t n_features = input_size;
-    const bool halfka2_factorized = input_size == SFNN_HALFKA2_FACTORIZED_INPUT_SIZE;
-    if (halfka2_factorized) {
-        n_features = SFNN_HALFKA2_BASE_INPUT_SIZE;
-    }
+    const size_t factorized_ft_base = sfnn_ft_factorized_base(input_size);
+    if (factorized_ft_base != 0) n_features = factorized_ft_base;
 
     // Training accumulates across mini-batches. Gradients are cleared at runner
     // initialization / optimizer update, not at the first perspective of each batch.
@@ -6402,7 +6409,7 @@ int launch_sfnn_inverse_index_l0_backward(
         return -1;
     }
 
-    if (halfka2_factorized) {
+    if (factorized_ft_base != 0) {
         constexpr int gather_threads = 128;
         dim3 reduce_grid(
             static_cast<unsigned int>(SFNN_HALFKA2_PIECE_INPUTS),
@@ -6410,7 +6417,7 @@ int launch_sfnn_inverse_index_l0_backward(
             1);
         sfnn_reduce_halfka2_virtual_l0w_gradients_kernel<<<reduce_grid, gather_threads, 0, ctx->stream>>>(
             l0w_gradients,
-            ft_size, ft_factorizer_alpha);
+            ft_size, ft_factorizer_alpha, factorized_ft_base);
         if (check_kernel_launch("sfnn_reduce_halfka2_virtual_l0w_gradients_kernel launch") != 0) {
             return -1;
         }

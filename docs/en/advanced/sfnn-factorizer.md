@@ -12,13 +12,13 @@ You do not need this page for a first training run. Read it when you want to com
 
 ### Convert a trained FT factorizer to OFF
 
-Standalone training/grid search supports `"ft_factorizer": {"epoch1": true, "epoch3": false}` for an automatic fold at epoch 3 (non-BN SFNN HalfKA2 only). Resume with the same settings: ON checkpoints fold on restoration; OFF checkpoints load unchanged. No manual conversion is needed. See [per-epoch settings](epoch-settings.md#disable-the-ft-factorizer-at-an-epoch-boundary). The script below remains useful for creating a separate converted checkpoint.
+Standalone training/grid search supports `"ft_factorizer": {"epoch1": true, "epoch3": false}` for an automatic fold at epoch 3 (non-BN SFNN HalfKA2 / HalfKA_hm2 only). Resume with the same settings: ON checkpoints fold on restoration; OFF checkpoints load unchanged. No manual conversion is needed. See [per-epoch settings](epoch-settings.md#disable-the-ft-factorizer-at-an-epoch-boundary). The script below remains useful for creating a separate converted checkpoint.
 
 For non-BN `SFNN_halfka2` checkpoints, run `python convert_ft_factorizer_off.py --checkpoint <checkpoint-directory> --output <new-directory>` (requires NumPy). The source is unchanged. Master and Lookahead slow FT weights are folded separately. Individual FT momentum/velocity and step counters are retained; virtual-row momentum/velocity is discarded. This does not preserve the factorized optimizer update. Other layers are unchanged, and every output record is verified.
 
 Continue training into a separate output directory with `--initial-state <new-directory>/state.bin --initial-dataloader-pos <new-directory>/dataloader_pos.txt --ft-factorizer false`. Use the copied `progress.bin` when applicable. No `nn.bin` is copied. Effective weights are preserved at conversion, so switching off does not instantly reduce saturation.
 
-`SFNN_halfka2` architectures also share weights in the feature transformer (FT), the first layer that turns input features into neuron activations.
+`SFNN_halfka2` and `SFNN_halfkahm2` architectures also share weights in the feature transformer (FT), the first layer that turns input features into neuron activations.
 For king position `k` and piece feature `p` (piece type, ownership, square, etc.), each FT neuron's weight is:
 
 ```text
@@ -27,6 +27,8 @@ effective_FT_weight[k, p] = individual_weight[k, p] + alpha_FT * shared_weight[p
 
 The shared weight receives gradients from the same piece feature across king positions. Individual weights remain trainable, so king-specific differences can still be learned.
 Shared weights start at zero and are added to the individual weights when exporting `nn.bin`.
+
+`SFNN_halfkahm2` adds 1,629 shared piece rows after the 73,305 base rows. To resume an older checkpoint without shared rows, set `"sfnn_ft_factorizer": false`.
 
 FT factorization is enabled by default. `--ft-factorizer false` disables allocation, addition, and updates of the shared FT weights.
 The canonical name is `sfnn_ft_factorizer` (CLI: `--sfnn-ft-factorizer`). `ft_factorizer` / `--ft-factorizer` remain aliases. L1 uses `sfnn_l1_factorizer`, with `sfnn_factorizer` as its legacy alias. Grid settings and CSV columns use canonical names. Legacy manifests are normalized on read without changing trial IDs, folders or historical values.
@@ -63,7 +65,7 @@ Resume from a checkpoint without L2/L3 factorizers or start a fresh run. Existin
 
 ### FT and L1 shared strength
 
-For `SFNN_halfka2`, `--ft-factorizer-alpha` controls the shared FT coefficient.
+For `SFNN_halfka2` and `SFNN_halfkahm2`, `--ft-factorizer-alpha` controls the shared FT coefficient.
 Its default is 1.0 and its range is 0–100. L1 shared uses the independent
 `--sfnn-l1-factorizer-alpha shared=...` option.
 
@@ -92,7 +94,7 @@ validation use the same coefficient. FT biases are not shared terms and are not 
 `sfnn_l1_factorizer_alpha: "all=0.5"` controls L1 shared/axis/pair, not the FT.
 FT alpha 0 keeps the shared array allocated with zero contribution;
 `ft_factorizer: false` removes the array entirely. These are different settings.
-Non-default FT alpha is supported only for `SFNN_halfka2` with FT sharing enabled.
+Non-default FT alpha is supported only for `SFNN_halfka2` / `SFNN_halfkahm2` with FT sharing enabled.
 Other architectures, including `NNUE_halfkp`, or `ft_factorizer: false` produce an error.
 
 ### Rebasing when alpha changes

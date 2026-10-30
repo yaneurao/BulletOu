@@ -11,7 +11,7 @@ use bullet_gpu::runtime::Gpu;
 use bullet_trainer::model::Model;
 
 use crate::{
-    game::inputs::{HALFKA2_DIMENSIONS, PIECE_INPUTS},
+    game::inputs::{HALFKA2_DIMENSIONS, HALFKA_HM2_DIMENSIONS, PIECE_INPUTS},
     value::{FastBatchHost, fast_batch::active_feature_indices},
 };
 
@@ -472,8 +472,13 @@ fn affine_sparse_padded(weights: &[f32], bias: &[f32], rows: usize, cols: usize,
 }
 
 fn halfka2_ft_factorized_virtual_feature(feature: usize, cols: usize) -> Option<usize> {
-    if cols == SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE && feature < HALFKA2_DIMENSIONS {
-        Some(HALFKA2_DIMENSIONS + feature % PIECE_INPUTS)
+    let base = match cols {
+        SFNN_HALFKA2_FT_FACTORIZED_INPUT_SIZE => HALFKA2_DIMENSIONS,
+        n if n == HALFKA_HM2_DIMENSIONS + PIECE_INPUTS => HALFKA_HM2_DIMENSIONS,
+        _ => return None,
+    };
+    if feature < base {
+        Some(base + feature % PIECE_INPUTS)
     } else {
         None
     }
