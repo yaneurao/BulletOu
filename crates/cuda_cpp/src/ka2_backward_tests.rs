@@ -173,6 +173,205 @@ fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
 }
 
 #[test]
+#[ignore = "requires CUDA; compares compact axis reduction to the original general reducer"]
+fn many_bucket_l1_gather_matches_reference_and_accumulates() {
+    unsafe extern "C" {
+        fn bulletou_bn_reference_mode(enabled: i32);
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            unsafe {
+                bulletou_bn_reference_mode(0);
+            }
+        }
+    }
+    let _reset = Reset;
+    let ctx = Context::new(0).unwrap();
+    let upload = Context::new(0).unwrap();
+    const N: usize = 1031;
+    let indices: Vec<i32> = (0..N).map(|i| (i % 4) as i32).collect();
+    let targets: Vec<f32> = (0..N).map(|i| (i % 11) as f32 / 10.0).collect();
+    let entries: Vec<f32> = (0..N).map(|i| if i % 5 == 0 { 0.0 } else { 1.0 }).collect();
+    for (stacks, king, hand, progress, pairs, hidden) in
+        [(648, 9, 0, true, false, 15)]
+    {
+        let shape = SfnnForwardShape {
+            input_size: 4,
+            ft_size: 64,
+            l1_hidden: hidden,
+            l1_skip: true,
+            l2_size: 4,
+            num_stacks: stacks,
+            factorizer_king_axis_dim: king,
+            factorizer_hand_axis_dim: hand,
+            factorizer_progress_axis: progress,
+            factorizer_king_hand_pair: pairs,
+            factorizer_king_progress_pair: true,
+            ..tiny_sfnn_shape()
+        };
+        let values = |n, scale| (0..n).map(|i| ((i * 17 % 101) as f32 - 50.0) * scale).collect::<Vec<_>>();
+        let w0 = values(4 * 64, 0.002);
+        let b0 = vec![0.5; 64];
+        let outputs = hidden + 1;
+        let w1 = values(stacks * 64 * outputs, 0.0002);
+        let b1 = vec![0.25; stacks * outputs];
+        let fw = values(64 * outputs, 0.0001);
+        let fb = vec![0.03; outputs];
+        let aw = values(shape.factorizer_axis_count() * 64 * outputs, 0.0003);
+        let ab = values(shape.factorizer_axis_count() * outputs, 0.0002);
+        let w2 = values(stacks * hidden * 2 * 4, 0.01);
+        let b2 = vec![0.3; stacks * 4];
+        let w3 = values(stacks * 4, 0.1);
+        let b3 = vec![0.0; stacks];
+        let host = SfnnForwardHostWeights {
+            shape,
+            l0w: &w0,
+            l0b: &b0,
+            l1w: &w1,
+            l1b: &b1,
+            l1fw: Some(&fw),
+            l1fb: Some(&fb),
+            l1axw: (king != 0 || hand != 0 || progress).then_some(&aw),
+            l1axb: (king != 0 || hand != 0 || progress).then_some(&ab),
+            l2w: &w2,
+            l2b: &b2,
+            l3w: &w3,
+            l3b: &b3,
+            l2fw: None,
+            l2fb: None,
+            l3fw: None,
+            l3fb: None,
+            ..tiny_sfnn_weights(tiny_sfnn_shape())
+        };
+        let buckets: Vec<i32> = (0..N).map(|i| if i % 2 == 0 { 42 } else { (i % (stacks - 1)) as i32 }).collect();
+        let batch = SfnnTrainStepHostBatch {
+            stm_indices: &indices,
+            nstm_indices: &indices,
+            buckets: &buckets,
+            targets: &targets,
+            entry_weights: &entries,
+            batch_size: N,
+            max_active: 1,
+        };
+        for qat in [true] {
+            for shared in [false, true] {
+                let mut fast = SfnnTrainStepRunner::new(&ctx, host, N, 1).unwrap();
+                let mut reference = SfnnTrainStepRunner::new(&ctx, host, N, 1).unwrap();
+                for r in [&mut fast, &mut reference] {
+                    let active = SfnnFactorizerActive { shared, ..r.factorizer };
+                    r.set_factorizer_config(
+                        active,
+                        SfnnFactorizerAlpha {
+                            shared: 0.7,
+                            king_axis: 0.6,
+                            hand_axis: 0.8,
+                            progress_axis: 0.9,
+                            pair: 0.4,
+                            ..SfnnFactorizerAlpha::ONE
+                        },
+                    )
+                    .unwrap();
+                    let confidence: Vec<f32> =
+                        (0..shape.factorizer_axis_count()).map(|i| 0.2 + (i % 5) as f32 * 0.15).collect();
+                    if king != 0 || hand != 0 || progress {
+                        r.set_factorizer_axis_confidences(&ctx, Some(&confidence)).unwrap();
+                    }
+                    let gates: Vec<f32> = (0..stacks).map(|i| if i == 0 { 0.0 } else { 0.6 }).collect();
+                    if king != 0 || hand != 0 || progress {
+                        r.set_residual_count_gates_by_stack(&ctx, Some(&gates)).unwrap();
+                    }
+                }
+                let policy = SfnnLayerLrMultipliers { qat_l1: qat, ..Default::default() };
+                for micro in 1..=1 {
+                    for (r, old) in [(&mut fast, false), (&mut reference, true)] {
+                        unsafe {
+                            bulletou_bn_reference_mode(i32::from(old));
+                        }
+                        r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                            &ctx,
+                            &upload,
+                            RangerUpdateParams::default(),
+                            ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                            1.0,
+                            batch,
+                            true,
+                            false,
+                            policy,
+                        )
+                        .unwrap();
+                    }
+                    let fast_output = fast.forward_workspace.download_output(&ctx).unwrap();
+                    let reference_output = reference.forward_workspace.download_output(&ctx).unwrap();
+                    for (&x, &y) in fast_output.iter().zip(&reference_output) {
+                        assert!((x - y).abs() < 1e-6 + y.abs() * 1e-5,
+                            "forward stacks={stacks} qat={qat} shared={shared} micro={micro}: {x} vs {y}");
+                    }
+                    let a = fast.backward_workspace.download(&ctx).unwrap();
+                    let b = reference.backward_workspace.download(&ctx).unwrap();
+                    // Include axis gradients: a double-counted BPU contribution must fail.
+                    for (name, x, y) in [
+                        ("FT", &a.l0w_gradients, &b.l0w_gradients),
+                        ("L1", &a.l1w_gradients, &b.l1w_gradients),
+                        ("bias", &a.l1b_gradients, &b.l1b_gradients),
+                        ("shared", &a.l1fw_gradients, &b.l1fw_gradients),
+                        ("shared bias", &a.l1fb_gradients, &b.l1fb_gradients),
+                    ] {
+                        for (j, (&x, &y)) in x.iter().zip(y).enumerate() {
+                            assert!(
+                                (x - y).abs() < 2e-6 + y.abs() * 3e-4,
+                                "{name} stacks={stacks} qat={qat} shared={shared} micro={micro} j={j}: {x} vs {y}"
+                            );
+                        }
+                    }
+                    for (x, y) in [
+                        (&fast.backward_workspace.l1axw_gradients, &reference.backward_workspace.l1axw_gradients),
+                        (&fast.backward_workspace.l1axb_gradients, &reference.backward_workspace.l1axb_gradients),
+                    ] {
+                        let x = x.download(&ctx).unwrap();
+                        let y = y.download(&ctx).unwrap();
+                        if king != 0 || hand != 0 || progress {
+                            assert!(y.iter().any(|v| v.abs() > 1e-8), "vacuous axis gradient");
+                        }
+                        for (&x, &y) in x.iter().zip(&y) {
+                            assert!((x - y).abs() < 2e-6 + y.abs() * 3e-4, "axis {x} vs {y}");
+                        }
+                    }
+                    // The same microbatch twice without an optimizer update must
+                    // double each gradient, including shared and pair axes.
+                    unsafe { bulletou_bn_reference_mode(0); }
+                    fast.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                        &ctx, &upload, RangerUpdateParams::default(),
+                        ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0,
+                        batch, true, false, policy,
+                    ).unwrap();
+                    let doubled = fast.backward_workspace.download(&ctx).unwrap();
+                    for (name, first, next) in [
+                        ("FT", &a.l0w_gradients, &doubled.l0w_gradients),
+                        ("L1", &a.l1w_gradients, &doubled.l1w_gradients),
+                        ("bias", &a.l1b_gradients, &doubled.l1b_gradients),
+                        ("shared", &a.l1fw_gradients, &doubled.l1fw_gradients),
+                        ("shared bias", &a.l1fb_gradients, &doubled.l1fb_gradients),
+                    ] {
+                        for (&x, &y) in first.iter().zip(next) {
+                            assert!((2.0*x-y).abs() < 2e-6 + x.abs()*6e-4, "{name}: {x} vs {y}");
+                        }
+                    }
+                    for (x, y) in [
+                        (&reference.backward_workspace.l1axw_gradients, &fast.backward_workspace.l1axw_gradients),
+                        (&reference.backward_workspace.l1axb_gradients, &fast.backward_workspace.l1axb_gradients),
+                    ] {
+                        for (&first, &next) in x.download(&ctx).unwrap().iter().zip(y.download(&ctx).unwrap().iter()) {
+                            assert!((2.0*first-next).abs() < 2e-6 + first.abs()*6e-4, "axis: {first} vs {next}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires CUDA; checks large-batch Ka2 and wide L1 fast paths"]
 fn ka2_parallel_backward_matches_cpu_with_qat_and_accumulation() {
     let ctx = Context::new(0).unwrap();

@@ -5685,6 +5685,38 @@ struct CompactL1AxisGradient {
     }
 };
 
+// Many buckets: invert the sample->bucket map once, then each thread owns
+// one (bucket, output, input) cell. Only the shared/axis terms need atomics.
+// Add this microbatch's sums directly, not the accumulated master gradients.
+__global__ void sfnn_l1_bucket_gather_gradient(
+    const float* inputs, const float* dy, const int* offsets, const int* positions,
+    float* dw, float* db, float* dfw, float* dfb,
+    size_t width, size_t outputs, float shared_alpha, CompactL1AxisGradient axis) {
+    const size_t lane = threadIdx.x % 32;
+    const size_t out = blockIdx.z * 8 + threadIdx.x / 32;
+    const size_t in = blockIdx.x * 32 + lane;
+    const size_t stack = blockIdx.y;
+    if (out >= outputs || in > width) return;
+    const bool bias = in == width;
+    const int begin = offsets[stack], end = offsets[stack + 1];
+    float sum = 0.0f;
+    for (int i = begin; i < end; ++i) {
+        const size_t sample = static_cast<size_t>(positions[i]);
+        const float grad = dy[sample * outputs + out];
+        const float value = bias ? 1.0f : inputs[sample * width + in];
+        sum += grad * value;
+    }
+    if (sum == 0.0f) return;
+    if (bias) {
+        db[stack * outputs + out] += sum;
+        if (dfb) atomicAdd(dfb + out, shared_alpha * sum);
+    } else {
+        dw[(stack * outputs + out) * width + in] += sum;
+        if (dfw) atomicAdd(dfw + in * outputs + out, shared_alpha * sum);
+    }
+    if (axis.weights) axis.add(stack, in * outputs + out, width, out, outputs, bias, sum);
+}
+
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
 template<int Stacks, bool Axis=false>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
@@ -6939,6 +6971,28 @@ int launch_sfnn_backward_kernels(
         }
     } else if (common_shard_l1 || grouped_l1 || has_l1f != 0 || has_l1ax != 0) {
         const bool compact=common_shard_l1 || grouped_l1;
+        const bool bucket_gather = !compact && !ctx->bn[1].params && !bn_use_reference()
+            && qat_l1w && num_stacks == 648 && batch >= 1024 && l1_out == 16;
+        if (bucket_gather) {
+            if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, num_stacks) != 0) return -1;
+            int input_blocks = 0;
+            if (block_count_1d(batch * ft_size, threads, &input_blocks, "sfnn L1 input gradient") != 0) return -1;
+            bn_l1_input_gradient<16><<<input_blocks, threads, 0, ctx->stream>>>(
+                l1_gradients, qat_l1w, nullptr, buckets, combined_gradients, batch, ft_size, num_stacks, 1.0f);
+            if (check_kernel_launch("sfnn L1 input gradient") != 0) return -1;
+            const CompactL1AxisGradient axis={has_l1ax ? l1axw_gradients : nullptr,
+                has_l1ax ? l1axb_gradients : nullptr, num_stacks, factorizer_king_axis_dim, factorizer_hand_axis_dim,
+                use_king_axis, use_hand_axis, use_progress_axis, use_king_hand_pair, use_king_progress_pair,
+                use_hand_progress_pair, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
+                factorizer_progress_axis_alpha, factorizer_pair_alpha, factorizer_axis_confidences};
+            const dim3 grid(static_cast<unsigned>((ft_size + 32) / 32),
+                static_cast<unsigned>(num_stacks), static_cast<unsigned>((l1_out + 7) / 8));
+            sfnn_l1_bucket_gather_gradient<<<grid, 256, 0, ctx->stream>>>(
+                combined, l1_gradients, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_positions,
+                l1w_gradients, l1b_gradients, has_l1f ? l1fw_gradients : nullptr,
+                has_l1f ? l1fb_gradients : nullptr, ft_size, l1_out, factorizer_shared_alpha, axis);
+            if (check_kernel_launch("sfnn L1 bucket gather gradient") != 0) return -1;
+        } else {
         const bool reduce_l1_params = !compact && dense_param_reduce_fast_path;
         size_t l1_threads = reduce_l1_params ? batch * ft_size : std::max(batch * ft_size, batch * ft_size * l1_out);
         if (!reduce_l1_params) {
@@ -7074,6 +7128,7 @@ int launch_sfnn_backward_kernels(
                 return -1;
             }
         }
+        } // bucket_gather
     } else {
         const bool reduce_l1_params = dense_param_reduce_fast_path;
         size_t l1_threads = reduce_l1_params ? batch * ft_size : std::max(batch * ft_size, batch * ft_size * l1_out);
