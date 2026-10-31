@@ -8865,6 +8865,7 @@ fn sfnn_initial_weights_into_readback(
         batch_norm: weights.batch_norm,
         l1_revival_flags: weights.l1_revival_flags,
         l1_last_reset_epoch: weights.l1_last_reset_epoch,
+        l1_suppress_until: weights.l1_suppress_until,
         l2_revival_flags: weights.l2_revival_flags,
         revival_rng: weights.revival_rng,
         l0w: weights.l0w,
@@ -9716,6 +9717,7 @@ fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
     let proxy = CudaCppSfnnInitialWeights {
         l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         batch_norm: Default::default(),
@@ -9848,6 +9850,7 @@ fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Res
     let proxy = CudaCppSfnnInitialWeights {
         l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         batch_norm: Default::default(),
@@ -10969,6 +10972,7 @@ impl WorkerSfnnSession {
         let count_settings = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
         runner.l1_revival_flags = initial_weights.l1_revival_flags;
         runner.l1_last_reset_epoch = initial_weights.l1_last_reset_epoch;
+        runner.l1_suppress_until = initial_weights.l1_suppress_until;
         runner.l2_revival_flags = initial_weights.l2_revival_flags;
         runner.revival_rng = initial_weights.revival_rng;
         let dataloader_pos =
@@ -11077,6 +11081,29 @@ impl WorkerSfnnSession {
             let new_factorizer = effective_sfnn_factorizer_spec(args);
             let old_alpha = effective_sfnn_factorizer_alpha(&old_args);
             let new_alpha = effective_sfnn_factorizer_alpha(args);
+            if old_factorizer.any() || new_factorizer.any() {
+                // Validate singular gates before any in-place axis folding.
+                cuda_cpp_sfnn_residual_count_gate_rebase_ratios(self.shape, old_factorizer,
+                    self.residual_count_gates.as_deref(), new_factorizer, new_count_settings.residual_count_gates.as_deref())?;
+            }
+            if old_factorizer.any_axis() || new_factorizer.any_axis() {
+                cuda_cpp_sfnn_axis_factorizer_rebase_ratios(self.shape, old_factorizer, old_alpha,
+                    self.factorizer_axis_confidences.as_deref(), new_factorizer, new_alpha,
+                    new_count_settings.factorizer_axis_confidences.as_deref())?;
+            }
+            let singular_axis = cuda_cpp_sfnn_factorizer_axis_indices(self.shape, new_factorizer).into_iter().any(|i| {
+                cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(self.shape, i, old_alpha, self.factorizer_axis_confidences.as_deref()) != 0.0
+                    && cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(self.shape, i, new_alpha, new_count_settings.factorizer_axis_confidences.as_deref()) == 0.0
+            });
+            if singular_axis {
+                let mut counts = Self::compute_count_settings(&old_args, self.shape)?;
+                counts.residual_count_gates = self.residual_count_gates.clone();
+                counts.factorizer_axis_confidences = self.factorizer_axis_confidences.clone();
+                let coefficients = scheduled_l1_axis_fold_coefficients(&old_args, self.shape, &counts)?;
+                self.runner.switch_l1_factorizer(&self.ctx, self.shape, cuda_cpp_sfnn_factorizer_active(&old_args),
+                    cuda_cpp_sfnn_factorizer_alpha(&old_args), &coefficients).map_err(|e| e.to_string())?;
+                Self::upload_count_settings_to_runner(&self.ctx, &mut self.runner, &counts)?;
+            }
             // Rebase shared terms with the OLD residual gates before rebasing
             // residuals to their new gates below.
             let old_shared = if old_factorizer.shared { old_alpha.shared } else { 0.0 };
@@ -17800,7 +17827,21 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     }
     eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, outgoing L2 +/-1/64, per-branch mean bias compensation (approximate, not pointwise-equivalent), selected moments reset; audit={}",ids.len(),path.display());
     audit.complete_layer("L1",ids.len())?;
-    if !ids.is_empty() { runner.l1_last_reset_epoch = Some(audit.epoch.checked_add(1).ok_or("L1 revival epoch overflow")?); }
+    if !ids.is_empty() {
+        let previous_until = match runner.l1_suppress_until {
+            Some(value) => value,
+            None => match runner.l1_last_reset_epoch {
+                Some(encoded) if encoded > 0 => {
+                    let e = encoded - 1;
+                    l1_suppression_epoch_start(args, e).saturating_add(args_at_epoch(args, e)?.sfnn_l1_revive_lr_suppress_sb)
+                },
+                _ => 0,
+            },
+        };
+        let until = l1_suppression_epoch_start(args, audit.epoch).saturating_add(args.sfnn_l1_revive_lr_suppress_sb);
+        runner.l1_suppress_until = Some(previous_until.max(until));
+        runner.l1_last_reset_epoch = Some(audit.epoch.checked_add(1).ok_or("L1 revival epoch overflow")?);
+    }
     for i in ids {
         eprintln!("  [L1 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
             i/shape.l1_hidden,i%shape.l1_hidden,calibration.contribution.utility[i],
@@ -17976,12 +18017,12 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     } else {
         None
     };
-    let sfnn_residual_count_gates = sfnn_residual_count_gates_from_counts(
+    let mut sfnn_residual_count_gates = sfnn_residual_count_gates_from_counts(
         args,
         initial_weights.shape,
         sfnn_bucket_counts.as_ref().map(|(_, counts)| counts),
     )?;
-    let sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
+    let mut sfnn_factorizer_axis_confidences = if effective_sfnn_factorizer_axis_multiplier_enabled(args) {
         let counts = sfnn_bucket_counts.as_ref().map(|(_, counts)| counts);
         sfnn_factorizer_axis_confidences_from_counts(args, initial_weights.shape, factorizer_spec, counts)?
     } else {
@@ -18350,6 +18391,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             initial_gamma:args.sfnn_bn_gamma,initial_beta:args.sfnn_bn_beta},&initial_weights.batch_norm).map_err(|e|e.to_string())?;
     runner.l1_revival_flags = initial_weights.l1_revival_flags;
         runner.l1_last_reset_epoch = initial_weights.l1_last_reset_epoch;
+        runner.l1_suppress_until = initial_weights.l1_suppress_until;
     runner.l2_revival_flags = initial_weights.l2_revival_flags;
     runner.revival_rng = initial_weights.revival_rng;
     if runner.batch_norm.is_some() {
@@ -18641,6 +18683,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     .map_err(|e| e.to_string())?;
                     runner.revival_rng = snapshot_weights.revival_rng;
                     runner.l1_last_reset_epoch = snapshot_weights.l1_last_reset_epoch;
+                    runner.l1_suppress_until = snapshot_weights.l1_suppress_until;
                     if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
                         runner
                             .set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice()))
@@ -18907,6 +18950,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     cuda_shape = runner.shape;
                     let counts = WorkerSfnnSession::compute_count_settings(&next_args, cuda_shape)?;
                     WorkerSfnnSession::upload_count_settings_to_runner(&ctx, &mut runner, &counts)?;
+                    sfnn_residual_count_gates = counts.residual_count_gates;
+                    sfnn_factorizer_axis_confidences = counts.factorizer_axis_confidences;
                     sfnn_resident_validation_cache = None;
                     sfnn_quantized_validation_cache = None;
                     eprintln!("{}", paint(format!("  [L1 FACTORIZER] epoch={} {} -> {}: old axis/pair master + Lookahead folded; new axis/pair coordinates zero; base/shared moments and steps retained",
@@ -19004,7 +19049,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if let Some(progress) = progress_for_step {
             let key = (progress.epoch, progress.superbatch);
             if !l1_suppress_cache.is_some_and(|(e, sb, _)| (e, sb) == key) {
-                l1_suppress_cache = Some((key.0, key.1, l1_lr_suppressed_with_reset(base_args, key.0, key.1, runner.l1_last_reset_epoch)?));
+                l1_suppress_cache = Some((key.0, key.1, l1_lr_suppressed_with_history(base_args, key.0, key.1, runner.l1_last_reset_epoch, runner.l1_suppress_until)?));
             }
             if l1_suppress_cache.is_some_and(|(_, _, active)| active) { lr_multipliers.l1 *= 0.1; }
         }
@@ -19635,8 +19680,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         &trained_optimizer_states,
         completed_steps,
         optimizer_steps,
-        factorizer_spec,
-        effective_sfnn_factorizer_alpha(args),
+        effective_sfnn_factorizer_spec(&epoch_args),
+        effective_sfnn_factorizer_alpha(&epoch_args),
         sfnn_residual_count_gates.as_deref(),
         sfnn_factorizer_axis_confidences.as_deref(),
         sfnn_progress_train_state.as_ref(),
@@ -20323,6 +20368,8 @@ fn write_cuda_cpp_direct_checkpoint_metadata_files(
     args: &Args,
     log: CudaCppCheckpointLog,
 ) -> Result<(), String> {
+    std::fs::write(dir.join(RESUME_CONFIG_NAME), resume_signature(args))
+        .map_err(|err| format!("failed to write checkpoint resume configuration: {err}"))?;
     std::fs::write(dir.join("teacher.txt"), format!("{}\n", args.teacher))
         .map_err(|err| format!("failed to write {}: {err}", dir.join("teacher.txt").display()))?;
     std::fs::write(
@@ -20958,12 +21005,6 @@ struct SfnnResidualCountGateRebaseStats {
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
-const SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER: f32 = 1.0e-6;
-
-#[cfg(feature = "cuda-cpp-backend")]
-const SFNN_AXIS_REBASE_MAX_RATIO: f32 = 100.0;
-
-#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
     shape: bulletou_cuda_cpp::SfnnForwardShape,
     old_factorizer: SfnnFactorizerSpec,
@@ -21006,7 +21047,7 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
 
     let mut ratios = vec![1.0f32; axis_count];
     let mut changed_axes = 0usize;
-    let mut clamped_axes = 0usize;
+    let clamped_axes = 0usize;
     let mut zeroed_axes = 0usize;
     let mut min_ratio = f32::INFINITY;
     let mut max_ratio = f32::NEG_INFINITY;
@@ -21021,9 +21062,9 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
         };
         let new_effective =
             cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(shape, axis, new_alpha, new_confidences);
-        let old_is_zero = old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
-        let new_is_zero = new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
-        let mut ratio = if old_is_zero && new_is_zero {
+        let old_is_zero = old_effective == 0.0;
+        let new_is_zero = new_effective == 0.0;
+        let ratio = if old_is_zero && new_is_zero {
             1.0
         } else if old_is_zero || new_is_zero {
             // Enabling a previously inactive axis is singular:
@@ -21036,19 +21077,10 @@ fn cuda_cpp_sfnn_axis_factorizer_rebase_ratios(
         } else {
             old_effective / new_effective
         };
-        if !(ratio.is_finite() && ratio >= 0.0) {
-            ratio = 1.0;
-            clamped_axes += 1;
+        if !(ratio.is_finite() && ratio >= 0.0) || (ratio != 0.0 && (!(ratio*ratio).is_finite() || ratio*ratio == 0.0)) {
+            return Err(format!("axis {axis} rebase ratio is outside the supported range"));
         }
-        if ratio > SFNN_AXIS_REBASE_MAX_RATIO {
-            ratio = SFNN_AXIS_REBASE_MAX_RATIO;
-            clamped_axes += 1;
-        }
-        if ratio < 0.0 {
-            ratio = 0.0;
-            clamped_axes += 1;
-        }
-        if (ratio - 1.0).abs() > 1.0e-6 {
+        if ratio != 1.0 {
             changed_axes += 1;
         }
         min_ratio = min_ratio.min(ratio);
@@ -21090,7 +21122,7 @@ fn cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
 
     let mut ratios = vec![1.0f32; stacks];
     let mut changed_stacks = 0usize;
-    let mut clamped_stacks = 0usize;
+    let clamped_stacks = 0usize;
     let mut zeroed_stacks = 0usize;
     let mut min_ratio = f32::INFINITY;
     let mut max_ratio = f32::NEG_INFINITY;
@@ -21107,9 +21139,12 @@ fn cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
         } else {
             1.0
         };
-        let old_is_zero = old_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
-        let new_is_zero = new_effective.abs() < SFNN_AXIS_REBASE_MIN_EFFECTIVE_MULTIPLIER;
-        let mut ratio = if old_is_zero && new_is_zero {
+        let old_is_zero = old_effective == 0.0;
+        let new_is_zero = new_effective == 0.0;
+        if !old_is_zero && new_is_zero {
+            return Err(format!("cannot preserve bucket {stack} when its residual count gate changes to zero"));
+        }
+        let ratio = if old_is_zero && new_is_zero {
             1.0
         } else if old_is_zero || new_is_zero {
             zeroed_stacks += 1;
@@ -21117,15 +21152,10 @@ fn cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
         } else {
             old_effective / new_effective
         };
-        if !(ratio.is_finite() && ratio >= 0.0) {
-            ratio = 1.0;
-            clamped_stacks += 1;
+        if !(ratio.is_finite() && ratio >= 0.0) || (ratio != 0.0 && (!(ratio*ratio).is_finite() || ratio*ratio == 0.0)) {
+            return Err(format!("residual gate rebase ratio for bucket {stack} is outside the supported range"));
         }
-        if ratio > SFNN_AXIS_REBASE_MAX_RATIO {
-            ratio = SFNN_AXIS_REBASE_MAX_RATIO;
-            clamped_stacks += 1;
-        }
-        if (ratio - 1.0).abs() > 1.0e-6 {
+        if ratio != 1.0 {
             changed_stacks += 1;
         }
         min_ratio = min_ratio.min(ratio);
@@ -21608,6 +21638,7 @@ fn build_sfnn_validation_fast_batch(
 struct CudaCppSfnnInitialWeights {
     l1_revival_flags: u8,
     l1_last_reset_epoch: Option<usize>,
+    l1_suppress_until: Option<usize>,
     l2_revival_flags: u8,
     revival_rng: bulletou_cuda_cpp::revival_rng::RevivalRng,
     batch_norm: bulletou_cuda_cpp::batch_norm::NetworkState,
@@ -22138,6 +22169,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
         batch_norm: Default::default(),
         l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         shape,
@@ -22454,6 +22486,51 @@ fn rebase_loaded_sfnn_axes(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn rebase_loaded_sfnn_residual_gates(
+    weights: &mut CudaCppSfnnInitialWeights,
+    optimizer: &mut Option<CudaCppSfnnOptimizerState>,
+    old: Option<&[f32]>, new: Option<&[f32]>,
+) -> Result<(), String> {
+    let stacks = weights.shape.num_stacks;
+    for gates in [old, new].into_iter().flatten() {
+        if gates.len() != stacks || gates.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err("invalid checkpoint residual count gates".into());
+        }
+    }
+    for stack in 0..stacks {
+        let a = old.map_or(1.0, |g| g[stack]);
+        let b = new.map_or(1.0, |g| g[stack]);
+        if a == b { continue; }
+        if b == 0.0 && a != 0.0 {
+            return Err(format!("cannot preserve bucket {stack} when its residual count gate changes to zero"));
+        }
+        let ratio = if b == 0.0 { 1.0 } else { a / b };
+        if !ratio.is_finite() || (ratio != 0.0 && (!(ratio*ratio).is_finite() || ratio*ratio == 0.0)) {
+            return Err(format!("invalid residual gate rebase ratio for bucket {stack}"));
+        }
+        for bias in [false, true] {
+            let tensor = if bias { &mut weights.l1b } else { &mut weights.l1w };
+            let width = tensor.len() / stacks;
+            let range = stack*width..(stack+1)*width;
+            for x in &mut tensor[range.clone()] { *x *= ratio; if !x.is_finite() { return Err("residual gate rebase overflow".into()); } }
+            if let Some(opt) = optimizer.as_mut() {
+                let group = if bias { &mut opt.l1b } else { &mut opt.l1w };
+                for i in range {
+                    if ratio == 0.0 { group.momentum[i]=0.0; group.velocity[i]=0.0; group.slow_params[i]=0.0; }
+                    else {
+                        group.momentum[i]/=ratio; group.velocity[i]/=ratio*ratio; group.slow_params[i]*=ratio;
+                        if !group.momentum[i].is_finite() || !group.velocity[i].is_finite() || !group.slow_params[i].is_finite() {
+                            return Err("residual gate optimizer rebase overflow".into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_sfnn_shared_coefficients(train: &BTreeMap<String, Vec<f32>>) -> Result<Option<[f32; 2]>, String> {
     let Some(values) = train.get("shared_coefficients") else {
         return Ok(None);
@@ -22653,6 +22730,7 @@ fn load_cuda_cpp_sfnn_initial_state(
             )
         })?;
     let mut progress = load_cuda_cpp_sfnn_progress_train_state_from_path(path, layerstack, &weights_records)?;
+    let source_has_factorizer = weights.l1fw.is_some() || weights.l1axw.is_some();
     let wants_l1f = effective_sfnn_factorized_l1(args);
     let wants_l1ax = effective_sfnn_axis_factorized_l1(args);
     let mut created_factorizers = CudaCppSfnnCreatedFactorizers::default();
@@ -22696,6 +22774,10 @@ fn load_cuda_cpp_sfnn_initial_state(
         load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
     };
     let train = initial_sections.remove("train").unwrap_or_default();
+    let target_counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
+    let old_gates = if source_has_factorizer { train.get("residual_count_gates").map(Vec::as_slice) } else { None };
+    let new_gates = if effective_sfnn_factorizer_spec(args).any() { target_counts.residual_count_gates.as_deref() } else { None };
+    rebase_loaded_sfnn_residual_gates(&mut weights, &mut pre_migration_optimizer_states, old_gates, new_gates)?;
     let new_shared_coefficients = shared_coefficients_for_args(args);
     let old_shared_coefficients = match load_sfnn_shared_coefficients(&train)? {
         Some(values) => values,
@@ -22740,17 +22822,22 @@ fn load_cuda_cpp_sfnn_initial_state(
     let legacy_axis_coefficients = if (inactive_nonzero || (active.any_axis() && !created_factorizers.axis_l1)) && !train.contains_key("axis_coefficients") {
         legacy_checkpoint_axis_coefficients(path, weights.shape)
     } else { None };
-    let source_axis_coefficients = train.get("axis_coefficients").map(Vec::as_slice)
+    let mut saved_axis_coefficients = train.get("axis_coefficients").cloned();
+    if progress_axis_appended {
+        if let Some(values) = saved_axis_coefficients.as_mut() {
+            let progress_count = weights.shape.factorizer_progress_axis_count();
+            if values.len().checked_add(progress_count) == Some(weights.shape.factorizer_axis_count()) {
+                values.resize(weights.shape.factorizer_axis_count(), 0.0);
+            }
+        }
+    }
+    let source_axis_coefficients = saved_axis_coefficients.as_deref()
         .or(legacy_axis_coefficients.as_deref());
     if active.any_axis() && !created_factorizers.axis_l1 {
         let counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
         let new = checkpoint_axis_coefficients(weights.shape, effective_sfnn_factorizer_alpha(args), counts.factorizer_axis_confidences.as_deref());
         let old = match source_axis_coefficients {
             Some(old) => old,
-            None if args.initial_state.is_none() => {
-                eprintln!("  WARN: legacy checkpoint lacks axis coefficients; assuming unchanged settings for resume");
-                &new
-            },
             None => return Err(format!("{} lacks saved L1 axis coefficients and its original settings cannot be reconstructed; cannot safely load active axis weights", path.display())),
         };
         rebase_loaded_sfnn_axes(&mut weights, &mut pre_migration_optimizer_states, active, old, &new)?;
@@ -22980,6 +23067,12 @@ fn legacy_checkpoint_axis_coefficients(path: &Path, shape: bulletou_cuda_cpp::Sf
     if !settings.is_file() { return None; }
     let raw = vec![std::ffi::OsString::from("bulletou"), std::ffi::OsString::from("--settings-file"), settings.into_os_string()];
     let saved = Args::try_parse_from(expand_settings_file_args(raw).ok()?).ok()?;
+    // The copied JSON does not include CLI overrides. Only trust it if the
+    // recorded effective resume signature confirms the settings match.
+    // The top-level signature is overwritten at startup, so it is not
+    // evidence of the settings that produced this checkpoint.
+    let signature = std::fs::read_to_string(dir.join(RESUME_CONFIG_NAME)).ok()?;
+    if !resume_signature_matches(&signature, &saved) { return None; }
     // An external count file may have changed since the checkpoint was saved.
     if saved.sfnn_bucket_counts.is_some() { return None; }
     let epoch = read_checkpoint_epoch_superbatch(dir).map_or(1, |(epoch, _)| epoch);
@@ -23887,6 +23980,7 @@ fn load_cuda_cpp_sfnn_weights_from_records(
     let weights = CudaCppSfnnInitialWeights {
         batch_norm,
         l1_last_reset_epoch: records.get("l1_last_reset_epoch_u16").map(|v| decode_sfnn_exact_step("l1_last_reset_epoch_u16", v)).transpose()?,
+        l1_suppress_until: records.get("l1_suppress_until_u16").map(|v| decode_sfnn_exact_step("l1_suppress_until_u16", v)).transpose()?,
         revival_rng: records.get("revival_rng").map(|v| bulletou_cuda_cpp::revival_rng::RevivalRng::decode(v)).transpose()?.unwrap_or_default(),
         l1_revival_flags: match records.get("l1_revival_flags").map(Vec::as_slice) {
             None => 0,
@@ -24901,6 +24995,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     let l1_revival_record = [weights.l1_revival_flags as f32];
     let l1_last_reset_record = weights.l1_last_reset_epoch.map(encode_sfnn_exact_step);
+    let l1_suppress_until_record = weights.l1_suppress_until.map(encode_sfnn_exact_step);
     let l2_revival_record = [weights.l2_revival_flags as f32];
     let revival_rng_record = weights.revival_rng.encode();
     let completed_steps_record = [completed_steps as f32];
@@ -24930,6 +25025,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
     }
     records.push(("nnue/weights/l1_revival_flags", &l1_revival_record));
     if let Some(ref value) = l1_last_reset_record { records.push(("nnue/weights/l1_last_reset_epoch_u16", value)); }
+    if let Some(ref value) = l1_suppress_until_record { records.push(("nnue/weights/l1_suppress_until_u16", value)); }
     records.push(("nnue/weights/l2_revival_flags", &l2_revival_record));
     records.push(("nnue/weights/revival_rng", &revival_rng_record));
     if let Some(progress_state) = progress_state {
@@ -26022,8 +26118,22 @@ fn l1_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn l1_lr_suppressed_with_reset(args: &Args, epoch: usize, superbatch: usize, last_reset: Option<usize>) -> Result<bool, String> {
+    l1_lr_suppressed_with_history(args, epoch, superbatch, last_reset, None)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_suppression_epoch_start(args: &Args, epoch: usize) -> usize {
+    if epoch == 0 { return 0; }
+    (1..epoch).fold(args.warmup_sb, |sum, e| sum.saturating_add(configured_epoch_superbatches(args, e)))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_lr_suppressed_with_history(args: &Args, epoch: usize, superbatch: usize, last_reset: Option<usize>, until: Option<usize>) -> Result<bool, String> {
     if epoch == 1 && superbatch > 0 && superbatch <= args.sfnn_l1_initial_lr_suppress_sb {
         return Ok(true);
+    }
+    if let Some(end) = until {
+        return Ok(l1_suppression_epoch_start(args, epoch).saturating_add(superbatch.saturating_sub(1)) < end);
     }
     l1_revival_lr_suppressed_with_reset(args, epoch, superbatch, last_reset)
 }
@@ -28507,6 +28617,85 @@ mod tests {
         for invalid in [&[0.0f32, 0.0, 0.0][..], &[65536.0, 0.0, 0.0, 0.0], &[0.5, 0.0, 0.0, 0.0]] {
             assert!(decode_sfnn_exact_step("test", invalid).is_err());
         }
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn suppression_windows_overlap_and_resume() {
+        let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_8_32_k3k3","--superbatches","64","--max-epochs","3"]).unwrap();
+        args.epoch_settings_json=Some(serde_json::json!({"sfnn_l1_revive":{"epoch1":true,"epoch2":true},
+            "sfnn_l1_revive_lr_suppress_sb":{"epoch1":100,"epoch2":0}}).to_string());
+        let prior_until = l1_suppression_epoch_start(&args,1)+100;
+        let after_second = prior_until.max(l1_suppression_epoch_start(&args,2));
+        assert!(l1_lr_suppressed_with_history(&args,2,1,Some(3),Some(after_second)).unwrap());
+        assert!(l1_lr_suppressed_with_history(&args,2,36,Some(3),Some(after_second)).unwrap());
+        assert!(!l1_lr_suppressed_with_history(&args,2,37,Some(3),Some(after_second)).unwrap());
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn loaded_residual_gate_rebase_preserves_master_and_rejects_singular() {
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_8_32_k3k3","--sfnn-factorizer","axis"]).unwrap();
+        let mut w=build_sfnn_initial_weights_for_cuda_cpp(&args,CudaCppSfnnFeatureKind::Ka2).unwrap();
+        w.l1b[0]=2.0;
+        let old=vec![0.5;w.shape.num_stacks];
+        rebase_loaded_sfnn_residual_gates(&mut w,&mut None,Some(&old),None).unwrap();
+        assert_eq!(w.l1b[0],1.0);
+        let zero=vec![0.0;w.shape.num_stacks];
+        assert!(rebase_loaded_sfnn_residual_gates(&mut w,&mut None,None,Some(&zero)).is_err());
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn checkpoint_restores_old_residual_gate_effect() {
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_8_32_k3k3","--sfnn-factorizer","shared"]).unwrap();
+        let kind=CudaCppSfnnFeatureKind::Ka2; let mut w=build_sfnn_initial_weights_for_cuda_cpp(&args,kind).unwrap();
+        w.l1b[0]=2.0; let gates=vec![0.5;w.shape.num_stacks];
+        let path=std::env::temp_dir().join(format!("bulletou-gate-rebase-{}.bin",std::process::id()));
+        let records=vec![("nnue/train/shared_coefficients",&[1.0,1.0][..]),("nnue/train/residual_count_gates",gates.as_slice()),
+          ("nnue/weights/l0w",w.l0w.as_slice()),("nnue/weights/l0b",w.l0b.as_slice()),
+          ("nnue/weights/l1w",w.l1w.as_slice()),("nnue/weights/l1b",w.l1b.as_slice()),
+          ("nnue/weights/l1fw",w.l1fw.as_deref().unwrap()),("nnue/weights/l1fb",w.l1fb.as_deref().unwrap()),
+          ("nnue/weights/l2w",w.l2w.as_slice()),("nnue/weights/l2b",w.l2b.as_slice()),
+          ("nnue/weights/l3w",w.l3w.as_slice()),("nnue/weights/l3b",w.l3b.as_slice())];
+        write_cuda_cpp_state_records_atomic(&path,records).unwrap();
+        let loaded=load_cuda_cpp_sfnn_initial_state(&path,&args,kind).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.weights.l1b[0],1.0);
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn worker_axis_rebase_keeps_small_nonzero_coefficients() {
+        let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_8_32_k3k3","--sfnn-factorizer","axis"]).unwrap();
+        let w=build_sfnn_initial_weights_for_cuda_cpp(&args,CudaCppSfnnFeatureKind::Ka2).unwrap();
+        let spec=effective_sfnn_factorizer_spec(&args);
+        let mut new=SfnnFactorizerAlphaSpec::ONE; new.king_axis=0.001;
+        let (ratios,stats)=cuda_cpp_sfnn_axis_factorizer_rebase_ratios(w.shape,spec,SfnnFactorizerAlphaSpec::ONE,None,spec,new,None).unwrap();
+        assert!((ratios[0]*new.king_axis-1.0).abs()<1e-6);
+        assert_eq!(stats.clamped_axes,0);
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn checkpoint_extends_axis_coefficients_for_progress_tail() {
+        let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_ka2_32_1_2_k3k3_progress8","--sfnn-factorizer","king=axis"]).unwrap();
+        let kind=CudaCppSfnnFeatureKind::Ka2; let w=build_sfnn_initial_weights_for_cuda_cpp(&args,kind).unwrap();
+        let coeff=vec![1.0;w.shape.factorizer_axis_count()];
+        let path=std::env::temp_dir().join(format!("bulletou-progress-axis-{}.bin",std::process::id()));
+        let records=vec![("nnue/train/shared_coefficients",&[1.0,1.0][..]),("nnue/train/axis_coefficients",coeff.as_slice()),
+          ("nnue/weights/l0w",w.l0w.as_slice()),("nnue/weights/l0b",w.l0b.as_slice()),
+          ("nnue/weights/l1w",w.l1w.as_slice()),("nnue/weights/l1b",w.l1b.as_slice()),
+          ("nnue/weights/l1fw",w.l1fw.as_deref().unwrap()),("nnue/weights/l1fb",w.l1fb.as_deref().unwrap()),
+          ("nnue/weights/l1axw",w.l1axw.as_deref().unwrap()),("nnue/weights/l1axb",w.l1axb.as_deref().unwrap()),
+          ("nnue/weights/l2w",w.l2w.as_slice()),("nnue/weights/l2b",w.l2b.as_slice()),
+          ("nnue/weights/l3w",w.l3w.as_slice()),("nnue/weights/l3b",w.l3b.as_slice())];
+        write_cuda_cpp_state_records_atomic(&path,records).unwrap();
+        args.sfnn_factorizer=Some("axis".parse().unwrap());
+        let loaded=load_cuda_cpp_sfnn_initial_state(&path,&args,kind).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(loaded.weights.shape.factorizer_progress_axis);
+        assert!(loaded.weights.l1axw.unwrap()[w.l1axw.unwrap().len()..].iter().all(|&x|x==0.0));
     }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
@@ -31920,7 +32109,9 @@ mod tests {
         };
         let factorizer = SfnnFactorizerSpec { shared: true, ..SfnnFactorizerSpec::NONE };
         let old_gates = [0.5, 1.0, 0.0, 0.25];
-        let new_gates = [1.0, 0.25, 0.5, 0.0];
+        let singular_gates = [1.0, 0.25, 0.5, 0.0];
+        assert!(cuda_cpp_sfnn_residual_count_gate_rebase_ratios(shape, factorizer, Some(&old_gates), factorizer, Some(&singular_gates)).is_err());
+        let new_gates = [1.0, 0.25, 0.5, 0.5];
 
         let (ratios, stats) = cuda_cpp_sfnn_residual_count_gate_rebase_ratios(
             shape,
@@ -31931,9 +32122,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(ratios, vec![0.5, 4.0, 0.0, 0.0]);
+        assert_eq!(ratios, vec![0.5, 4.0, 0.0, 0.5]);
         assert_eq!(stats.changed_stacks, 4);
-        assert_eq!(stats.zeroed_stacks, 2);
+        assert_eq!(stats.zeroed_stacks, 1);
         assert_eq!(stats.clamped_stacks, 0);
     }
 
@@ -33196,7 +33387,8 @@ mod tests {
             let path=std::env::temp_dir().join(format!("bulletou-l1-schedule-{}-{arch}.bin",std::process::id()));
             let write_checkpoint=|w: &CudaCppSfnnInitialWeights| {
                 let mut records: Vec<(String,Vec<f32>)>=vec![("nnue/train/completed_steps".into(),vec![123.]),
-                    ("nnue/train/shared_coefficients".into(),vec![1.,1.])];
+                    ("nnue/train/shared_coefficients".into(),vec![1.,1.]),
+                    ("nnue/train/axis_coefficients".into(),vec![1.; w.shape.factorizer_axis_count()])];
                 for (key, values) in [("l0w",Some(&w.l0w)),("l0b",Some(&w.l0b)),("l1w",Some(&w.l1w)),("l1b",Some(&w.l1b)),
                     ("l1fw",w.l1fw.as_ref()),("l1fb",w.l1fb.as_ref()),("l1axw",w.l1axw.as_ref()),("l1axb",w.l1axb.as_ref()),
                     ("l2w",Some(&w.l2w)),("l2b",Some(&w.l2b)),("l3w",Some(&w.l3w)),("l3b",Some(&w.l3b))] {
@@ -33562,12 +33754,15 @@ mod tests {
         if compact {
             args.sfnn_l1_revive=true;
             args.sfnn_ft_revive=true;
+            args.sfnn_l1_revive_lr_suppress_sb=16;
             run_sfnn_epoch_revival(&args,feature,&ctx,&mut runner,&config,4).unwrap();
             let summary=std::fs::read_to_string(directory.join("revive-summary.csv")).unwrap();
             let fields:Vec<_>=summary.lines().last().unwrap().split(',').collect();
             assert_eq!(fields[18],"8");
             assert_eq!(runner.l1_last_reset_epoch, Some(5));
+            assert_eq!(runner.l1_suppress_until, Some(l1_suppression_epoch_start(&args,4)+16));
             assert_eq!(runner.read_weights(&ctx).unwrap().l1_last_reset_epoch, Some(5));
+            assert_eq!(runner.read_weights(&ctx).unwrap().l1_suppress_until, runner.l1_suppress_until);
             assert_eq!(runner.read_weights(&ctx).unwrap().l1w.len(),weights.l1w.len());
         }
         std::fs::remove_dir_all(directory).unwrap();
@@ -34152,6 +34347,7 @@ mod tests {
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
             l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -34424,6 +34620,7 @@ mod tests {
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
             l1_revival_flags: 3,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 3,
             revival_rng: { let mut rng=bulletou_cuda_cpp::revival_rng::RevivalRng::default(); for _ in 0..137 {rng.signed_uniform();} rng },
             batch_norm: Default::default(),
@@ -34485,6 +34682,7 @@ mod tests {
         assert_eq!(decode_sfnn_exact_step("completed", &records["nnue/train/completed_steps_u16"]).unwrap(), 1234);
         assert_eq!(decode_sfnn_exact_step("optimizer", &records["nnue/train/optimizer_steps_u16"]).unwrap(), 11);
         assert_eq!(decode_sfnn_exact_step("reset", &records["nnue/weights/l1_last_reset_epoch_u16"]).unwrap(), 0);
+        assert_eq!(decode_sfnn_exact_step("suppress", &records["nnue/weights/l1_suppress_until_u16"]).unwrap(), 0);
         assert_eq!(records["nnue/train/axis_coefficients"], vec![0.25, 0.5]);
         assert_eq!(records["nnue/train/residual_count_gates"], vec![0.9]);
         assert_eq!(records["nnue/weights/l1_revival_flags"], vec![3.0]);
@@ -34559,6 +34757,7 @@ mod tests {
         let weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -34996,6 +35195,7 @@ mod tests {
         let weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -35117,10 +35317,14 @@ mod tests {
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn legacy_checkpoint_recovers_axis_alpha_from_settings() {
-        let dir = std::env::temp_dir().join(format!("bulletou-legacy-axis-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("bulletou-legacy-axis-{}", std::process::id()));
+        let dir = root.join("0001");
         std::fs::create_dir_all(&dir).unwrap();
         let settings = dir.join("bulletou-settings.json");
         std::fs::write(&settings, r#"{"arch":"SFNN_halfka2_128_8_32_k3k3","teacher":"/dev/null","backend":"cuda-cpp","sfnn_l1_factorizer":"axis","sfnn_l1_factorizer_alpha":"king=0.5"}"#).unwrap();
+        let raw=vec![std::ffi::OsString::from("bulletou"),std::ffi::OsString::from("--settings-file"),settings.as_os_str().to_owned()];
+        let saved=Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+        std::fs::write(dir.join(RESUME_CONFIG_NAME),resume_signature(&saved)).unwrap();
         let shape = bulletou_cuda_cpp::SfnnForwardShape {
             input_size: 2, ft_size: 2, l1_hidden: 1, l1_skip: false, l2_size: 1,
             num_stacks: 9, l1_group_count: 1, l1_common_size: 0, l1_shard_size: 0,
@@ -35129,8 +35333,13 @@ mod tests {
             factorizer_king_progress_pair: false, factorizer_hand_progress_pair: false,
         };
         assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), Some(vec![0.5; 6]));
+        let mut changed=saved.clone(); changed.sfnn_factorizer_alpha=Some("king=1".parse().unwrap());
+        std::fs::write(dir.join(RESUME_CONFIG_NAME),resume_signature(&changed)).unwrap();
+        assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), None);
         std::fs::remove_file(settings).unwrap();
+        std::fs::remove_file(dir.join(RESUME_CONFIG_NAME)).unwrap();
         std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -35193,6 +35402,7 @@ mod tests {
         let mut expected_weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -35281,6 +35491,7 @@ mod tests {
         let original = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
             l1_last_reset_epoch: Some(0),
+            l1_suppress_until: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),

@@ -130,6 +130,11 @@ Rangerのslow paramsは `r` 倍、momentumは `1/r` 倍、velocityは `1/r²` �
 workerのrebaseは既存のGPUバッファをその場で更新し、重み一式のVRAMコピーを追加しません。
 通常のcheckpoint読み込みでは、アップロード前のCPU上の重み・optimizer stateをその場で変換します。
 
+L1 axis/pair係数の変更時も、保存済みの係数を使って重みとoptimizer stateを変換します。
+workerで係数を0にする場合は、旧axis/pair成分をL1本体へ畳み込んでから、その共有成分のoptimizer stateを初期化します。
+checkpointにaxis係数がない旧形式では、保存時の実効設定をcheckpoint内の記録から確認できない場合、安全のため読み込みを拒否します。
+残差count gateの変更時も出力を保つよう変換しますが、非ゼロからゼロへ変わるbucketは出力を保存できないためエラーになります。
+
 `state.bin` には `nnue/train/shared_coefficients` としてFTとL1 sharedの係数を保存します。
 この記録がないファイルは、FT係数を1として読み、L1 sharedは保存時の係数が不明なため自動rebaseせず警告します。
 そのファイルから再開する際は、保存時と同じL1 shared係数を指定してください。
