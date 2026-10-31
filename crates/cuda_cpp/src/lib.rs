@@ -1184,6 +1184,17 @@ impl SfnnFactorizerActive {
     }
 
     fn validate_for_shape(self, shape: SfnnForwardShape) -> Result<()> {
+        // CUDA lays out later axis rows using the active pair flags.  Those
+        // flags must match the allocation whenever any axis is in use.
+        if self.any_axis()
+            && (self.king_hand_pair != shape.factorizer_king_hand_pair
+                || self.king_progress_pair != shape.factorizer_king_progress_pair
+                || self.hand_progress_pair != shape.factorizer_hand_progress_pair)
+        {
+            return Err(CudaCppError::message(
+                "SFNN active pair layout differs from the allocated layout; rebuild the factorizer layout before changing pair settings",
+            ));
+        }
         if self.king_axis && shape.factorizer_king_axis_dim == 0 {
             return Err(CudaCppError::message("SFNN king-axis factorizer is active but the shape has no king axis"));
         }
@@ -10212,6 +10223,27 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn factorizer_rejects_pair_layout_mismatches() {
+        let shape = super::SfnnForwardShape {
+            num_stacks: 9 * 8,
+            factorizer_king_axis_dim: 3,
+            factorizer_progress_axis: true,
+            factorizer_king_progress_pair: true,
+            ..tiny_sfnn_shape()
+        };
+        let active = super::SfnnFactorizerActive {
+            shared: true, king_axis: true, progress_axis: true,
+            king_progress_pair: true, ..super::SfnnFactorizerActive::NONE
+        };
+        assert!(active.validate_for_shape(shape).is_ok());
+        assert!(super::SfnnFactorizerActive { king_progress_pair: false, ..active }
+            .validate_for_shape(shape).is_err());
+        assert!(active.validate_for_shape(super::SfnnForwardShape {
+            factorizer_king_progress_pair: false, ..shape
+        }).is_err());
+        assert!(super::SfnnFactorizerActive::SHARED.validate_for_shape(shape).is_ok());
+    }
     mod norm_loss_tests;
     mod validation_stats {
         include!("validation_stats_tests.rs");

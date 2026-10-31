@@ -11410,6 +11410,16 @@ impl WorkerSfnnSession {
         cache_dir: Option<std::path::PathBuf>,
         borda_dominators: Vec<WorkerBordaMetric>,
     ) -> Result<WorkerSfnnTrialOutcome, String> {
+        if trial_args.epoch_settings_json.is_some() {
+            return Err("epoch schedules are supported by standalone SFNN training/grid_search, not worker trials".into());
+        }
+        if trial_args.sfnn_ft_revival_requested() || trial_args.sfnn_l1_revival_requested()
+            || trial_args.sfnn_l2_revival_requested() {
+            return Err("revival is supported by standalone SFNN training/grid_search, not worker trials".into());
+        }
+        if effective_sfnn_factorizer_spec(&trial_args) != effective_sfnn_factorizer_spec(&self.args) {
+            return Err("worker trial cannot change the L1 factorizer layout; open a separate session with the desired setting".into());
+        }
         let trial_feature = worker_require_sfnn_feature(&trial_args)?;
         if trial_feature != self.feature_kind {
             return Err("worker trial feature kind differs from the opened session".to_string());
@@ -11547,8 +11557,13 @@ impl WorkerSfnnSession {
                 norm_loss_before: false,
                 clip_after_lookahead: true,
             };
-            let lr_multipliers =
+            let mut lr_multipliers =
                 cuda_cpp_sfnn_layer_lr_multipliers(&trial_args, schedule.progress_for_step(seen_steps));
+            if let Some(progress) = progress_for_step {
+                if l1_lr_suppressed(&trial_args, progress.epoch, progress.superbatch)? {
+                    lr_multipliers.l1 *= 0.1;
+                }
+            }
             let buckets = if let Some(progress_params) = frozen_progress_params.as_ref() {
                 if let Some(progress) = fast.progress.as_ref() {
                     let hard_progress_started = std::time::Instant::now();
