@@ -8864,6 +8864,7 @@ fn sfnn_initial_weights_into_readback(
     bulletou_cuda_cpp::SfnnTrainWeightsReadback {
         batch_norm: weights.batch_norm,
         l1_revival_flags: weights.l1_revival_flags,
+        l1_last_reset_epoch: weights.l1_last_reset_epoch,
         l2_revival_flags: weights.l2_revival_flags,
         revival_rng: weights.revival_rng,
         l0w: weights.l0w,
@@ -9714,6 +9715,7 @@ fn cuda_cpp_sfnn_factorized_quantized_proxy_weights_from_readback(
     let fc_bias_scale = qa * qb;
     let proxy = CudaCppSfnnInitialWeights {
         l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         batch_norm: Default::default(),
@@ -9845,6 +9847,7 @@ fn cuda_cpp_sfnn_dequantize_proxy_weights(weights: &QuantizedSfnnWeights) -> Res
 
     let proxy = CudaCppSfnnInitialWeights {
         l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         batch_norm: Default::default(),
@@ -10965,6 +10968,7 @@ impl WorkerSfnnSession {
         .map_err(|e| e.to_string())?;
         let count_settings = Self::apply_count_settings_to_runner(&args, shape, &ctx, &mut runner)?;
         runner.l1_revival_flags = initial_weights.l1_revival_flags;
+        runner.l1_last_reset_epoch = initial_weights.l1_last_reset_epoch;
         runner.l2_revival_flags = initial_weights.l2_revival_flags;
         runner.revival_rng = initial_weights.revival_rng;
         let dataloader_pos =
@@ -17796,6 +17800,7 @@ fn run_sfnn_l1_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     }
     eprintln!("  [L1 REVIVE] complete: {} units; Glorot L1 inputs, outgoing L2 +/-1/64, per-branch mean bias compensation (approximate, not pointwise-equivalent), selected moments reset; audit={}",ids.len(),path.display());
     audit.complete_layer("L1",ids.len())?;
+    if !ids.is_empty() { runner.l1_last_reset_epoch = Some(audit.epoch.checked_add(1).ok_or("L1 revival epoch overflow")?); }
     for i in ids {
         eprintln!("  [L1 REVIVE] bucket={} unit={} contribution={:.10} relative={:.6}% threshold={:.6}%",
             i/shape.l1_hidden,i%shape.l1_hidden,calibration.contribution.utility[i],
@@ -18344,6 +18349,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         bulletou_cuda_cpp::batch_norm::Config {epsilon:args.sfnn_bn_epsilon,momentum:args.sfnn_bn_momentum,
             initial_gamma:args.sfnn_bn_gamma,initial_beta:args.sfnn_bn_beta},&initial_weights.batch_norm).map_err(|e|e.to_string())?;
     runner.l1_revival_flags = initial_weights.l1_revival_flags;
+        runner.l1_last_reset_epoch = initial_weights.l1_last_reset_epoch;
     runner.l2_revival_flags = initial_weights.l2_revival_flags;
     runner.revival_rng = initial_weights.revival_rng;
     if runner.batch_norm.is_some() {
@@ -18634,6 +18640,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     )
                     .map_err(|e| e.to_string())?;
                     runner.revival_rng = snapshot_weights.revival_rng;
+                    runner.l1_last_reset_epoch = snapshot_weights.l1_last_reset_epoch;
                     if let Some((_, _, lambdas)) = sfnn_residual_count_decay.as_ref() {
                         runner
                             .set_residual_count_decay_by_stack(&ctx, Some(lambdas.as_slice()))
@@ -18997,7 +19004,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if let Some(progress) = progress_for_step {
             let key = (progress.epoch, progress.superbatch);
             if !l1_suppress_cache.is_some_and(|(e, sb, _)| (e, sb) == key) {
-                l1_suppress_cache = Some((key.0, key.1, l1_lr_suppressed(base_args, key.0, key.1)?));
+                l1_suppress_cache = Some((key.0, key.1, l1_lr_suppressed_with_reset(base_args, key.0, key.1, runner.l1_last_reset_epoch)?));
             }
             if l1_suppress_cache.is_some_and(|(_, _, active)| active) { lr_multipliers.l1 *= 0.1; }
         }
@@ -21600,6 +21607,7 @@ fn build_sfnn_validation_fast_batch(
 #[derive(Debug, Clone, PartialEq)]
 struct CudaCppSfnnInitialWeights {
     l1_revival_flags: u8,
+    l1_last_reset_epoch: Option<usize>,
     l2_revival_flags: u8,
     revival_rng: bulletou_cuda_cpp::revival_rng::RevivalRng,
     batch_norm: bulletou_cuda_cpp::batch_norm::NetworkState,
@@ -22129,6 +22137,7 @@ fn build_sfnn_initial_weights_for_cuda_cpp(
     let weights = CudaCppSfnnInitialWeights {
         batch_norm: Default::default(),
         l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
         l2_revival_flags: 0,
         revival_rng: Default::default(),
         shape,
@@ -22385,6 +22394,61 @@ fn rebase_loaded_sfnn_shared(
             "  initial shared rebase = FT {:.6} -> {:.6}, L1 shared {:.6} -> {:.6}",
             old[0], new[0], old[1], new[1]
         );
+    }
+    Ok(())
+}
+
+// Reparameterize the active axes when loading a checkpoint with different
+// alpha/confidence settings. Master and Lookahead tensors preserve the model;
+// moments transform with the inverse coordinate scale.
+#[cfg(feature = "cuda-cpp-backend")]
+fn rebase_loaded_sfnn_axes(
+    weights: &mut CudaCppSfnnInitialWeights,
+    optimizer: &mut Option<CudaCppSfnnOptimizerState>,
+    active: SfnnFactorizerSpec,
+    old: &[f32],
+    new: &[f32],
+) -> Result<(), String> {
+    let shape = weights.shape;
+    let count = shape.factorizer_axis_count();
+    if old.len() != count || new.len() != count || old.iter().chain(new).any(|x| !x.is_finite()) {
+        return Err("invalid checkpoint axis coefficients".into());
+    }
+    for axis in cuda_cpp_sfnn_factorizer_axis_indices(shape, active) {
+        if old[axis] == new[axis] { continue; }
+        if new[axis] == 0.0 && old[axis] != 0.0 {
+            return Err(format!("cannot preserve active L1 axis {axis} when its coefficient changes to zero; resume with the original coefficients and switch using an epoch schedule"));
+        }
+        let ratio = if new[axis] == 0.0 { 1.0 } else { old[axis] / new[axis] };
+        if !ratio.is_finite() || ratio < 0.0 || (ratio != 0.0 && (!(ratio * ratio).is_finite() || ratio * ratio == 0.0)) {
+            return Err(format!("invalid L1 axis {axis} coefficient rebase ratio"));
+        }
+        for is_bias in [false, true] {
+            let width = if is_bias { shape.l1_out() } else { shape.ft_size * shape.l1_out() };
+            let tensor = if is_bias { weights.l1axb.as_mut() } else { weights.l1axw.as_mut() }
+                .ok_or("missing active L1 axis tensor")?;
+            let range = axis * width..(axis + 1) * width;
+            for value in &mut tensor[range.clone()] {
+                *value *= ratio;
+                if !value.is_finite() { return Err(format!("L1 axis {axis} rebase overflow")); }
+            }
+            if let Some(opt) = optimizer.as_mut() {
+                let group = if is_bias { opt.l1axb.as_mut() } else { opt.l1axw.as_mut() }
+                    .ok_or("missing active L1 axis optimizer state")?;
+                for i in range {
+                    if ratio == 0.0 {
+                        group.momentum[i] = 0.0; group.velocity[i] = 0.0; group.slow_params[i] = 0.0;
+                    } else {
+                        group.momentum[i] /= ratio;
+                        group.velocity[i] /= ratio * ratio;
+                        group.slow_params[i] *= ratio;
+                        if !group.momentum[i].is_finite() || !group.velocity[i].is_finite() || !group.slow_params[i].is_finite() {
+                            return Err(format!("L1 axis {axis} optimizer rebase overflow"));
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -22673,11 +22737,24 @@ fn load_cuda_cpp_sfnn_initial_state(
     }
     let active = effective_sfnn_factorizer_spec(args);
     let inactive_nonzero = cuda_cpp_sfnn_has_nonzero_inactive_axis(&weights, active)?;
-    let legacy_axis_coefficients = if inactive_nonzero && !train.contains_key("axis_coefficients") {
+    let legacy_axis_coefficients = if (inactive_nonzero || (active.any_axis() && !created_factorizers.axis_l1)) && !train.contains_key("axis_coefficients") {
         legacy_checkpoint_axis_coefficients(path, weights.shape)
     } else { None };
     let source_axis_coefficients = train.get("axis_coefficients").map(Vec::as_slice)
         .or(legacy_axis_coefficients.as_deref());
+    if active.any_axis() && !created_factorizers.axis_l1 {
+        let counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
+        let new = checkpoint_axis_coefficients(weights.shape, effective_sfnn_factorizer_alpha(args), counts.factorizer_axis_confidences.as_deref());
+        let old = match source_axis_coefficients {
+            Some(old) => old,
+            None if args.initial_state.is_none() => {
+                eprintln!("  WARN: legacy checkpoint lacks axis coefficients; assuming unchanged settings for resume");
+                &new
+            },
+            None => return Err(format!("{} lacks saved L1 axis coefficients and its original settings cannot be reconstructed; cannot safely load active axis weights", path.display())),
+        };
+        rebase_loaded_sfnn_axes(&mut weights, &mut pre_migration_optimizer_states, active, old, &new)?;
+    }
     if inactive_nonzero {
         let coefficients = source_axis_coefficients.ok_or_else(|| format!(
             "{} lacks saved axis coefficients; cannot safely fold inactive L1 axes. Resume with the original factorizer and use an epoch schedule to switch it.", path.display()
@@ -22711,7 +22788,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     }
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
-    let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_steps(&step_ranger, &weights)?;
+    let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_sections(&train, &step_ranger, &weights)?;
     let optimizer_states = if created_factorizers.any() || folded_inactive_factorizers || progress_axis_appended {
         if progress_axis_appended {
             if keep_optimizer_state_on_factorizer_change {
@@ -23809,6 +23886,7 @@ fn load_cuda_cpp_sfnn_weights_from_records(
 
     let weights = CudaCppSfnnInitialWeights {
         batch_norm,
+        l1_last_reset_epoch: records.get("l1_last_reset_epoch_u16").map(|v| decode_sfnn_exact_step("l1_last_reset_epoch_u16", v)).transpose()?,
         revival_rng: records.get("revival_rng").map(|v| bulletou_cuda_cpp::revival_rng::RevivalRng::decode(v)).transpose()?.unwrap_or_default(),
         l1_revival_flags: match records.get("l1_revival_flags").map(Vec::as_slice) {
             None => 0,
@@ -24038,10 +24116,41 @@ fn load_cuda_cpp_sfnn_completed_steps_from_sections(
     steps: &BTreeMap<String, Vec<f32>>,
     weights: &CudaCppSfnnInitialWeights,
 ) -> Result<usize, String> {
+    if let Some(values) = train.get("completed_steps_u16") {
+        return decode_sfnn_exact_step("completed_steps_u16", values);
+    }
     if let Some(values) = train.get("completed_steps") {
         return load_cuda_cpp_single_step_record("SFNN", "nnue/train/completed_steps", values);
     }
     load_cuda_cpp_sfnn_optimizer_steps_from_steps(steps, weights)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn encode_sfnn_exact_step(value: usize) -> [f32; 4] {
+    let value = value as u64;
+    std::array::from_fn(|i| ((value >> (16 * i)) & 0xffff) as f32)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn decode_sfnn_exact_step(label: &str, values: &[f32]) -> Result<usize, String> {
+    if values.len() != 4 || values.iter().any(|v| !v.is_finite() || *v < 0.0 || *v > 65535.0 || v.fract() != 0.0) {
+        return Err(format!("invalid SFNN exact step record {label}"));
+    }
+    let mut value = 0u64;
+    for (i, &v) in values.iter().enumerate() { value |= (v as u64) << (16 * i); }
+    usize::try_from(value).map_err(|_| format!("SFNN exact step record {label} overflows usize"))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn load_cuda_cpp_sfnn_optimizer_steps_from_sections(
+    train: &BTreeMap<String, Vec<f32>>, steps: &BTreeMap<String, Vec<f32>>,
+    weights: &CudaCppSfnnInitialWeights,
+) -> Result<usize, String> {
+    if let Some(values) = train.get("optimizer_steps_u16") {
+        decode_sfnn_exact_step("optimizer_steps_u16", values)
+    } else {
+        load_cuda_cpp_sfnn_optimizer_steps_from_steps(steps, weights)
+    }
 }
 
 #[cfg(all(feature = "cuda-cpp-backend", test))]
@@ -24791,12 +24900,17 @@ fn write_cuda_cpp_sfnn_weights_bin(
     let bn_records=weights.batch_norm.0.iter().map(|s|s.as_ref().map(|s|s.encode()).transpose())
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
     let l1_revival_record = [weights.l1_revival_flags as f32];
+    let l1_last_reset_record = weights.l1_last_reset_epoch.map(encode_sfnn_exact_step);
     let l2_revival_record = [weights.l2_revival_flags as f32];
     let revival_rng_record = weights.revival_rng.encode();
     let completed_steps_record = [completed_steps as f32];
     let optimizer_steps_record = [optimizer_steps as f32];
+    let completed_steps_exact = encode_sfnn_exact_step(completed_steps);
+    let optimizer_steps_exact = encode_sfnn_exact_step(optimizer_steps);
     let mut records: Vec<(&str, &[f32])> = vec![
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
+        ("nnue/train/completed_steps_u16", completed_steps_exact.as_slice()),
+        ("nnue/train/optimizer_steps_u16", optimizer_steps_exact.as_slice()),
         ("nnue/train/shared_coefficients", shared_coefficients.as_slice()),
         ("nnue/weights/l0w", weights.l0w.as_slice()),
         ("nnue/weights/l0b", weights.l0b.as_slice()),
@@ -24815,6 +24929,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
         if let Some(v)=&bn_records[i] {records.push((key,v.as_slice()));}
     }
     records.push(("nnue/weights/l1_revival_flags", &l1_revival_record));
+    if let Some(ref value) = l1_last_reset_record { records.push(("nnue/weights/l1_last_reset_epoch_u16", value)); }
     records.push(("nnue/weights/l2_revival_flags", &l2_revival_record));
     records.push(("nnue/weights/revival_rng", &revival_rng_record));
     if let Some(progress_state) = progress_state {
@@ -25902,10 +26017,15 @@ fn print_sfnn_qat_mode(args: &Args) {
 // must not compound. Epoch 0 is the independent warmup, not epoch 1.
 #[cfg(feature = "cuda-cpp-backend")]
 fn l1_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool, String> {
+    l1_lr_suppressed_with_reset(args, epoch, superbatch, None)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_lr_suppressed_with_reset(args: &Args, epoch: usize, superbatch: usize, last_reset: Option<usize>) -> Result<bool, String> {
     if epoch == 1 && superbatch > 0 && superbatch <= args.sfnn_l1_initial_lr_suppress_sb {
         return Ok(true);
     }
-    l1_revival_lr_suppressed(args, epoch, superbatch)
+    l1_revival_lr_suppressed_with_reset(args, epoch, superbatch, last_reset)
 }
 
 // Revival occurs at the start of an enabled epoch. Count complete superbatches
@@ -25913,35 +26033,27 @@ fn l1_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool
 // also reconstructs the remaining interval when resuming a saved superbatch.
 #[cfg(feature = "cuda-cpp-backend")]
 fn l1_revival_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool, String> {
+    l1_revival_lr_suppressed_with_reset(args, epoch, superbatch, None)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_revival_lr_suppressed_with_reset(args: &Args, epoch: usize, superbatch: usize, last_reset: Option<usize>) -> Result<bool, String> {
     if args.sfnn_l1_revive_lr_suppress_sb == 0 && args.epoch_settings_json.is_none() { return Ok(false); }
     let mut elapsed = superbatch.saturating_sub(1);
     let mut e = epoch;
     loop {
         let at = args_at_epoch(args, e)?;
-        if at.sfnn_l1_revive && l1_revival_reset_count(&args.output_dir(), e) != Some(0) {
+        let reset_here = match last_reset {
+            Some(encoded) => encoded != 0 && encoded - 1 == e,
+            None => at.sfnn_l1_revive, // Legacy checkpoints lack reset metadata.
+        };
+        if reset_here {
             return Ok(elapsed < at.sfnn_l1_revive_lr_suppress_sb);
         }
         if e == 0 || (e == 1 && args.warmup_sb == 0) { return Ok(false); }
         e -= 1;
         elapsed = elapsed.saturating_add(configured_epoch_superbatches(args, e));
     }
-}
-
-// A missing summary (legacy runs, or a locked CSV) leaves the historical
-// schedule behavior in place.  The last completed row is authoritative when
-// an epoch was retried and therefore has several audit runs.
-#[cfg(feature = "cuda-cpp-backend")]
-fn l1_revival_reset_count(output_dir: &Path, epoch: usize) -> Option<usize> {
-    let text = std::fs::read_to_string(output_dir.join("revive-summary.csv")).ok()?;
-    let mut lines = text.lines();
-    let header: Vec<_> = lines.next()?.split(',').collect();
-    let epoch_col = header.iter().position(|&s| s.trim() == "epoch")?;
-    let count_col = header.iter().position(|&s| s.trim() == "l1_revived")?;
-    lines.filter_map(|line| {
-        let fields: Vec<_> = line.split(',').collect();
-        if fields.get(epoch_col)?.trim().parse::<usize>().ok()? != epoch { return None; }
-        fields.get(count_col)?.trim().parse::<usize>().ok()
-    }).last()
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -28386,6 +28498,36 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn exact_step_records_roundtrip_beyond_float_precision() {
+        for value in [0usize, 16_777_216, 16_777_217, 16_777_219, usize::MAX] {
+            assert_eq!(decode_sfnn_exact_step("test", &encode_sfnn_exact_step(value)).unwrap(), value);
+        }
+        for invalid in [&[0.0f32, 0.0, 0.0][..], &[65536.0, 0.0, 0.0, 0.0], &[0.5, 0.0, 0.0, 0.0]] {
+            assert!(decode_sfnn_exact_step("test", invalid).is_err());
+        }
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn loaded_active_axis_coefficients_preserve_effective_weights() {
+        let args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_ka2_32_8_32_k3k3", "--sfnn-l1-factorizer", "axis"]).unwrap();
+        let mut weights = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+        let active = effective_sfnn_factorizer_spec(&args);
+        let ids = cuda_cpp_sfnn_factorizer_axis_indices(weights.shape, active);
+        assert!(!ids.is_empty());
+        let axis = ids[0];
+        let width = weights.shape.l1_out();
+        weights.l1axb.as_mut().unwrap()[axis * width] = 2.0;
+        let mut old = vec![1.0; weights.shape.factorizer_axis_count()];
+        let new = old.clone();
+        old[axis] = 0.5;
+        rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &old, &new).unwrap();
+        assert_eq!(weights.l1axb.as_ref().unwrap()[axis * width], 1.0);
+        let mut zero = new.clone(); zero[axis] = 0.0;
+        assert!(rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &new, &zero).is_err());
+    }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn l1_revival_flags_load_legacy_and_validate() {
@@ -33186,24 +33328,16 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
-    fn l1_suppression_uses_latest_completed_revival_count() {
-        let dir = std::env::temp_dir().join(format!("bulletou-revival-count-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("revive-summary.csv");
-        std::fs::write(&path, "epoch,run,l1_revived\n2,1,7\n3,1,9\n2,2,0\n").unwrap();
-        assert_eq!(l1_revival_reset_count(&dir, 2), Some(0));
-        assert_eq!(l1_revival_reset_count(&dir, 3), Some(9));
-        assert_eq!(l1_revival_reset_count(&dir, 4), None);
+    fn l1_suppression_uses_checkpoint_reset_state_not_summary() {
         let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
             "--arch", "SFNN_halfka2_1536_15_64_k3k3", "--superbatches", "64", "--max-epochs", "4"]).unwrap();
-        args.output = Some(dir.clone());
         args.sfnn_l1_revive_lr_suppress_sb = 16;
         args.epoch_settings_json = Some(serde_json::json!({"sfnn_l1_revive":{"epoch1":false,"epoch2":true,"epoch3":false}}).to_string());
-        assert!(!l1_revival_lr_suppressed(&args, 2, 1).unwrap());
-        std::fs::write(&path, "epoch,run,l1_revived\n2,1,7\n").unwrap();
-        assert!(l1_revival_lr_suppressed(&args, 2, 1).unwrap());
-        std::fs::remove_file(path).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        assert!(!l1_revival_lr_suppressed_with_reset(&args, 2, 1, Some(0)).unwrap());
+        assert!(l1_revival_lr_suppressed_with_reset(&args, 2, 1, Some(3)).unwrap());
+        assert!(l1_revival_lr_suppressed_with_reset(&args, 2, 16, Some(3)).unwrap());
+        assert!(!l1_revival_lr_suppressed_with_reset(&args, 2, 17, Some(3)).unwrap());
+        assert!(l1_revival_lr_suppressed_with_reset(&args, 2, 1, None).unwrap());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -34015,6 +34149,7 @@ mod tests {
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -34286,6 +34421,7 @@ mod tests {
 
         let weights = bulletou_cuda_cpp::SfnnTrainWeightsReadback {
             l1_revival_flags: 3,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 3,
             revival_rng: { let mut rng=bulletou_cuda_cpp::revival_rng::RevivalRng::default(); for _ in 0..137 {rng.signed_uniform();} rng },
             batch_norm: Default::default(),
@@ -34344,6 +34480,9 @@ mod tests {
         let records = parse_model_weights_bin(&bytes).unwrap();
 
         assert_eq!(records["nnue/train/shared_coefficients"], vec![0.5, 0.75]);
+        assert_eq!(decode_sfnn_exact_step("completed", &records["nnue/train/completed_steps_u16"]).unwrap(), 1234);
+        assert_eq!(decode_sfnn_exact_step("optimizer", &records["nnue/train/optimizer_steps_u16"]).unwrap(), 11);
+        assert_eq!(decode_sfnn_exact_step("reset", &records["nnue/weights/l1_last_reset_epoch_u16"]).unwrap(), 0);
         assert_eq!(records["nnue/train/axis_coefficients"], vec![0.25, 0.5]);
         assert_eq!(records["nnue/train/residual_count_gates"], vec![0.9]);
         assert_eq!(records["nnue/weights/l1_revival_flags"], vec![3.0]);
@@ -34417,6 +34556,7 @@ mod tests {
         };
         let weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -34853,6 +34993,7 @@ mod tests {
         let l2_in = shape.l2_in();
         let weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -35049,6 +35190,7 @@ mod tests {
 
         let mut expected_weights = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),
@@ -35136,6 +35278,7 @@ mod tests {
         let l2_in = shape.l2_in();
         let original = CudaCppSfnnInitialWeights {
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             batch_norm: Default::default(),

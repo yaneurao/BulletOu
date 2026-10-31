@@ -5996,6 +5996,8 @@ impl<'a> SfnnTrainStepHostBatch<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SfnnTrainWeightsReadback {
     pub l1_revival_flags: u8,
+    /// Encoded last actual L1 reset epoch (0 = none, None = legacy unknown).
+    pub l1_last_reset_epoch: Option<usize>,
     pub l2_revival_flags: u8,
     pub revival_rng: revival_rng::RevivalRng,
     pub batch_norm: batch_norm::NetworkState,
@@ -6121,6 +6123,8 @@ impl SfnnTrainStepUploadSlot {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
     pub l1_revival_flags: u8,
+    /// Encoded last actual L1 reset epoch (0 = none, None = legacy unknown).
+    pub l1_last_reset_epoch: Option<usize>,
     pub l2_revival_flags: u8,
     pub revival_rng: revival_rng::RevivalRng,
     layer_qat: layer_qat::State,
@@ -6161,6 +6165,8 @@ pub struct SfnnTrainStepRunner {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunnerSnapshot {
     pub l1_revival_flags: u8,
+    /// Encoded last actual L1 reset epoch (0 = none, None = legacy unknown).
+    pub l1_last_reset_epoch: Option<usize>,
     pub l2_revival_flags: u8,
     pub revival_rng: revival_rng::RevivalRng,
     pub batch_norm: batch_norm::NetworkState,
@@ -6518,6 +6524,7 @@ impl SfnnTrainStepRunner {
             bn_qat: None,
             layer_qat: Default::default(),
             l1_revival_flags: 0,
+            l1_last_reset_epoch: Some(0),
             l2_revival_flags: 0,
             revival_rng: Default::default(),
             output_center_bucketwise: std::env::var("BULLETOU_EXPERIMENT_OUTPUT_CENTER_BUCKET").as_deref()==Ok("1"),
@@ -7076,6 +7083,7 @@ impl SfnnTrainStepRunner {
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
             l1_revival_flags: self.l1_revival_flags,
+            l1_last_reset_epoch: self.l1_last_reset_epoch,
             l2_revival_flags: self.l2_revival_flags,
             revival_rng: self.revival_rng,
             batch_norm: self.read_batch_norm_state(ctx)?,
@@ -7089,6 +7097,7 @@ impl SfnnTrainStepRunner {
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
         self.layer_qat.invalidate();
         self.l1_revival_flags = src.l1_revival_flags;
+        self.l1_last_reset_epoch = src.l1_last_reset_epoch;
         self.l2_revival_flags = src.l2_revival_flags;
         self.revival_rng = src.revival_rng;
         self.restore_batch_norm(ctx,&src.batch_norm)?;
@@ -7707,6 +7716,7 @@ impl SfnnTrainStepRunner {
     pub fn read_weights(&self, ctx: &Context) -> Result<SfnnTrainWeightsReadback> {
         Ok(SfnnTrainWeightsReadback {
             l1_revival_flags: self.l1_revival_flags,
+            l1_last_reset_epoch: self.l1_last_reset_epoch,
             l2_revival_flags: self.l2_revival_flags,
             revival_rng: self.revival_rng,
             batch_norm: self.read_batch_norm_state(ctx)?,
