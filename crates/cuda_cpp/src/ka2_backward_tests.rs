@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+#[ignore = "requires CUDA; checks large king/hand/progress axis and pair indexing"]
+fn large_king_hand_progress_axis_pair_quantization_matches_reference() {
+    let ctx=Context::new(0).unwrap();
+    for hand_dim in [16usize,32] {
+        let k=9usize; let h=hand_dim*hand_dim; let p=8usize; let nk=k*k; let stacks=nk*h*p;
+        let shape=SfnnForwardShape {input_size:4,ft_size:2,l1_hidden:1,l1_skip:true,l2_size:1,num_stacks:stacks,
+          factorizer_king_axis_dim:k,factorizer_hand_axis_dim:hand_dim,factorizer_progress_axis:true,
+          factorizer_king_hand_pair:true,factorizer_king_progress_pair:true,factorizer_hand_progress_pair:true,..tiny_sfnn_shape()};
+        let axis_count=shape.factorizer_axis_count(); let out=shape.l1_out();
+        let l0w=vec![0.1;8]; let l0b=vec![0.5;2]; let l1w=vec![0.0;stacks*2*out]; let l1b=vec![0.0;stacks*out];
+        let l1fw=vec![0.0;2*out]; let l1fb=vec![0.0;out]; let aw=vec![0.0;axis_count*2*out];
+        let ab:Vec<f32>=(0..axis_count*out).map(|i|((i/out)%97) as f32/8128.0).collect();
+        let l2w=vec![0.0;stacks*2]; let l2b=vec![0.0;stacks]; let l3w=vec![0.0;stacks]; let l3b=vec![0.0;stacks];
+        let weights=SfnnForwardHostWeights {shape,l0w:&l0w,l0b:&l0b,l1w:&l1w,l1b:&l1b,l1fw:Some(&l1fw),l1fb:Some(&l1fb),
+          l1axw:Some(&aw),l1axb:Some(&ab),l2w:&l2w,l2b:&l2b,l3w:&l3w,l3b:&l3b,
+          l2fw:None,l2fb:None,l2axw:None,l2axb:None,l3fw:None,l3fb:None,l3axw:None,l3axb:None};
+        let source=SfnnForwardDeviceWeights::from_host(&ctx,weights).unwrap();
+        let ps=SfnnForwardShape {factorizer_king_axis_dim:0,factorizer_hand_axis_dim:0,factorizer_progress_axis:false,
+          factorizer_king_hand_pair:false,factorizer_king_progress_pair:false,factorizer_hand_progress_pair:false,..shape};
+        let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,ps).unwrap();
+        let active=SfnnFactorizerActive {shared:true,king_axis:true,hand_axis:true,progress_axis:true,
+          king_hand_pair:true,king_progress_pair:true,hand_progress_pair:true};
+        sfnn_build_quantized_proxy_device(&ctx,4,0,&source,&proxy,active,SfnnFactorizerAlpha::ONE,None,None).unwrap();
+        let actual=proxy.l1b.download(&ctx).unwrap();
+        for &stack in &[0,1,7,8,647,648,stacks/2,stacks-2,stacks-1] {
+            let progress=stack%p; let king=(stack/p)%nk; let hand=(stack/p/nk)%h; let base=2*k+2*hand_dim;
+            let ids=[king/k,k+king%k,2*k+hand/hand_dim,2*k+hand_dim+hand%hand_dim,
+              base+hand*nk+king,base+h*nk+progress*nk+king,
+              base+h*nk+p*nk+progress*h+hand,base+h*nk+p*nk+p*h+progress];
+            let expected: f32=ids.iter().map(|&id|ab[id*out]).sum();
+            assert!((actual[stack*out]-expected).abs()<1e-6,"hand_dim={hand_dim} stack={stack}");
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires CUDA; compares compact axis reduction to the original general reducer"]
 fn compact_axis_backward_matches_reference_with_qat_and_bpu() {
     unsafe extern "C" {

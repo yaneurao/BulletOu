@@ -285,6 +285,16 @@ mod tests {
         r.switch_l1_factorizer(&ctx,old,r.factorizer,zero,&coefficients).unwrap();
         r.forward_current_weights(&ctx,&batch,&workspace).unwrap();
         for (a,b) in before.iter().zip(workspace.download_output(&ctx).unwrap()) {assert!((a-b).abs()<1e-5);}
+        r.set_factorizer_config(r.factorizer,alpha).unwrap();
+        r.weights.l1axw.as_ref().unwrap().fill(&ctx,0.03125).unwrap();
+        r.weights.l1axb.as_ref().unwrap().fill(&ctx,0.0625).unwrap();
+        r.forward_current_weights(&ctx,&batch,&workspace).unwrap();
+        let before=workspace.download_output(&ctx).unwrap();
+        r.rebase_axis_factorizer_terms(&ctx,&vec![1000.0;old.factorizer_axis_count()]).unwrap();
+        let small=SfnnFactorizerAlpha {king_axis:alpha.king_axis/1000.0,progress_axis:alpha.progress_axis/1000.0,..alpha};
+        r.set_factorizer_config(r.factorizer,small).unwrap();
+        r.forward_current_weights(&ctx,&batch,&workspace).unwrap();
+        for (a,b) in before.iter().zip(workspace.download_output(&ctx).unwrap()) {assert!((a-b).abs()<1e-5);}
     }
 
 }
