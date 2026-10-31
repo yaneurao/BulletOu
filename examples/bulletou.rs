@@ -26031,7 +26031,7 @@ fn l1_lr_suppressed_with_reset(args: &Args, epoch: usize, superbatch: usize, las
 // Revival occurs at the start of an enabled epoch. Count complete superbatches
 // from the most recent enabled epoch, including across epoch boundaries; this
 // also reconstructs the remaining interval when resuming a saved superbatch.
-#[cfg(feature = "cuda-cpp-backend")]
+#[cfg(all(feature = "cuda-cpp-backend", test))]
 fn l1_revival_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Result<bool, String> {
     l1_revival_lr_suppressed_with_reset(args, epoch, superbatch, None)
 }
@@ -33566,6 +33566,8 @@ mod tests {
             let summary=std::fs::read_to_string(directory.join("revive-summary.csv")).unwrap();
             let fields:Vec<_>=summary.lines().last().unwrap().split(',').collect();
             assert_eq!(fields[18],"8");
+            assert_eq!(runner.l1_last_reset_epoch, Some(5));
+            assert_eq!(runner.read_weights(&ctx).unwrap().l1_last_reset_epoch, Some(5));
             assert_eq!(runner.read_weights(&ctx).unwrap().l1w.len(),weights.l1w.len());
         }
         std::fs::remove_dir_all(directory).unwrap();
