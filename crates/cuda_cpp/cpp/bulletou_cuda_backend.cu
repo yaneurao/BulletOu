@@ -2666,140 +2666,6 @@ __global__ void sfnn_dense_param_reduce_accum_stacks_kernel(
     }
 }
 
-__global__ void sfnn_fold_stacked_param_gradients_to_factorizers_kernel(
-    const float* weight_gradients,
-    const float* bias_gradients,
-    float* shared_weight_gradients,
-    float* shared_bias_gradients,
-    float* axis_weight_gradients,
-    float* axis_bias_gradients,
-    size_t input_dim,
-    size_t output_dim,
-    size_t num_stacks,
-    size_t factorizer_king_axis_dim,
-    size_t factorizer_hand_axis_dim,
-    int has_shared,
-    int shared_weight_input_major,
-    int has_axis,
-    int use_king_axis,
-    int use_hand_axis,
-    int use_progress_axis,
-    int use_king_hand_pair,
-    int use_king_progress_pair,
-    int use_hand_progress_pair,
-    float shared_alpha,
-    float king_axis_alpha,
-    float hand_axis_alpha,
-    float progress_axis_alpha,
-    float pair_alpha,
-    const float* factorizer_axis_confidences) {
-    const size_t weight_cell_count = input_dim * output_dim;
-    const size_t weight_total = num_stacks * weight_cell_count;
-    const size_t bias_total = num_stacks * output_dim;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = weight_total > bias_total ? weight_total : bias_total;
-    if (tid >= total) {
-        return;
-    }
-
-    if (tid < weight_total) {
-        const float grad = weight_gradients[tid];
-        if (grad != 0.0f) {
-            const size_t stack = tid / weight_cell_count;
-            const size_t cell = tid - stack * weight_cell_count;
-            const size_t out_col = cell / input_dim;
-            const size_t in_col = cell - out_col * input_dim;
-            const size_t factorizer_cell = shared_weight_input_major != 0
-                ? in_col * output_dim + out_col
-                : cell;
-            if (has_shared != 0) {
-                atomicAdd(&shared_weight_gradients[factorizer_cell], shared_alpha * grad);
-            }
-            if (has_axis != 0) {
-                size_t axis_ids[8];
-                const size_t axis_count = sfnn_factorizer_axis_ids(
-                    stack,
-                    num_stacks,
-                    factorizer_king_axis_dim,
-                    factorizer_hand_axis_dim,
-                    use_king_axis,
-                    use_hand_axis,
-                    use_progress_axis,
-                    use_king_hand_pair,
-                    use_king_progress_pair,
-                    use_hand_progress_pair,
-                    axis_ids);
-                float axis_alphas[8];
-                sfnn_factorizer_axis_alphas(
-                    axis_ids,
-                    axis_count,
-                    num_stacks,
-                    factorizer_king_axis_dim,
-                    factorizer_hand_axis_dim,
-                    use_king_hand_pair,
-                    use_king_progress_pair,
-                    use_hand_progress_pair,
-                    king_axis_alpha,
-                    hand_axis_alpha,
-                    progress_axis_alpha,
-                    pair_alpha,
-                    factorizer_axis_confidences,
-            axis_alphas);
-                for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
-                    atomicAdd(
-                        &axis_weight_gradients[axis_ids[axis_idx] * weight_cell_count + factorizer_cell],
-                        axis_alphas[axis_idx] * grad);
-                }
-            }
-        }
-    }
-
-    if (tid < bias_total) {
-        const float grad = bias_gradients[tid];
-        if (grad != 0.0f) {
-            const size_t stack = tid / output_dim;
-            const size_t out_col = tid - stack * output_dim;
-            if (has_shared != 0) {
-                atomicAdd(&shared_bias_gradients[out_col], shared_alpha * grad);
-            }
-            if (has_axis != 0) {
-                size_t axis_ids[8];
-                const size_t axis_count = sfnn_factorizer_axis_ids(
-                    stack,
-                    num_stacks,
-                    factorizer_king_axis_dim,
-                    factorizer_hand_axis_dim,
-                    use_king_axis,
-                    use_hand_axis,
-                    use_progress_axis,
-                    use_king_hand_pair,
-                    use_king_progress_pair,
-                    use_hand_progress_pair,
-                    axis_ids);
-                float axis_alphas[8];
-                sfnn_factorizer_axis_alphas(
-                    axis_ids,
-                    axis_count,
-                    num_stacks,
-                    factorizer_king_axis_dim,
-                    factorizer_hand_axis_dim,
-                    use_king_hand_pair,
-                    use_king_progress_pair,
-                    use_hand_progress_pair,
-                    king_axis_alpha,
-                    hand_axis_alpha,
-                    progress_axis_alpha,
-                    pair_alpha,
-                    factorizer_axis_confidences,
-            axis_alphas);
-                for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
-                    atomicAdd(&axis_bias_gradients[axis_ids[axis_idx] * output_dim + out_col], axis_alphas[axis_idx] * grad);
-                }
-            }
-        }
-    }
-}
-
 __global__ void sfnn_add_saturation_penalty_gradients_kernel(
     const float* weights,
     const float* shared_weights,
@@ -5945,86 +5811,6 @@ int launch_sfnn_dense_param_reduce_tiled(
     return 0;
 }
 
-int launch_sfnn_fold_stacked_param_gradients_to_factorizers(
-    BulletOuCudaCppContext* ctx,
-    const float* weight_gradients,
-    const float* bias_gradients,
-    float* shared_weight_gradients,
-    float* shared_bias_gradients,
-    float* axis_weight_gradients,
-    float* axis_bias_gradients,
-    size_t input_dim,
-    size_t output_dim,
-    size_t num_stacks,
-    size_t factorizer_king_axis_dim,
-    size_t factorizer_hand_axis_dim,
-    int has_shared,
-    int shared_weight_input_major,
-    int has_axis,
-    int use_king_axis,
-    int use_hand_axis,
-    int use_progress_axis,
-    int use_king_hand_pair,
-    int use_king_progress_pair,
-    int use_hand_progress_pair,
-    float shared_alpha,
-    float king_axis_alpha,
-    float hand_axis_alpha,
-    float progress_axis_alpha,
-    float pair_alpha,
-    const float* factorizer_axis_confidences,
-    const char* label) {
-    if ((has_shared == 0 && has_axis == 0) || input_dim == 0 || output_dim == 0 || num_stacks == 0) {
-        return 0;
-    }
-    if (input_dim > SIZE_MAX / output_dim) {
-        return fail_message("sfnn factorizer gradient fold weight cell overflow");
-    }
-    const size_t weight_cell_count = input_dim * output_dim;
-    if (num_stacks > SIZE_MAX / weight_cell_count || num_stacks > SIZE_MAX / output_dim) {
-        return fail_message("sfnn factorizer gradient fold total size overflow");
-    }
-    const size_t weight_total = num_stacks * weight_cell_count;
-    const size_t bias_total = num_stacks * output_dim;
-    const size_t total = std::max(weight_total, bias_total);
-    int blocks = 0;
-    constexpr int threads = 256;
-    if (block_count_1d(total, threads, &blocks, label) != 0) {
-        return -1;
-    }
-    sfnn_fold_stacked_param_gradients_to_factorizers_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        weight_gradients,
-        bias_gradients,
-        shared_weight_gradients,
-        shared_bias_gradients,
-        axis_weight_gradients,
-        axis_bias_gradients,
-        input_dim,
-        output_dim,
-        num_stacks,
-        factorizer_king_axis_dim,
-        factorizer_hand_axis_dim,
-        has_shared,
-        shared_weight_input_major,
-        has_axis,
-        use_king_axis,
-        use_hand_axis,
-        use_progress_axis,
-        use_king_hand_pair,
-        use_king_progress_pair,
-        use_hand_progress_pair,
-        shared_alpha,
-        king_axis_alpha,
-        hand_axis_alpha,
-        progress_axis_alpha,
-        pair_alpha,
-        factorizer_axis_confidences);
-    if (check_kernel_launch(label) != 0) {
-        return -1;
-    }
-    return 0;
-}
-
 int launch_sfnn_add_saturation_penalty_gradients(
     BulletOuCudaCppContext* ctx,
     const float* weights,
@@ -6634,6 +6420,9 @@ int launch_sfnn_backward_kernels(
     if (block_count_1d(l3_threads, threads, &blocks, "sfnn_stacked_l3_backward_kernel") != 0) {
         return -1;
     }
+    // The scatter path accumulates each microbatch directly into shared/axis
+    // gradients; folding cumulative stack gradients here would count older
+    // microbatches repeatedly when batches_per_update is greater than one.
     sfnn_stacked_l3_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
         l2,
         mean_output_gradients,
@@ -6672,43 +6461,11 @@ int launch_sfnn_backward_kernels(
         residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
-        0);
+        dense_param_reduce_fast_path ? 0 : 1);
     if (check_kernel_launch("sfnn_stacked_l3_backward_kernel launch") != 0) {
         return -1;
     }
-    if (!dense_param_reduce_fast_path) {
-        if (launch_sfnn_fold_stacked_param_gradients_to_factorizers(
-                ctx,
-                l3w_gradients,
-                l3b_gradients,
-                has_l3f != 0 ? l3fw_gradients : nullptr,
-                has_l3f != 0 ? l3fb_gradients : nullptr,
-                has_l3ax != 0 ? l3axw_gradients : nullptr,
-                has_l3ax != 0 ? l3axb_gradients : nullptr,
-                l2_size,
-                1,
-                num_stacks,
-                factorizer_king_axis_dim,
-                factorizer_hand_axis_dim,
-                has_l3f,
-                0,
-                has_l3ax,
-                use_king_axis,
-                use_hand_axis,
-                use_progress_axis,
-                use_king_hand_pair,
-                use_king_progress_pair,
-                use_hand_progress_pair,
-                factorizer_shared_alpha,
-                factorizer_king_axis_alpha,
-                factorizer_hand_axis_alpha,
-                factorizer_progress_axis_alpha,
-                factorizer_pair_alpha,
-                factorizer_axis_confidences,
-                "sfnn fold L3 factorizer gradients") != 0) {
-            return -1;
-        }
-    }
+
     if (dense_param_reduce_fast_path) {
         if (launch_sfnn_dense_param_reduce_tiled(
                 ctx,
@@ -6805,43 +6562,11 @@ int launch_sfnn_backward_kernels(
         residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
-        0, ctx->bn[2].params != nullptr);
+        dense_param_reduce_fast_path ? 0 : 1, ctx->bn[2].params != nullptr);
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
         return -1;
     }
-    if (!dense_param_reduce_fast_path) {
-        if (launch_sfnn_fold_stacked_param_gradients_to_factorizers(
-                ctx,
-                l2w_gradients,
-                l2b_gradients,
-                has_l2f != 0 ? l2fw_gradients : nullptr,
-                has_l2f != 0 ? l2fb_gradients : nullptr,
-                has_l2ax != 0 ? l2axw_gradients : nullptr,
-                has_l2ax != 0 ? l2axb_gradients : nullptr,
-                l2_in,
-                l2_size,
-                num_stacks,
-                factorizer_king_axis_dim,
-                factorizer_hand_axis_dim,
-                has_l2f,
-                0,
-                has_l2ax,
-                use_king_axis,
-                use_hand_axis,
-                use_progress_axis,
-                use_king_hand_pair,
-                use_king_progress_pair,
-                use_hand_progress_pair,
-                factorizer_shared_alpha,
-                factorizer_king_axis_alpha,
-                factorizer_hand_axis_alpha,
-                factorizer_progress_axis_alpha,
-                factorizer_pair_alpha,
-                factorizer_axis_confidences,
-                "sfnn fold L2 factorizer gradients") != 0) {
-            return -1;
-        }
-    }
+
     if (dense_param_reduce_fast_path) {
         if (launch_sfnn_dense_param_reduce_tiled(
                 ctx,
@@ -7048,7 +6773,7 @@ int launch_sfnn_backward_kernels(
             residual_count_gates, \
             factorizer_axis_confidences, \
             reduce_l1_params ? 0 : 1, \
-            compact ? 1 : 0, l1_group_count, l1_common_size, l1_shard_size)
+            reduce_l1_params ? 0 : 1, l1_group_count, l1_common_size, l1_shard_size)
             if (compact) { LAUNCH_L1_BACKWARD(true); }
             else { LAUNCH_L1_BACKWARD(false); }
 #undef LAUNCH_L1_BACKWARD
@@ -7056,39 +6781,7 @@ int launch_sfnn_backward_kernels(
         if (check_kernel_launch("sfnn_factorized_l1_backward_kernel launch") != 0) {
             return -1;
         }
-        if (!reduce_l1_params && !compact) {
-            if (launch_sfnn_fold_stacked_param_gradients_to_factorizers(
-                    ctx,
-                    l1w_gradients,
-                    l1b_gradients,
-                    has_l1f != 0 ? l1fw_gradients : nullptr,
-                    has_l1f != 0 ? l1fb_gradients : nullptr,
-                    has_l1ax != 0 ? l1axw_gradients : nullptr,
-                    has_l1ax != 0 ? l1axb_gradients : nullptr,
-                    ft_size,
-                    l1_out,
-                    num_stacks,
-                    factorizer_king_axis_dim,
-                    factorizer_hand_axis_dim,
-                    has_l1f,
-                    1,
-                    has_l1ax,
-                    use_king_axis,
-                    use_hand_axis,
-                    use_progress_axis,
-                    use_king_hand_pair,
-                    use_king_progress_pair,
-                    use_hand_progress_pair,
-                    factorizer_shared_alpha,
-                    factorizer_king_axis_alpha,
-                    factorizer_hand_axis_alpha,
-                    factorizer_progress_axis_alpha,
-                    factorizer_pair_alpha,
-                    factorizer_axis_confidences,
-                    "sfnn fold L1 factorizer gradients") != 0) {
-                return -1;
-            }
-        }
+
         if (reduce_l1_params) {
             if (launch_sfnn_dense_param_reduce_tiled(
                     ctx,

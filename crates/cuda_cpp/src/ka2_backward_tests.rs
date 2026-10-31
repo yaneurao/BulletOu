@@ -194,7 +194,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
     let targets: Vec<f32> = (0..N).map(|i| (i % 11) as f32 / 10.0).collect();
     let entries: Vec<f32> = (0..N).map(|i| if i % 5 == 0 { 0.0 } else { 1.0 }).collect();
     for (stacks, king, hand, progress, pairs, hidden) in
-        [(648, 9, 0, true, false, 15)]
+        [(648, 9, 0, true, false, 15), (81, 9, 0, false, false, 15), (1024, 0, 32, false, false, 15)]
     {
         let shape = SfnnForwardShape {
             input_size: 4,
@@ -207,7 +207,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
             factorizer_hand_axis_dim: hand,
             factorizer_progress_axis: progress,
             factorizer_king_hand_pair: pairs,
-            factorizer_king_progress_pair: true,
+            factorizer_king_progress_pair: king != 0 && progress,
             ..tiny_sfnn_shape()
         };
         let values = |n, scale| (0..n).map(|i| ((i * 17 % 101) as f32 - 50.0) * scale).collect::<Vec<_>>();
@@ -224,6 +224,14 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
         let b2 = vec![0.3; stacks * 4];
         let w3 = values(stacks * 4, 0.1);
         let b3 = vec![0.0; stacks];
+        let f2w = values(hidden * 2 * 4, 0.0001);
+        let f2b = vec![0.01; 4];
+        let a2w = values(shape.factorizer_axis_count() * hidden * 2 * 4, 0.0001);
+        let a2b = values(shape.factorizer_axis_count() * 4, 0.0001);
+        let f3w = values(4, 0.001);
+        let f3b = vec![0.01];
+        let a3w = values(shape.factorizer_axis_count() * 4, 0.0001);
+        let a3b = values(shape.factorizer_axis_count(), 0.0001);
         let host = SfnnForwardHostWeights {
             shape,
             l0w: &w0,
@@ -238,10 +246,14 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
             l2b: &b2,
             l3w: &w3,
             l3b: &b3,
-            l2fw: None,
-            l2fb: None,
-            l3fw: None,
-            l3fb: None,
+            l2fw: Some(&f2w),
+            l2fb: Some(&f2b),
+            l2axw: Some(&a2w),
+            l2axb: Some(&a2b),
+            l3fw: Some(&f3w),
+            l3fb: Some(&f3b),
+            l3axw: Some(&a3w),
+            l3axb: Some(&a3b),
             ..tiny_sfnn_weights(tiny_sfnn_shape())
         };
         let buckets: Vec<i32> = (0..N).map(|i| if i % 2 == 0 { 42 } else { (i % (stacks - 1)) as i32 }).collect();
@@ -352,6 +364,14 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                         ("bias", &a.l1b_gradients, &doubled.l1b_gradients),
                         ("shared", &a.l1fw_gradients, &doubled.l1fw_gradients),
                         ("shared bias", &a.l1fb_gradients, &doubled.l1fb_gradients),
+                        ("L2 shared weight", &a.l2fw_gradients, &doubled.l2fw_gradients),
+                        ("L2 shared bias", &a.l2fb_gradients, &doubled.l2fb_gradients),
+                        ("L2 axis weight", &a.l2axw_gradients, &doubled.l2axw_gradients),
+                        ("L2 axis bias", &a.l2axb_gradients, &doubled.l2axb_gradients),
+                        ("L3 shared weight", &a.l3fw_gradients, &doubled.l3fw_gradients),
+                        ("L3 shared bias", &a.l3fb_gradients, &doubled.l3fb_gradients),
+                        ("L3 axis weight", &a.l3axw_gradients, &doubled.l3axw_gradients),
+                        ("L3 axis bias", &a.l3axb_gradients, &doubled.l3axb_gradients),
                     ] {
                         for (&x, &y) in first.iter().zip(next) {
                             assert!((2.0*x-y).abs() < 2e-6 + x.abs()*6e-4, "{name}: {x} vs {y}");
