@@ -25808,13 +25808,30 @@ fn l1_revival_lr_suppressed(args: &Args, epoch: usize, superbatch: usize) -> Res
     let mut e = epoch;
     loop {
         let at = args_at_epoch(args, e)?;
-        if at.sfnn_l1_revive {
+        if at.sfnn_l1_revive && l1_revival_reset_count(&args.output_dir(), e) != Some(0) {
             return Ok(elapsed < at.sfnn_l1_revive_lr_suppress_sb);
         }
         if e == 0 || (e == 1 && args.warmup_sb == 0) { return Ok(false); }
         e -= 1;
         elapsed = elapsed.saturating_add(configured_epoch_superbatches(args, e));
     }
+}
+
+// A missing summary (legacy runs, or a locked CSV) leaves the historical
+// schedule behavior in place.  The last completed row is authoritative when
+// an epoch was retried and therefore has several audit runs.
+#[cfg(feature = "cuda-cpp-backend")]
+fn l1_revival_reset_count(output_dir: &Path, epoch: usize) -> Option<usize> {
+    let text = std::fs::read_to_string(output_dir.join("revive-summary.csv")).ok()?;
+    let mut lines = text.lines();
+    let header: Vec<_> = lines.next()?.split(',').collect();
+    let epoch_col = header.iter().position(|&s| s.trim() == "epoch")?;
+    let count_col = header.iter().position(|&s| s.trim() == "l1_revived")?;
+    lines.filter_map(|line| {
+        let fields: Vec<_> = line.split(',').collect();
+        if fields.get(epoch_col)?.trim().parse::<usize>().ok()? != epoch { return None; }
+        fields.get(count_col)?.trim().parse::<usize>().ok()
+    }).last()
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -33055,6 +33072,28 @@ mod tests {
         assert!(!resume_signature_matches(&old, &args));
         args.lr_schedule = LrScheduleKind::Plateau;
         assert!(args.validate_arch_flags().is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn l1_suppression_uses_latest_completed_revival_count() {
+        let dir = std::env::temp_dir().join(format!("bulletou-revival-count-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("revive-summary.csv");
+        std::fs::write(&path, "epoch,run,l1_revived\n2,1,7\n3,1,9\n2,2,0\n").unwrap();
+        assert_eq!(l1_revival_reset_count(&dir, 2), Some(0));
+        assert_eq!(l1_revival_reset_count(&dir, 3), Some(9));
+        assert_eq!(l1_revival_reset_count(&dir, 4), None);
+        let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfka2_1536_15_64_k3k3", "--superbatches", "64", "--max-epochs", "4"]).unwrap();
+        args.output = Some(dir.clone());
+        args.sfnn_l1_revive_lr_suppress_sb = 16;
+        args.epoch_settings_json = Some(serde_json::json!({"sfnn_l1_revive":{"epoch1":false,"epoch2":true,"epoch3":false}}).to_string());
+        assert!(!l1_revival_lr_suppressed(&args, 2, 1).unwrap());
+        std::fs::write(&path, "epoch,run,l1_revived\n2,1,7\n").unwrap();
+        assert!(l1_revival_lr_suppressed(&args, 2, 1).unwrap());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
