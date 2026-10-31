@@ -214,7 +214,7 @@ mod tests {
             stm_indices:&[0,1,2,3],nstm_indices:&[3,2,1,0],buckets:&[0,1,6,7],batch_size:4,max_active:1 }).unwrap();
         let proxy_shape=SfnnForwardShape {factorizer_king_axis_dim:0,..shape};
         let proxy=SfnnForwardDeviceWeights::new_dense(&ctx,proxy_shape).unwrap();
-        for mode in ["axis","pair","axis","shared","pair","shared"] {
+        for mode in ["axis","pair","axis","shared","pair","shared","axis"] {
             let old=r.shape;let f=r.factorizer;
             if f.any_axis() {
                 r.weights.l1axw.as_ref().unwrap().fill(&ctx,0.03125).unwrap();
@@ -270,6 +270,21 @@ mod tests {
                 buckets:&[0,1,6,7],targets:&[0.2,0.8,0.3,0.7],entry_weights:&[1.0;4],batch_size:4,max_active:1},
                 true,true,SfnnLayerLrMultipliers {qat_l1:true,l0:0.0,l1:0.0,l2:0.0,l3:0.0,..Default::default()},None).unwrap();
         }
+        // A worker can set an axis coefficient to zero without changing its layout.
+        let old=r.shape;
+        r.weights.l1axw.as_ref().unwrap().fill(&ctx,0.03125).unwrap();
+        r.weights.l1axb.as_ref().unwrap().fill(&ctx,0.0625).unwrap();
+        let workspace=SfnnForwardWorkspace::new(&ctx,SfnnForwardWorkspaceLayout::new(old,4)).unwrap();
+        r.forward_current_weights(&ctx,&batch,&workspace).unwrap();
+        let before=workspace.download_output(&ctx).unwrap();
+        let coefficients=(0..old.num_stacks).map(|bucket| {
+            let king=bucket/2; let progress=bucket%2;
+            vec![(king/2,1.0),(2+king%2,1.0),(4+progress,1.0)]
+        }).collect::<Vec<_>>();
+        let zero=SfnnFactorizerAlpha {king_axis:0.0,progress_axis:0.0,..alpha};
+        r.switch_l1_factorizer(&ctx,old,r.factorizer,zero,&coefficients).unwrap();
+        r.forward_current_weights(&ctx,&batch,&workspace).unwrap();
+        for (a,b) in before.iter().zip(workspace.download_output(&ctx).unwrap()) {assert!((a-b).abs()<1e-5);}
     }
 
 }
