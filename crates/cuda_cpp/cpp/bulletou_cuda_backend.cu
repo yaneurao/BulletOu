@@ -1344,7 +1344,14 @@ __device__ __forceinline__ float sfnn_quantize_dequant_clamped(
         q=fmin(fmax(q,double(qmin)),hi);
         return __fdiv_rn(float(q),scale);
     }
-    float q = roundf(value * scale);
+    const float scaled = value * scale;
+    float q = roundf(scaled);
+    // The FP32 product can round to a half-integer from either side.  Only
+    // that case needs the FP64 product used by nn.bin export; avoiding FP64
+    // for ordinary values keeps the training QAT path fast on consumer GPUs.
+    if (fabsf(scaled - truncf(scaled)) == 0.5f) {
+        q = static_cast<float>(round(static_cast<double>(value) * static_cast<double>(scale)));
+    }
     q = fminf(fmaxf(q, qmin), qmax);
     return q / scale;
 }
@@ -1382,7 +1389,7 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     if (src_input_size != dst_input_size && virtual_rows != 0) {
         const size_t virtual_feature = dst_input_size + (feature % virtual_rows);
         float virtual_value=bn_fold_weight(src[virtual_feature * ft_size + row],bn,0,row);
-        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(ft_factorizer_alpha,virtual_value)) : value+ft_factorizer_alpha*virtual_value;
+        value = __fadd_rn(value,__fmul_rn(ft_factorizer_alpha,virtual_value));
     }
     dst[tid] = sfnn_quantize_dequant_clamped(value, scale, -32768.0f, 32767.0f, precise);
 }
@@ -1469,7 +1476,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
     float value = residual_gate * weights[source];
     if (has_shared != 0) {
-        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(shared_alpha,shared_weights[factorizer_cell])) : value+shared_alpha*shared_weights[factorizer_cell];
+        value = __fadd_rn(value,__fmul_rn(shared_alpha,shared_weights[factorizer_cell]));
     }
 
     size_t axis_ids[8];
@@ -1503,7 +1510,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
             factorizer_axis_confidences,
             axis_alphas);
         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
-            value += axis_alphas[axis_idx] * axis_weights[axis_ids[axis_idx] * weight_cell_count + factorizer_cell];
+            value = __fadd_rn(value, __fmul_rn(axis_alphas[axis_idx], axis_weights[axis_ids[axis_idx] * weight_cell_count + factorizer_cell]));
         }
     }
 
@@ -1546,7 +1553,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     const float residual_gate = sfnn_residual_count_gate(residual_count_gates, stack, has_shared, has_axis);
     float value = residual_gate * bias[tid];
     if (has_shared != 0) {
-        value = (bn.params || precise) ? __fadd_rn(value,__fmul_rn(shared_alpha,shared_bias[out_col])) : value+shared_alpha*shared_bias[out_col];
+        value = __fadd_rn(value,__fmul_rn(shared_alpha,shared_bias[out_col]));
     }
 
     size_t axis_ids[8];
@@ -1580,7 +1587,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
             factorizer_axis_confidences,
             axis_alphas);
         for (size_t axis_idx = 0; axis_idx < axis_count; ++axis_idx) {
-            value += axis_alphas[axis_idx] * axis_bias[axis_ids[axis_idx] * output_dim + out_col];
+            value = __fadd_rn(value, __fmul_rn(axis_alphas[axis_idx], axis_bias[axis_ids[axis_idx] * output_dim + out_col]));
         }
     }
 
@@ -7389,7 +7396,7 @@ __global__ void layer_qat_ft_fold_kernel(const float* src,float* dst,size_t base
     for(size_t u=threadIdx.x;u<width;u+=blockDim.x) {
         const size_t j=f*width+u;
         if(f>=base) {dst[j]=0.0f;continue;}
-        float v=src[j]+alpha*src[vrow*width+u];
+        float v=__fadd_rn(src[j],__fmul_rn(alpha,src[vrow*width+u]));
         dst[j]=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f);
     }
 }
