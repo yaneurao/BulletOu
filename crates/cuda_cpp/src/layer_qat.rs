@@ -178,7 +178,7 @@ mod tests {
     fn qat_rounding_matches_f64_export_at_half_boundaries() {
         let ctx = Context::new(0).unwrap();
         let w = F32Buffer::from_host(&ctx, &[-0.0669291317_f32]).unwrap();
-        let b = F32Buffer::from_host(&ctx, &[-1.96770418_f32]).unwrap();
+        let b = F32Buffer::from_host(&ctx, &[-1.96770418_f32, 1032.0859375_f32, -1032.0859375_f32]).unwrap();
         let mut q = None;
         prepare(&ctx, &mut q, &w, &b, true, true, 0, 0, 1, 1.0).unwrap();
         let actual = q.as_ref().unwrap().0.download(&ctx).unwrap()[0];
@@ -189,6 +189,11 @@ mod tests {
         let actual = q.as_ref().unwrap().1.download(&ctx).unwrap()[0];
         let expected = ((f64::from(-1.96770418_f32) * 8128.0).round() as f32) / 8128.0;
         assert!((actual - expected).abs() < 1e-7, "{actual} != {expected}");
+        for (actual, source) in q.as_ref().unwrap().1.download(&ctx).unwrap().into_iter()
+            .zip([-1.96770418_f32, 1032.0859375_f32, -1032.0859375_f32]) {
+            let expected = ((f64::from(source) * 8128.0).round() as f32) / 8128.0;
+            assert_eq!(actual, expected);
+        }
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]

@@ -1349,11 +1349,11 @@ __device__ __forceinline__ float sfnn_quantize_dequant_clamped(
     // The FP32 product can round to a half-integer from either side.  Only
     // that case needs the FP64 product used by nn.bin export; avoiding FP64
     // for ordinary values keeps the training QAT path fast on consumer GPUs.
-    if (fabsf(scaled - truncf(scaled)) == 0.5f) {
+    if (fabsf(scaled) >= 4194304.0f || fabsf(scaled - truncf(scaled)) == 0.5f) {
         q = static_cast<float>(round(static_cast<double>(value) * static_cast<double>(scale)));
     }
     q = fminf(fmaxf(q, qmin), qmax);
-    return q / scale;
+    return __fdiv_rn(q, scale);
 }
 
 __device__ float bn_fold_weight(float value,BnConfig bn,size_t bucket,size_t unit) {
