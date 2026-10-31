@@ -23071,8 +23071,12 @@ fn legacy_checkpoint_axis_coefficients(path: &Path, shape: bulletou_cuda_cpp::Sf
     // recorded effective resume signature confirms the settings match.
     // The top-level signature is overwritten at startup, so it is not
     // evidence of the settings that produced this checkpoint.
-    let signature = std::fs::read_to_string(dir.join(RESUME_CONFIG_NAME)).ok()?;
-    if !resume_signature_matches(&signature, &saved) { return None; }
+    match std::fs::read_to_string(dir.join(RESUME_CONFIG_NAME)) {
+        Ok(signature) if resume_signature_matches(&signature, &saved) => {},
+        Ok(_) => return None,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && legacy_grid_settings_match(dir) => {},
+        Err(_) => return None,
+    }
     // An external count file may have changed since the checkpoint was saved.
     if saved.sfnn_bucket_counts.is_some() { return None; }
     let epoch = read_checkpoint_epoch_superbatch(dir).map_or(1, |(epoch, _)| epoch);
@@ -23081,6 +23085,47 @@ fn legacy_checkpoint_axis_coefficients(path: &Path, shape: bulletou_cuda_cpp::Sf
     let count_settings = WorkerSfnnSession::compute_count_settings(&saved, shape).ok()?;
     Some(checkpoint_axis_coefficients(shape, effective_sfnn_factorizer_alpha(&saved),
         count_settings.factorizer_axis_confidences.as_deref()))
+}
+
+// Older grid-search checkpoints predate the per-checkpoint signature. The
+// grid history records the effective settings of every launch; also require
+// the recorded invocations to contain no command-line settings overrides.
+#[cfg(feature = "cuda-cpp-backend")]
+fn legacy_grid_settings_match(checkpoint_dir: &Path) -> bool {
+    fn check(checkpoint_dir: &Path) -> Option<()> {
+        fn equivalent(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+            let (Some(a), Some(b)) = (a.as_object(), b.as_object()) else { return false; };
+            a.iter().filter(|(_,v)| !v.is_null()).all(|(k,v)| b.get(k) == Some(v))
+                && b.iter().filter(|(_,v)| !v.is_null()).all(|(k,v)| a.get(k) == Some(v))
+        }
+        let trial = checkpoint_dir.parent()?;
+        let expected: serde_json::Value = serde_json::from_slice(&std::fs::read(checkpoint_dir.join("bulletou-settings.json")).ok()?).ok()?;
+        let history: serde_json::Value = serde_json::from_slice(&std::fs::read(trial.join("grid-settings-history.json")).ok()?).ok()?;
+        let launches = history.get("launches")?.as_array()?;
+        if launches.is_empty() || launches.iter().any(|entry| entry.get("effective_settings").is_none_or(|v| !equivalent(v, &expected))) { return None; }
+        let tag = std::fs::read_to_string(trial.join("tag.txt")).ok()?;
+        let mut seen = 0usize;
+        for line in tag.lines().filter(|line| !line.trim().is_empty()) {
+            let (_, command) = line.split_once('\t')?;
+            let mut parts = command.split_whitespace();
+            parts.next()?; // executable
+            let mut settings = None;
+            while let Some(arg) = parts.next() {
+                match arg {
+                    "--settings-file" if settings.is_none() => settings = Some(parts.next()?),
+                    "--resume" | "--verbose" => {},
+                    _ => return None,
+                }
+            }
+            let source = Path::new(settings?.trim_matches('"'));
+            let actual: serde_json::Value = serde_json::from_slice(&std::fs::read(source).ok()?).ok()?;
+            if !equivalent(&actual, &expected) { return None; }
+            seen += 1;
+        }
+        if seen == 0 { return None; }
+        Some(())
+    }
+    check(checkpoint_dir).is_some()
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -35336,10 +35381,39 @@ mod tests {
         let mut changed=saved.clone(); changed.sfnn_factorizer_alpha=Some("king=1".parse().unwrap());
         std::fs::write(dir.join(RESUME_CONFIG_NAME),resume_signature(&changed)).unwrap();
         assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), None);
-        std::fs::remove_file(settings).unwrap();
         std::fs::remove_file(dir.join(RESUME_CONFIG_NAME)).unwrap();
+        let source=root.join("bulletou-run-settings.json");
+        std::fs::copy(&settings,&source).unwrap();
+        let saved_json:serde_json::Value=serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+        std::fs::write(root.join("grid-settings-history.json"),serde_json::json!({"launches":[{"effective_settings":saved_json}]}).to_string()).unwrap();
+        std::fs::write(root.join("tag.txt"),format!("123\tbulletou.exe --settings-file {} --verbose\n",source.display())).unwrap();
+        assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), Some(vec![0.5; 6]));
+        std::fs::write(dir.join(RESUME_CONFIG_NAME),resume_signature(&changed)).unwrap();
+        assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), None);
+        std::fs::remove_file(dir.join(RESUME_CONFIG_NAME)).unwrap();
+        std::fs::write(root.join("tag.txt"),format!("123\tbulletou.exe --settings-file {} --sfnn-l1-factorizer-alpha king=1\n",source.display())).unwrap();
+        assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), None);
+        std::fs::remove_file(settings).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(root.join("grid-settings-history.json")).unwrap();
+        std::fs::remove_file(root.join("tag.txt")).unwrap();
         std::fs::remove_dir(dir).unwrap();
         std::fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    #[ignore = "requires a user-supplied legacy grid checkpoint"]
+    fn legacy_grid_checkpoint_loads_without_modification() {
+        let path=std::path::PathBuf::from(std::env::var_os("BULLETOU_LEGACY_AXIS_TEST_STATE").expect("set BULLETOU_LEGACY_AXIS_TEST_STATE"));
+        let settings=path.parent().unwrap().join("bulletou-settings.json");
+        let raw=vec![std::ffi::OsString::from("bulletou"),std::ffi::OsString::from("--settings-file"),settings.into_os_string()];
+        let args=Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+        let epoch=read_checkpoint_epoch_superbatch(path.parent().unwrap()).unwrap().0;
+        let args=args_at_epoch(&args,epoch+1).unwrap();
+        let state=load_cuda_cpp_sfnn_initial_state(&path,&args,CudaCppSfnnFeatureKind::Halfka2hm).unwrap();
+        assert!(state.weights.l1axw.is_some());
+        assert!(state.optimizer_states.is_some());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
