@@ -8,7 +8,7 @@ __device__ float bn_project_weight(float w, float r) {
     return v;
 }
 __global__ void bn_project_l2(float* w,float* slow,size_t input,size_t channels,BnConfig bn) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(j>=input*channels)return;
     size_t ch=j/input;
     float r=__fdiv_rn(bn.params[ch],__fsqrt_rn(__fadd_rn(bn.running[channels+ch],bn.epsilon)));
@@ -32,7 +32,7 @@ extern "C" int bulletou_bn_qat_project_l2(BulletOuCudaCppContext* ctx,
 // The raw parameter tensors are never quantized in place.
 __global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size_t width,float alpha,BnConfig bn,
     bool training=false,const float* bias=nullptr,float* out_bias=nullptr) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(j>=(base+vr)*width)return;
     size_t f=j/width,u=j%width;
     if(f>=base) {dst[j]=0;return;}
@@ -56,7 +56,7 @@ __global__ void bn_qat_ft(const float* src,float* dst,size_t base,size_t vr,size
 // to avoid division by zero and permit gamma to learn away from zero.
 __global__ void bn_qat_unfold_training(const float* w,const float* b,const float* sw,const float* sb,
     float* qw,float* qb,size_t input,size_t output,size_t groups,int layer,size_t vr,float alpha,BnConfig bn) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x,n=input*output*groups;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x,n=input*output*groups;
     if(j>=n)return;
     size_t ch=layer==0?j%output:j/input,u=ch%output,group=ch/output;
     if(!bn.params || u>=bn.width)return;
@@ -88,7 +88,7 @@ extern "C" int bulletou_bn_qat_unfold_training(BulletOuCudaCppContext* ctx,
 }
 // Must run before replacing base gradients with raw-coordinate gradients.
 __global__ void bn_qat_ft_virtual(float* g,size_t base,size_t vr,size_t width,float alpha,BnConfig bn) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=vr*width)return;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(j>=vr*width)return;
     size_t f=j/width,u=j%width; double sum=0;
     for(size_t k=f;k<base;k+=vr)sum+=g[k*width+u];
     float scale=bn.params?bn.params[u]/sqrtf(bn.running[width+u]+bn.epsilon):1.0f;
@@ -99,7 +99,7 @@ __global__ void bn_qat_pullback(const float* w,const float* b,const float* sw,co
     float* gw,float* gb,float* gs,float* gsb,size_t input,size_t output,size_t groups,int layer,
     size_t vr,float alpha,BnConfig bn) {
     __shared__ double sums[256];
-    size_t ch=blockIdx.x*32+threadIdx.x%32,lane=threadIdx.x/32;
+    size_t ch=static_cast<size_t>(blockIdx.x)*32+threadIdx.x%32,lane=threadIdx.x/32;
     size_t group=ch/output,u=ch%output;
     bool valid=ch<groups*output, normalized=valid && bn.params && u<bn.width;
     size_t bc=group*bn.width+u,c=bn.width*bn.groups;
@@ -136,7 +136,7 @@ __global__ void bn_qat_pullback(const float* w,const float* b,const float* sw,co
 __global__ void bn_qat_ft_pullback_tiles(const float* w,float* gw,double* partial,
     size_t input,size_t output,size_t vr,float alpha,BnConfig bn) {
     __shared__ double sums[256];
-    size_t u=blockIdx.x*32+threadIdx.x%32,lane=threadIdx.x/32;
+    size_t u=static_cast<size_t>(blockIdx.x)*32+threadIdx.x%32,lane=threadIdx.x/32;
     double sum=0;
     if(u<output) {
         float inv=1.0f/sqrtf(bn.running[output+u]+bn.epsilon);
@@ -153,7 +153,7 @@ __global__ void bn_qat_ft_pullback_tiles(const float* w,float* gw,double* partia
 }
 __global__ void bn_qat_ft_pullback_finish(const double* partial,const float* b,float* gb,
     size_t tiles,size_t output,BnConfig bn) {
-    size_t u=blockIdx.x*blockDim.x+threadIdx.x;if(u>=output)return;
+    size_t u=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(u>=output)return;
     double sum=0;for(size_t p=0;p<tiles;++p)sum+=partial[p*output+u];
     float inv=1.0f/sqrtf(bn.running[output+u]+bn.epsilon),d=gb[u];
     bn.grads[u]+=float((sum+double(d)*(b[u]-bn.running[u]))*inv);

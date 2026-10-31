@@ -42,14 +42,14 @@ __global__ void experiment_l1_mean_penalty(const float* z, const int* buckets, c
 
 // Experimental L1 centering reduction, never used by default training.
 __global__ void experiment_mean_partial(const float* x, float* scratch, size_t rows, size_t cols) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t col = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col >= cols) return;
     float sum = 0.0f;
     for (size_t row = blockIdx.y; row < rows; row += 32) sum += x[row * cols + col];
     scratch[blockIdx.y * cols + col] = sum;
 }
 __global__ void experiment_mean_finish(float* scratch, size_t rows, size_t cols) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t col = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col >= cols) return;
     float sum = 0.0f;
     for (size_t p = 0; p < 32; ++p) sum += scratch[p * cols + col];
@@ -61,7 +61,7 @@ __global__ void experiment_mean_finish(float* scratch, size_t rows, size_t cols)
 // avoid the long single-thread dependency chain of the reference reduction.
 __global__ void center_mean_tiled(const float* x,float* scratch,size_t rows,size_t cols) {
     __shared__ float sums[8][32];
-    const size_t col=blockIdx.x*32+threadIdx.x;
+    const size_t col=static_cast<size_t>(blockIdx.x)*32+threadIdx.x;
     float sum=0.0f;
     if(col<cols) for(size_t row=blockIdx.y+32*threadIdx.y;row<rows;row+=256)
         sum+=x[row*cols+col];
@@ -389,7 +389,7 @@ int warmup_context(BulletOuCudaCppContext* ctx) {
 }
 
 __global__ void axpy_kernel(size_t len, float a, const float* x, const float* y, float* out) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
@@ -397,7 +397,7 @@ __global__ void axpy_kernel(size_t len, float a, const float* x, const float* y,
 }
 
 __global__ void fill_f32_kernel(size_t len, float value, float* out) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
@@ -405,7 +405,7 @@ __global__ void fill_f32_kernel(size_t len, float value, float* out) {
 }
 
 __global__ void scale_axis_rows_f32_kernel(size_t len, size_t row_len, const float* row_scales, float* values) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
@@ -467,7 +467,7 @@ __global__ void radam_update_reset_gradients_kernel(
     float epsilon,
     float min_weight,
     float max_weight) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
@@ -501,7 +501,7 @@ __global__ void radam_update_reset_gradients_vec4_kernel(
     float epsilon,
     float min_weight,
     float max_weight) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len4) {
         return;
     }
@@ -576,7 +576,7 @@ __global__ void radam_update_reset_gradients_vec4_kernel(
 
 __global__ void ranger_lookahead_kernel(
     float* weights, float* slow_params, size_t len, float alpha, float min_weight, float max_weight) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len) {
         return;
     }
@@ -589,7 +589,7 @@ __global__ void ranger_lookahead_kernel(
 
 __global__ void ranger_lookahead_vec4_kernel(
     float* weights, float* slow_params, size_t len4, float alpha, float min_weight, float max_weight) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len4) {
         return;
     }
@@ -623,7 +623,7 @@ __global__ void radam_update_reset_gradients_stacked_dirty_kernel(
     float epsilon,
     float min_weight,
     float max_weight) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride;
     if (tid >= total) {
         return;
@@ -672,7 +672,7 @@ __global__ void radam_update_reset_gradients_stacked_dirty_vec4_kernel(
     float epsilon,
     float min_weight,
     float max_weight) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride4;
     if (tid >= total) {
         return;
@@ -763,7 +763,7 @@ __global__ void clear_gradients_stacked_dirty_kernel(
     size_t stride,
     size_t len,
     float* gradients) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride;
     if (tid >= total) {
         return;
@@ -787,7 +787,7 @@ __global__ void clear_gradients_stacked_dirty_vec4_kernel(
     size_t stride4,
     size_t len4,
     float* gradients) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride4;
     if (tid >= total) {
         return;
@@ -815,7 +815,7 @@ __global__ void ranger_lookahead_stacked_dirty_kernel(
     float alpha,
     float min_weight,
     float max_weight) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride;
     if (tid >= total) {
         return;
@@ -848,7 +848,7 @@ __global__ void ranger_lookahead_stacked_dirty_vec4_kernel(
     float alpha,
     float min_weight,
     float max_weight) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = dirty_count * stride4;
     if (tid >= total) {
         return;
@@ -905,7 +905,7 @@ __global__ void nnue_sparse_l0_crelu_kernel(
     size_t max_active,
     size_t input_size,
     size_t rows, bool activate = true) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * rows;
     if (tid >= total) {
         return;
@@ -932,7 +932,7 @@ __global__ void nnue_sparse_l0_crelu_kernel(
 }
 
 __global__ void crelu_inplace_kernel(float* values, size_t len) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= len) {
         return;
     }
@@ -945,7 +945,7 @@ __global__ void nnue_concat_l0_kernel(
     float* combined,
     size_t batch,
     size_t rows) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t combined_rows = rows * 2;
     size_t total = batch * combined_rows;
     if (tid >= total) {
@@ -966,7 +966,7 @@ __global__ void nnue_dense_crelu_kernel(
     size_t batch,
     size_t input_dim,
     size_t output_dim, bool activate = true) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -989,7 +989,7 @@ __global__ void nnue_dense_output_kernel(
     float* output,
     size_t batch,
     size_t input_dim) {
-    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (sample >= batch) {
         return;
     }
@@ -1008,7 +1008,7 @@ __global__ void dense_add_bias_kernel(
     size_t batch,
     size_t output_dim,
     int apply_crelu) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -1083,7 +1083,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t max_active,
     size_t input_size,
     size_t ft_size, float ft_factorizer_alpha, bool bn_raw=false) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
     if (tid >= total) {
@@ -1147,7 +1147,7 @@ __global__ void sfnn_fold_halfka2_l0w_kernel(
     const float* weights,
     float* folded_weights,
     size_t ft_size, float ft_factorizer_alpha, size_t base) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = base * ft_size;
     if (tid >= total) {
         return;
@@ -1370,7 +1370,7 @@ __global__ void sfnn_build_quantized_proxy_l0w_kernel(
     size_t virtual_rows,
     size_t ft_size,
     float scale, float ft_factorizer_alpha, BnConfig bn={}, bool precise=false) {
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total = dst_input_size * ft_size;
     if (tid >= total) {
         return;
@@ -1394,7 +1394,7 @@ __global__ void sfnn_build_quantized_proxy_vector_kernel(
     float scale,
     float qmin,
     float qmax, BnConfig bn={}, bool precise=false) {
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= len) {
         return;
     }
@@ -1447,7 +1447,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     const bool cs=common_size!=0 || shard_size!=0;
     const size_t row_width=compact_output ? (cs?common_size+shard_size:input_dim/compact_groups) : input_dim;
     const size_t total = num_stacks * output_dim * row_width;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
@@ -1536,7 +1536,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     const float* factorizer_axis_confidences,
     float scale, BnConfig bn={}, bool precise=false) {
     const size_t total = num_stacks * output_dim;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
@@ -1618,7 +1618,7 @@ __global__ void sfnn_stacked_l1_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -1861,7 +1861,7 @@ __global__ void sfnn_grouped_l1_kernel(
     size_t group_count,
     size_t group_input,
     size_t group_output) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -1906,7 +1906,7 @@ __global__ void sfnn_common_shard_l1_kernel(
     size_t common_input,
     size_t shard_input,
     size_t group_output) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -1944,7 +1944,7 @@ __global__ void sfnn_common_shard_l1_kernel(
 }
 
 __global__ void sfnn_l2_input_kernel(const float* l1, float* output, size_t batch, size_t l1_hidden, int l1_skip) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t l2_input_dim = l1_hidden * 2;
     size_t total = batch * l2_input_dim;
     if (tid >= total) {
@@ -1995,7 +1995,7 @@ __global__ void sfnn_stacked_l2_crelu_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences, bool bn_raw=false) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * output_dim;
     if (tid >= total) {
         return;
@@ -2102,7 +2102,7 @@ __global__ void sfnn_stacked_l3_output_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences) {
-    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (sample >= batch) {
         return;
     }
@@ -2185,7 +2185,7 @@ __global__ void sfnn_validation_stats_kernel(
         (metric == 1 || metric == 2) ? batch * hidden :
         metric == 3 ? batch * l2_size : batch;
     float sum = 0.0f;
-    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * blockDim.x) {
         if (metric == 0) sum += float(stm[i] >= 1.0f) + float(nstm[i] >= 1.0f);
         else if (metric == 1 || metric == 2) {
             // Square branch first, normal branch second. Skip is excluded.
@@ -2208,7 +2208,7 @@ __global__ void sfnn_validation_stats_kernel(
 // Tile FT over positions to avoid an atomic for every activation.
 __global__ void sfnn_unit_ft_stats_kernel(const float* stm, const float* nstm,
     int* counts, size_t batch, size_t ft) {
-    size_t unit = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t unit = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (unit >= ft) return;
     int count = 0;
     size_t end = min(batch, (size_t(blockIdx.y) + 1) * 256);
@@ -2220,7 +2220,7 @@ __global__ void sfnn_unit_ft_stats_kernel(const float* stm, const float* nstm,
 __global__ void sfnn_unit_dense_stats_kernel(const float* input, const float* l2,
     const int* buckets, int* counts, size_t batch, size_t ft, size_t hidden,
     size_t width, size_t stacks) {
-    size_t p = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t p = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (p >= batch) return;
     int b = buckets[p];
     if (b < 0 || size_t(b) >= stacks) return;
@@ -2252,7 +2252,7 @@ __device__ float sign_f32(float value) {
 __global__ void loss_bce_with_logits_reduce_kernel(
     const float* outputs, const float* targets, const float* entry_weights,
     float* per_sample, float* mean_output_gradients, float output_inv_scale, size_t batch) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= batch) return;
     float z = outputs[idx] * output_inv_scale;
     float t = targets[idx];
@@ -2294,7 +2294,7 @@ __global__ void bce_apply_error_weight_kernel(
     const float* outputs, const float* targets, const float* entry_weights,
     float* per_sample, float* gradients, const float* mean_error,
     float scale, float k, size_t batch) {
-    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= batch || entry_weights[i] == 0.0f) return;
     const float error = fabsf(loss_sigmoid(outputs[i] * scale) - targets[i]);
     // Double intermediates avoid overflow for large finite k. Both numerator
@@ -2314,7 +2314,7 @@ __global__ void loss_sigmoid_pow_reduce_kernel(
     float output_inv_scale,
     float loss_pow_exp,
     size_t batch) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= batch) {
         return;
     }
@@ -2340,7 +2340,7 @@ __global__ void loss_win_rate_model_reduce_kernel(
     float wrm_output_scale,
     float wrm_in_offset_over_scaling,
     size_t batch) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= batch) {
         return;
     }
@@ -2702,7 +2702,7 @@ __global__ void sfnn_add_saturation_penalty_gradients_kernel(
     const size_t weight_cell_count = input_dim * output_dim;
     const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
     const size_t total = stack_count * weight_cell_count;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
@@ -2792,7 +2792,7 @@ __global__ void sfnn_add_residual_count_decay_gradients_kernel(
     size_t num_stacks) {
     const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
     const size_t total = stack_count * stride;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
@@ -2820,7 +2820,7 @@ __global__ void sfnn_apply_residual_count_gates_to_gradients_kernel(
     size_t num_stacks) {
     const size_t stack_count = dirty_count == 0 ? num_stacks : dirty_count;
     const size_t total = stack_count * stride;
-    const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
         return;
     }
@@ -2878,7 +2878,7 @@ __global__ void sfnn_stacked_l3_backward_kernel(
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t l1_gradient_len = batch * l1_out;
 
@@ -3042,7 +3042,7 @@ __global__ void sfnn_stacked_crelu_backward_kernel(
     const float* factorizer_axis_confidences,
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients, bool bn_pregradient=false) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
     size_t bias_scatter_len = batch * output_dim;
@@ -3232,7 +3232,7 @@ __global__ void sfnn_l2_input_backward_kernel(
     size_t batch,
     size_t l1_hidden,
     int l1_skip) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     size_t total = batch * l1_out;
     if (tid >= total) {
@@ -3269,7 +3269,7 @@ __global__ void sfnn_stacked_affine_backward_kernel(
     size_t output_dim,
     size_t num_stacks,
     int compute_parameter_gradients) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
     size_t bias_scatter_len = batch * output_dim;
@@ -3338,7 +3338,7 @@ __global__ void sfnn_grouped_l1_backward_kernel(
     size_t group_count,
     size_t group_input,
     size_t group_output) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * group_output;
     size_t bias_scatter_len = batch * output_dim;
@@ -3420,7 +3420,7 @@ __global__ void sfnn_common_shard_l1_backward_kernel(
     size_t common_input,
     size_t shard_input,
     size_t group_output) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t row_input = common_input + shard_input;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * output_dim * row_input;
@@ -3546,7 +3546,7 @@ __global__ void sfnn_factorized_l1_backward_kernel(
     int compute_parameter_gradients,
     int accumulate_factorizer_gradients,
     size_t groups=1, size_t common=0, size_t shard=0) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_scatter_len = batch * input_dim * output_dim;
     size_t bias_scatter_len = batch * output_dim;
@@ -3745,7 +3745,7 @@ __global__ void sfnn_pairwise_backward_kernel(
     float* nstm_gradients,
     size_t batch,
     size_t ft_size) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = batch * ft_size;
     if (tid >= total) {
         return;
@@ -3783,7 +3783,7 @@ __global__ void sfnn_pairwise_l0_sparse_backward_kernel(
     size_t max_active,
     size_t input_size,
     size_t ft_size, float ft_factorizer_alpha) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
     if (tid >= total) {
@@ -3854,7 +3854,7 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     float* l0b_gradients,
     size_t batch,
     size_t ft_size, FtSaturationConfig guard, bool bn_no_bias=false) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
     if (tid >= total) {
@@ -3908,7 +3908,7 @@ __global__ void sfnn_inverse_feature_counts_kernel(
     size_t total_entries,
     size_t max_active,
     size_t n_features) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total_entries) {
         return;
     }
@@ -3925,7 +3925,7 @@ __global__ void sfnn_inverse_prefix_sum_block_local_kernel(
     size_t n_features) {
     __shared__ int partials[1024];
     size_t tid = threadIdx.x;
-    size_t idx = blockIdx.x * blockDim.x + tid;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + tid;
     int value = idx < n_features ? counts[idx] : 0;
     partials[tid] = value;
     __syncthreads();
@@ -3976,7 +3976,7 @@ __global__ void sfnn_inverse_prefix_add_block_offsets_kernel(
     size_t n_features,
     size_t num_blocks) {
     size_t tid = threadIdx.x;
-    size_t idx = blockIdx.x * blockDim.x + tid;
+    size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + tid;
     if (idx < n_features) {
         offsets[idx] += block_offsets[blockIdx.x];
     }
@@ -3993,7 +3993,7 @@ __global__ void sfnn_inverse_scatter_positions_kernel(
     size_t total_entries,
     size_t max_active,
     size_t n_features) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total_entries) {
         return;
     }
@@ -4142,7 +4142,7 @@ __global__ void sfnn_l0_sparse_backward_kernel(
     size_t max_active,
     size_t input_size,
     size_t ft_size, float ft_factorizer_alpha) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t l0_len = batch * ft_size;
     if (tid >= l0_len) {
         return;
@@ -4185,7 +4185,7 @@ __global__ void dense_output_backward_kernel(
     float* bias_gradient,
     size_t batch,
     size_t input_len) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_len;
 
     if (tid < input_gradient_len) {
@@ -4222,7 +4222,7 @@ __global__ void dense_crelu_backward_kernel(
     size_t batch,
     size_t input_dim,
     size_t output_dim) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t input_gradient_len = batch * input_dim;
     size_t weight_len = input_dim * output_dim;
 
@@ -4265,7 +4265,7 @@ __global__ void dense_crelu_pre_gradient_kernel(
     float* gradients,
     size_t batch,
     size_t output_dim) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t len = batch * output_dim;
     if (tid >= len) {
         return;
@@ -4305,7 +4305,7 @@ __global__ void l0_crelu_backward_inplace_kernel(
     const float* activations,
     float* gradients,
     size_t len) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= len) {
         return;
     }
@@ -4398,7 +4398,7 @@ __global__ void nnue_l0_crelu_backward_kernel(
     float* nstm_gradients,
     size_t batch,
     size_t l1) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t combined_stride = l1 * 2;
     size_t combined_len = batch * combined_stride;
     if (tid >= combined_len) {
@@ -4424,7 +4424,7 @@ __global__ void nnue_l0_sparse_zero_gradients_kernel(
     float* l0b_gradients,
     size_t input_size,
     size_t l1) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t weight_len = nnue_l0w_len_for_shape(input_size, l1);
 
     if (tid < weight_len) {
@@ -4445,7 +4445,7 @@ __global__ void nnue_l0_sparse_backward_kernel(
     size_t max_active,
     size_t input_size,
     size_t l1) {
-    size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t scatter_len = batch * max_active * l1;
     if (tid >= scatter_len) {
         return;
@@ -5514,7 +5514,7 @@ unsigned int sfnn_dense_reduce_split_count(size_t batch) {
 template<int Outputs>
 __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float* shared,
     const int* buckets,float* dx,size_t batch,size_t width,size_t stacks,float alpha) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=batch*width)return;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(j>=batch*width)return;
     size_t row=j/width,u=j%width;
     int id=buckets[row];if(id<0 || static_cast<size_t>(id)>=stacks){dx[j]=0;return;}
     size_t stack=static_cast<size_t>(id);float sum=0;
@@ -5560,7 +5560,7 @@ __global__ void sfnn_l1_bucket_gather_gradient(
     size_t width, size_t outputs, float shared_alpha, CompactL1AxisGradient axis) {
     const size_t lane = threadIdx.x % 32;
     const size_t out = blockIdx.z * 8 + threadIdx.x / 32;
-    const size_t in = blockIdx.x * 32 + lane;
+    const size_t in = static_cast<size_t>(blockIdx.x) * 32 + lane;
     const size_t stack = blockIdx.y;
     if (out >= outputs || in > width) return;
     const bool bias = in == width;
@@ -5588,7 +5588,7 @@ template<int Stacks, bool Axis=false>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
     float* dw,float* db,float* dfw,float* dfb,size_t batch,size_t width,size_t outputs,
     size_t stacks,float alpha,bool input_major,CompactL1AxisGradient axis={}) {
-    size_t lane=threadIdx.x%32,out=blockIdx.z*8+threadIdx.x/32,in=blockIdx.x*32+lane;
+    size_t lane=threadIdx.x%32,out=blockIdx.z*8+threadIdx.x/32,in=static_cast<size_t>(blockIdx.x)*32+lane;
     if(out>=outputs || in>width)return;
     size_t begin=blockIdx.y*256,end=min(batch,begin+256);
     // One extra input column represents the bias. Keeping a second bucket
@@ -7062,7 +7062,7 @@ __global__ void kppt_table_forward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size) {
-    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (sample >= batch) {
         return;
     }
@@ -7099,7 +7099,7 @@ __global__ void kppt_table_backward_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size) {
-    size_t sample = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (sample >= batch) {
         return;
     }
@@ -7375,7 +7375,7 @@ int launch_nnue_backward_kernels(
 #include "bn_qat.cuh"
 
 template<int KIND> __global__ void layer_qat_vector_kernel(const float* src,float* dst,size_t n) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(j>=n)return;
     constexpr float scale=KIND==0?127.0f:KIND==1?64.0f:8128.0f;
     constexpr float lo=KIND==0?-32768.0f:KIND==1?-128.0f:-2147483648.0f;
@@ -8180,7 +8180,7 @@ extern "C" int bulletou_cuda_cpp_axpy_device(
 __global__ void norm_loss_sum_kernel(const float* w, size_t n, float* sums) {
     __shared__ float values[256];
     float sum = 0.0f;
-    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += 256 * 256)
+    for (size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x; i < n; i += 256 * 256)
         sum += w[i] * w[i];
     values[threadIdx.x] = sum;
     __syncthreads();
@@ -8199,7 +8199,7 @@ __global__ void norm_loss_scale_kernel(float* w, size_t n, const float* sums, fl
         __syncthreads();
     }
     const float scale = 1.0f - rate * (1.0f - 1.0f / (sqrtf(values[0]) + 1.0e-7f));
-    for (size_t i = blockIdx.x * 256 + threadIdx.x; i < n; i += gridDim.x * 256)
+    for (size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * 256)
         w[i] *= scale;
 }
 int apply_norm_loss(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* w, size_t n, float rate) {
@@ -11159,7 +11159,7 @@ __global__ void rebase_shared_fold_kernel(
     float* base, float* slow, float* momentum, float* velocity,
     const float* shared, const float* shared_slow, const float* gates,
     size_t count, size_t shared_count, size_t input_dim, size_t output_dim, float old_alpha) {
-    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const size_t cell = i % shared_count;
     const size_t j = input_dim == 0 ? cell : (cell % input_dim) * output_dim + cell / input_dim;
@@ -11173,7 +11173,7 @@ __global__ void rebase_shared_fold_kernel(
 
 __global__ void rebase_shared_scale_kernel(
     float* weights, float* slow, float* momentum, float* velocity, size_t count, float ratio) {
-    const size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) return;
     if (ratio == 0.0f) {
         weights[i] = slow[i] = momentum[i] = velocity[i] = 0.0f;
@@ -11243,7 +11243,7 @@ __global__ void ft_guard_count(const float* a,const float* b,const float* weight
     __shared__ int hits[256];
     __shared__ int eligible[8];
     const unsigned x=threadIdx.x,y=threadIdx.y;
-    const size_t u=blockIdx.x*32+x;
+    const size_t u=static_cast<size_t>(blockIdx.x)*32+x;
     int h=0,n=0;
     for(size_t i=blockIdx.y*8+y;i<batch;i+=gridDim.y*8) {
         if(weights[i]>0.0f) {
@@ -11267,7 +11267,7 @@ __global__ void ft_guard_count(const float* a,const float* b,const float* weight
 }
 
 __global__ void ft_guard_streak(const int* counts,int* streaks,size_t ft,float rate,int patience) {
-    const size_t u=blockIdx.x*blockDim.x+threadIdx.x;
+    const size_t u=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(u>=ft) return;
     // Compare in the rate's f32 representation so exact fractions such as 2/10
     // qualify at rate=0.2f (promoting 0.2f to double would exclude that boundary).
@@ -11280,7 +11280,7 @@ __global__ void ft_guard_bias_gradient(const float* a,const float* b,const float
     const int* streaks,float* gb,size_t batch,size_t ft,float strength,int patience) {
     // Contiguous FT reads; one reduced bias atomic per unit and row block.
     const unsigned x=threadIdx.x,y=threadIdx.y;
-    const size_t u=blockIdx.x*32+x;
+    const size_t u=static_cast<size_t>(blockIdx.x)*32+x;
     const bool enabled=u<ft && streaks[u]>=patience;
     float g=0.0f;
     for(size_t i=blockIdx.y*8+y;i<batch;i+=gridDim.y*8) {
@@ -11394,7 +11394,7 @@ extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,
 
 __global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,
     size_t n,size_t cols,size_t outputs,float alpha) {
-    const size_t i=blockIdx.x*static_cast<size_t>(blockDim.x)+threadIdx.x;
+    const size_t i=static_cast<size_t>(blockIdx.x)*static_cast<size_t>(blockDim.x)+threadIdx.x;
     if(i>=n) return;
     const size_t si=(i%cols)*outputs+(i/cols)%outputs;
     const float f=shared ? alpha*shared[si] : 0.0f;
@@ -11511,7 +11511,7 @@ extern "C" int bulletou_center_affine_layout(BulletOuCudaCppContext* ctx,
 }
 
 __global__ void center_scale_kernel(const float* src,float* dst,size_t n,float scale) {
-    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) dst[i]=src[i]*scale;
 }
 extern "C" int bulletou_center_scale(BulletOuCudaCppContext* ctx,
@@ -11553,13 +11553,13 @@ __global__ void bucket_center_partial(const float* x,const int* buckets,float* s
     scratch[part*stacks*(d+1)+b*(d+1)+c]=s;
 }
 __global__ void bucket_center_finish(float* scratch,size_t n,size_t width) {
-    const size_t c=blockIdx.x*blockDim.x+threadIdx.x;
+    const size_t c=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(c>=width)return;
     float s=0;for(size_t p=0;p<32;++p)s+=scratch[p*width+c];
     scratch[c]=s/n;
 }
 __global__ void bucket_center_normalize(const float* sums,float* centers,size_t d,size_t stacks) {
-    const size_t i=blockIdx.x*blockDim.x+threadIdx.x;
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i>=stacks*(d+1))return;
     float count=sums[(i/(d+1))*(d+1)+d];
     centers[i]=count>0?sums[i]/count:0;

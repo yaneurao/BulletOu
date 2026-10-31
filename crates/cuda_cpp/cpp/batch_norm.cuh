@@ -4,7 +4,7 @@
 // Layout: params=[gamma,beta], running=[mean,variance,initialized],
 // stats=[inverse_std,count_used_for_batch_statistics].
 __global__ void bn_ft_activate(float* a,float* b,float* combined,size_t rows,size_t width) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x,half=width/2;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x,half=width/2;
     if(j>=rows*half)return;
     size_t base=(j/half)*width,u=j%half;
     float a0=crelu(a[base+u]),a1=crelu(a[base+half+u]);
@@ -14,10 +14,10 @@ __global__ void bn_ft_activate(float* a,float* b,float* combined,size_t rows,siz
     combined[base+half+u]=b0*b1*SFNN_PAIRWISE_SCALE;
 }
 __global__ void bn_activate(float* a,size_t n) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j<n)a[j]=crelu(a[j]);
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(j<n)a[j]=crelu(a[j]);
 }
 __global__ void bn_bias_sum(const float* a,const float* b,float* gb,size_t rows,size_t width) {
-    size_t u=blockIdx.x*blockDim.x+threadIdx.x;if(u>=width)return;
+    size_t u=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(u>=width)return;
     float s=0;for(size_t i=0;i<rows;++i)s+=a[i*width+u]+b[i*width+u];gb[u]+=s;
 }
 __global__ void bn_forward_kernel(float* a, float* b, float* xa, float* xb,
@@ -119,7 +119,7 @@ __global__ void bn_backward_kernel(float* da,float* db,const float* xa,const flo
 template<int Mode,int Units=8>
 __global__ void bn_partial(const float* a,const float* b,const float* xa,const float* xb,
     const int* ids,float* stats,size_t rows,size_t stride,size_t width,size_t groups) {
-    size_t lane=threadIdx.x%Units,ch=blockIdx.x*Units+lane,c=width*groups,u=ch%width,g=ch/width;
+    size_t lane=threadIdx.x%Units,ch=static_cast<size_t>(blockIdx.x)*Units+lane,c=width*groups,u=ch%width,g=ch/width;
     size_t tiles=(rows+1023)/1024,begin=blockIdx.y*1024,end=min(rows,begin+1024);
     double* mean=reinterpret_cast<double*>(stats+2*c);
     double* sums=mean+c;double* aux=sums+tiles*c;
@@ -151,7 +151,7 @@ void bn_launch_partial(BulletOuCudaCppContext* ctx,const float* a,const float* b
 }
 template<int Mode>
 __global__ void bn_finish(float* stats,float* running,float* grads,size_t rows,size_t c,float epsilon,float momentum) {
-    size_t ch=blockIdx.x*blockDim.x+threadIdx.x;if(ch>=c)return;
+    size_t ch=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(ch>=c)return;
     size_t tiles=(rows+1023)/1024;
     double* mean=reinterpret_cast<double*>(stats+2*c);
     double* sums=mean+c;double* aux=sums+tiles*c;
@@ -178,7 +178,7 @@ __global__ void bn_finish(float* stats,float* running,float* grads,size_t rows,s
 template<bool Backward>
 __global__ void bn_apply(float* a,float* b,float* xa,float* xb,const int* ids,
     const float* params,const float* stats,size_t rows,size_t stride,size_t width,size_t groups,int activation=0,float* branches=nullptr) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;if(j>=rows*width)return;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(j>=rows*width)return;
     size_t row=j/width,u=j%width,g=groups>1?static_cast<size_t>(ids[row]):0,c=width*groups,ch=g*width+u,k=row*stride+u;
     const double* mean=reinterpret_cast<const double*>(stats+2*c);
     if constexpr(!Backward) {
@@ -199,7 +199,7 @@ __global__ void bn_apply(float* a,float* b,float* xa,float* xb,const int* ids,
 }
 __global__ void bn_inference_kernel(float* a,float* b,const int* ids,const float* params,
     const float* running,size_t rows,size_t stride,size_t width,size_t groups,float epsilon) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(j>=rows*width)return;
     size_t row=j/width,u=j%width,g=groups>1?static_cast<size_t>(ids[row]):0,c=width*groups,ch=g*width+u,k=row*stride+u;
     float inv=1.0f/sqrtf(running[c+ch]+epsilon);
@@ -211,7 +211,7 @@ thread_local bool bn_reference_test=false;
 // FT training: normalize, save x-hat for backward, clamp and multiply in one pass.
 __global__ void bn_ft_apply_activate(float* a,float* b,float* xa,float* xb,float* combined,
     const float* params,const float* stats,size_t rows,size_t width) {
-    size_t j=blockIdx.x*blockDim.x+threadIdx.x,half=width/2;
+    size_t j=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x,half=width/2;
     if(j>=rows*half)return;
     size_t base=(j/half)*width,u=j%half;
     const double* mean=reinterpret_cast<const double*>(stats+2*width);
@@ -253,7 +253,7 @@ void bn_launch_forward(BulletOuCudaCppContext* ctx,float* a,float* b,float* xa,f
 }
 __global__ void bn_ft_backward_apply_bias(float* a,float* b,const float* xa,const float* xb,
     const float* params,float* stats,size_t rows,size_t width) {
-    size_t lane=threadIdx.x%32,u=blockIdx.x*32+lane;
+    size_t lane=threadIdx.x%32,u=static_cast<size_t>(blockIdx.x)*32+lane;
     size_t begin=blockIdx.y*1024,end=min(rows,begin+1024);
     const float* means=stats+2*width;
     double* sums=reinterpret_cast<double*>(stats+2*width)+width;
@@ -349,7 +349,7 @@ int bn_backward_bound(BulletOuCudaCppContext* ctx,int layer,float* a,float* b,
     return check_kernel_launch("SFNN BN backward");
 }
 __global__ void bn_bias_finish(const float* stats,float* gb,size_t rows,size_t width) {
-    size_t u=blockIdx.x*blockDim.x+threadIdx.x;if(u>=width)return;
+    size_t u=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;if(u>=width)return;
     const double* sums=reinterpret_cast<const double*>(stats+2*width)+width;
     double s=0;for(size_t t=0;t<(rows+1023)/1024;++t)s+=sums[t*width+u];
     gb[u]+=float(s);
