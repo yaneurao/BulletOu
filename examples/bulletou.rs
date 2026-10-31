@@ -11235,6 +11235,7 @@ impl WorkerSfnnSession {
     fn save_disk_cached_trial_state(
         &mut self,
         dir: &std::path::Path,
+        trial_args: &Args,
         completed_steps: usize,
         optimizer_steps: usize,
         dataloader_pos: bulletou_lib::value::TeacherDataloaderPos,
@@ -11267,6 +11268,8 @@ impl WorkerSfnnSession {
                     self.runner.factorizer_alpha.ft,
                     if self.runner.factorizer.shared { self.runner.factorizer_alpha.shared } else { 0.0 },
                 ],
+                &checkpoint_axis_coefficients(self.shape, effective_sfnn_factorizer_alpha(trial_args), self.factorizer_axis_confidences.as_deref()),
+                self.residual_count_gates.as_deref(),
             )?;
             std::fs::write(
                 tmp_dir.join("dataloader_pos.txt"),
@@ -11819,6 +11822,7 @@ impl WorkerSfnnSession {
                     let storage = if let Some(cache_dir) = cache_dir {
                         self.save_disk_cached_trial_state(
                             &cache_dir,
+                            &trial_args,
                             completed_steps_after,
                             optimizer_steps_after,
                             dataloader_pos,
@@ -12024,6 +12028,8 @@ impl WorkerSfnnSession {
                     self.completed_steps,
                     self.optimizer_steps,
                     shared_coefficients_for_args(&save_args),
+                    &checkpoint_axis_coefficients(self.shape, effective_sfnn_factorizer_alpha(&save_args), self.factorizer_axis_confidences.as_deref()),
+                    self.residual_count_gates.as_deref(),
                 )?;
                 write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, &save_args, log)?;
                 Ok(())
@@ -20289,6 +20295,8 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             completed_steps,
             optimizer_steps,
             shared_coefficients_for_args(args),
+            &checkpoint_axis_coefficients(shape, effective_sfnn_factorizer_alpha(args), factorizer_axis_confidences),
+            residual_count_gates,
         )?;
         write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, args, log)?;
         Ok(())
@@ -21698,6 +21706,10 @@ impl CudaCppSfnnCreatedFactorizers {
     fn any(self) -> bool {
         self.shared_l1 || self.shared_l2_l3 || self.axis_l1 || self.axis_l2_l3
     }
+
+    fn output_preserving_extraction(self) -> Self {
+        Self { axis_l1: false, axis_l2_l3: false, ..self }
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -22605,6 +22617,12 @@ fn load_cuda_cpp_sfnn_initial_state(
             path.display()
         );
     }
+    if created_factorizers.shared_l1 && (created_factorizers.axis_l1 || weights.l1axw.is_none()) {
+        let counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
+        if counts.residual_count_gates.as_ref().is_some_and(|g| g.iter().any(|&v| v != 1.0)) {
+            return Err("enabling an L1 factorizer on an unfactorized checkpoint with residual count gates cannot preserve its output; first load it without bucket-count gates".into());
+        }
+    }
     let keep_optimizer_state_on_factorizer_change = args.sfnn_keep_optimizer_state_on_factorizer_change;
     // New factorizer coordinates reset the optimizer during migration; do not
     // load an incomplete shared optimizer state just to discard it afterwards.
@@ -22634,10 +22652,14 @@ fn load_cuda_cpp_sfnn_initial_state(
         old_shared_coefficients,
         new_shared_coefficients,
     )?;
+    // A freshly enabled axis has no historical optimizer state.  Keep it at
+    // zero: extracting unit-coefficient axis averages would change the
+    // effective model whenever axis alpha or confidence differs from one.
+    let extraction = created_factorizers.output_preserving_extraction();
     let extracted_new_factorizers = extract_cuda_cpp_sfnn_new_factorizers_from_base(
         &mut weights,
         effective_sfnn_factorizer_spec(args),
-        created_factorizers,
+        extraction,
     )?;
     if created_factorizers.shared_l1 {
         // Extraction builds a unit-coefficient shared term.
@@ -22649,8 +22671,34 @@ fn load_cuda_cpp_sfnn_initial_state(
             new_shared_coefficients,
         )?;
     }
+    let active = effective_sfnn_factorizer_spec(args);
+    let inactive_nonzero = cuda_cpp_sfnn_has_nonzero_inactive_axis(&weights, active)?;
+    let legacy_axis_coefficients = if inactive_nonzero && !train.contains_key("axis_coefficients") {
+        legacy_checkpoint_axis_coefficients(path, weights.shape)
+    } else { None };
+    let source_axis_coefficients = train.get("axis_coefficients").map(Vec::as_slice)
+        .or(legacy_axis_coefficients.as_deref());
+    if inactive_nonzero {
+        let coefficients = source_axis_coefficients.ok_or_else(|| format!(
+            "{} lacks saved axis coefficients; cannot safely fold inactive L1 axes. Resume with the original factorizer and use an epoch schedule to switch it.", path.display()
+        ))?;
+        if coefficients.len() != weights.shape.factorizer_axis_count() || coefficients.iter().any(|v| !v.is_finite()) {
+            return Err("checkpoint axis coefficients are invalid for the factorizer layout".into());
+        }
+        if train.get("residual_count_gates").is_some_and(|g| g.iter().any(|&v| v != 1.0)) {
+            return Err("cannot migrate inactive factorizer axes from a checkpoint with residual count gates; use an epoch schedule with the original settings".into());
+        }
+        let target_counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
+        if active.any() && target_counts.residual_count_gates.as_ref().is_some_and(|g| g.iter().any(|&v| v != 1.0)) {
+            return Err("cannot fold inactive axes into a target with residual count gates; use an epoch schedule with the original settings".into());
+        }
+        if args.sfnn_keep_optimizer_state_on_factorizer_change {
+            return Err("cannot preserve optimizer moments while folding inactive axis terms; disable sfnn_keep_optimizer_state_on_factorizer_change".into());
+        }
+    }
     let folded_inactive_factorizers =
-        fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut weights, effective_sfnn_factorizer_spec(args))?;
+        fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut weights, active,
+            if inactive_nonzero { source_axis_coefficients } else { None })?;
     if extracted_new_factorizers {
         eprintln!(
             "  initial factorizer migration = extracted common base-weight components into newly enabled factorizer tensors"
@@ -22664,7 +22712,7 @@ fn load_cuda_cpp_sfnn_initial_state(
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_steps(&step_ranger, &weights)?;
-    let optimizer_states = if extracted_new_factorizers || folded_inactive_factorizers || progress_axis_appended {
+    let optimizer_states = if created_factorizers.any() || folded_inactive_factorizers || progress_axis_appended {
         if progress_axis_appended {
             if keep_optimizer_state_on_factorizer_change {
                 eprintln!("  initial optimizer state = reset because progress-axis factorizer tensors were appended");
@@ -22849,9 +22897,56 @@ fn extract_cuda_cpp_sfnn_new_factorizers_from_base(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn legacy_checkpoint_axis_coefficients(path: &Path, shape: bulletou_cuda_cpp::SfnnForwardShape) -> Option<Vec<f32>> {
+    let dir = path.parent()?;
+    let settings = dir.join("bulletou-settings.json");
+    if !settings.is_file() { return None; }
+    let raw = vec![std::ffi::OsString::from("bulletou"), std::ffi::OsString::from("--settings-file"), settings.into_os_string()];
+    let saved = Args::try_parse_from(expand_settings_file_args(raw).ok()?).ok()?;
+    // An external count file may have changed since the checkpoint was saved.
+    if saved.sfnn_bucket_counts.is_some() { return None; }
+    let epoch = read_checkpoint_epoch_superbatch(dir).map_or(1, |(epoch, _)| epoch);
+    let saved = args_at_epoch(&saved, epoch).ok()?;
+    if scheduled_l1_shape(shape, &saved) != shape { return None; }
+    let count_settings = WorkerSfnnSession::compute_count_settings(&saved, shape).ok()?;
+    Some(checkpoint_axis_coefficients(shape, effective_sfnn_factorizer_alpha(&saved),
+        count_settings.factorizer_axis_confidences.as_deref()))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn cuda_cpp_sfnn_has_nonzero_inactive_axis(
+    weights: &CudaCppSfnnInitialWeights,
+    active: SfnnFactorizerSpec,
+) -> Result<bool, String> {
+    let shape = weights.shape;
+    let count = shape.factorizer_axis_count();
+    let mut enabled = vec![false; count];
+    for axis in cuda_cpp_sfnn_factorizer_axis_indices(shape, active) {
+        if axis < count { enabled[axis] = true; }
+    }
+    for (values, stride) in [
+        (weights.l1axw.as_ref(), shape.ft_size * shape.l1_out()),
+        (weights.l1axb.as_ref(), shape.l1_out()),
+        (weights.l2axw.as_ref(), shape.l2_size * shape.l2_in()),
+        (weights.l2axb.as_ref(), shape.l2_size),
+        (weights.l3axw.as_ref(), shape.l2_size),
+        (weights.l3axb.as_ref(), 1),
+    ] {
+        if let Some(values) = values {
+            if values.len() != count * stride { return Err("invalid checkpoint axis tensor length".into()); }
+            for (axis, row) in values.chunks_exact(stride).enumerate() {
+                if !enabled[axis] && row.iter().any(|&v| v != 0.0) { return Ok(true); }
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
     weights: &mut CudaCppSfnnInitialWeights,
     active: SfnnFactorizerSpec,
+    axis_coefficients: Option<&[f32]>,
 ) -> Result<bool, String> {
     let mut folded_any = false;
     let shape = weights.shape;
@@ -22929,7 +23024,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l1axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
-            None,
+            axis_coefficients,
         )?;
         fold_cuda_cpp_sfnn_l2_axis_into_stacked_l2(
             shape,
@@ -22939,7 +23034,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l2axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
-            None,
+            axis_coefficients,
         )?;
         fold_cuda_cpp_sfnn_l3_axis_into_stacked_l3(
             shape,
@@ -22949,7 +23044,7 @@ fn fold_cuda_cpp_sfnn_inactive_factorizers_into_base(
             weights.l3axb.as_deref(),
             fold_axis,
             SfnnFactorizerAlphaSpec::ONE,
-            None,
+            axis_coefficients,
         )?;
         if active.any_axis() {
             zero_cuda_cpp_sfnn_axis_factorizer_slices(weights, fold_axis)?;
@@ -24663,6 +24758,8 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         completed_steps,
         optimizer_steps,
         [factorizer_alpha.ft, if factorizer.shared { factorizer_alpha.shared } else { 0.0 }],
+        &checkpoint_axis_coefficients(shape, factorizer_alpha, factorizer_axis_confidences),
+        residual_count_gates,
     )
 }
 
@@ -24670,6 +24767,13 @@ fn write_cuda_cpp_sfnn_direct_outputs(
 fn shared_coefficients_for_args(args: &Args) -> [f32; 2] {
     let a = effective_sfnn_factorizer_alpha(args);
     [a.ft, if effective_sfnn_factorizer_spec(args).shared { a.shared } else { 0.0 }]
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn checkpoint_axis_coefficients(shape: bulletou_cuda_cpp::SfnnForwardShape,
+    alpha: SfnnFactorizerAlphaSpec, confidence: Option<&[f32]>) -> Vec<f32> {
+    (0..shape.factorizer_axis_count()).map(|i|
+        cuda_cpp_sfnn_factorizer_axis_alpha_with_confidence(shape, i, alpha, confidence)).collect()
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -24681,6 +24785,8 @@ fn write_cuda_cpp_sfnn_weights_bin(
     completed_steps: usize,
     optimizer_steps: usize,
     shared_coefficients: [f32; 2],
+    axis_coefficients: &[f32],
+    residual_count_gates: Option<&[f32]>,
 ) -> Result<(), String> {
     let bn_records=weights.batch_norm.0.iter().map(|s|s.as_ref().map(|s|s.encode()).transpose())
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
@@ -24701,6 +24807,10 @@ fn write_cuda_cpp_sfnn_weights_bin(
         ("nnue/weights/l3w", weights.l3w.as_slice()),
         ("nnue/weights/l3b", weights.l3b.as_slice()),
     ];
+    records.push(("nnue/train/axis_coefficients", axis_coefficients));
+    if let Some(gates) = residual_count_gates {
+        records.push(("nnue/train/residual_count_gates", gates));
+    }
     for (i,key) in ["nnue/weights/bn_ft","nnue/weights/bn_l1","nnue/weights/bn_l2"].into_iter().enumerate() {
         if let Some(v)=&bn_records[i] {records.push((key,v.as_slice()));}
     }
@@ -34228,12 +34338,14 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11, [0.5, 0.75]).unwrap();
+        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11, [0.5, 0.75], &[0.25, 0.5], Some(&[0.9])).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let records = parse_model_weights_bin(&bytes).unwrap();
 
         assert_eq!(records["nnue/train/shared_coefficients"], vec![0.5, 0.75]);
+        assert_eq!(records["nnue/train/axis_coefficients"], vec![0.25, 0.5]);
+        assert_eq!(records["nnue/train/residual_count_gates"], vec![0.9]);
         assert_eq!(records["nnue/weights/l1_revival_flags"], vec![3.0]);
         assert_eq!(records["nnue/weights/l2_revival_flags"], vec![3.0]);
         let mut restored_rng=bulletou_cuda_cpp::revival_rng::RevivalRng::decode(&records["nnue/weights/revival_rng"]).unwrap();
@@ -34768,6 +34880,15 @@ mod tests {
         };
         weights.validate().unwrap();
 
+        assert!(cuda_cpp_sfnn_has_nonzero_inactive_axis(&weights, SfnnFactorizerSpec::NONE).unwrap());
+        let mut half = weights.clone();
+        let coefficients = vec![0.5; axis_count];
+        let ids = cuda_cpp_sfnn_factorizer_axis_ids(shape, 0, SfnnFactorizerSpec::AXIS);
+        let expected_bias = weights.l1b[0] + weights.l1fb.as_ref().unwrap()[0]
+            + ids.iter().map(|&axis| 0.5 * weights.l1axb.as_ref().unwrap()[axis * l1_out]).sum::<f32>();
+        fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut half, SfnnFactorizerSpec::NONE, Some(&coefficients)).unwrap();
+        assert!((half.l1b[0] - expected_bias).abs() < 1e-5);
+
         let mut expected = weights.clone();
         fold_cuda_cpp_sfnn_l1f_into_stacked_l1(
             shape,
@@ -34844,10 +34965,29 @@ mod tests {
         expected.l3axb = None;
 
         let mut migrated = weights;
-        assert!(fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut migrated, SfnnFactorizerSpec::NONE).unwrap());
+        assert!(fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut migrated, SfnnFactorizerSpec::NONE, None).unwrap());
 
         assert_eq!(migrated, expected);
         migrated.validate().unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn legacy_checkpoint_recovers_axis_alpha_from_settings() {
+        let dir = std::env::temp_dir().join(format!("bulletou-legacy-axis-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("bulletou-settings.json");
+        std::fs::write(&settings, r#"{"arch":"SFNN_halfka2_128_8_32_k3k3","teacher":"/dev/null","backend":"cuda-cpp","sfnn_l1_factorizer":"axis","sfnn_l1_factorizer_alpha":"king=0.5"}"#).unwrap();
+        let shape = bulletou_cuda_cpp::SfnnForwardShape {
+            input_size: 2, ft_size: 2, l1_hidden: 1, l1_skip: false, l2_size: 1,
+            num_stacks: 9, l1_group_count: 1, l1_common_size: 0, l1_shard_size: 0,
+            factorizer_king_axis_dim: 3, factorizer_hand_axis_dim: 0,
+            factorizer_progress_axis: false, factorizer_king_hand_pair: false,
+            factorizer_king_progress_pair: false, factorizer_hand_progress_pair: false,
+        };
+        assert_eq!(legacy_checkpoint_axis_coefficients(&dir.join("state.bin"), shape), Some(vec![0.5; 6]));
+        std::fs::remove_file(settings).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -34935,7 +35075,7 @@ mod tests {
             l3axb: optimizer.l3axb.as_ref().map(|state| state.momentum.clone()),
         };
         assert!(
-            fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut expected_weights, SfnnFactorizerSpec::NONE).unwrap()
+            fold_cuda_cpp_sfnn_inactive_factorizers_into_base(&mut expected_weights, SfnnFactorizerSpec::NONE, None).unwrap()
         );
 
         let mut migrated = optimizer;
@@ -35024,6 +35164,21 @@ mod tests {
         original.validate().unwrap();
 
         let axis_count = shape.factorizer_axis_count();
+        let mut newly_enabled = original.clone();
+        newly_enabled.l1axw = Some(vec![0.0; axis_count * shape.ft_size * l1_out]);
+        newly_enabled.l1axb = Some(vec![0.0; axis_count * l1_out]);
+        let created = CudaCppSfnnCreatedFactorizers { axis_l1: true, ..Default::default() };
+        assert!(!extract_cuda_cpp_sfnn_new_factorizers_from_base(
+            &mut newly_enabled, SfnnFactorizerSpec::AXIS, created.output_preserving_extraction()).unwrap());
+        assert_eq!(newly_enabled.l1w, original.l1w);
+        let mut alpha = SfnnFactorizerAlphaSpec::ONE;
+        alpha.king_axis = 0.5;
+        fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(shape, &mut newly_enabled.l1w,
+            &mut newly_enabled.l1b, newly_enabled.l1axw.as_deref(), newly_enabled.l1axb.as_deref(),
+            SfnnFactorizerSpec::AXIS, alpha, None).unwrap();
+        assert_eq!(newly_enabled.l1w, original.l1w);
+        assert_eq!(newly_enabled.l1b, original.l1b);
+
         let mut migrated = original.clone();
         migrated.l1fw = Some(vec![0.0; shape.ft_size * l1_out]);
         migrated.l1fb = Some(vec![0.0; l1_out]);
