@@ -10262,6 +10262,7 @@ mod tests {
         assert!(super::SfnnFactorizerActive::SHARED.validate_for_shape(shape).is_ok());
     }
     mod norm_loss_tests;
+    mod dense_qat_reference;
     mod validation_stats {
         include!("validation_stats_tests.rs");
     }
