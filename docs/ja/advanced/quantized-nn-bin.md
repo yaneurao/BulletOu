@@ -31,7 +31,7 @@ JSON設定なら、既存の `bulletou-settings.json` のトップレベルに�
 `false` または省略で従来の学習です。通常学習・worker・profilingの各経路で有効です。
 grouped/common-shard L1でも接続構造を保ち、共有項をfoldしてから量子化します。
 
-`sfnn_qat_l1` の対象は **L1のweightとbiasだけ**です。ほかの層も以下の個別指定で有効化できます。活性値の整数演算は模擬しません。
+L1だけを有効にした場合は **L1のweightとbiasだけ**が対象で、活性値の整数演算は模擬しません。L1・L2・L3をすべて有効にした場合は、下記のdense QATになります。
 shared / axis / pair / count gateを使っている場合は、それらを足し合わせた実効重み `W` に対して、次の計算をします。
 
 ```text
@@ -74,7 +74,9 @@ CUDA SFNNでは次を個別に指定できます。すべてデフォルトOFF�
 
 - FT: weight/biasを127倍してint16範囲で丸めます。FT factorizer使用時はfold後の実効重みが対象です。
 - L2/L3: weightを64倍してint8範囲、biasを8128倍してint32範囲で丸めます。
-- forward/backwardは丸めた重みを使い、FP32の学習用重みにはidentity STEで更新します。活性値の整数演算を完全再現する機能ではありません。
+- L1・L2・L3のいずれかがOFFの場合、選択した層の重みだけを丸め、活性値はf32で計算します。
+- **L1・L2・L3をすべてON**にすると、tatara方式のdense QATになります。FTの出力を1/127刻みに切り捨て、L1〜L3を整数積和、整数活性化、L1 skipの整数加算で計算します。逆伝播は量子化後の重みと丸め前の連続活性値を使うSTEです。FT演算自体は浮動小数点で、エンジンの最後のFV_SCALE除算は含みません。
+- FTのQAT指定は独立です。tataraと同様にFTを浮動小数点のままにするなら `sfnn_qat_ft: false` とし、L1・L2・L3を `true` にしてください。
 - 通常学習・worker・profiling・batches_per_updateに対応します。checkpointはFP32重みとoptimizer stateを保持し、既存checkpointからの再開時にも切り替えられます。
 - `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}` のようなepoch別指定にも対応します。
 - BNとは併用しません。BNが有効なら警告を出してこれら3項目を無効化します。BN用は `sfnn_bn_qat` を使ってください。

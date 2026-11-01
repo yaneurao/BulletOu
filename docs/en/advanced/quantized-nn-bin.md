@@ -24,7 +24,9 @@ CUDA SFNN supports independent `sfnn_qat_ft`, `sfnn_qat_l2`, and `sfnn_qat_l3` b
 
 - FT weights/biases use scale 127 and int16 bounds. FT factorizer contributions are folded before rounding.
 - L2/L3 weights use scale 64 and int8 bounds; biases use scale 8128 and int32 bounds.
-- Forward/backward use fake-quantized weights; FP32 masters receive identity-STE updates. Integer activation arithmetic is not fully emulated.
+- When any of L1/L2/L3 is off, selected layers use weight-only fake quantization and floating-point activations.
+- Enabling **all of L1, L2 and L3** selects tatara-style dense QAT: the FT output is floored to the 1/127 grid, followed by integer dense products, activations and L1 skip addition. Backward uses quantized weights and continuous activation STEs. FT arithmetic remains floating point and the final engine FV_SCALE division is excluded.
+- FT QAT is independent. Set `sfnn_qat_ft` to `false` and enable L1/L2/L3 to retain floating-point FT precision as in tatara.
 - Direct, worker, profiling and gradient accumulation paths are supported. Checkpoints retain FP32 masters and optimizer state; export format is unchanged. Toggle on resume or use an epoch schedule such as `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}`.
 - With BN enabled, a warning is printed and these three flags are disabled. Use `sfnn_bn_qat` instead.
 - Each selected layer needs a GPU FP32 weight/bias copy. FT1024 HalfKA2 with factorization costs about 512 MiB extra; L2/L3-only QAT does not allocate an FT copy. Rounding adds runtime overhead.
@@ -43,7 +45,7 @@ It is **off by default**. In the top level of `bulletou-settings.json`, use:
 ```
 
 `false` or omission preserves ordinary training. The normal, worker and profiling paths support it.
-Grouped/common-shard L1 preserves structural zeros and folds shared terms before quantization. This flag fake-quantizes **L1 weights and biases** only. Other layers have separate flags below; activation integer arithmetic is not emulated.
+Grouped/common-shard L1 preserves structural zeros and folds shared terms before quantization. When enabled alone, this flag fake-quantizes **L1 weights and biases** only. Enabling L1, L2 and L3 together selects dense integer QAT as described above.
 Factorizers and count gates are folded before quantization:
 
 ```text
