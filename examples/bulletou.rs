@@ -28653,6 +28653,20 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    // Integer activation boundaries used by tatara's dense QAT.  The training
+    // implementation must agree with the independent nn.bin CPU evaluator.
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn dense_qat_integer_activation_boundaries_match_nn_bin() {
+        let inputs = [i32::MIN, -8193, -8192, -4096, -725, -724, -64, -1,
+            0, 1, 63, 64, 724, 725, 4096, 8127, 8128, 8191, 8192, i32::MAX];
+        for raw in inputs {
+            let linear = (i64::from(raw) >> 6).clamp(0, 127) as u8;
+            let square = ((i64::from(raw) * i64::from(raw)) >> 19).clamp(0, 127) as u8;
+            assert_eq!(quantized_sfnn_clipped_relu(raw, QuantizedRoundMode::Floor), linear, "linear {raw}");
+            assert_eq!(quantized_sfnn_sqr_clipped_relu(raw, QuantizedRoundMode::Floor), square, "square {raw}");
+        }
+    }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn exact_step_records_roundtrip_beyond_float_precision() {
