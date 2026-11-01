@@ -7441,6 +7441,45 @@ extern "C" int bulletou_dense_qat_integer_reference(
         input->ptr,weights->ptr,bias->ptr,buckets->ptr,output->ptr,batch,inputs,outputs,stacks);
     return check_kernel_launch("dense QAT reference");
 }
+
+// Reference fused integer activations and their continuous STE derivatives.
+// The real-valued derivative is deliberately computed from raw, not from the
+// rounded activation (a positive value can round to zero).
+__global__ void dense_qat_activation_reference_kernel(
+    const int* raw, const float* square_gradient, const float* linear_gradient,
+    int* square_output, int* linear_output, float* gradient, size_t n) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (i>=n) return;
+    const long long v=raw[i];
+    const long long square=(v*v)>>19;
+    square_output[i]=static_cast<int>(min(127LL,square));
+    linear_output[i]=max(0,min(127,raw[i]>>6));
+    const float x=static_cast<float>(raw[i])/8128.0f;
+    const float continuous_square=x*x*(127.0f/128.0f);
+    const float gs=continuous_square>0.0f && continuous_square<1.0f
+        ? square_gradient[i]*2.0f*x*(127.0f/128.0f) : 0.0f;
+    const float gl=x>0.0f && x<1.0f ? linear_gradient[i] : 0.0f;
+    gradient[i]=gs+gl;
+}
+
+extern "C" int bulletou_dense_qat_activation_reference(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* raw,
+    BulletOuCudaCppF32Buffer* square_gradient, BulletOuCudaCppF32Buffer* linear_gradient,
+    BulletOuCudaCppI32Buffer* square_output, BulletOuCudaCppI32Buffer* linear_output,
+    BulletOuCudaCppF32Buffer* gradient, size_t n) {
+    if (!ctx || n==0) return fail_message("invalid dense QAT activation dimensions");
+    if (validate_i32_buffer(ctx,raw,n,"dense QAT raw") ||
+        validate_buffer(ctx,square_gradient,n,"dense QAT square gradient") ||
+        validate_buffer(ctx,linear_gradient,n,"dense QAT linear gradient") ||
+        validate_i32_buffer(ctx,square_output,n,"dense QAT square output") ||
+        validate_i32_buffer(ctx,linear_output,n,"dense QAT linear output") ||
+        validate_buffer(ctx,gradient,n,"dense QAT gradient")) return -1;
+    int blocks=0;
+    if (block_count_1d(n,256,&blocks,"dense QAT activation") != 0) return -1;
+    dense_qat_activation_reference_kernel<<<blocks,256,0,ctx->stream>>>(
+        raw->ptr,square_gradient->ptr,linear_gradient->ptr,square_output->ptr,linear_output->ptr,gradient->ptr,n);
+    return check_kernel_launch("dense QAT activation");
+}
 extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,
     float scale,float lo,float hi,size_t base,size_t vr,size_t width,float alpha) {

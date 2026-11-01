@@ -104,3 +104,35 @@ fn gpu_integer_dense_matches_scalar_reference() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires CUDA; validates integer activations and their STE"]
+fn gpu_integer_activation_uses_unrounded_ste() {
+    use crate::{check, ffi, Context, F32Buffer, I32Buffer};
+    unsafe extern "C" {
+        fn bulletou_dense_qat_activation_reference(
+            ctx: *mut ffi::BulletOuCudaCppContext, raw: *mut ffi::BulletOuCudaCppI32Buffer,
+            square_gradient: *mut ffi::BulletOuCudaCppF32Buffer, linear_gradient: *mut ffi::BulletOuCudaCppF32Buffer,
+            square_output: *mut ffi::BulletOuCudaCppI32Buffer, linear_output: *mut ffi::BulletOuCudaCppI32Buffer,
+            gradient: *mut ffi::BulletOuCudaCppF32Buffer, n: usize,
+        ) -> i32;
+    }
+    let raw = [i32::MIN,-8192,-725,-724,-64,-1,0,1,63,64,724,725,8127,8128,8192,i32::MAX];
+    let ctx=Context::new(0).unwrap();
+    let r=I32Buffer::from_host(&ctx,&raw).unwrap();
+    let gs=F32Buffer::from_host(&ctx,&vec![0.25;raw.len()]).unwrap();
+    let gl=F32Buffer::from_host(&ctx,&vec![0.75;raw.len()]).unwrap();
+    let so=I32Buffer::new(&ctx,raw.len()).unwrap(); let lo=I32Buffer::new(&ctx,raw.len()).unwrap();
+    let g=F32Buffer::new(&ctx,raw.len()).unwrap();
+    // SAFETY: each buffer has one element for every entry in `raw`.
+    check(unsafe { bulletou_dense_qat_activation_reference(ctx.as_ptr(),r.as_ptr(),gs.as_ptr(),gl.as_ptr(),
+        so.as_ptr(),lo.as_ptr(),g.as_ptr(),raw.len()) }).unwrap();
+    let sv=so.download(&ctx).unwrap(); let lv=lo.download(&ctx).unwrap(); let gv=g.download(&ctx).unwrap();
+    for (i,&v) in raw.iter().enumerate() {
+        assert_eq!(sv[i],square(v)); assert_eq!(lv[i],linear(v));
+        let x=f64::from(v)/8128.0;
+        let expected=(if active_square(v) { 0.25*2.0*x*(127.0/128.0) } else { 0.0 })
+            +(if active_linear(v) {0.75} else {0.0});
+        assert!((f64::from(gv[i])-expected).abs()<1e-6,"raw={v} actual={} expected={expected}",gv[i]);
+    }
+}
