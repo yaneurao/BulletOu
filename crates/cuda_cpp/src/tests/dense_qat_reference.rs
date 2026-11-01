@@ -66,3 +66,41 @@ fn integer_forward_keeps_skip_and_continuous_ste_boundaries() {
     assert!(active_square(-1));
     assert!(!active_linear(8128));
 }
+
+#[test]
+#[ignore = "requires CUDA; validates the standalone dense integer QAT kernel"]
+fn gpu_integer_dense_matches_scalar_reference() {
+    use crate::{check, ffi, Context, F32Buffer, I32Buffer};
+    unsafe extern "C" {
+        fn bulletou_dense_qat_integer_reference(
+            ctx: *mut ffi::BulletOuCudaCppContext, input: *mut ffi::BulletOuCudaCppI32Buffer,
+            weights: *mut ffi::BulletOuCudaCppF32Buffer, bias: *mut ffi::BulletOuCudaCppF32Buffer,
+            buckets: *mut ffi::BulletOuCudaCppI32Buffer, output: *mut ffi::BulletOuCudaCppI32Buffer,
+            batch: usize, inputs: usize, outputs: usize, stacks: usize,
+        ) -> i32;
+    }
+    let (batch, inputs, outputs, stacks) = (4, 5, 3, 2);
+    let x = [0,1,63,126,127, 127,0,5,64,1, 1,2,3,4,5, 126,127,0,1,99];
+    let buckets = [0,1,1,0];
+    let mut w: Vec<f32> = (0..stacks*outputs*inputs)
+        .map(|i| (i as f32 - 12.5) / 64.0).collect();
+    w[0]=-100.0; w[1]=100.0; w[2]=-0.5/64.0; w[3]=0.5/64.0;
+    let b = [-0.5/8128.0,0.5/8128.0,1.0,-1.0,100.0,-100.0];
+    let ctx=Context::new(0).unwrap();
+    let xi=I32Buffer::from_host(&ctx,&x).unwrap();
+    let wi=F32Buffer::from_host(&ctx,&w).unwrap();
+    let bi=F32Buffer::from_host(&ctx,&b).unwrap();
+    let ki=I32Buffer::from_host(&ctx,&buckets).unwrap();
+    let out=I32Buffer::new(&ctx,batch*outputs).unwrap();
+    // SAFETY: all buffers have the exact lengths required by the CUDA API.
+    check(unsafe { bulletou_dense_qat_integer_reference(ctx.as_ptr(),xi.as_ptr(),wi.as_ptr(),bi.as_ptr(),
+        ki.as_ptr(),out.as_ptr(),batch,inputs,outputs,stacks) }).unwrap();
+    let got=out.download(&ctx).unwrap();
+    for sample in 0..batch {
+        for unit in 0..outputs {
+            let row=buckets[sample] as usize*outputs+unit;
+            assert_eq!(got[sample*outputs+unit],dense(&x[sample*inputs..(sample+1)*inputs],
+                &w[row*inputs..(row+1)*inputs],b[row]),"sample={sample} unit={unit}");
+        }
+    }
+}

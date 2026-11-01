@@ -7400,6 +7400,47 @@ __global__ void layer_qat_ft_fold_kernel(const float* src,float* dst,size_t base
         dst[j]=sfnn_quantize_dequant_clamped(v,127.0f,-32768.0f,32767.0f);
     }
 }
+
+// Standalone integer dense operation for dense-QAT parity testing. Inputs are
+// already on the 0..127 lattice; weights and bias are quantized exactly as
+// in the network exporter. Training does not call this kernel yet.
+__global__ void dense_qat_integer_reference_kernel(
+    const int* input, const float* weights, const float* bias, const int* buckets,
+    int* output, size_t batch, size_t inputs, size_t outputs, size_t stacks) {
+    const size_t tid=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (tid>=batch*outputs) return;
+    const size_t sample=tid/outputs, unit=tid%outputs;
+    const int bucket=buckets[sample];
+    if (bucket<0 || static_cast<size_t>(bucket)>=stacks) { output[tid]=0; return; }
+    const size_t row=static_cast<size_t>(bucket)*outputs+unit;
+    const double b=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(bias[row])*8128.0)));
+    long long sum=static_cast<long long>(b);
+    for (size_t i=0;i<inputs;++i) {
+        const double q=fmin(127.0,fmax(-128.0,round(static_cast<double>(weights[row*inputs+i])*64.0)));
+        sum+=static_cast<long long>(input[sample*inputs+i])*static_cast<long long>(q);
+    }
+    output[tid]=static_cast<int>(sum);
+}
+
+extern "C" int bulletou_dense_qat_integer_reference(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* input,
+    BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias,
+    BulletOuCudaCppI32Buffer* buckets, BulletOuCudaCppI32Buffer* output,
+    size_t batch, size_t inputs, size_t outputs, size_t stacks) {
+    if (!ctx || !batch || !inputs || !outputs || !stacks ||
+        batch>SIZE_MAX/inputs || batch>SIZE_MAX/outputs || stacks>SIZE_MAX/outputs ||
+        stacks*outputs>SIZE_MAX/inputs) return fail_message("invalid dense QAT dimensions");
+    if (validate_i32_buffer(ctx,input,batch*inputs,"dense QAT input") ||
+        validate_buffer(ctx,weights,stacks*outputs*inputs,"dense QAT weights") ||
+        validate_buffer(ctx,bias,stacks*outputs,"dense QAT bias") ||
+        validate_i32_buffer(ctx,buckets,batch,"dense QAT buckets") ||
+        validate_i32_buffer(ctx,output,batch*outputs,"dense QAT output")) return -1;
+    int blocks=0;
+    if (block_count_1d(batch*outputs,256,&blocks,"dense QAT reference") != 0) return -1;
+    dense_qat_integer_reference_kernel<<<blocks,256,0,ctx->stream>>>(
+        input->ptr,weights->ptr,bias->ptr,buckets->ptr,output->ptr,batch,inputs,outputs,stacks);
+    return check_kernel_launch("dense QAT reference");
+}
 extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,
     float scale,float lo,float hi,size_t base,size_t vr,size_t width,float alpha) {
