@@ -136,3 +136,35 @@ fn gpu_integer_activation_uses_unrounded_ste() {
         assert!((f64::from(gv[i])-expected).abs()<1e-6,"raw={v} actual={} expected={expected}",gv[i]);
     }
 }
+
+#[test]
+#[ignore = "requires CUDA; exercises the training L1 backward kernel with quantized activations"]
+fn gpu_training_l1_backward_uses_prequantized_activation_for_ste() {
+    use crate::{check, ffi, Context, F32Buffer};
+    unsafe extern "C" {
+        fn bulletou_dense_qat_l1_backward_reference(
+            ctx: *mut ffi::BulletOuCudaCppContext, l1: *mut ffi::BulletOuCudaCppF32Buffer,
+            l2_input: *mut ffi::BulletOuCudaCppF32Buffer, l2_grad: *mut ffi::BulletOuCudaCppF32Buffer,
+            l1_grad: *mut ffi::BulletOuCudaCppF32Buffer, batch: usize, hidden: usize, skip: i32,
+        ) -> i32;
+    }
+    let raw=[-8192,-725,-1,0,1,63,64,724,725,8127,8128,8192];
+    let l1:Vec<f32>=raw.iter().flat_map(|&v| [v as f32/8128.0, 0.25]).collect();
+    let input:Vec<f32>=raw.iter().flat_map(|&v| [square(v) as f32/127.0,linear(v) as f32/127.0]).collect();
+    let ctx=Context::new(0).unwrap();
+    let d_l1=F32Buffer::from_host(&ctx,&l1).unwrap();
+    let d_input=F32Buffer::from_host(&ctx,&input).unwrap();
+    let d_input_grad=F32Buffer::from_host(&ctx,&vec![1.0;input.len()]).unwrap();
+    let d_grad=F32Buffer::from_host(&ctx,&vec![0.0;l1.len()]).unwrap();
+    // SAFETY: all buffers match the specified batch/hidden/skip dimensions.
+    check(unsafe { bulletou_dense_qat_l1_backward_reference(ctx.as_ptr(),d_l1.as_ptr(),d_input.as_ptr(),
+        d_input_grad.as_ptr(),d_grad.as_ptr(),raw.len(),1,1) }).unwrap();
+    let got=d_grad.download(&ctx).unwrap();
+    for (i,&v) in raw.iter().enumerate() {
+        let x=f64::from(v)/8128.0;
+        let expected=(if active_square(v) {2.0*x*(127.0/128.0)} else {0.0})
+            +(if active_linear(v) {1.0} else {0.0});
+        assert!((f64::from(got[2*i])-expected).abs()<1e-6,"raw={v}");
+        assert_eq!(got[2*i+1],0.0);
+    }
+}

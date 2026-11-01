@@ -3257,9 +3257,13 @@ __global__ void sfnn_l2_input_backward_kernel(
     size_t square_idx = l2_base + col;
     size_t linear_idx = l2_base + l1_hidden + col;
     float value = l1[tid];
-    float square_grad = crelu_pre_gradient_from_value(l2_input[square_idx], l2_input_gradients[square_idx]) *
+    // The activation buffers may be rounded to the integer lattice by dense
+    // QAT.  Rounding is an identity STE: the clamp derivative must therefore
+    // be evaluated from the pre-rounding L1 value, not the rounded output.
+    const float continuous_square = fabsf(value) * fabsf(value) * SFNN_PAIRWISE_SCALE;
+    const float square_grad = crelu_pre_gradient_from_value(continuous_square, l2_input_gradients[square_idx]) *
         (2.0f * value * SFNN_PAIRWISE_SCALE);
-    float linear_grad = crelu_pre_gradient_from_value(l2_input[linear_idx], l2_input_gradients[linear_idx]);
+    const float linear_grad = crelu_pre_gradient_from_value(value, l2_input_gradients[linear_idx]);
     l1_gradients[tid] += square_grad + linear_grad;
 }
 
@@ -7479,6 +7483,26 @@ extern "C" int bulletou_dense_qat_activation_reference(
     dense_qat_activation_reference_kernel<<<blocks,256,0,ctx->stream>>>(
         raw->ptr,square_gradient->ptr,linear_gradient->ptr,square_output->ptr,linear_output->ptr,gradient->ptr,n);
     return check_kernel_launch("dense QAT activation");
+}
+
+extern "C" int bulletou_dense_qat_l1_backward_reference(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* l1,
+    BulletOuCudaCppF32Buffer* l2_input, BulletOuCudaCppF32Buffer* l2_input_gradients,
+    BulletOuCudaCppF32Buffer* l1_gradients, size_t batch, size_t hidden, int skip) {
+    if (!ctx || !batch || !hidden || (skip!=0 && skip!=1) ||
+        hidden>(SIZE_MAX-1)/2 || batch>SIZE_MAX/(hidden*2) || batch>SIZE_MAX/(hidden+static_cast<size_t>(skip)))
+        return fail_message("invalid dense QAT L1 backward dimensions");
+    const size_t l1_count=batch*(hidden+static_cast<size_t>(skip));
+    const size_t l2_count=batch*hidden*2;
+    if (validate_buffer(ctx,l1,l1_count,"dense QAT L1 values") ||
+        validate_buffer(ctx,l2_input,l2_count,"dense QAT L2 inputs") ||
+        validate_buffer(ctx,l2_input_gradients,l2_count,"dense QAT L2 gradients") ||
+        validate_buffer(ctx,l1_gradients,l1_count,"dense QAT L1 gradients")) return -1;
+    int blocks=0;
+    if (block_count_1d(l1_count,256,&blocks,"dense QAT L1 backward") != 0) return -1;
+    sfnn_l2_input_backward_kernel<<<blocks,256,0,ctx->stream>>>(
+        l1->ptr,l2_input->ptr,l2_input_gradients->ptr,l1_gradients->ptr,batch,hidden,skip);
+    return check_kernel_launch("dense QAT L1 backward");
 }
 extern "C" int bulletou_layer_qat(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* src,BulletOuCudaCppF32Buffer* dst,
