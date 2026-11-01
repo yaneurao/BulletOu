@@ -116,6 +116,15 @@ struct BulletOuCudaCppContext {
     size_t sfnn_inverse_write_counters_len = 0;
     int* sfnn_inverse_positions = nullptr;
     size_t sfnn_inverse_positions_len = 0;
+    bool dense_qat = false;
+    const float* dense_qat_l2_bias = nullptr;
+    const float* dense_qat_l3_bias = nullptr;
+    int* dense_qat_l1_raw = nullptr;
+    size_t dense_qat_l1_raw_len = 0;
+    int* dense_qat_l2_raw = nullptr;
+    size_t dense_qat_l2_raw_len = 0;
+    int* dense_qat_l1_bias = nullptr;
+    size_t dense_qat_l1_bias_len = 0;
 };
 
 struct BulletOuCudaCppF32Buffer {
@@ -1541,7 +1550,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale, BnConfig bn={}, bool precise=false) {
+    float scale, BnConfig bn={}, bool precise=false, int* integer_bias=nullptr) {
     const size_t total = num_stacks * output_dim;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
@@ -1591,7 +1600,12 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
         }
     }
 
-    dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_bias(value,bn,stack,out_col), scale, -2147483648.0f, 2147483647.0f, precise);
+    const float folded = bn_fold_bias(value,bn,stack,out_col);
+    if (integer_bias) {
+        const double q=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(folded)*static_cast<double>(scale))));
+        integer_bias[tid]=static_cast<int>(q);
+    }
+    dst[tid] = sfnn_quantize_dequant_clamped(folded, scale, -2147483648.0f, 2147483647.0f, precise);
 }
 
 __global__ void sfnn_stacked_l1_kernel(
@@ -5093,6 +5107,80 @@ int launch_nnue_forward_kernels(
     return 0;
 }
 
+__global__ void dense_qat_ft_lattice_kernel(float* values, size_t n) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<n) values[i]=static_cast<float>(floor(fmin(127.0,fmax(0.0,static_cast<double>(values[i])*127.0))))/127.0f;
+}
+
+__global__ void dense_qat_l1_warp_kernel(const float* input,const float* weights,const int* bias,
+    const int* buckets,float* output,int* raw,size_t batch,size_t inputs,size_t outputs,size_t stacks,
+    size_t groups,size_t common,size_t shard) {
+    constexpr unsigned WARPS=8;
+    const unsigned lane=threadIdx.x&31u;
+    const size_t i=static_cast<size_t>(blockIdx.x)*WARPS+(threadIdx.x>>5);
+    if(i>=batch*outputs)return;
+    const size_t sample=i/outputs, unit=i%outputs;
+    const int bucket=buckets[sample];
+    if(bucket<0 || static_cast<size_t>(bucket)>=stacks) { if(lane==0){raw[i]=0;output[i]=0;} return; }
+    const size_t stack=static_cast<size_t>(bucket);
+    long long sum=0;
+    for(size_t j=lane;j<inputs;j+=32) {
+        const size_t coordinate=sfnn_l1_coordinate(stack,unit,j,inputs,outputs,groups,common,shard);
+        if(coordinate!=SIZE_MAX)
+            sum+=static_cast<long long>(__float2int_rn(input[sample*inputs+j]*127.0f))*__float2int_rn(weights[coordinate]*64.0f);
+    }
+    for(unsigned shift=16;shift;shift>>=1) sum+=__shfl_down_sync(0xffffffffu,sum,shift);
+    if(lane==0) {
+        const int v=static_cast<int>(sum+static_cast<long long>(bias[stack*outputs+unit]));
+        raw[i]=v; output[i]=static_cast<float>(static_cast<double>(v)/8128.0);
+    }
+}
+
+__global__ void dense_qat_l1_activations_kernel(const int* raw,float* output,size_t batch,size_t hidden,int skip) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=batch*hidden)return;
+    const size_t row=i/hidden, col=i%hidden, l1out=hidden+static_cast<size_t>(skip);
+    const long long x=raw[row*l1out+col];
+    const int sq=static_cast<int>(min(127LL,(x*x)>>19));
+    const int linear=max(0,min(127,static_cast<int>(x>>6)));
+    output[row*hidden*2+col]=static_cast<float>(sq)/127.0f;
+    output[row*hidden*2+hidden+col]=static_cast<float>(linear)/127.0f;
+}
+
+__global__ void dense_qat_l2_kernel(const float* input,const float* weights,const float* master_bias,
+    const int* buckets,float* output,int* raw,size_t batch,size_t inputs,size_t outputs,size_t stacks) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=batch*outputs)return;
+    const size_t row=i/outputs, unit=i%outputs; const int bucket=buckets[row];
+    if(bucket<0 || static_cast<size_t>(bucket)>=stacks){raw[i]=0;output[i]=0;return;}
+    const size_t neuron=static_cast<size_t>(bucket)*outputs+unit;
+    const double b=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(master_bias[neuron])*8128.0)));
+    long long sum=static_cast<long long>(b);
+    for(size_t j=0;j<inputs;++j)
+        sum+=static_cast<long long>(__float2int_rn(input[row*inputs+j]*127.0f))*__float2int_rn(weights[neuron*inputs+j]*64.0f);
+    const int v=static_cast<int>(sum); raw[i]=v;
+    output[i]=static_cast<float>(max(0,min(127,v>>6)))/127.0f;
+}
+
+__global__ void dense_qat_l3_kernel(const float* input,const float* weights,const float* master_bias,
+    const int* l1_raw,const int* buckets,float* output,size_t batch,size_t inputs,size_t l1out,int skip,size_t stacks) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i>=batch)return;
+    const int bucket=buckets[i]; if(bucket<0 || static_cast<size_t>(bucket)>=stacks){output[i]=0;return;}
+    const size_t stack=static_cast<size_t>(bucket);
+    const double b=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(master_bias[stack])*8128.0)));
+    long long sum=static_cast<long long>(b);
+    for(size_t j=0;j<inputs;++j)
+        sum+=static_cast<long long>(__float2int_rn(input[i*inputs+j]*127.0f))*__float2int_rn(weights[stack*inputs+j]*64.0f);
+    if(skip)sum+=static_cast<long long>(l1_raw[i*l1out+l1out-1]);
+    output[i]=static_cast<float>(static_cast<double>(static_cast<int>(sum))/8128.0);
+}
+
+__global__ void dense_qat_l2_ste_kernel(const int* raw,float* gradient,size_t n) {
+    const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<n && (raw[i]<=0 || raw[i]>=8128)) gradient[i]=0.0f;
+}
+
 int launch_sfnn_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -5227,6 +5315,30 @@ int launch_sfnn_forward_kernels(
         if(bn_forward_bound(ctx,0,stm_l0,nstm_l0,nullptr,batch,ft_size,fused?combined:nullptr)) return -1;
         if(!fused) bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
         if(check_kernel_launch("BN FT activation"))return -1;
+    }
+    if (ctx->dense_qat) {
+        if(ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params || has_l1f || has_l1ax || has_l2f || has_l2ax || has_l3f || has_l3ax)
+            return fail_message("dense QAT requires folded L1 and unfactorized L2/L3 without BN");
+        if(block_count_1d(batch*ft_size,threads,&blocks,"dense QAT FT lattice"))return -1;
+        dense_qat_ft_lattice_kernel<<<blocks,threads,0,ctx->stream>>>(combined,batch*ft_size);
+        if(check_kernel_launch("dense QAT FT lattice"))return -1;
+        constexpr size_t warps=8;
+        if(batch*l1_out > static_cast<size_t>(INT_MAX)*warps) return fail_message("dense QAT L1 grid overflow");
+        blocks=static_cast<int>((batch*l1_out+warps-1)/warps);
+        dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(combined,l1w,ctx->dense_qat_l1_bias,buckets,
+            l1,ctx->dense_qat_l1_raw,batch,ft_size,l1_out,num_stacks,l1_group_count,l1_common_size,l1_shard_size);
+        if(check_kernel_launch("dense QAT L1"))return -1;
+        if(block_count_1d(batch*l1_hidden,threads,&blocks,"dense QAT L1 activation"))return -1;
+        dense_qat_l1_activations_kernel<<<blocks,threads,0,ctx->stream>>>(ctx->dense_qat_l1_raw,l2_input,batch,l1_hidden,l1_skip);
+        if(check_kernel_launch("dense QAT L1 activation"))return -1;
+        if(block_count_1d(batch*l2_size,threads,&blocks,"dense QAT L2"))return -1;
+        dense_qat_l2_kernel<<<blocks,threads,0,ctx->stream>>>(l2_input,l2w,ctx->dense_qat_l2_bias,buckets,l2,
+            ctx->dense_qat_l2_raw,batch,l2_in,l2_size,num_stacks);
+        if(check_kernel_launch("dense QAT L2"))return -1;
+        if(block_count_1d(batch,threads,&blocks,"dense QAT L3"))return -1;
+        dense_qat_l3_kernel<<<blocks,threads,0,ctx->stream>>>(l2,l3w,ctx->dense_qat_l3_bias,ctx->dense_qat_l1_raw,
+            buckets,output,batch,l2_size,l1_out,l1_skip,num_stacks);
+        return check_kernel_launch("dense QAT L3");
     }
     if (common_shard_l1 && !has_l1f && !has_l1ax) {
         const size_t group_output = l1_out / l1_group_count;
@@ -6520,6 +6632,13 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
+    if(ctx->dense_qat) {
+        int qat_blocks=0;
+        if(block_count_1d(batch*l2_size,threads,&qat_blocks,"dense QAT L2 STE"))return -1;
+        dense_qat_l2_ste_kernel<<<qat_blocks,threads,0,ctx->stream>>>(ctx->dense_qat_l2_raw,l2_gradients,batch*l2_size);
+        if(check_kernel_launch("dense QAT L2 STE"))return -1;
+    }
+
     if(ctx->bn[2].params) {
         // Apply clamp derivative once, then full BN derivative. Downstream
         // affine backward must not apply the clamp derivative a second time.
@@ -6573,7 +6692,7 @@ int launch_sfnn_backward_kernels(
         residual_count_gates,
         factorizer_axis_confidences,
         dense_param_reduce_fast_path ? 0 : 1,
-        dense_param_reduce_fast_path ? 0 : 1, ctx->bn[2].params != nullptr);
+        dense_param_reduce_fast_path ? 0 : 1, ctx->bn[2].params != nullptr || ctx->dense_qat);
     if (check_kernel_launch("sfnn_stacked_crelu_backward_kernel launch") != 0) {
         return -1;
     }
@@ -6612,7 +6731,7 @@ int launch_sfnn_backward_kernels(
                 factorizer_progress_axis_alpha,
                 factorizer_pair_alpha,
                 factorizer_axis_confidences,
-                ctx->bn[2].params ? 0 : 1,
+                (ctx->bn[2].params || ctx->dense_qat) ? 0 : 1,
                 "sfnn dense reduce L2 params") != 0) {
             return -1;
         }
@@ -7446,6 +7565,30 @@ extern "C" int bulletou_dense_qat_integer_reference(
     return check_kernel_launch("dense QAT reference");
 }
 
+extern "C" int bulletou_dense_qat_begin(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* l2_bias, BulletOuCudaCppF32Buffer* l3_bias,
+    size_t batch, size_t l1_out, size_t l2_size, size_t stacks) {
+    if (!ctx || !batch || !l1_out || !l2_size || !stacks ||
+        batch>SIZE_MAX/l1_out || batch>SIZE_MAX/l2_size || stacks>SIZE_MAX/l1_out || stacks>SIZE_MAX/l2_size)
+        return fail_message("invalid dense QAT dimensions");
+    if (validate_buffer(ctx,l2_bias,stacks*l2_size,"dense QAT master L2 bias") ||
+        validate_buffer(ctx,l3_bias,stacks,"dense QAT master L3 bias") || set_context_device(ctx)) return -1;
+    if (ensure_i32_scratch(&ctx->dense_qat_l1_raw,&ctx->dense_qat_l1_raw_len,batch*l1_out,"dense QAT L1 raw") ||
+        ensure_i32_scratch(&ctx->dense_qat_l2_raw,&ctx->dense_qat_l2_raw_len,batch*l2_size,"dense QAT L2 raw") ||
+        ensure_i32_scratch(&ctx->dense_qat_l1_bias,&ctx->dense_qat_l1_bias_len,stacks*l1_out,"dense QAT L1 bias")) return -1;
+    ctx->dense_qat_l2_bias=l2_bias->ptr;
+    ctx->dense_qat_l3_bias=l3_bias->ptr;
+    ctx->dense_qat=true;
+    return 0;
+}
+
+extern "C" void bulletou_dense_qat_end(BulletOuCudaCppContext* ctx) {
+    if (!ctx) return;
+    ctx->dense_qat=false;
+    ctx->dense_qat_l2_bias=nullptr;
+    ctx->dense_qat_l3_bias=nullptr;
+}
+
 // Reference fused integer activations and their continuous STE derivatives.
 // The real-valued derivative is deliberately computed from raw, not from the
 // rounded activation (a positive value can round to zero).
@@ -7622,7 +7765,10 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         free_i32_scratch(ctx->sfnn_inverse_block_sums, ctx->sfnn_inverse_block_sums_len, "cudaFree sfnn inverse block sums") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_block_offsets, ctx->sfnn_inverse_block_offsets_len, "cudaFree sfnn inverse block offsets") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_write_counters, ctx->sfnn_inverse_write_counters_len, "cudaFree sfnn inverse write counters") != 0 ||
-        free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0) {
+        free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0 ||
+        free_i32_scratch(ctx->dense_qat_l1_raw, ctx->dense_qat_l1_raw_len, "cudaFree dense QAT L1") != 0 ||
+        free_i32_scratch(ctx->dense_qat_l2_raw, ctx->dense_qat_l2_raw_len, "cudaFree dense QAT L2") != 0 ||
+        free_i32_scratch(ctx->dense_qat_l1_bias, ctx->dense_qat_l1_bias_len, "cudaFree dense QAT bias") != 0) {
         delete ctx;
         return -1;
     }
@@ -9270,6 +9416,12 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 residual_count_gates_ptr, factorizer_axis_confidences_ptr, 64.0f, {}, false,
                 l1_group_count, l1_common_size, l1_shard_size, true);
             if (check_kernel_launch("QAT L1 weights launch") != 0) return -1;
+        }
+        // The integer bias scratch belongs to the context and may have been
+        // used by another runner, so refresh it even within an accumulation group.
+        if (refresh_qat_l1 != 0 || ctx->dense_qat) {
+            constexpr int threads = 256;
+            int blocks = 0;
             if (block_count_1d(num_stacks * l1_out, threads, &blocks, "QAT L1 bias") != 0) return -1;
             sfnn_build_quantized_proxy_stacked_bias_kernel<<<blocks, threads, 0, ctx->stream>>>(
                 l1b->ptr, has_l1f ? l1fb->ptr : nullptr, has_l1ax ? l1axb->ptr : nullptr,
@@ -9280,7 +9432,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
                 factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha,
-                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 127.0f * 64.0f);
+                residual_count_gates_ptr, factorizer_axis_confidences_ptr, 127.0f * 64.0f, {}, false,
+                ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr);
             if (check_kernel_launch("QAT L1 bias launch") != 0) return -1;
         }
     }

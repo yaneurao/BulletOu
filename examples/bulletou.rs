@@ -18334,6 +18334,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("SFNN layer QAT", format!("FT={} L1={} L2={} L3={} (non-BN; FP32 masters)",
             args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
             args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
+        if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
+            print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
+        }
     }
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);

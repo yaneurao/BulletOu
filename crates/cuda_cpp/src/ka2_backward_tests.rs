@@ -449,7 +449,8 @@ fn ka2_parallel_backward_matches_cpu_with_qat_and_accumulation() {
             ..tiny_sfnn_shape()
         };
         // All masters are exactly representable at export precision. Thus the
-        // same independent CPU reference checks both ordinary and all-layer QAT.
+        // same independent CPU reference checks both ordinary and L1-only QAT.
+        // Full dense QAT has integer activations and is tested separately.
         let pattern = |len, divisor| (0..len).map(|i| ((i % 7) as f32 - 3.0) / divisor).collect::<Vec<_>>();
         let w0 = pattern(shape.input_size * ft, 127.0);
         let b0 = vec![64.0 / 127.0; ft];
@@ -499,8 +500,7 @@ fn ka2_parallel_backward_matches_cpu_with_qat_and_accumulation() {
             };
             for qat in [false, true] {
                 let mut r = SfnnTrainStepRunner::new(&ctx, host, BATCH, 3).unwrap();
-                let policy =
-                    SfnnLayerLrMultipliers { qat_ft: qat, qat_l1: qat, qat_l2: qat, qat_l3: qat, ..Default::default() };
+                let policy = SfnnLayerLrMultipliers { qat_l1: qat, ..Default::default() };
                 for micro in 1..=4 {
                     r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
                         &ctx,

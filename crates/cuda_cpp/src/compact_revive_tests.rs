@@ -381,7 +381,7 @@ fn compact_factorizer_switch_qat_and_gradients() {
             r.build_quantized_proxy(&ctx, s.input_size, 0, &proxy).unwrap();
             let qfw = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(ps, 4)).unwrap();
             sfnn_forward_device(&ctx, &batch, &proxy, &qfw).unwrap();
-            let expected = qfw.download_output(&ctx).unwrap();
+            let expected = crate::layer_qat::tests::integer_dense_expected(&ctx, &qfw, &proxy, ps, hb.buckets);
             let masters = r.weights.l1w.download(&ctx).unwrap();
             r.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
                 &ctx,
