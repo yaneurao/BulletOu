@@ -35,7 +35,11 @@
 
 `--epoch` は保存checkpointのepochで、設定のepoch別factorizerを解決するために使います。校正には検証用とは別の代表的な学習局面を使ってください。現在は指定ファイルの先頭から取得します。`--min-bucket-positions`（デフォルト128）未満のbucketや校正行列を計算できないbucketは通常の丸めに戻し、適用bucket数を表示します。`--damping`（デフォルト0.01）は相関行列の安定化係数です。校正で層出力の二乗誤差が通常丸めより悪い行も通常丸めに戻します。これは検証精度や棋力の改善を保証しません。
 
-出力先の既存ファイルは上書きしません。出力先にはcheckpointの `progress.bin` も保存します。通常の `nn.bin` とGPTQ版を別々に `quantized-test --mode cpu-exact` で比較してください。学習中のqvalidは通常の丸めによる近似で、GPTQを反映しません。GPTQは自動保存時には実行されません。
+出力先の既存ファイルは上書きしません。出力先にはcheckpointの `progress.bin` も保存します。通常の `nn.bin` とGPTQ版を別々に `quantized-test --mode cpu-exact` で比較してください。学習中のqvalidは通常の丸めによる近似で、GPTQを反映しません。
+
+設定に `"sfnn_gptq": true` を加えると、番号付きcheckpointの通常保存後に `nn-gptq.bin` を自動生成します。省略時や `false` では生成しません。学習中に作られる `nn.bin` と `state.bin` は従来どおりです。校正はデフォルトで学習用teacherのファイル先頭262,144局面を使い、teacherがディレクトリなら対応ファイルを名前順に並べた最初のファイルを使います。`sfnn_gptq_calibration_teacher` と `sfnn_gptq_calibration_positions` で変更できます。校正用は検証とは別の代表的な学習データを選んでください。
+
+自動生成の対象・制約は上記のL2/L3 GPTQと同じです。checkpointの保存後にGPUで校正するため、保存のたびに時間とGPUメモリが必要です。GPTQが失敗した場合は警告を出し、通常checkpointを保持して学習を続けます。
 
 ### L1のQATをON/OFFで比較する
 
