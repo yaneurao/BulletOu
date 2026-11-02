@@ -18,6 +18,25 @@
 
 ## 量子化後のaccuracy / lossを測る
 
+### 学習済みcheckpointにL2/L3 GPTQを試す
+
+`export-gptq` はFP32 checkpointを変更せず、校正用の教師局面における層入力の相関を使ってL2/L3の重みを整数化します。FTとL1、biasは通常の丸めです。非BN・FT factorizer OFF・L2/L3 factorizerなし、count gateなし、factorizer係数1のcheckpointに対応します。QATの有無にかかわらず実行できますが、QATを使わない実験では学習時に各QAT設定をOFFにしてください。
+
+```powershell
+.\target\release\examples\bulletou.exe export-gptq `
+  --arch SFNN_halfkahm2_2304_15_64_k9k9_progress8 `
+  --state-bin D:\...\0020\state.bin `
+  --settings-file D:\...\0020\bulletou-settings.json `
+  --epoch 5 `
+  --calibration-teacher D:\...\training.bin `
+  --calibration-positions 1000000 `
+  --output D:\...\gptq-e5\nn.bin
+```
+
+`--epoch` は保存checkpointのepochで、設定のepoch別factorizerを解決するために使います。校正には検証用とは別の代表的な学習局面を使ってください。現在は指定ファイルの先頭から取得します。`--min-bucket-positions`（デフォルト128）未満のbucketや校正行列を計算できないbucketは通常の丸めに戻し、適用bucket数を表示します。`--damping`（デフォルト0.01）は相関行列の安定化係数です。校正で層出力の二乗誤差が通常丸めより悪い行も通常丸めに戻します。これは検証精度や棋力の改善を保証しません。
+
+出力先の既存ファイルは上書きしません。出力先にはcheckpointの `progress.bin` も保存します。通常の `nn.bin` とGPTQ版を別々に `quantized-test --mode cpu-exact` で比較してください。学習中のqvalidは通常の丸めによる近似で、GPTQを反映しません。GPTQは自動保存時には実行されません。
+
 ### L1のQATをON/OFFで比較する
 
 QAT（Quantization-Aware Training、量子化を考慮した学習）は、丸めた重みでの出力を改善するように学習する方法です。
