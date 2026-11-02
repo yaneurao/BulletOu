@@ -12118,7 +12118,7 @@ impl WorkerSfnnSession {
             )?
         };
         if exact_dir.is_some() && save_args.sfnn_gptq {
-            if let Err(err) = gptq::run_automatic(&save_args, &checkpoint_dir, log.epoch) {
+            if let Err(err) = gptq::run_automatic(&save_args, &checkpoint_dir, log.epoch, log.superbatch) {
                 eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", checkpoint_dir.display());
             }
         }
@@ -20409,7 +20409,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
     append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
     if args.sfnn_gptq {
-        if let Err(err) = gptq::run_automatic(args, &dir, log.epoch) {
+        if let Err(err) = gptq::run_automatic(args, &dir, log.epoch, log.superbatch) {
             eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", dir.display());
         }
     }

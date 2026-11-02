@@ -33,6 +33,7 @@ METRICS = (
     "quantized_value_accuracy", "quantized_value_loss",
 )
 LAST8_METRICS = ("last8_acc", "last8_loss", "last8_qacc", "last8_qloss")
+GPTQ_METRICS = ("gptq_qacc", "gptq_qloss", "gptq_mode", "gptq_positions")
 PLURAL_OPTIONS = {
     "lrs": "lr", "lr_mins": "lr_min",
     "wrm_target_scalings": "wrm_target_scaling",
@@ -509,6 +510,43 @@ def checkpoint_path(directory: Path, row: dict) -> str:
     return str(path) if state.is_file() and state.stat().st_size > 0 else ""
 
 
+def gptq_checkpoint_metrics(directory: Path, row: dict) -> dict:
+    """Only accept complete metrics for this exact saved epoch/superbatch."""
+    checkpoint = checkpoint_path(directory, row)
+    if not checkpoint:
+        return {}
+    path = Path(checkpoint) / "gptq-validation.json"
+    try:
+        data = read_json(path)
+        accuracy, loss = numeric(data.get("gptq_qacc")), numeric(data.get("gptq_qloss"))
+        positions = data.get("positions")
+        if (data.get("version") != 1 or data.get("epoch") != int(row["epoch"])
+                or data.get("superbatch") != int(row["superbatch"])
+                or data.get("mode") != "cpu-exact" or accuracy is None or loss is None
+                or not 0 <= accuracy <= 1 or type(positions) is not int or positions < 1
+                or not (Path(checkpoint) / "nn-gptq.bin").is_file()):
+            return {}
+        return {"gptq_qacc": data["gptq_qacc"], "gptq_qloss": data["gptq_qloss"],
+                "gptq_mode": data["mode"], "gptq_positions": positions}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
+def gptq_summary_signature(directory: Path, rows: list[dict]) -> tuple:
+    """Detect metrics published after the completed summary-learn row."""
+    values = []
+    for row in rows:
+        checkpoint = checkpoint_path(directory, row)
+        if checkpoint:
+            path = Path(checkpoint) / "gptq-validation.json"
+            try:
+                info = path.stat()
+                values.append((str(path), info.st_mtime_ns, info.st_size))
+            except FileNotFoundError:
+                pass
+    return tuple(values)
+
+
 def is_complete(directory: Path, trial: dict, state: dict, rows=None) -> bool:
     if rows is None:
         rows = log_rows(directory)
@@ -729,7 +767,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     parameter_columns = list(dict.fromkeys([*parameter_columns,
         *(key for settings in all_settings for key, value in settings.items() if isinstance(value, dict))]))
-    fields = ["trial", "epoch", "superbatch", *METRICS, *LAST8_METRICS, "positions",
+    fields = ["trial", "epoch", "superbatch", *METRICS, *LAST8_METRICS, *GPTQ_METRICS, "positions",
               *parameter_columns, "status", "trial_status", "output_dir", "checkpoint"]
     # Generic grid keys must not duplicate metric/status columns.
     fields = list(dict.fromkeys(fields))
@@ -769,6 +807,7 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
             for key in (*METRICS, "positions"):
                 value = last.get(key, "")
                 row[key] = value if numeric(value) is not None else ""
+            row.update(gptq_checkpoint_metrics(directory, last))
             # Last eight SB numbers, not the last eight validation events.
             window = [r for r in group
                       if int(last["superbatch"]) - 8 < int(r["superbatch"]) <= int(last["superbatch"])]
@@ -823,7 +862,8 @@ def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, int
             trial["settings"].get("warmup_sb", 0) if int(r["epoch"]) == 0 else
             resolve_epoch_settings(trial["settings"], int(r["epoch"]))["superbatches"])]
 
-    previous = closed_rows(log_rows(directory))
+    initial_closed = closed_rows(log_rows(directory))
+    previous = (initial_closed, gptq_summary_signature(directory, initial_closed))
 
     def watch():
         nonlocal previous
@@ -832,11 +872,12 @@ def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, int
             try:
                 rows = log_rows(directory, live=True)
                 closed = closed_rows(rows)
-                if not closed or closed == previous:
+                signature = (closed, gptq_summary_signature(directory, closed))
+                if not closed or signature == previous:
                     continue
                 # Use the same complete snapshot for detection and aggregation.
                 write_summary(root, plan, path, trial_rows={trial["id"]: rows})
-                previous = closed
+                previous = signature
                 warned = None
                 print(f"[SUMMARY] trial={trial['id']} completed_epoch={closed[-1]['epoch']} updated: {path}", flush=True)
             except (OSError, ValueError, csv.Error) as exc:

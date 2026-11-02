@@ -33,7 +33,7 @@ fn calibration_teacher(args: &Args) -> Result<PathBuf, String> {
     files.into_iter().next().ok_or_else(||format!("no supported GPTQ calibration file in {}",path.display()))
 }
 
-pub(super) fn run_automatic(args:&Args, checkpoint:&Path, epoch:usize) -> Result<(),String> {
+pub(super) fn run_automatic(args:&Args, checkpoint:&Path, epoch:usize, superbatch:usize) -> Result<(),String> {
     let teacher=calibration_teacher(args)?;
     let settings=checkpoint.join("bulletou-settings.json");
     if !settings.is_file() {return Err("automatic GPTQ requires a checkpoint settings file (--settings-file)".into());}
@@ -43,6 +43,31 @@ pub(super) fn run_automatic(args:&Args, checkpoint:&Path, epoch:usize) -> Result
         epoch,calibration_teacher:teacher,calibration_positions:args.sfnn_gptq_calibration_positions,
         min_bucket_positions:128,damping:0.01,cuda_cpp_device:args.cuda_cpp_device,output})?;
     eprintln!("  [GPTQ] DONE {}",checkpoint.join("nn-gptq.bin").display());
+    if let Err(err)=validate_automatic(args,checkpoint,epoch,superbatch) {
+        eprintln!("  WARNING: GPTQ validation failed for {}: {err}; nn-gptq.bin was saved",checkpoint.display());
+    }
+    Ok(())
+}
+
+fn validate_automatic(args:&Args, checkpoint:&Path, epoch:usize, superbatch:usize) -> Result<(),String> {
+    let Some(mut test_args)=quantized_test_args_from_training_args(args,checkpoint.join("nn-gptq.bin"))? else {
+        return Err("GPTQ validation requires --test-teacher and a supported SFNN arch".into());
+    };
+    // Exact CPU inference avoids a second full-model GPU allocation while the
+    // training runner and its validation caches remain resident.
+    test_args.mode=QuantizedTestMode::CpuExact;
+    let report=run_quantized_test_impl(&test_args,false)?;
+    let accuracy=report.train_scale.accuracy();
+    let loss=report.train_scale.test_loss.ok_or("GPTQ validation returned no loss")?;
+    if !accuracy.is_finite() || !loss.is_finite() {return Err("GPTQ validation returned non-finite metrics".into());}
+    let record=serde_json::json!({"version":1,"epoch":epoch,"superbatch":superbatch,
+        "gptq_qacc":accuracy,"gptq_qloss":loss,"mode":"cpu-exact","positions":report.records});
+    let tmp=checkpoint.join(format!(".gptq-validation-{}.tmp",std::process::id()));
+    let dest=checkpoint.join("gptq-validation.json");
+    let bytes=serde_json::to_vec_pretty(&record).map_err(|e|e.to_string())?;
+    std::fs::write(&tmp,bytes).map_err(|e|e.to_string())?;
+    if let Err(e)=std::fs::rename(&tmp,&dest) {let _=std::fs::remove_file(&tmp);return Err(e.to_string());}
+    eprintln!("  [GPTQ VALID] epoch={epoch} sb={superbatch} qacc={accuracy:.7} qloss={loss:.8} mode=cpu-exact positions={} elapsed={:.3}s",report.records,report.elapsed.as_secs_f64());
     Ok(())
 }
 
@@ -264,7 +289,7 @@ mod tests {
         let dir=source.parent().unwrap().join(format!("bulletou-auto-gptq-test-{}",std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         struct Cleanup(PathBuf); impl Drop for Cleanup {fn drop(&mut self){
-            for name in ["state.bin","bulletou-settings.json","nn-gptq.bin","progress.bin"] {let _=std::fs::remove_file(self.0.join(name));}
+            for name in ["state.bin","bulletou-settings.json","nn-gptq.bin","progress.bin","gptq-validation.json"] {let _=std::fs::remove_file(self.0.join(name));}
             let _=std::fs::remove_dir(&self.0);
         }}
         let _cleanup=Cleanup(dir.clone());
@@ -274,9 +299,13 @@ mod tests {
         raw.extend(bulletou_settings_json_args(&dir.join("bulletou-settings.json")).unwrap());
         let mut args=args_at_epoch(&Args::try_parse_from(raw).unwrap(),5).unwrap();
         args.sfnn_gptq=true; args.sfnn_gptq_calibration_teacher=Some(teacher); args.sfnn_gptq_calibration_positions=65536;
-        run_automatic(&args,&dir,5).unwrap();
+        args.test_positions=Some(ValidationPositionCount::Count(2048));
+        run_automatic(&args,&dir,5,1296).unwrap();
         assert!(dir.join("nn-gptq.bin").is_file());
         assert!(dir.join("progress.bin").is_file());
-        assert!(run_automatic(&args,&dir,5).is_err(),"must not overwrite output");
+        let metrics:serde_json::Value=serde_json::from_slice(&std::fs::read(dir.join("gptq-validation.json")).unwrap()).unwrap();
+        assert_eq!(metrics["mode"],"cpu-exact"); assert_eq!(metrics["epoch"],5); assert_eq!(metrics["superbatch"],1296);
+        assert!(metrics["gptq_qacc"].as_f64().is_some()); assert!(metrics["gptq_qloss"].as_f64().is_some());
+        assert!(run_automatic(&args,&dir,5,1296).is_err(),"must not overwrite output");
     }
 }

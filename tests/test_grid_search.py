@@ -550,6 +550,42 @@ class GridSearchTests(unittest.TestCase):
         # No monitor remains to race the final writer after leaving the context.
         self.assertEqual(self.csv_rows(path)[0]["test_value_accuracy"], "0.63")
 
+    def test_gptq_metrics_follow_exact_checkpoint_and_update_live(self):
+        plan = self.plan()
+        trial = plan["trials"][0]
+        directory = grid.trial_dir(self.output, trial)
+        cp = self.checkpoint(directory)
+        self.summary(directory, [self.metrics(epoch=1, sb=4, checkpoint="0001")])
+        path = self.output / "grid_summary.csv"
+        grid.write_summary(self.output, plan, path)
+        self.assertEqual(self.csv_rows(path)[0]["gptq_qacc"], "")
+        data = {"version": 1, "epoch": 1, "superbatch": 4, "gptq_qacc": .645,
+                "gptq_qloss": .667, "mode": "cpu-exact", "positions": 1000}
+        with redirect_stdout(io.StringIO()):
+            with grid.live_summary_updates(self.output, plan, path, trial, interval=.01):
+                (cp / "nn-gptq.bin").write_bytes(b"network")
+                grid.atomic_json(cp / "gptq-validation.json", data)
+                self.wait_until(lambda: self.csv_rows(path)[0]["gptq_qacc"] == "0.645")
+                row = self.csv_rows(path)[0]
+                self.assertEqual((row["gptq_qloss"], row["gptq_mode"], row["gptq_positions"]),
+                                 ("0.667", "cpu-exact", "1000"))
+                grid.atomic_json(cp / "gptq-validation.json", {**data, "superbatch": 3})
+                self.wait_until(lambda: self.csv_rows(path)[0]["gptq_qacc"] == "")
+                grid.atomic_json(cp / "gptq-validation.json", {**data, "gptq_qacc": "nan"})
+                self.assertEqual(grid.gptq_checkpoint_metrics(directory, {"epoch":1,"superbatch":4,"checkpoint":"0001"}), {})
+
+    def test_gptq_metrics_do_not_leak_from_earlier_checkpoint(self):
+        plan = self.plan()
+        directory = grid.trial_dir(self.output, plan["trials"][0])
+        old = self.checkpoint(directory, "0001")
+        self.checkpoint(directory, "0002")
+        (old / "nn-gptq.bin").write_bytes(b"network")
+        grid.atomic_json(old / "gptq-validation.json", {"version":1,"epoch":1,"superbatch":3,
+                         "gptq_qacc":.9,"gptq_qloss":.1,"mode":"cpu-exact","positions":100})
+        self.summary(directory, [self.metrics(epoch=1,sb=4,checkpoint="0002")])
+        row=grid.summarize(self.output,plan)[1][0]
+        self.assertEqual(row.get("gptq_qacc", ""), "")
+
     def test_bce_grid_settings_and_columns(self):
         plan = self.plan(["--grid", "loss_bce_with_logits", "false", "true"])
         self.assertEqual(len(plan["trials"]), 4)
