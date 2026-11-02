@@ -20,6 +20,32 @@ pub(super) struct ExportArgs {
     #[arg(long)] output: PathBuf,
 }
 
+fn calibration_teacher(args: &Args) -> Result<PathBuf, String> {
+    let path=args.sfnn_gptq_calibration_teacher.clone().unwrap_or_else(||PathBuf::from(&args.teacher));
+    if path.is_file() { return Ok(path); }
+    if !path.is_dir() { return Err(format!("GPTQ calibration teacher does not exist: {}",path.display())); }
+    let mut files=Vec::new();
+    for entry in std::fs::read_dir(&path).map_err(|e|format!("cannot read {}: {e}",path.display()))? {
+        let entry=entry.map_err(|e|e.to_string())?; let p=entry.path();
+        if p.is_file() && p.extension().and_then(|v|v.to_str()).is_some_and(|v|["bin","hcpe","psv"].iter().any(|x|v.eq_ignore_ascii_case(x))) { files.push(p); }
+    }
+    files.sort();
+    files.into_iter().next().ok_or_else(||format!("no supported GPTQ calibration file in {}",path.display()))
+}
+
+pub(super) fn run_automatic(args:&Args, checkpoint:&Path, epoch:usize) -> Result<(),String> {
+    let teacher=calibration_teacher(args)?;
+    let settings=checkpoint.join("bulletou-settings.json");
+    if !settings.is_file() {return Err("automatic GPTQ requires a checkpoint settings file (--settings-file)".into());}
+    let output=checkpoint.join("nn-gptq.bin");
+    eprintln!("  [GPTQ] START epoch={epoch} teacher={} positions={} output={}",teacher.display(),args.sfnn_gptq_calibration_positions,output.display());
+    run(&ExportArgs {arch:args.arch(),state_bin:checkpoint.join("state.bin"),settings_file:settings,
+        epoch,calibration_teacher:teacher,calibration_positions:args.sfnn_gptq_calibration_positions,
+        min_bucket_positions:128,damping:0.01,cuda_cpp_device:args.cuda_cpp_device,output})?;
+    eprintln!("  [GPTQ] DONE {}",checkpoint.join("nn-gptq.bin").display());
+    Ok(())
+}
+
 pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     if args.epoch == 0 || args.calibration_positions == 0 || args.min_bucket_positions == 0
         || !args.damping.is_finite() || args.damping <= 0.0 { return Err("invalid epoch, calibration size, bucket minimum or damping".into()); }
@@ -217,5 +243,40 @@ mod tests {
             };
             assert!(loss(&q[row*3..row*3+3])<=loss(&naive)+1e-12);
         }
+    }
+    #[test]
+    fn automatic_calibration_file_selection_is_stable() {
+        let dir=std::env::temp_dir().join(format!("bulletou-gptq-teacher-test-{}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for name in ["z.bin","a.bin","README.md"] {std::fs::write(dir.join(name),[]).unwrap();}
+        let mut args=Args::try_parse_from(["bulletou","--teacher",dir.to_str().unwrap()]).unwrap();
+        assert_eq!(calibration_teacher(&args).unwrap(),dir.join("a.bin"));
+        args.sfnn_gptq_calibration_teacher=Some(dir.join("z.bin"));
+        assert_eq!(calibration_teacher(&args).unwrap(),dir.join("z.bin"));
+        for name in ["z.bin","a.bin","README.md"] {std::fs::remove_file(dir.join(name)).unwrap();}
+        std::fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires GPU and BULLETOU_GPTQ_TEST_CHECKPOINT / BULLETOU_GPTQ_TEST_TEACHER"]
+    fn automatic_export_from_real_checkpoint() {
+        let source=PathBuf::from(std::env::var_os("BULLETOU_GPTQ_TEST_CHECKPOINT").unwrap());
+        let teacher=PathBuf::from(std::env::var_os("BULLETOU_GPTQ_TEST_TEACHER").unwrap());
+        let dir=source.parent().unwrap().join(format!("bulletou-auto-gptq-test-{}",std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(PathBuf); impl Drop for Cleanup {fn drop(&mut self){
+            for name in ["state.bin","bulletou-settings.json","nn-gptq.bin","progress.bin"] {let _=std::fs::remove_file(self.0.join(name));}
+            let _=std::fs::remove_dir(&self.0);
+        }}
+        let _cleanup=Cleanup(dir.clone());
+        std::fs::hard_link(source.join("state.bin"),dir.join("state.bin")).unwrap();
+        std::fs::copy(source.join("bulletou-settings.json"),dir.join("bulletou-settings.json")).unwrap();
+        let mut raw=vec![std::ffi::OsString::from("bulletou")];
+        raw.extend(bulletou_settings_json_args(&dir.join("bulletou-settings.json")).unwrap());
+        let mut args=args_at_epoch(&Args::try_parse_from(raw).unwrap(),5).unwrap();
+        args.sfnn_gptq=true; args.sfnn_gptq_calibration_teacher=Some(teacher); args.sfnn_gptq_calibration_positions=65536;
+        run_automatic(&args,&dir,5).unwrap();
+        assert!(dir.join("nn-gptq.bin").is_file());
+        assert!(dir.join("progress.bin").is_file());
+        assert!(run_automatic(&args,&dir,5).is_err(),"must not overwrite output");
     }
 }

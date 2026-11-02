@@ -5384,6 +5384,17 @@ struct Args {
     #[arg(long)]
     sfnn_qat_l3: bool,
 
+    /// Export an additional nn-gptq.bin after each numbered SFNN checkpoint.
+    #[arg(long)]
+    sfnn_gptq: bool,
+    /// Training teacher file for GPTQ calibration. Defaults to the first
+    /// supported file in the training teacher directory.
+    #[arg(long)]
+    sfnn_gptq_calibration_teacher: Option<PathBuf>,
+    /// Number of positions read from the start of the calibration file.
+    #[arg(long, default_value_t = 262144)]
+    sfnn_gptq_calibration_positions: usize,
+
     /// Optional penalty for SFNN i8 weight saturation after factorizer folding.
     /// Default 0 disables it. The penalty is added as an optimizer-gradient
     /// term before each update and does not change the reported value loss.
@@ -5654,6 +5665,17 @@ impl Args {
     }
 
     fn validate_arch_flags(&self) -> Result<(), String> {
+        if self.sfnn_gptq {
+            if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack() {
+                return Err("--sfnn-gptq requires the cuda-cpp SFNN trainer".into());
+            }
+            if self.settings_file.is_none() {
+                return Err("--sfnn-gptq requires --settings-file for checkpoint export".into());
+            }
+            if self.sfnn_gptq_calibration_positions == 0 {
+                return Err("--sfnn-gptq-calibration-positions must be positive".into());
+            }
+        }
         if !self.sfnn_bn_affine_lr_multiplier.is_finite() || self.sfnn_bn_affine_lr_multiplier < 0.0 {
             return Err("--sfnn-bn-affine-lr-multiplier must be finite and non-negative".into());
         }
@@ -12095,6 +12117,11 @@ impl WorkerSfnnSession {
                 log,
             )?
         };
+        if exact_dir.is_some() && save_args.sfnn_gptq {
+            if let Err(err) = gptq::run_automatic(&save_args, &checkpoint_dir, log.epoch) {
+                eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", checkpoint_dir.display());
+            }
+        }
         if cuda_cpp_should_schedule_quantized_validation(&save_args) {
             if let Some(test_args) =
                 quantized_test_args_from_training_args(&save_args, PathBuf::from("<worker-save-live-quantized-sfnn>"))?
@@ -18353,6 +18380,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
             print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
         }
+        if args.sfnn_gptq {
+            print_startup_kv("SFNN GPTQ", format!("on: L2/L3 export after checkpoint; {} calibration positions", args.sfnn_gptq_calibration_positions));
+        }
     }
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
@@ -20378,6 +20408,11 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     }
     commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
     append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
+    if args.sfnn_gptq {
+        if let Err(err) = gptq::run_automatic(args, &dir, log.epoch) {
+            eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", dir.display());
+        }
+    }
     Ok(dir)
 }
 

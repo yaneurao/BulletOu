@@ -50,6 +50,7 @@ FORBIDDEN_GRID = OUTPUT_KEYS | {
 COMMON_COLUMNS = (
     "sfnn_ft_factorizer",
     "sfnn_qat_ft", "sfnn_qat_l1", "sfnn_qat_l2", "sfnn_qat_l3",
+    "sfnn_gptq", "sfnn_gptq_calibration_teacher", "sfnn_gptq_calibration_positions",
     "sfnn_init_l1_glorot", "sfnn_init_l1_shared_zero",
     "sfnn_init_ft_glorot", "sfnn_init_ft_shared_zero", "sfnn_init_l2_glorot", "sfnn_init_l3_glorot",
     "sfnn_ft_lr_mult", "sfnn_l1_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
