@@ -1879,6 +1879,7 @@ struct SfnnL1Qat {
     weights: F32Buffer,
     bias: F32Buffer,
     refresh: std::cell::Cell<bool>,
+    quantized: bool,
 }
 
 #[derive(Debug)]
@@ -2188,7 +2189,7 @@ fn sfnn_forward_device_with_factorizer_impl(
             workspace.output.as_ptr(),
             qat.map_or(std::ptr::null_mut(), |q| q.weights.as_ptr()),
             qat.map_or(std::ptr::null_mut(), |q| q.bias.as_ptr()),
-            i32::from(qat.is_some_and(|q| q.refresh.get())),
+            qat.map_or(0, |q| if q.quantized { i32::from(q.refresh.get()) } else if q.refresh.get() { -2 } else { -1 }),
         )
     })?;
     if let Some(qat) = qat {
@@ -6379,14 +6380,23 @@ impl SfnnTrainStepRunner {
         // step. Reaching here with cached buffers means all its flags are off.
         // Release them when an epoch schedule disables selected-layer QAT.
         self.layer_qat = Default::default();
-        if !enabled {
+        // Fold the many-bucket pair factors into FP32 scratch once per update.
+        // This uses the same fast forward/input-gradient kernels as QAT without
+        // quantizing master weights, activations, or optimizer state.
+        let fold_fp32 = !enabled && self.shape.num_stacks == 648 && self.shape.l1_out() == 16
+            && self.batch_size >= 1024 && !self.shape.has_compact_l1()
+            && self.factorizer.any_axis() && self.batch_norm.is_none()
+            && !self.residual_count_gates_enabled
+            && std::env::var_os("BULLETOU_DISABLE_FP32_L1_FOLD").is_none();
+        if !enabled && !fold_fp32 {
             self.forward_workspace.qat_l1 = None;
             self.forward_workspace.qat_l1_active.set(false);
-        } else if self.forward_workspace.qat_l1.is_none() {
+        } else if self.forward_workspace.qat_l1.as_ref().is_none_or(|q| q.quantized != enabled) {
             self.forward_workspace.qat_l1 = Some(SfnnL1Qat {
                 weights: F32Buffer::new(ctx, self.shape.l1w_len()?)?,
                 bias: F32Buffer::new(ctx, self.shape.num_stacks * self.shape.l1_out())?,
                 refresh: std::cell::Cell::new(true),
+                quantized: enabled,
             });
         }
         Ok(())

@@ -1458,7 +1458,8 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
     float scale, BnConfig bn={}, bool precise=false,
-    size_t compact_groups=1, size_t common_size=0, size_t shard_size=0, bool compact_output=false) {
+    size_t compact_groups=1, size_t common_size=0, size_t shard_size=0, bool compact_output=false,
+    bool quantize=true) {
     const size_t weight_cell_count = input_dim * output_dim;
     const bool cs=common_size!=0 || shard_size!=0;
     const size_t row_width=compact_output ? (cs?common_size+shard_size:input_dim/compact_groups) : input_dim;
@@ -1523,7 +1524,8 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
         }
     }
 
-    dst[tid] = sfnn_quantize_dequant_clamped(bn_fold_weight(value,bn,stack,out_col), scale, -128.0f, 127.0f, precise);
+    const float folded=bn_fold_weight(value,bn,stack,out_col);
+    dst[tid] = quantize ? sfnn_quantize_dequant_clamped(folded, scale, -128.0f, 127.0f, precise) : folded;
 }
 
 __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
@@ -1550,7 +1552,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale, BnConfig bn={}, bool precise=false, int* integer_bias=nullptr) {
+    float scale, BnConfig bn={}, bool precise=false, int* integer_bias=nullptr, bool quantize=true) {
     const size_t total = num_stacks * output_dim;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
@@ -1605,7 +1607,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
         const double q=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(folded)*static_cast<double>(scale))));
         integer_bias[tid]=static_cast<int>(q);
     }
-    dst[tid] = sfnn_quantize_dequant_clamped(folded, scale, -2147483648.0f, 2147483647.0f, precise);
+    dst[tid] = quantize ? sfnn_quantize_dequant_clamped(folded, scale, -2147483648.0f, 2147483647.0f, precise) : folded;
 }
 
 __global__ void sfnn_stacked_l1_kernel(
@@ -9400,7 +9402,9 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     if (qat_l1w != nullptr) {
         if (validate_buffer(ctx, qat_l1w, l1w_len, "QAT L1 weights") != 0 ||
             validate_buffer(ctx, qat_l1b, num_stacks * l1_out, "QAT L1 bias") != 0) return -1;
-        if (refresh_qat_l1 != 0) {
+        const bool quantize_l1 = refresh_qat_l1 >= 0;
+        const bool refresh_l1 = refresh_qat_l1 == 1 || refresh_qat_l1 == -2;
+        if (refresh_l1) {
             constexpr int threads = 256;
             int blocks = 0;
             if (block_count_1d(l1w_len, threads, &blocks, "QAT L1 weights") != 0) return -1;
@@ -9414,12 +9418,12 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha,
                 residual_count_gates_ptr, factorizer_axis_confidences_ptr, 64.0f, {}, false,
-                l1_group_count, l1_common_size, l1_shard_size, true);
+                l1_group_count, l1_common_size, l1_shard_size, true, quantize_l1);
             if (check_kernel_launch("QAT L1 weights launch") != 0) return -1;
         }
         // The integer bias scratch belongs to the context and may have been
         // used by another runner, so refresh it even within an accumulation group.
-        if (refresh_qat_l1 != 0 || ctx->dense_qat) {
+        if (refresh_l1 || ctx->dense_qat) {
             constexpr int threads = 256;
             int blocks = 0;
             if (block_count_1d(num_stacks * l1_out, threads, &blocks, "QAT L1 bias") != 0) return -1;
@@ -9433,7 +9437,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha,
                 residual_count_gates_ptr, factorizer_axis_confidences_ptr, 127.0f * 64.0f, {}, false,
-                ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr);
+                ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr, quantize_l1);
             if (check_kernel_launch("QAT L1 bias launch") != 0) return -1;
         }
     }

@@ -219,6 +219,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
         fn drop(&mut self) {
             unsafe {
                 bulletou_bn_reference_mode(0);
+                std::env::remove_var("BULLETOU_DISABLE_FP32_L1_FOLD");
             }
         }
     }
@@ -302,7 +303,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
             batch_size: N,
             max_active: 1,
         };
-        for qat in [true] {
+        for qat in [true, false] {
             for shared in [false, true] {
                 let mut fast = SfnnTrainStepRunner::new(&ctx, host, N, 1).unwrap();
                 let mut reference = SfnnTrainStepRunner::new(&ctx, host, N, 1).unwrap();
@@ -326,7 +327,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                         r.set_factorizer_axis_confidences(&ctx, Some(&confidence)).unwrap();
                     }
                     let gates: Vec<f32> = (0..stacks).map(|i| if i == 0 { 0.0 } else { 0.6 }).collect();
-                    if king != 0 || hand != 0 || progress {
+                    if qat && (king != 0 || hand != 0 || progress) {
                         r.set_residual_count_gates_by_stack(&ctx, Some(&gates)).unwrap();
                     }
                 }
@@ -335,6 +336,8 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                     for (r, old) in [(&mut fast, false), (&mut reference, true)] {
                         unsafe {
                             bulletou_bn_reference_mode(i32::from(old));
+                            if !qat && old { std::env::set_var("BULLETOU_DISABLE_FP32_L1_FOLD", "1"); }
+                            else { std::env::remove_var("BULLETOU_DISABLE_FP32_L1_FOLD"); }
                         }
                         r.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
                             &ctx,
@@ -351,6 +354,10 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                     }
                     let fast_output = fast.forward_workspace.download_output(&ctx).unwrap();
                     let reference_output = reference.forward_workspace.download_output(&ctx).unwrap();
+                    if stacks == 648 && !qat {
+                        assert!(!fast.forward_workspace.qat_l1.as_ref().expect("FP32 folded scratch").quantized);
+                        assert!(reference.forward_workspace.qat_l1.is_none());
+                    }
                     for (&x, &y) in fast_output.iter().zip(&reference_output) {
                         assert!((x - y).abs() < 1e-6 + y.abs() * 1e-5,
                             "forward stacks={stacks} qat={qat} shared={shared} micro={micro}: {x} vs {y}");
@@ -387,7 +394,7 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                     }
                     // The same microbatch twice without an optimizer update must
                     // double each gradient, including shared and pair axes.
-                    unsafe { bulletou_bn_reference_mode(0); }
+                    unsafe { bulletou_bn_reference_mode(0); std::env::remove_var("BULLETOU_DISABLE_FP32_L1_FOLD"); }
                     fast.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
                         &ctx, &upload, RangerUpdateParams::default(),
                         ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0,
@@ -420,6 +427,28 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                         for (&first, &next) in x.download(&ctx).unwrap().iter().zip(y.download(&ctx).unwrap().iter()) {
                             assert!((2.0*first-next).abs() < 2e-6 + first.abs()*6e-4, "axis: {first} vs {next}");
                         }
+                    }
+                    if stacks == 648 && !qat {
+                        unsafe { bulletou_bn_reference_mode(1); std::env::set_var("BULLETOU_DISABLE_FP32_L1_FOLD", "1"); }
+                        reference.step_pipelined_no_readback_with_loss_finalize_update_and_lr_multipliers(
+                            &ctx, &upload, RangerUpdateParams::default(), ScalarLossKind::SigmoidPow { pow_exp: 2.0 },
+                            1.0, batch, true, false, policy,
+                        ).unwrap();
+                        let mut params=RangerUpdateParams::default();
+                        params.radam.step=1; params.radam.learning_rate=0.0001;
+                        fast.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,params,policy,None).unwrap();
+                        reference.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,params,policy,None).unwrap();
+                        assert!(fast.forward_workspace.qat_l1.as_ref().unwrap().refresh.get());
+                        for (name,x,y) in [
+                            ("L1",&fast.weights.l1w,&reference.weights.l1w),
+                            ("L1 bias",&fast.weights.l1b,&reference.weights.l1b),
+                            ("axis",fast.weights.l1axw.as_ref().unwrap(),reference.weights.l1axw.as_ref().unwrap()),
+                        ] {
+                            for (a,b) in x.download(&ctx).unwrap().iter().zip(y.download(&ctx).unwrap()) {
+                                assert!((a-b).abs()<2e-6+2e-4*b.abs(),"updated {name}: {a} vs {b}");
+                            }
+                        }
+                        unsafe { bulletou_bn_reference_mode(0); std::env::remove_var("BULLETOU_DISABLE_FP32_L1_FOLD"); }
                     }
                 }
             }
