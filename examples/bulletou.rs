@@ -58,6 +58,10 @@ mod progress_train;
 mod export_nn16;
 
 #[cfg(feature = "cuda-cpp-backend")]
+#[path = "bulletou/gptq.rs"]
+mod gptq;
+
+#[cfg(feature = "cuda-cpp-backend")]
 #[path = "bulletou/revival_audit.rs"]
 mod revival_audit;
 
@@ -12489,6 +12493,18 @@ fn main() {
             eprintln!("error: calibrate-nn-bin requires building with --features cuda-cpp-backend");
             std::process::exit(2);
         }
+        return;
+    }
+    if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("export-gptq")) {
+        raw_args.remove(1);
+        if let Some(program) = raw_args.get_mut(0) { *program = std::ffi::OsString::from("bulletou export-gptq"); }
+        #[cfg(feature = "cuda-cpp-backend")]
+        {
+            let args = gptq::ExportArgs::parse_from(raw_args);
+            if let Err(e) = gptq::run(&args) { eprintln!("error: export-gptq failed: {e}"); std::process::exit(2); }
+        }
+        #[cfg(not(feature = "cuda-cpp-backend"))]
+        { eprintln!("error: export-gptq requires --features cuda-cpp-backend"); std::process::exit(2); }
         return;
     }
     if raw_args.get(1).is_some_and(|arg| arg == std::ffi::OsStr::new("export-nn16")) {
