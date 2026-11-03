@@ -18,6 +18,16 @@ pub(super) struct ExportArgs {
     #[arg(long, default_value_t = 0)] cuda_cpp_device: i32,
     /// New output path; existing files are never overwritten.
     #[arg(long)] output: PathBuf,
+    /// Count file produced by bucket-count; enables removal of rare L1 residuals.
+    #[arg(long, requires = "residual_max_count")] bucket_counts: Option<PathBuf>,
+    /// Remove the bucket-specific L1 residual when its count is at most this value.
+    #[arg(long, requires = "bucket_counts")] residual_max_count: Option<u32>,
+    /// Also export the non-GPTQ network after residual removal.
+    #[arg(long)] normal_output: Option<PathBuf>,
+    /// Check that this progress classifier is the one saved with the checkpoint.
+    #[arg(long)] progress_bin: Option<PathBuf>,
+    /// Measure and print GPTQ qacc/qloss with the checkpoint's test settings.
+    #[arg(long)] validate: bool,
 }
 
 fn calibration_teacher(args: &Args) -> Result<PathBuf, String> {
@@ -41,7 +51,8 @@ pub(super) fn run_automatic(args:&Args, checkpoint:&Path, epoch:usize, superbatc
     eprintln!("  [GPTQ] START epoch={epoch} teacher={} positions={} output={}",teacher.display(),args.sfnn_gptq_calibration_positions,output.display());
     run(&ExportArgs {arch:args.arch(),state_bin:checkpoint.join("state.bin"),settings_file:settings,
         epoch,calibration_teacher:teacher,calibration_positions:args.sfnn_gptq_calibration_positions,
-        min_bucket_positions:128,damping:0.01,cuda_cpp_device:args.cuda_cpp_device,output})?;
+        min_bucket_positions:128,damping:0.01,cuda_cpp_device:args.cuda_cpp_device,output,
+        bucket_counts:None,residual_max_count:None,normal_output:None,progress_bin:None,validate:false})?;
     eprintln!("  [GPTQ] DONE {}",checkpoint.join("nn-gptq.bin").display());
     if let Err(err)=validate_automatic(args,checkpoint,epoch,superbatch) {
         eprintln!("  WARNING: GPTQ validation failed for {}: {err}; nn-gptq.bin was saved",checkpoint.display());
@@ -75,6 +86,8 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     if args.epoch == 0 || args.calibration_positions == 0 || args.min_bucket_positions == 0
         || !args.damping.is_finite() || args.damping <= 0.0 { return Err("invalid epoch, calibration size, bucket minimum or damping".into()); }
     if args.output.exists() { return Err("output already exists; choose a new file".into()); }
+    let validation_path = args.output.with_file_name("gptq-validation.json");
+    if args.validate && validation_path.exists() { return Err("GPTQ validation output already exists; choose a new directory".into()); }
     let train=training_args_for_export(&args.settings_file,args.epoch)?;
     if train.arch().cli_name()!=args.arch.cli_name() { return Err("--arch disagrees with settings".into()); }
     if train.ft_factorizer { return Err("export-gptq currently requires a checkpoint with FT factorizer off".into()); }
@@ -88,7 +101,7 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     let feature=cuda_cpp_sfnn_feature_kind_from_arch(args.arch)?;
     let stack=train.effective_layerstack().ok_or("SFNN layerstack required")?;
     eprintln!("export-gptq: loading checkpoint and calibration positions; L2/L3 only");
-    let state=load_cuda_cpp_sfnn_initial_state(&args.state_bin,&train,feature)?;
+    let mut state=load_cuda_cpp_sfnn_initial_state(&args.state_bin,&train,feature)?;
     let shape=state.weights.shape;
     if state.weights.batch_norm.0.iter().any(Option::is_some)
         || state.weights.l2fw.is_some() || state.weights.l2axw.is_some()
@@ -97,6 +110,29 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     }
     let progress=cuda_cpp_sfnn_progress_params_for_state(state.progress.as_ref())?;
     if stack.progress_bucket_count()>1 && progress.is_none() {return Err("checkpoint lacks progress classifier".into());}
+    if let Some(path) = &args.progress_bin {
+        let checkpoint_progress = args.state_bin.parent().ok_or("checkpoint has no parent")?.join("progress.bin");
+        if std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?
+            != std::fs::read(&checkpoint_progress).map_err(|e| format!("cannot read {}: {e}", checkpoint_progress.display()))? {
+            return Err("--progress-bin differs from the checkpoint progress.bin".into());
+        }
+    }
+    if let Some(path) = &args.bucket_counts {
+        if !effective_sfnn_factorizer_spec(&train).any_axis() && !effective_sfnn_factorizer_spec(&train).shared {
+            return Err("residual removal requires an active L1 factorizer".into());
+        }
+        let counts = SfnnBucketCounts::read_from_path(path)?;
+        if counts.arch != args.arch.cli_name() { return Err("bucket-count arch differs from checkpoint arch".into()); }
+        let removed = zero_rare_l1_residuals(&mut state.weights, &counts.counts, args.residual_max_count.unwrap())?;
+        eprintln!("  residual removal: {removed}/{} buckets (count <= {})", shape.num_stacks, args.residual_max_count.unwrap());
+    }
+    if let Some(path) = &args.normal_output {
+        if path.exists() || path == &args.output { return Err("normal output already exists or matches GPTQ output".into()); }
+        if path.parent() != args.output.parent() { return Err("normal and GPTQ output must be in the same directory".into()); }
+        if progress.is_some() && path.with_file_name("progress.bin").exists() {
+            return Err("normal output directory already contains progress.bin; choose a new output directory".into());
+        }
+    }
     let path=args.calibration_teacher.to_str().ok_or("invalid calibration path")?;
     let positions=read_teacher_positions_prefix(path,args.calibration_positions).map_err(|e|e.to_string())?;
     if positions.is_empty() {return Err("empty calibration teacher".into());}
@@ -127,6 +163,11 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     }
     drop(device);
     let mut weights=sfnn_initial_weights_into_readback(state.weights);
+    if let Some(path) = &args.normal_output {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+        write_cuda_cpp_sfnn_nn_bin(path,feature,shape,&weights,effective_sfnn_factorizer_spec(&train),alpha,None,None,progress.as_ref())?;
+        println!("normal export complete: {}",path.display());
+    }
     let mut optimized=0usize;
     for (s,&count) in counts.iter().enumerate() {
         if count<args.min_bucket_positions {continue;}
@@ -162,7 +203,43 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     }
     std::fs::hard_link(&out,&args.output).map_err(|e|e.to_string())?;
     println!("export-gptq complete: {}",args.output.display());
+    if args.validate {
+        let Some(mut test_args) = quantized_test_args_from_training_args(&train, args.output.clone())? else {
+            return Err("GPTQ validation requires test_teacher in settings".into());
+        };
+        test_args.mode = QuantizedTestMode::CpuExact;
+        let report = run_quantized_test_impl(&test_args, false)?;
+        let loss = report.train_scale.test_loss.ok_or("GPTQ validation returned no loss")?;
+        let accuracy = report.train_scale.accuracy();
+        if !accuracy.is_finite() || !loss.is_finite() { return Err("GPTQ validation returned non-finite metrics".into()); }
+        let record = serde_json::json!({"version":1, "epoch":args.epoch, "gptq_qacc":accuracy,
+            "gptq_qloss":loss, "mode":"cpu-exact", "positions":report.records});
+        let bytes = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
+        std::fs::write(&validation_path, bytes).map_err(|e| format!("cannot write {}: {e}", validation_path.display()))?;
+        println!("GPTQ validation: qacc={accuracy:.7} qloss={loss:.8} positions={} mode=cpu-exact file={}", report.records, validation_path.display());
+    }
     Ok(())
+}
+
+fn zero_rare_l1_residuals(weights: &mut CudaCppSfnnInitialWeights, counts: &[u32], max_count: u32) -> Result<usize, String> {
+    zero_rare_l1_residual_slices(weights.shape.num_stacks, &mut weights.l1w, &mut weights.l1b, counts, max_count)
+}
+
+fn zero_rare_l1_residual_slices(stacks: usize, l1w: &mut [f32], l1b: &mut [f32], counts: &[u32], max_count: u32) -> Result<usize, String> {
+    if stacks == 0 || counts.len() != stacks || l1w.len() % stacks != 0 || l1b.len() % stacks != 0 {
+        return Err("bucket counts or L1 tensor shape do not match checkpoint".into());
+    }
+    let w_stride = l1w.len() / stacks;
+    let b_stride = l1b.len() / stacks;
+    let mut removed = 0;
+    for (stack, &count) in counts.iter().enumerate() {
+        if count <= max_count {
+            l1w[stack*w_stride..(stack+1)*w_stride].fill(0.0);
+            l1b[stack*b_stride..(stack+1)*b_stride].fill(0.0);
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn training_args_for_export(settings_file: &Path, epoch: usize) -> Result<Args, String> {
@@ -242,6 +319,23 @@ fn cholesky(a: &[f64], n: usize) -> Result<Vec<f64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rare_residual_removal_uses_inclusive_threshold_and_preserves_other_buckets() {
+        let mut w = vec![1., 2., 3., 4., 5., 6.];
+        let mut b = vec![7., 8., 9.];
+        assert_eq!(zero_rare_l1_residual_slices(3, &mut w, &mut b, &[0, 4, 5], 4).unwrap(), 2);
+        assert_eq!(w, [0., 0., 0., 0., 5., 6.]);
+        assert_eq!(b, [0., 0., 9.]);
+        assert!(zero_rare_l1_residual_slices(3, &mut w, &mut b, &[0], 0).is_err());
+    }
+    #[test]
+    fn bucket_csv_sorts_counts_and_includes_zeros() {
+        let path = std::env::temp_dir().join(format!("bulletou-bucket-sorted-{}.csv", std::process::id()));
+        let counts = SfnnBucketCounts { arch: "test".into(), positions: 7, counts: vec![0, 3, 1, 3] };
+        counts.write_sorted_csv(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "bucket,count\n1,3\n3,3\n2,1\n0,0\n");
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn export_preserves_settings_path_and_epoch_schedules_with_automatic_gptq() {
         let dir = std::env::temp_dir().join(format!("bulletou-gptq-settings-{}", std::process::id()));

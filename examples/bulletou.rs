@@ -2056,6 +2056,13 @@ impl BucketCountArgs {
         if self.output.exists() && !self.overwrite {
             return Err(format!("{} already exists; pass --overwrite to replace it", self.output.display()));
         }
+        let csv_path = self.output.with_extension("csv");
+        if csv_path == self.output {
+            return Err("bucket-count binary output must not use the .csv extension".into());
+        }
+        if csv_path.exists() && !self.overwrite {
+            return Err(format!("{} already exists; pass --overwrite to replace it", csv_path.display()));
+        }
         if !(self.progress_interval_sec.is_finite() && self.progress_interval_sec >= 0.0) {
             return Err(format!(
                 "--progress-interval-sec must be finite and non-negative (got {})",
@@ -15887,6 +15894,19 @@ impl SfnnBucketCounts {
         self.counts.len()
     }
 
+    fn write_sorted_csv(&self, path: &Path) -> Result<(), String> {
+        use std::io::Write as _;
+        let mut rows: Vec<_> = self.counts.iter().copied().enumerate().collect();
+        rows.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?);
+        writeln!(writer, "bucket,count").map_err(|e| e.to_string())?;
+        for (bucket, count) in rows {
+            writeln!(writer, "{bucket},{count}").map_err(|e| e.to_string())?;
+        }
+        writer.flush().map_err(|e| format!("failed to write {}: {e}", path.display()))
+    }
+
     fn write_to_path(&self, path: &Path) -> Result<(), String> {
         let arch_bytes = self.arch.as_bytes();
         if arch_bytes.len() > u32::MAX as usize {
@@ -16647,6 +16667,8 @@ fn finish_bucket_count_report(
     elapsed: std::time::Duration,
 ) -> Result<(), String> {
     report.write_to_path(&args.output)?;
+    let csv_path = args.output.with_extension("csv");
+    report.write_sorted_csv(&csv_path)?;
     let total_positions = usize::try_from(report.positions)
         .map_err(|_| format!("bucket-count positions {} do not fit in usize", report.positions))?;
     let touched_buckets = report.nonzero_count();
@@ -16666,6 +16688,7 @@ fn finish_bucket_count_report(
     println!("  arch              = {}", report.arch);
     println!("  layerstack        = {}", layerstack.cli_name());
     println!("  output            = {}", args.output.display());
+    println!("  csv               = {}", csv_path.display());
     println!("  stacks            = {}", format_count(report.stack_count()));
     println!("  scanned_batches   = {}", format_count(seen_batches));
     println!("  scanned_positions = {}", format_count(total_positions));
