@@ -75,10 +75,7 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     if args.epoch == 0 || args.calibration_positions == 0 || args.min_bucket_positions == 0
         || !args.damping.is_finite() || args.damping <= 0.0 { return Err("invalid epoch, calibration size, bucket minimum or damping".into()); }
     if args.output.exists() { return Err("output already exists; choose a new file".into()); }
-    let mut raw=vec![std::ffi::OsString::from("bulletou")];
-    raw.extend(bulletou_settings_json_args(&args.settings_file)?);
-    let parsed=Args::try_parse_from(raw).map_err(|e|e.to_string())?;
-    let train=args_at_epoch(&parsed,args.epoch)?;
+    let train=training_args_for_export(&args.settings_file,args.epoch)?;
     if train.arch().cli_name()!=args.arch.cli_name() { return Err("--arch disagrees with settings".into()); }
     if train.ft_factorizer { return Err("export-gptq currently requires a checkpoint with FT factorizer off".into()); }
     // This first implementation does not silently ignore per-axis gates or BN.
@@ -168,6 +165,16 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn training_args_for_export(settings_file: &Path, epoch: usize) -> Result<Args, String> {
+    let raw = vec![
+        std::ffi::OsString::from("bulletou"),
+        std::ffi::OsString::from("--settings-file"),
+        settings_file.as_os_str().to_owned(),
+    ];
+    let parsed = Args::try_parse_from(expand_settings_file_args(raw)?).map_err(|e| e.to_string())?;
+    args_at_epoch(&parsed, epoch)
+}
+
 /// Quantize rows of a matrix using a shared input Gram matrix and the fixed
 /// NNUE i8 scale. `gram` is row-major X^T X, not its inverse.
 pub(crate) fn quantize_rows(weights: &[f32], rows: usize, columns: usize, gram: &[f64], damping: f64) -> Result<Vec<f32>, String> {
@@ -235,6 +242,25 @@ fn cholesky(a: &[f64], n: usize) -> Result<Vec<f64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn export_preserves_settings_path_and_epoch_schedules_with_automatic_gptq() {
+        let dir = std::env::temp_dir().join(format!("bulletou-gptq-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{
+            "arch": "SFNN_halfkahm2_2304_15_64_k9k9_progress8",
+            "teacher": "teacher.bin",
+            "sfnn_gptq": true,
+            "sfnn_qat_l1": {"epoch1": true, "epoch6": false}
+        }"#).unwrap();
+        let first = training_args_for_export(&path, 1).unwrap();
+        let sixth = training_args_for_export(&path, 6).unwrap();
+        assert_eq!(sixth.settings_file.as_deref(), Some(path.as_path()));
+        assert!(sixth.sfnn_gptq);
+        assert!(first.sfnn_qat_l1);
+        assert!(!sixth.sfnn_qat_l1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn correlated_inputs_can_compensate_rounding() {
         let w=[0.49/64.0, 0.49/64.0];
