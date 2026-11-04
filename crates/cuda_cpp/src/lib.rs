@@ -10581,6 +10581,29 @@ mod tests {
                 assert!((old - new).abs() <= 1e-5, "bias {old} != {new}");
             }
         }
+        unsafe extern "C" {
+            fn bulletou_test_l1_to_ft_f32_gradient(ctx: *mut ffi::BulletOuCudaCppContext,
+                dy: *mut ffi::BulletOuCudaCppF32Buffer, weights: *mut ffi::BulletOuCudaCppF32Buffer,
+                buckets: *mut ffi::BulletOuCudaCppI32Buffer, activations: *mut ffi::BulletOuCudaCppF32Buffer,
+                result: *mut ffi::BulletOuCudaCppF32Buffer, bias: *mut ffi::BulletOuCudaCppF32Buffer,
+                batch: usize, width: usize, stacks: usize, fused: i32) -> i32;
+        }
+        let mut fp32_results = Vec::new(); let mut fp32_biases = Vec::new();
+        for fused in [0, 1] {
+            let result = F32Buffer::new(&ctx, 2 * batch * width).unwrap();
+            let bias = F32Buffer::from_host(&ctx, &vec![0.1; width]).unwrap();
+            for _ in 0..2 {
+                assert_eq!(unsafe { bulletou_test_l1_to_ft_f32_gradient(ctx.as_ptr(), dy.as_ptr(), weights.as_ptr(),
+                    buckets.as_ptr(), activations.as_ptr(), result.as_ptr(), bias.as_ptr(), batch, width, stacks, fused) }, 0);
+            }
+            fp32_results.push(result.download(&ctx).unwrap()); fp32_biases.push(bias.download(&ctx).unwrap());
+        }
+        for (old, new) in fp32_results[0].iter().zip(&fp32_results[1]) {
+            assert!((old - new).abs() <= 1e-6, "FT gradient {old} != {new}");
+        }
+        for (old, new) in fp32_biases[0].iter().zip(&fp32_biases[1]) {
+            assert!((old - new).abs() <= 1e-5, "FT bias {old} != {new}");
+        }
     }
 
     #[test]
