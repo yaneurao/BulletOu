@@ -4131,7 +4131,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4166,7 +4166,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
             return Err(format!("superbatches.{name} must be a positive integer"));
         }
-        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4281,7 +4281,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(superbatches, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
-            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -5391,6 +5391,9 @@ struct Args {
     /// Use scaled FP16 temporary FT gradients in the experimental HalfKA_hm2 path.
     #[arg(long)]
     sfnn_ft_fp16_grad: bool,
+    /// Keep FT activations in FP16 in the experimental HalfKA_hm2 training path.
+    #[arg(long)]
+    sfnn_ft_fp16_act: bool,
     /// Non-BN L2 weight/bias QAT (int8 weights, scale 64), identity STE. Default off.
     #[arg(long)]
     sfnn_qat_l2: bool,
@@ -5689,6 +5692,9 @@ impl Args {
             if self.sfnn_gptq_calibration_positions == 0 {
                 return Err("--sfnn-gptq-calibration-positions must be positive".into());
             }
+        }
+        if self.sfnn_ft_fp16_act && !self.sfnn_ft_fp16_grad {
+            return Err("--sfnn-ft-fp16-act requires --sfnn-ft-fp16-grad and --sfnn-ft-fp16".into());
         }
         if self.sfnn_ft_fp16_grad && (!self.sfnn_ft_fp16 || self.sfnn_ft_saturation_penalty != 0.0) {
             return Err("--sfnn-ft-fp16-grad requires --sfnn-ft-fp16 and FT saturation penalty off".into());
@@ -18419,7 +18425,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
             args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
         if args.sfnn_ft_fp16 {
-            print_startup_kv("SFNN FT precision", if args.sfnn_ft_fp16_grad { "FP16 forward weights and scaled FP16 temporary gradients; FP32 master/optimizer and FP32 validation (experimental)" } else { "FP16 forward weights; FP32 master/gradients/optimizer and FP32 validation (experimental)" });
+            print_startup_kv("SFNN FT precision", format!("FP16 forward weights; FP16 activations={}; scaled FP16 temporary gradients={}; FP32 master/optimizer and FP32 validation (experimental)", args.sfnn_ft_fp16_act, args.sfnn_ft_fp16_grad));
         }
         if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
             print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
@@ -19181,6 +19187,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         };
         if args.sfnn_ft_fp16 { ctx.set_sfnn_ft_fp16(true).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16_grad { ctx.set_sfnn_ft_fp16_grad(true).map_err(|e| e.to_string())?; }
+        if args.sfnn_ft_fp16_act { ctx.set_sfnn_ft_fp16_act(true).map_err(|e| e.to_string())?; }
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
                 .step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
@@ -19245,6 +19252,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 )
                 .map_err(|e| e.to_string())?;
         }
+        if args.sfnn_ft_fp16_act { ctx.set_sfnn_ft_fp16_act(false).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16_grad { ctx.set_sfnn_ft_fp16_grad(false).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16 { ctx.set_sfnn_ft_fp16(false).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16_grad && progress_for_step.is_some_and(|p| p.batch_in_superbatch == p.batches_per_superbatch) {
@@ -27037,6 +27045,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_qat_ft={}", args.sfnn_qat_ft && args.non_bn_layer_qat()),
         format!("sfnn_ft_fp16={}", args.sfnn_ft_fp16),
         format!("sfnn_ft_fp16_grad={}", args.sfnn_ft_fp16_grad),
+        format!("sfnn_ft_fp16_act={}", args.sfnn_ft_fp16_act),
         format!("sfnn_qat_l2={}", args.sfnn_qat_l2 && args.non_bn_layer_qat()),
         format!("sfnn_qat_l3={}", args.sfnn_qat_l3 && args.non_bn_layer_qat()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
@@ -27334,6 +27343,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_qat_ft=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16_grad=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16_act=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l2=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l3=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
@@ -28780,17 +28790,23 @@ mod tests {
             "sfnn_ft_factorizer":{"epoch1":true,"epoch5":false},
             "sfnn_qat_l1":{"epoch1":true,"epoch6":false},
             "sfnn_ft_fp16":{"epoch1":false,"epoch10":true},
-            "sfnn_ft_fp16_grad":{"epoch1":false,"epoch10":true}
+            "sfnn_ft_fp16_grad":{"epoch1":false,"epoch10":true},
+            "sfnn_ft_fp16_act":{"epoch1":false,"epoch10":true}
         }"#).unwrap();
         let raw = vec!["bulletou".into(), "--settings-file".into(), path.as_os_str().to_owned()];
         let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
         let ninth = args_at_epoch(&args, 9).unwrap();
         assert!(!ninth.sfnn_ft_fp16);
         assert!(!ninth.sfnn_ft_fp16_grad);
+        assert!(!ninth.sfnn_ft_fp16_act);
         let mut tenth = args_at_epoch(&args, 10).unwrap();
         assert!(tenth.sfnn_ft_fp16);
         assert!(tenth.sfnn_ft_fp16_grad);
+        assert!(tenth.sfnn_ft_fp16_act);
         assert!(resume_signature_matches(&resume_signature(&ninth), &tenth));
+        tenth.sfnn_ft_fp16_grad = false;
+        assert!(tenth.validate_arch_flags().is_err());
+        tenth.sfnn_ft_fp16_grad = true;
         tenth.sfnn_ft_fp16 = false;
         assert!(tenth.validate_arch_flags().is_err());
         tenth.sfnn_ft_fp16 = true;

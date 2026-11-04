@@ -126,8 +126,11 @@ struct BulletOuCudaCppContext {
     __half* sfnn_ft_half_grads = nullptr;
     size_t sfnn_ft_half_grads_len = 0;
     unsigned long long* sfnn_ft_half_grad_clipped = nullptr;
+    __half* sfnn_ft_half_activations = nullptr;
+    size_t sfnn_ft_half_activations_len = 0;
     bool sfnn_ft_fp16 = false;
     bool sfnn_ft_fp16_grad = false;
+    bool sfnn_ft_fp16_act = false;
     bool dense_qat = false;
     const float* dense_qat_l2_bias = nullptr;
     const float* dense_qat_l3_bias = nullptr;
@@ -1235,7 +1238,7 @@ __global__ void sfnn_test_ft_from_half(const __half* weights, float* out, size_t
 
 __global__ void sfnn_hm2_one_view_half_kernel(const int* indices, const __half* weights, const float* bias,
     float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
-    const int* order, size_t view) {
+    const int* order, size_t view, __half* half_l0=nullptr) {
     const size_t pairwise = ft_size / 2;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= batch * pairwise) return;
@@ -1250,10 +1253,54 @@ __global__ void sfnn_hm2_one_view_half_kernel(const int* indices, const __half* 
             sum1 += __half2float(weights[base + pairwise + pair]);
         }
     }
-    const float x0 = crelu(sum0), x1 = crelu(sum1);
-    l0[sample * ft_size + pair] = x0;
-    l0[sample * ft_size + pairwise + pair] = x1;
+    float x0 = crelu(sum0), x1 = crelu(sum1);
+    if (half_l0) {
+        const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
+        half_l0[sample * ft_size + pair] = h0;
+        half_l0[sample * ft_size + pairwise + pair] = h1;
+        x0 = __half2float(h0); x1 = __half2float(h1);
+    } else {
+        l0[sample * ft_size + pair] = x0;
+        l0[sample * ft_size + pairwise + pair] = x1;
+    }
     combined[sample * ft_size + view * pairwise + pair] = x0 * x1 * SFNN_PAIRWISE_SCALE;
+}
+
+// Adjacent channels share feature indices; half2 loads halve index traffic.
+__global__ void sfnn_hm2_one_view_half2_kernel(const int* indices, const __half* weights, const float* bias,
+    float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
+    const int* order, size_t view, __half* half_l0) {
+    const size_t pairwise = ft_size / 2;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= batch * (pairwise / 2)) return;
+    const size_t pair = (tid % (pairwise / 2)) * 2;
+    const size_t sample = static_cast<size_t>(order[tid / (pairwise / 2)]);
+    float2 sum0 = *reinterpret_cast<const float2*>(bias + pair);
+    float2 sum1 = *reinterpret_cast<const float2*>(bias + pairwise + pair);
+    for (size_t slot = 0; slot < active; ++slot) {
+        const int feature = indices[sample * active + slot];
+        if (feature >= 0 && static_cast<size_t>(feature) < input_size) {
+            const size_t base = static_cast<size_t>(feature) * ft_size;
+            const float2 v0 = __half22float2(*reinterpret_cast<const __half2*>(weights + base + pair));
+            const float2 v1 = __half22float2(*reinterpret_cast<const __half2*>(weights + base + pairwise + pair));
+            sum0.x += v0.x; sum0.y += v0.y;
+            sum1.x += v1.x; sum1.y += v1.y;
+        }
+    }
+    float2 x0 = make_float2(crelu(sum0.x), crelu(sum0.y));
+    float2 x1 = make_float2(crelu(sum1.x), crelu(sum1.y));
+    const size_t base = sample * ft_size + pair;
+    if (half_l0) {
+        const __half2 h0 = __floats2half2_rn(x0.x, x0.y), h1 = __floats2half2_rn(x1.x, x1.y);
+        *reinterpret_cast<__half2*>(half_l0 + base) = h0;
+        *reinterpret_cast<__half2*>(half_l0 + base + pairwise) = h1;
+        x0 = __half22float2(h0); x1 = __half22float2(h1);
+    } else {
+        *reinterpret_cast<float2*>(l0 + base) = x0;
+        *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
+    }
+    *reinterpret_cast<float2*>(combined + base + view * pairwise) =
+        make_float2(x0.x * x1.x * SFNN_PAIRWISE_SCALE, x0.y * x1.y * SFNN_PAIRWISE_SCALE);
 }
 
 __global__ void sfnn_fold_halfka2_l0w_kernel(
@@ -1847,6 +1894,35 @@ __global__ void sfnn_dense_l1_plain_warp_kernel(
         sum += __shfl_down_sync(0xffffffffU, sum, offset);
     }
     if (lane == 0) output[warp_id] = sum + bias[stack * output_dim + out_col];
+}
+
+// Each warp reuses one input value across all 16 outputs. Each output retains
+// the same per-lane accumulation and warp reduction order as the scalar path.
+__global__ void sfnn_dense_l1_16_warp(const float* input, const float* weights, const float* bias,
+    const int* buckets, float* output, size_t batch, size_t input_dim, size_t num_stacks) {
+    constexpr unsigned WARP = 32, WARPS = 8;
+    const unsigned lane = threadIdx.x & 31U;
+    const size_t sample = static_cast<size_t>(blockIdx.x) * WARPS + (threadIdx.x >> 5);
+    if (sample >= batch) return;
+    const int bucket = buckets[sample];
+    if (bucket < 0 || static_cast<size_t>(bucket) >= num_stacks) {
+        if (lane == 0) for (int o=0; o<16; ++o) output[sample*16+o] = 0.0f;
+        return;
+    }
+    const size_t input_base = sample * input_dim;
+    const size_t weight_base = static_cast<size_t>(bucket) * 16 * input_dim;
+    float sums[16] = {};
+    for (size_t col=lane; col<input_dim; col+=WARP) {
+        const float x = input[input_base+col];
+        #pragma unroll
+        for (int o=0; o<16; ++o) sums[o] += x * weights[weight_base + static_cast<size_t>(o)*input_dim + col];
+    }
+    #pragma unroll
+    for (int o=0; o<16; ++o) {
+        float sum = sums[o];
+        for (int offset=16; offset>0; offset>>=1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
+        if (lane == 0) output[sample*16+o] = sum + bias[static_cast<size_t>(bucket)*16+o];
+    }
 }
 
 __global__ void sfnn_stacked_l1_warp_kernel(
@@ -3995,7 +4071,7 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     size_t batch,
     size_t ft_size, FtSaturationConfig guard, bool bn_no_bias=false,
     __half* stm_half=nullptr, __half* nstm_half=nullptr, float half_scale=1.0f,
-    unsigned long long* clipped=nullptr) {
+    unsigned long long* clipped=nullptr, const __half* stm_act_half=nullptr, const __half* nstm_act_half=nullptr) {
     size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -4009,10 +4085,10 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     size_t row1 = pairwise + pair;
     size_t l0_base = sample * ft_size;
 
-    float stm0 = stm_activations[l0_base + row0];
-    float stm1 = stm_activations[l0_base + row1];
-    float nstm0 = nstm_activations[l0_base + row0];
-    float nstm1 = nstm_activations[l0_base + row1];
+    float stm0 = stm_act_half ? __half2float(stm_act_half[l0_base + row0]) : stm_activations[l0_base + row0];
+    float stm1 = stm_act_half ? __half2float(stm_act_half[l0_base + row1]) : stm_activations[l0_base + row1];
+    float nstm0 = nstm_act_half ? __half2float(nstm_act_half[l0_base + row0]) : nstm_activations[l0_base + row0];
+    float nstm1 = nstm_act_half ? __half2float(nstm_act_half[l0_base + row1]) : nstm_activations[l0_base + row1];
     float stm_pair_grad = combined_gradients[l0_base + pair] * SFNN_PAIRWISE_SCALE;
     float nstm_pair_grad = combined_gradients[l0_base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
     float stm_grad0 = crelu_pre_gradient_from_value(stm0, stm_pair_grad * stm1);
@@ -4204,6 +4280,21 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
 
 int validate_buffer(BulletOuCudaCppContext*, BulletOuCudaCppF32Buffer*, size_t, const char*);
 int validate_i32_buffer(BulletOuCudaCppContext*, BulletOuCudaCppI32Buffer*, size_t, const char*);
+extern "C" int bulletou_test_dense_l1_16(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* input, BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias,
+    BulletOuCudaCppI32Buffer* buckets, BulletOuCudaCppF32Buffer* output,
+    size_t batch, size_t input_dim, size_t stacks, int optimized) {
+    if (validate_buffer(ctx, input, batch*input_dim, "test L1 input") ||
+        validate_buffer(ctx, weights, stacks*16*input_dim, "test L1 weights") ||
+        validate_buffer(ctx, bias, stacks*16, "test L1 bias") ||
+        validate_i32_buffer(ctx, buckets, batch, "test L1 buckets") ||
+        validate_buffer(ctx, output, batch*16, "test L1 output")) return -1;
+    if (optimized) sfnn_dense_l1_16_warp<<<static_cast<unsigned>((batch+7)/8),256,0,ctx->stream>>>(
+        input->ptr, weights->ptr, bias->ptr, buckets->ptr, output->ptr, batch, input_dim, stacks);
+    else sfnn_dense_l1_plain_warp_kernel<<<static_cast<unsigned>((batch*16+7)/8),256,0,ctx->stream>>>(
+        input->ptr, weights->ptr, bias->ptr, buckets->ptr, output->ptr, batch, input_dim, 16, stacks);
+    return check_kernel_launch("test dense L1 16");
+}
 extern "C" int bulletou_test_sfnn_ft_sort(
     BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* stm, BulletOuCudaCppI32Buffer* nstm,
     BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias, BulletOuCudaCppF32Buffer* a,
@@ -4227,23 +4318,31 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         sfnn_hm2_sort_scatter<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, order->ptr, batch, active);
     }
     const size_t pairs = batch * ft / 2;
-    if (sorted == 2 || sorted == 3 || sorted == 4) {
-        const unsigned ft_blocks = static_cast<unsigned>((pairs + 255) / 256);
+    if (sorted >= 2 && sorted <= 7) {
+        const unsigned ft_blocks = static_cast<unsigned>((((sorted == 5 || sorted == 7) ? pairs / 2 : pairs) + 255) / 256);
         __half* half_weights = nullptr;
+        __half* half_activations = nullptr;
         float* rounded_weights = nullptr;
-        if (sorted == 3 || sorted == 4) {
+        if (sorted >= 3) {
             const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half_weights), input * ft * sizeof(__half));
             if (status != cudaSuccess) return fail("test half allocation", status);
             sfnn_ft_to_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(weights->ptr, half_weights, input*ft);
+        }
+        if (sorted == 6 || sorted == 7) {
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half_activations), 2 * batch * ft * sizeof(__half));
+            if (status != cudaSuccess) { cudaFree(half_weights); return fail("test half activation allocation", status); }
         }
         if (sorted == 4) {
             const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&rounded_weights), input * ft * sizeof(float));
             if (status != cudaSuccess) { cudaFree(half_weights); return fail("test rounded allocation", status); }
             sfnn_test_ft_from_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(half_weights, rounded_weights, input*ft);
         }
-        if (sorted == 3) {
+        if (sorted == 5 || sorted == 7) {
+            sfnn_hm2_one_view_half2_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, half_weights, bias->ptr,
+                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, half_activations);
+        } else if (sorted == 3 || sorted == 6) {
             sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, half_weights, bias->ptr,
-                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
+                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, half_activations);
         } else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
             a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
         if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
@@ -4251,11 +4350,19 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         sfnn_hm2_sort_count<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, batch, active);
         sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(counts->ptr);
         sfnn_hm2_sort_scatter<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, order->ptr, batch, active);
-        if (sorted == 3) sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
-            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
+        if (sorted == 5 || sorted == 7) sfnn_hm2_one_view_half2_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, half_activations ? half_activations + batch * ft : nullptr);
+        else if (sorted == 3 || sorted == 6) sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, half_activations ? half_activations + batch * ft : nullptr);
         else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
             b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
+        if (half_activations) {
+            const unsigned blocks = static_cast<unsigned>((batch*ft+255)/256);
+            sfnn_test_ft_from_half<<<blocks,256,0,ctx->stream>>>(half_activations, a->ptr, batch*ft);
+            sfnn_test_ft_from_half<<<blocks,256,0,ctx->stream>>>(half_activations + batch*ft, b->ptr, batch*ft);
+        }
         const int result = check_kernel_launch("test FT separate perspectives");
+        if (half_activations != nullptr) cudaFree(half_activations);
         if (rounded_weights != nullptr) cudaFree(rounded_weights);
         if (half_weights != nullptr) cudaFree(half_weights);
         return result;
@@ -4299,6 +4406,38 @@ __global__ void sfnn_half_grad_gather(const __half* pre, const int* positions, c
     gradients[feature * ft + row] += ((sums[0] + sums[1]) + (sums[2] + sums[3])) * inv_scale;
 }
 
+// Gather adjacent FT channels together without changing their reduction order.
+__global__ void sfnn_half_grad_gather2(const __half* pre, const int* positions, const int* offsets,
+    float* gradients, size_t features, size_t ft, float inv_scale) {
+    const size_t feature = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
+    const size_t pair = static_cast<size_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    const size_t row = pair * 2;
+    if (feature >= features || row + 1 >= ft) return;
+    const size_t start = static_cast<size_t>(offsets[feature]);
+    const size_t end = static_cast<size_t>(offsets[feature + 1]);
+    if (start == end) return;
+    float2 sums[4] = {{0,0}, {0,0}, {0,0}, {0,0}};
+    size_t i = start;
+    for (; i + 3 < end; i += 4) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const size_t index = static_cast<size_t>(positions[i+j]) * ft + row;
+            const float2 v = __half22float2(*reinterpret_cast<const __half2*>(pre + index));
+            sums[j].x += v.x; sums[j].y += v.y;
+        }
+    }
+    for (; i < end; ++i) {
+        const size_t index = static_cast<size_t>(positions[i]) * ft + row;
+        const float2 v = __half22float2(*reinterpret_cast<const __half2*>(pre + index));
+        sums[0].x += v.x; sums[0].y += v.y;
+    }
+    float2* out = reinterpret_cast<float2*>(gradients + feature * ft + row);
+    float2 old = *out;
+    old.x += ((sums[0].x + sums[1].x) + (sums[2].x + sums[3].x)) * inv_scale;
+    old.y += ((sums[0].y + sums[1].y) + (sums[2].y + sums[3].y)) * inv_scale;
+    *out = old;
+}
+
 __global__ void sfnn_test_half_grad_convert(const float* src, __half* out, size_t n, float scale) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) out[i] = sfnn_scaled_half_gradient(src[i], scale);
@@ -4312,7 +4451,7 @@ __global__ void sfnn_test_half_grad_decode(const __half* src, float* out, size_t
 extern "C" int bulletou_test_sfnn_half_grad_gather(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* pre, BulletOuCudaCppI32Buffer* positions,
     BulletOuCudaCppI32Buffer* offsets, BulletOuCudaCppF32Buffer* out,
-    size_t batch, size_t features, size_t ft, size_t occurrences) {
+    size_t batch, size_t features, size_t ft, size_t occurrences, int vector_width) {
     if (!ctx || validate_buffer(ctx, pre, batch*ft, "test pre") ||
         validate_i32_buffer(ctx, positions, occurrences, "test positions") ||
         validate_i32_buffer(ctx, offsets, features+1, "test offsets") ||
@@ -4323,9 +4462,15 @@ extern "C" int bulletou_test_sfnn_half_grad_gather(BulletOuCudaCppContext* ctx,
     const unsigned blocks = static_cast<unsigned>((batch*ft+255)/256);
     sfnn_test_half_grad_convert<<<blocks,256,0,ctx->stream>>>(pre->ptr, half, batch*ft, 1.0f);
     dim3 block(64,4);
-    dim3 grid(static_cast<unsigned>((features+3)/4), static_cast<unsigned>((ft+63)/64));
-    sfnn_half_grad_gather<<<grid,block,0,ctx->stream>>>(half, positions->ptr, offsets->ptr,
-        out->ptr, features, ft, 1.0f);
+    if (vector_width == 2 && ft % 2 == 0) {
+        dim3 grid(static_cast<unsigned>((features+3)/4), static_cast<unsigned>((ft+127)/128));
+        sfnn_half_grad_gather2<<<grid,block,0,ctx->stream>>>(half, positions->ptr, offsets->ptr,
+            out->ptr, features, ft, 1.0f);
+    } else {
+        dim3 grid(static_cast<unsigned>((features+3)/4), static_cast<unsigned>((ft+63)/64));
+        sfnn_half_grad_gather<<<grid,block,0,ctx->stream>>>(half, positions->ptr, offsets->ptr,
+            out->ptr, features, ft, 1.0f);
+    }
     const int result = check_kernel_launch("test FT half gather");
     cudaFree(half);
     return result;
@@ -4349,12 +4494,28 @@ extern "C" int bulletou_test_sfnn_half_grad(BulletOuCudaCppContext* ctx,
         if (status != cudaSuccess) { cudaFree(half); return fail("test FT grad counter initialization", status); }
     }
     const float scale = 16384.0f * static_cast<float>(batch);
+    __half* half_activations = nullptr;
+    float* float_activations = nullptr;
+    const unsigned convert_blocks = static_cast<unsigned>((n+255)/256);
+    if (fused >= 2) {
+        status = cudaMalloc(reinterpret_cast<void**>(&half_activations), 2*n*sizeof(__half));
+        if (status != cudaSuccess) { cudaFree(half); return fail("test FT activation allocation", status); }
+        sfnn_test_half_grad_convert<<<convert_blocks,256,0,ctx->stream>>>(stm->ptr, half_activations, n, 1.0f);
+        sfnn_test_half_grad_convert<<<convert_blocks,256,0,ctx->stream>>>(nstm->ptr, half_activations+n, n, 1.0f);
+        if (fused == 3) {
+            status = cudaMalloc(reinterpret_cast<void**>(&float_activations), 2*n*sizeof(float));
+            if (status != cudaSuccess) { cudaFree(half_activations); cudaFree(half); return fail("test FT float activation allocation", status); }
+            sfnn_test_half_grad_decode<<<convert_blocks,256,0,ctx->stream>>>(half_activations, float_activations, n, 1.0f);
+            sfnn_test_half_grad_decode<<<convert_blocks,256,0,ctx->stream>>>(half_activations+n, float_activations+n, n, 1.0f);
+        }
+    }
     const unsigned blocks = static_cast<unsigned>((batch*ft/2+255)/256);
-    sfnn_pairwise_l0_pregrad_kernel<<<blocks,256,0,ctx->stream>>>(stm->ptr, nstm->ptr, combined->ptr,
+    sfnn_pairwise_l0_pregrad_kernel<<<blocks,256,0,ctx->stream>>>(float_activations ? float_activations : stm->ptr,
+        float_activations ? float_activations+n : nstm->ptr, combined->ptr,
         out_stm->ptr, out_nstm->ptr, bias_grad->ptr, batch, ft, FtSaturationConfig{}, false,
         fused ? half : nullptr, fused ? half+n : nullptr, scale,
-        fused ? ctx->sfnn_ft_half_grad_clipped : nullptr);
-    const unsigned convert_blocks = static_cast<unsigned>((n+255)/256);
+        fused ? ctx->sfnn_ft_half_grad_clipped : nullptr,
+        fused == 2 ? half_activations : nullptr, fused == 2 ? half_activations+n : nullptr);
     if (!fused) {
         sfnn_test_half_grad_convert<<<convert_blocks,256,0,ctx->stream>>>(out_stm->ptr, half, n, scale);
         sfnn_test_half_grad_convert<<<convert_blocks,256,0,ctx->stream>>>(out_nstm->ptr, half+n, n, scale);
@@ -4362,6 +4523,8 @@ extern "C" int bulletou_test_sfnn_half_grad(BulletOuCudaCppContext* ctx,
     sfnn_test_half_grad_decode<<<convert_blocks,256,0,ctx->stream>>>(half, out_stm->ptr, n, 1.0f/scale);
     sfnn_test_half_grad_decode<<<convert_blocks,256,0,ctx->stream>>>(half+n, out_nstm->ptr, n, 1.0f/scale);
     const int result = check_kernel_launch("test FT half grad");
+    if (float_activations) cudaFree(float_activations);
+    if (half_activations) cudaFree(half_activations);
     cudaFree(half);
     return result;
 }
@@ -5601,6 +5764,17 @@ int launch_sfnn_forward_kernels(
     const bool separate_hm2_views = sort_hm2_ft;
     if (separate_hm2_views) {
         const bool half_ft = ctx->sfnn_ft_fp16;
+        const bool half_act = half_ft && ctx->sfnn_ft_fp16_grad && !ctx->ft_guard.weights && ctx->sfnn_ft_fp16_act;
+        if (ctx->sfnn_ft_fp16_act && !half_act) return fail_message("FT FP16 activations requested for an unsupported training path");
+        const size_t act_count = batch * ft_size;
+        if (half_act && ctx->sfnn_ft_half_activations_len < 2 * act_count) {
+            if (ctx->sfnn_ft_half_activations) cudaFree(ctx->sfnn_ft_half_activations);
+            ctx->sfnn_ft_half_activations = nullptr;
+            ctx->sfnn_ft_half_activations_len = 0;
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half_activations), 2 * act_count * sizeof(__half));
+            if (status != cudaSuccess) return fail("FT FP16 activation allocation", status);
+            ctx->sfnn_ft_half_activations_len = 2 * act_count;
+        }
         if (half_ft) {
             const size_t len = input_size * ft_size;
             if (ctx->sfnn_ft_half_len < len) {
@@ -5615,9 +5789,9 @@ int launch_sfnn_forward_kernels(
             sfnn_ft_to_half<<<blocks, threads, 0, ctx->stream>>>(effective_l0w, ctx->sfnn_ft_half, len);
             if (check_kernel_launch("FT FP16 conversion") != 0) return -1;
         }
-        if (block_count_1d(batch * pairwise, threads, &blocks, "FT sorted perspective") != 0) return -1;
-        if (half_ft) sfnn_hm2_one_view_half_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_half, l0b,
-            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
+        if (block_count_1d(batch * (half_ft ? pairwise / 2 : pairwise), threads, &blocks, "FT sorted perspective") != 0) return -1;
+        if (half_ft) sfnn_hm2_one_view_half2_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_half, l0b,
+            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0, half_act ? ctx->sfnn_ft_half_activations : nullptr);
         else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, effective_l0w, l0b,
             stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
         if (check_kernel_launch("FT sorted stm") != 0) return -1;
@@ -5630,8 +5804,8 @@ int launch_sfnn_forward_kernels(
         sfnn_hm2_sort_scatter<<<sort_blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_sort_counts,
             ctx->sfnn_ft_sort_positions, batch, max_active);
         if (check_kernel_launch("FT sort nstm") != 0) return -1;
-        if (half_ft) sfnn_hm2_one_view_half_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_half, l0b,
-            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
+        if (half_ft) sfnn_hm2_one_view_half2_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_half, l0b,
+            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1, half_act ? ctx->sfnn_ft_half_activations + act_count : nullptr);
         else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
             nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
         if (check_kernel_launch("FT sorted nstm") != 0) return -1;
@@ -5739,7 +5913,11 @@ int launch_sfnn_forward_kernels(
         }
         blocks = static_cast<int>((l1_warps + l1_warps_per_block - 1) / l1_warps_per_block);
         if (!grouped_l1 && !common_shard_l1 && !has_l1f && !has_l1ax && !bn_use_reference()) {
-            sfnn_dense_l1_plain_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
+            if (l1_out == 16 && ft_size == 2304 && batch >= 1024) {
+                const unsigned sample_blocks = static_cast<unsigned>((batch + 7) / 8);
+                sfnn_dense_l1_16_warp<<<sample_blocks, l1_warp_threads, 0, ctx->stream>>>(
+                    combined, l1w, l1b, buckets, l1, batch, ft_size, num_stacks);
+            } else sfnn_dense_l1_plain_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
                 combined, l1w, l1b, buckets, l1, batch, ft_size, l1_out, num_stacks);
         } else {
         sfnn_stacked_l1_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
@@ -6581,7 +6759,8 @@ int launch_sfnn_inverse_index_for_perspective(
         dim3 block(64, 4);
         dim3 grid(static_cast<unsigned>((n_features + 3) / 4), static_cast<unsigned>((ft_size + 63) / 64));
         if (half_gradients != nullptr) {
-            sfnn_half_grad_gather<<<grid, block, 0, ctx->stream>>>(half_gradients,
+            dim3 pair_grid(static_cast<unsigned>((n_features + 3) / 4), static_cast<unsigned>((ft_size + 127) / 128));
+            sfnn_half_grad_gather2<<<pair_grid, block, 0, ctx->stream>>>(half_gradients,
                 ctx->sfnn_inverse_positions, ctx->sfnn_inverse_offsets, l0w_gradients, n_features, ft_size, half_inv_scale);
             return check_kernel_launch("sfnn hm2 FP16 FT gather launch");
         }
@@ -6699,7 +6878,9 @@ int launch_sfnn_inverse_index_l0_backward(
         ft_size, ctx->ft_guard, ctx->bn[0].params != nullptr,
         half_grad ? ctx->sfnn_ft_half_grads : nullptr,
         half_grad ? ctx->sfnn_ft_half_grads + half_len : nullptr, half_scale,
-        half_grad ? ctx->sfnn_ft_half_grad_clipped : nullptr);
+        half_grad ? ctx->sfnn_ft_half_grad_clipped : nullptr,
+        half_grad && ctx->sfnn_ft_fp16_act ? ctx->sfnn_ft_half_activations : nullptr,
+        half_grad && ctx->sfnn_ft_fp16_act ? ctx->sfnn_ft_half_activations + half_len : nullptr);
     if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
         return -1;
     }
@@ -8165,6 +8346,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     }
     if (ctx->sfnn_ft_half_grads != nullptr) cudaFree(ctx->sfnn_ft_half_grads);
     if (ctx->sfnn_ft_half_grad_clipped != nullptr) cudaFree(ctx->sfnn_ft_half_grad_clipped);
+    if (ctx->sfnn_ft_half_activations != nullptr) cudaFree(ctx->sfnn_ft_half_activations);
     if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
     if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
     if (ctx->bn_qat_partials != nullptr) cudaFree(ctx->bn_qat_partials);
@@ -8184,6 +8366,12 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     }
     delete ctx;
     return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(BulletOuCudaCppContext* ctx, int enabled) {
+    if (!ctx) return fail_message("null CUDA context");
+    ctx->sfnn_ft_fp16_act = enabled != 0;
+    return 0;
 }
 
 extern "C" int bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(BulletOuCudaCppContext* ctx, int enabled) {

@@ -187,7 +187,7 @@ class GridSearchTests(unittest.TestCase):
                 self.assertEqual(grid.resolve_epoch_settings(settings, epoch)[key], epoch == 3)
 
     def test_ft_fp16_epoch_settings(self):
-        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad"):
+        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act"):
             settings = {key: {"epoch1": False, "epoch10": True}}
             self.assertFalse(grid.resolve_epoch_settings(settings, 9)[key])
             self.assertTrue(grid.resolve_epoch_settings(settings, 10)[key])

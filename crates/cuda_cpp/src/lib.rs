@@ -52,6 +52,9 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn set_sfnn_ft_fp16_act(&self, enabled: bool) -> Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(self.as_ptr(), i32::from(enabled)) })
+    }
     pub fn set_sfnn_ft_fp16_grad(&self, enabled: bool) -> Result<()> {
         check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(self.as_ptr(), i32::from(enabled)) })
     }
@@ -9358,7 +9361,7 @@ mod ffi {
         pub fn bulletou_test_sfnn_half_grad_gather(ctx: *mut BulletOuCudaCppContext,
             pre: *mut BulletOuCudaCppF32Buffer, positions: *mut BulletOuCudaCppI32Buffer,
             offsets: *mut BulletOuCudaCppI32Buffer, out: *mut BulletOuCudaCppF32Buffer,
-            batch: usize, features: usize, ft: usize, occurrences: usize) -> i32;
+            batch: usize, features: usize, ft: usize, occurrences: usize, vector_width: i32) -> i32;
         #[cfg(test)]
         pub fn bulletou_test_sfnn_half_grad(ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
@@ -9367,7 +9370,13 @@ mod ffi {
             batch: usize, ft: usize, fused: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
+        pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_take_ft_half_grad_clipped(ctx: *mut BulletOuCudaCppContext, out: *mut u64) -> i32;
+        #[cfg(test)]
+        pub fn bulletou_test_dense_l1_16(ctx: *mut BulletOuCudaCppContext,
+            input: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
+            bias: *mut BulletOuCudaCppF32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer, batch: usize, input_dim: usize, stacks: usize, optimized: i32) -> i32;
         #[cfg(test)]
         pub fn bulletou_test_sfnn_ft_sort(ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppI32Buffer, nstm: *mut BulletOuCudaCppI32Buffer,
@@ -10291,12 +10300,51 @@ mod ffi {
 mod tests {
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn dense_l1_16_reuses_input_without_changing_outputs() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, stacks) = (13usize, 8usize);
+        for input_dim in [37usize, 2304usize] {
+            let inputs: Vec<f32> = (0..batch*input_dim).map(|i| ((i*13 % 101) as f32 - 50.0) * 0.01).collect();
+            let weights: Vec<f32> = (0..stacks*16*input_dim).map(|i| ((i*17 % 113) as f32 - 56.0) * 0.001).collect();
+            let bias: Vec<f32> = (0..stacks*16).map(|i| ((i % 7) as f32 - 3.0) * 0.01).collect();
+            let buckets: Vec<i32> = (0..batch).map(|i| if i == 0 { -1 } else if i == 1 { stacks as i32 } else { (i % stacks) as i32 }).collect();
+            let input_gpu = F32Buffer::from_host(&ctx, &inputs).unwrap();
+            let weights_gpu = F32Buffer::from_host(&ctx, &weights).unwrap();
+            let bias_gpu = F32Buffer::from_host(&ctx, &bias).unwrap();
+            let buckets_gpu = I32Buffer::from_host(&ctx, &buckets).unwrap();
+            let reference = F32Buffer::new(&ctx, batch*16).unwrap();
+            let optimized = F32Buffer::new(&ctx, batch*16).unwrap();
+            for (out, flag) in [(&reference, 0), (&optimized, 1)] {
+                check(unsafe { ffi::bulletou_test_dense_l1_16(ctx.as_ptr(), input_gpu.as_ptr(), weights_gpu.as_ptr(),
+                    bias_gpu.as_ptr(), buckets_gpu.as_ptr(), out.as_ptr(), batch, input_dim, stacks, flag) }).unwrap();
+            }
+            let reference = reference.download(&ctx).unwrap();
+            let optimized = optimized.download(&ctx).unwrap();
+            assert_eq!(reference, optimized);
+            for sample in 0..batch {
+                for out in 0..16 {
+                    let bucket = buckets[sample];
+                    let expected = if bucket < 0 || bucket as usize >= stacks { 0.0 } else {
+                        let base = (bucket as usize * 16 + out) * input_dim;
+                        let dot: f64 = (0..input_dim).map(|i| inputs[sample*input_dim+i] as f64 * weights[base+i] as f64).sum();
+                        dot + bias[bucket as usize*16+out] as f64
+                    };
+                    assert!((optimized[sample*16+out] as f64 - expected).abs() < 0.0001);
+                }
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_fused_half_ft_pregrad_matches_scaled_rounding() {
         use super::*;
         let ctx = Context::new(0).unwrap();
         let (batch, ft) = (11usize, 2304usize);
         let n = batch * ft;
-        let stm = F32Buffer::from_host(&ctx, &(0..n).map(|i| (i % 103) as f32 / 102.0).collect::<Vec<_>>()).unwrap();
+        let stm = F32Buffer::from_host(&ctx, &(0..n).map(|i| match i % 103 {
+            0 => 0.9999, 1 => 0.00000002, 2 => -0.0001, _ => (i % 103) as f32 / 102.0,
+        }).collect::<Vec<_>>()).unwrap();
         let nstm = F32Buffer::from_host(&ctx, &(0..n).map(|i| (i % 79) as f32 / 78.0).collect::<Vec<_>>()).unwrap();
         let grad = F32Buffer::from_host(&ctx, &(0..n).map(|i| ((i % 97) as f32 - 48.0) * 1e-9).collect::<Vec<_>>()).unwrap();
         let outputs = || (F32Buffer::new(&ctx, n).unwrap(), F32Buffer::new(&ctx, n).unwrap(), F32Buffer::from_host(&ctx, &vec![0.0; ft]).unwrap());
@@ -10309,6 +10357,15 @@ mod tests {
         assert_eq!(reference.0.download(&ctx).unwrap(), fused.0.download(&ctx).unwrap());
         assert_eq!(reference.1.download(&ctx).unwrap(), fused.1.download(&ctx).unwrap());
         assert_close_slice("FT bias gradient", &reference.2.download(&ctx).unwrap(), &fused.2.download(&ctx).unwrap(), 1e-12);
+        let half_activation = outputs();
+        let rounded_activation = outputs();
+        for (o, mode) in [(&half_activation, 2), (&rounded_activation, 3)] {
+            check(unsafe { ffi::bulletou_test_sfnn_half_grad(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(), grad.as_ptr(),
+                o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(), batch, ft, mode) }).unwrap();
+        }
+        assert_eq!(half_activation.0.download(&ctx).unwrap(), rounded_activation.0.download(&ctx).unwrap());
+        assert_eq!(half_activation.1.download(&ctx).unwrap(), rounded_activation.1.download(&ctx).unwrap());
+        assert_close_slice("FP16 FT activation bias gradient", &half_activation.2.download(&ctx).unwrap(), &rounded_activation.2.download(&ctx).unwrap(), 1e-12);
         assert_eq!(ctx.take_ft_half_grad_clipped().unwrap(), 0);
         let huge_grad = F32Buffer::from_host(&ctx, &vec![1.0; n]).unwrap();
         check(unsafe { ffi::bulletou_test_sfnn_half_grad(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(), huge_grad.as_ptr(),
@@ -10321,46 +10378,57 @@ mod tests {
     fn hm2_ft_sorted_forward_matches_original_order() {
         use super::*;
         let ctx = Context::new(0).unwrap();
-        let (batch, active, input, ft) = (13usize, 3usize, 5000usize, 32usize);
-        let mut stm = vec![-1; batch * active];
-        let mut nstm = vec![-1; batch * active];
-        for i in 0..batch - 1 {
-            stm[i * active] = ((i * 7 % 3) * 1629 + i % 7) as i32;
-            stm[i * active + 1] = stm[i * active] + 8;
-            nstm[i * active] = ((i * 5 % 3) * 1629 + i % 11) as i32;
+        for ft in [32usize, 2304] {
+            let (batch, active, input) = (13usize, 3usize, 5000usize);
+            let mut stm = vec![-1; batch * active];
+            let mut nstm = vec![-1; batch * active];
+            for i in 0..batch - 1 {
+                stm[i * active] = ((i * 7 % 3) * 1629 + i % 7) as i32;
+                stm[i * active + 1] = stm[i * active] + 8;
+                nstm[i * active] = ((i * 5 % 3) * 1629 + i % 11) as i32;
+            }
+            let stm = I32Buffer::from_host(&ctx, &stm).unwrap();
+            let nstm = I32Buffer::from_host(&ctx, &nstm).unwrap();
+            let weights = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 / 128.0).collect::<Vec<_>>()).unwrap();
+            let bias = F32Buffer::from_host(&ctx, &vec![0.05; ft]).unwrap();
+            let counts = I32Buffer::new(&ctx, 46).unwrap();
+            let order = I32Buffer::new(&ctx, batch).unwrap();
+            let outputs = || (F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap());
+            let reference = outputs();
+            let separate = outputs();
+            let half = outputs();
+            for (o, flag) in [(&reference, 0), (&separate, 2), (&half, 3)] {
+                check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                    weights.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
+                    counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
+            }
+            assert_eq!(reference.0.download(&ctx).unwrap(), separate.0.download(&ctx).unwrap());
+            assert_eq!(reference.1.download(&ctx).unwrap(), separate.1.download(&ctx).unwrap());
+            assert_eq!(reference.2.download(&ctx).unwrap(), separate.2.download(&ctx).unwrap());
+            assert_eq!(reference.0.download(&ctx).unwrap(), half.0.download(&ctx).unwrap());
+            assert_eq!(reference.1.download(&ctx).unwrap(), half.1.download(&ctx).unwrap());
+            assert_eq!(reference.2.download(&ctx).unwrap(), half.2.download(&ctx).unwrap());
+            let nonexact = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+            let rounded = outputs();
+            let half_nonexact = outputs();
+            let half_vector = outputs();
+            let activation_scalar = outputs();
+            let activation_vector = outputs();
+            for (o, flag) in [(&rounded, 4), (&half_nonexact, 3), (&half_vector, 5), (&activation_scalar, 6), (&activation_vector, 7)] {
+                check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                    nonexact.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
+                    counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
+            }
+            assert_eq!(rounded.0.download(&ctx).unwrap(), half_nonexact.0.download(&ctx).unwrap());
+            assert_eq!(rounded.1.download(&ctx).unwrap(), half_nonexact.1.download(&ctx).unwrap());
+            assert_eq!(rounded.2.download(&ctx).unwrap(), half_nonexact.2.download(&ctx).unwrap());
+            assert_eq!(half_nonexact.0.download(&ctx).unwrap(), half_vector.0.download(&ctx).unwrap());
+            assert_eq!(half_nonexact.1.download(&ctx).unwrap(), half_vector.1.download(&ctx).unwrap());
+            assert_eq!(half_nonexact.2.download(&ctx).unwrap(), half_vector.2.download(&ctx).unwrap());
+            assert_eq!(activation_scalar.0.download(&ctx).unwrap(), activation_vector.0.download(&ctx).unwrap());
+            assert_eq!(activation_scalar.1.download(&ctx).unwrap(), activation_vector.1.download(&ctx).unwrap());
+            assert_eq!(activation_scalar.2.download(&ctx).unwrap(), activation_vector.2.download(&ctx).unwrap());
         }
-        let stm = I32Buffer::from_host(&ctx, &stm).unwrap();
-        let nstm = I32Buffer::from_host(&ctx, &nstm).unwrap();
-        let weights = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 / 128.0).collect::<Vec<_>>()).unwrap();
-        let bias = F32Buffer::from_host(&ctx, &vec![0.05; ft]).unwrap();
-        let counts = I32Buffer::new(&ctx, 46).unwrap();
-        let order = I32Buffer::new(&ctx, batch).unwrap();
-        let outputs = || (F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap());
-        let reference = outputs();
-        let separate = outputs();
-        let half = outputs();
-        for (o, flag) in [(&reference, 0), (&separate, 2), (&half, 3)] {
-            check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
-                weights.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
-                counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
-        }
-        assert_eq!(reference.0.download(&ctx).unwrap(), separate.0.download(&ctx).unwrap());
-        assert_eq!(reference.1.download(&ctx).unwrap(), separate.1.download(&ctx).unwrap());
-        assert_eq!(reference.2.download(&ctx).unwrap(), separate.2.download(&ctx).unwrap());
-        assert_eq!(reference.0.download(&ctx).unwrap(), half.0.download(&ctx).unwrap());
-        assert_eq!(reference.1.download(&ctx).unwrap(), half.1.download(&ctx).unwrap());
-        assert_eq!(reference.2.download(&ctx).unwrap(), half.2.download(&ctx).unwrap());
-        let nonexact = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
-        let rounded = outputs();
-        let half_nonexact = outputs();
-        for (o, flag) in [(&rounded, 4), (&half_nonexact, 3)] {
-            check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
-                nonexact.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
-                counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
-        }
-        assert_eq!(rounded.0.download(&ctx).unwrap(), half_nonexact.0.download(&ctx).unwrap());
-        assert_eq!(rounded.1.download(&ctx).unwrap(), half_nonexact.1.download(&ctx).unwrap());
-        assert_eq!(rounded.2.download(&ctx).unwrap(), half_nonexact.2.download(&ctx).unwrap());
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
@@ -10378,7 +10446,7 @@ mod tests {
         let out = F32Buffer::from_host(&ctx, &expected).unwrap();
         for _ in 0..2 {
             check(unsafe { ffi::bulletou_test_sfnn_half_grad_gather(ctx.as_ptr(), pre_gpu.as_ptr(),
-                positions_gpu.as_ptr(), offsets_gpu.as_ptr(), out.as_ptr(), batch, features, ft, positions.len()) }).unwrap();
+                positions_gpu.as_ptr(), offsets_gpu.as_ptr(), out.as_ptr(), batch, features, ft, positions.len(), 1) }).unwrap();
             for feature in 0..features {
                 for row in 0..ft {
                     for &pos in &positions[offsets[feature] as usize..offsets[feature+1] as usize] {
@@ -10388,6 +10456,30 @@ mod tests {
             }
         }
         assert_eq!(out.download(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn hm2_half_grad_gather_two_channels_matches_scalar() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, features, ft) = (9usize, 7usize, 36usize);
+        let pre: Vec<f32> = (0..batch*ft).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.0031).collect();
+        let positions = [0i32, 3, 7, 1, 4, 8, 1, 2, 6, 5, 2, 4, 0];
+        let offsets = [0i32, 6, 6, 8, 9, 9, 13, 13];
+        let initial: Vec<f32> = (0..features*ft).map(|i| (i % 13) as f32 * 0.1).collect();
+        let pre = F32Buffer::from_host(&ctx, &pre).unwrap();
+        let positions_gpu = I32Buffer::from_host(&ctx, &positions).unwrap();
+        let offsets_gpu = I32Buffer::from_host(&ctx, &offsets).unwrap();
+        let scalar = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let vector = F32Buffer::from_host(&ctx, &initial).unwrap();
+        for _ in 0..2 {
+            for (out, width) in [(&scalar, 1), (&vector, 2)] {
+                check(unsafe { ffi::bulletou_test_sfnn_half_grad_gather(ctx.as_ptr(), pre.as_ptr(),
+                    positions_gpu.as_ptr(), offsets_gpu.as_ptr(), out.as_ptr(), batch, features, ft, positions.len(), width) }).unwrap();
+            }
+        }
+        assert_eq!(scalar.download(&ctx).unwrap(), vector.download(&ctx).unwrap());
     }
 
     #[test]
