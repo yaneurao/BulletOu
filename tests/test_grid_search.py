@@ -203,6 +203,22 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual({trial["settings"]["all_optim"] for trial in plan["trials"]}, {False, True})
         self.assertIn("all_optim", grid.COMMON_COLUMNS)
 
+    def test_all_optim_reports_effective_fp16_settings(self):
+        keys = ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments")
+        settings = {"all_optim": True, **{key: {"epoch1": False, "epoch3": True} for key in keys}}
+        for epoch in (1, 3):
+            self.assertTrue(all(grid.resolve_epoch_settings(settings, epoch)[key] for key in keys))
+        settings["all_optim"] = False
+        self.assertFalse(any(grid.resolve_epoch_settings(settings, 1)[key] for key in keys))
+        self.assertTrue(all(grid.resolve_epoch_settings(settings, 3)[key] for key in keys))
+        plan = self.plan(["--grid", "all-optim", "true"])
+        # Explicit false and omitted options must both appear as effective true.
+        for trial in plan["trials"]:
+            trial["settings"][keys[0]] = False
+        fields, rows = grid.summarize(self.output, plan)
+        self.assertTrue(all(key in fields for key in keys))
+        self.assertTrue(all(row[key] is True for row in rows for key in keys))
+
     def test_ft_factorizer_epoch_switch(self):
         schedule={"epoch1": True, "epoch3": False}
         for alias in ("ft_factorizer", "sfnn_ft_factorizer"):

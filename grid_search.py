@@ -272,6 +272,12 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
         resolved[key] = value[name] if name is not None else False
         if key == "sfnn_ft_factorizer" and not resolved[key]:
             resolved["ft_factorizer_alpha"] = 1.0
+    # The trainer ORs --all-optim with the individual settings after resolving
+    # epoch schedules. Report the same effective values, including when a
+    # setting was explicitly false in the input file.
+    if resolved.get("all_optim") is True:
+        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"):
+            resolved[key] = True
     return resolved
 
 
@@ -762,8 +768,10 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
     all_settings = [settings for trial in plan["trials"]
                     for settings in [trial["settings"],
                                      *[e["settings"] for e in trial.get("epoch_settings", {}).values()]]]
+    all_optim_keys = {"sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"}
     parameter_columns = [key for key in parameter_columns
-                         if any(key in settings for settings in all_settings)]
+                         if any(key in settings or (key in all_optim_keys and settings.get("all_optim") is True)
+                                for settings in all_settings)]
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     parameter_columns = list(dict.fromkeys([*parameter_columns,
         *(key for settings in all_settings for key, value in settings.items() if isinstance(value, dict))]))
