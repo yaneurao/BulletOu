@@ -4131,7 +4131,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4166,7 +4166,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
             return Err(format!("superbatches.{name} must be a positive integer"));
         }
-        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4281,7 +4281,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(superbatches, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
-            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
@@ -5384,6 +5384,10 @@ struct Args {
     /// Non-BN FT weight/bias QAT (int16, scale 127), identity STE. Default off.
     #[arg(long)]
     sfnn_qat_ft: bool,
+    /// Experimental FP16 FT weights for the 2304-wide HalfKA_hm2 training path.
+    /// FP32 master weights and optimizer state are retained; this is not tatara's all-optim.
+    #[arg(long)]
+    sfnn_ft_fp16: bool,
     /// Non-BN L2 weight/bias QAT (int8 weights, scale 64), identity STE. Default off.
     #[arg(long)]
     sfnn_qat_l2: bool,
@@ -5682,6 +5686,12 @@ impl Args {
             if self.sfnn_gptq_calibration_positions == 0 {
                 return Err("--sfnn-gptq-calibration-positions must be positive".into());
             }
+        }
+        if self.sfnn_ft_fp16 && (self.backend != BackendKind::CudaCpp || self.arch().feature != NnueArchFeature::Halfkahm2
+            || self.arch().l1 != 2304 || effective_batch_size(self) < 1024 || self.lr_schedule == LrScheduleKind::Plateau
+            || self.ft_factorizer || self.sfnn_bn_ft || self.sfnn_qat_ft
+            || self.effective_sfnn_qat_l1() || self.sfnn_qat_l2 || self.sfnn_qat_l3) {
+            return Err("--sfnn-ft-fp16 requires 2304-wide HalfKA_hm2, batch >= 1024, FT BN/factorizer off and QAT off".into());
         }
         if !self.sfnn_bn_affine_lr_multiplier.is_finite() || self.sfnn_bn_affine_lr_multiplier < 0.0 {
             return Err("--sfnn-bn-affine-lr-multiplier must be finite and non-negative".into());
@@ -10978,6 +10988,7 @@ impl WorkerSfnnSession {
         let shape = initial_weights.shape;
         print_ft_factorizer_status(feature_kind.base_input_size(), shape.input_size, args.ft_factorizer_alpha);
         let ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
+        if args.sfnn_ft_fp16 { return Err("--sfnn-ft-fp16 is not supported by worker mode".into()); }
         let upload_ctx = bulletou_cuda_cpp::Context::new(device).map_err(|e| e.to_string())?;
         let factorizer_active = cuda_cpp_sfnn_factorizer_active(&args);
         let factorizer_alpha = cuda_cpp_sfnn_factorizer_alpha(&args);
@@ -11103,6 +11114,7 @@ impl WorkerSfnnSession {
     }
 
     fn apply_args_to_runner(&mut self, args: &Args, rebase_axis_factorizer: bool) -> Result<(), String> {
+        if args.sfnn_ft_fp16 { return Err("--sfnn-ft-fp16 is not supported by worker mode".into()); }
         print_sfnn_qat_mode(args);
         if self.feature_kind.input_size_for_args(args) != self.shape.input_size {
             return Err("worker FT factorizer setting differs from the opened session; --ft-factorizer cannot change within a session".to_string());
@@ -18400,6 +18412,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("SFNN layer QAT", format!("FT={} L1={} L2={} L3={} (non-BN; FP32 masters)",
             args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
             args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
+        if args.sfnn_ft_fp16 {
+            print_startup_kv("SFNN FT precision", "FP16 forward weights; FP32 master/gradients/optimizer and FP32 validation (experimental)");
+        }
         if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
             print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
         }
@@ -19158,6 +19173,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         } else {
             None
         };
+        if args.sfnn_ft_fp16 { ctx.set_sfnn_ft_fp16(true).map_err(|e| e.to_string())?; }
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
                 .step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
@@ -19222,6 +19238,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 )
                 .map_err(|e| e.to_string())?;
         }
+        if args.sfnn_ft_fp16 { ctx.set_sfnn_ft_fp16(false).map_err(|e| e.to_string())?; }
         if is_optimizer_step {
             optimizer_updates += 1;
             if args.sfnn_dirty_bucket_update {
@@ -27000,6 +27017,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_saturation_threshold={:.9}", args.sfnn_saturation_threshold),
         format!("sfnn_qat_l1={}", args.effective_sfnn_qat_l1()),
         format!("sfnn_qat_ft={}", args.sfnn_qat_ft && args.non_bn_layer_qat()),
+        format!("sfnn_ft_fp16={}", args.sfnn_ft_fp16),
         format!("sfnn_qat_l2={}", args.sfnn_qat_l2 && args.non_bn_layer_qat()),
         format!("sfnn_qat_l3={}", args.sfnn_qat_l3 && args.non_bn_layer_qat()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
@@ -27295,6 +27313,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     // QAT can be explicitly enabled/disabled for fine-tuning existing FP32 states.
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l1=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_ft=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l2=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l3=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
@@ -28730,6 +28749,32 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sfnn_ft_fp16_epoch_schedule_rejects_incompatible_options() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("bulletou-fp16-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{
+            "teacher":"teacher.bin", "arch":"SFNN_halfkahm2_2304_15_64_k9k9_progress8",
+            "sfnn_ft_factorizer":{"epoch1":true,"epoch5":false},
+            "sfnn_qat_l1":{"epoch1":true,"epoch6":false},
+            "sfnn_ft_fp16":{"epoch1":false,"epoch10":true}
+        }"#).unwrap();
+        let raw = vec!["bulletou".into(), "--settings-file".into(), path.as_os_str().to_owned()];
+        let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+        let ninth = args_at_epoch(&args, 9).unwrap();
+        assert!(!ninth.sfnn_ft_fp16);
+        let mut tenth = args_at_epoch(&args, 10).unwrap();
+        assert!(tenth.sfnn_ft_fp16);
+        assert!(resume_signature_matches(&resume_signature(&ninth), &tenth));
+        tenth.ft_factorizer = true;
+        assert!(tenth.validate_arch_flags().is_err());
+        tenth.ft_factorizer = false;
+        tenth.sfnn_qat_ft = true;
+        assert!(tenth.validate_arch_flags().is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     // Integer activation boundaries used by tatara's dense QAT.  The training
     // implementation must agree with the independent nn.bin CPU evaluator.
     #[cfg(feature = "cuda-cpp-backend")]

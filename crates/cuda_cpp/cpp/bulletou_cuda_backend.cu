@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cublas_v2.h>
 
 #include <algorithm>
@@ -120,6 +121,9 @@ struct BulletOuCudaCppContext {
     size_t sfnn_ft_sort_counts_len = 0;
     int* sfnn_ft_sort_positions = nullptr;
     size_t sfnn_ft_sort_positions_len = 0;
+    __half* sfnn_ft_half = nullptr;
+    size_t sfnn_ft_half_len = 0;
+    bool sfnn_ft_fp16 = false;
     bool dense_qat = false;
     const float* dense_qat_l2_bias = nullptr;
     const float* dense_qat_l3_bias = nullptr;
@@ -1202,6 +1206,44 @@ __global__ void sfnn_hm2_one_view_kernel(const int* indices, const float* weight
             const size_t base = static_cast<size_t>(feature) * ft_size;
             sum0 += weights[base + pair];
             sum1 += weights[base + pairwise + pair];
+        }
+    }
+    const float x0 = crelu(sum0), x1 = crelu(sum1);
+    l0[sample * ft_size + pair] = x0;
+    l0[sample * ft_size + pairwise + pair] = x1;
+    combined[sample * ft_size + view * pairwise + pair] = x0 * x1 * SFNN_PAIRWISE_SCALE;
+}
+
+__global__ void sfnn_ft_to_half(const float* weights, __half* out, size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float value = weights[i];
+        if (value > 65504.0f) value = 65504.0f;
+        if (value < -65504.0f) value = -65504.0f;
+        out[i] = __float2half_rn(value);
+    }
+}
+
+__global__ void sfnn_test_ft_from_half(const __half* weights, float* out, size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(weights[i]);
+}
+
+__global__ void sfnn_hm2_one_view_half_kernel(const int* indices, const __half* weights, const float* bias,
+    float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
+    const int* order, size_t view) {
+    const size_t pairwise = ft_size / 2;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= batch * pairwise) return;
+    const size_t pair = tid % pairwise;
+    const size_t sample = static_cast<size_t>(order[tid / pairwise]);
+    float sum0 = bias[pair], sum1 = bias[pairwise + pair];
+    for (size_t slot = 0; slot < active; ++slot) {
+        const int feature = indices[sample * active + slot];
+        if (feature >= 0 && static_cast<size_t>(feature) < input_size) {
+            const size_t base = static_cast<size_t>(feature) * ft_size;
+            sum0 += __half2float(weights[base + pair]);
+            sum1 += __half2float(weights[base + pairwise + pair]);
         }
     }
     const float x0 = crelu(sum0), x1 = crelu(sum1);
@@ -4163,18 +4205,38 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         sfnn_hm2_sort_scatter<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, order->ptr, batch, active);
     }
     const size_t pairs = batch * ft / 2;
-    if (sorted == 2) {
+    if (sorted == 2 || sorted == 3 || sorted == 4) {
         const unsigned ft_blocks = static_cast<unsigned>((pairs + 255) / 256);
-        sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, weights->ptr, bias->ptr,
+        __half* half_weights = nullptr;
+        float* rounded_weights = nullptr;
+        if (sorted == 3 || sorted == 4) {
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half_weights), input * ft * sizeof(__half));
+            if (status != cudaSuccess) return fail("test half allocation", status);
+            sfnn_ft_to_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(weights->ptr, half_weights, input*ft);
+        }
+        if (sorted == 4) {
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&rounded_weights), input * ft * sizeof(float));
+            if (status != cudaSuccess) { cudaFree(half_weights); return fail("test rounded allocation", status); }
+            sfnn_test_ft_from_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(half_weights, rounded_weights, input*ft);
+        }
+        if (sorted == 3) {
+            sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, half_weights, bias->ptr,
+                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
+        } else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
             a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
         if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
         const unsigned sort_blocks = static_cast<unsigned>((batch + 255) / 256);
         sfnn_hm2_sort_count<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, batch, active);
         sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(counts->ptr);
         sfnn_hm2_sort_scatter<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, order->ptr, batch, active);
-        sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, weights->ptr, bias->ptr,
+        if (sorted == 3) sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
             b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
-        return check_kernel_launch("test FT separate perspectives");
+        else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
+        const int result = check_kernel_launch("test FT separate perspectives");
+        if (rounded_weights != nullptr) cudaFree(rounded_weights);
+        if (half_weights != nullptr) cudaFree(half_weights);
+        return result;
     }
     sfnn_sparse_l0_pairwise_concat_kernel<<<static_cast<unsigned>((pairs + 255) / 256), 256, 0, ctx->stream>>>(
         stm->ptr, nstm->ptr, weights->ptr, bias->ptr, a->ptr, b->ptr, combined->ptr,
@@ -5414,6 +5476,7 @@ int launch_sfnn_forward_kernels(
     const bool sort_hm2_ft = !ctx->dense_qat && !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
         && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
+    if (ctx->sfnn_ft_fp16 && !sort_hm2_ft) return fail_message("FT FP16 requested for an unsupported forward shape");
     if (sort_hm2_ft) {
         if (ensure_i32_scratch(&ctx->sfnn_ft_sort_counts, &ctx->sfnn_ft_sort_counts_len, 46, "FT sort counts") != 0 ||
             ensure_i32_scratch(&ctx->sfnn_ft_sort_positions, &ctx->sfnn_ft_sort_positions_len, batch, "FT sort positions") != 0)
@@ -5430,8 +5493,25 @@ int launch_sfnn_forward_kernels(
     }
     const bool separate_hm2_views = sort_hm2_ft;
     if (separate_hm2_views) {
+        const bool half_ft = ctx->sfnn_ft_fp16;
+        if (half_ft) {
+            const size_t len = input_size * ft_size;
+            if (ctx->sfnn_ft_half_len < len) {
+                if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
+                ctx->sfnn_ft_half = nullptr;
+                ctx->sfnn_ft_half_len = 0;
+                const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half), len * sizeof(__half));
+                if (status != cudaSuccess) return fail("FT FP16 allocation", status);
+                ctx->sfnn_ft_half_len = len;
+            }
+            if (block_count_1d(len, threads, &blocks, "FT FP16 conversion") != 0) return -1;
+            sfnn_ft_to_half<<<blocks, threads, 0, ctx->stream>>>(effective_l0w, ctx->sfnn_ft_half, len);
+            if (check_kernel_launch("FT FP16 conversion") != 0) return -1;
+        }
         if (block_count_1d(batch * pairwise, threads, &blocks, "FT sorted perspective") != 0) return -1;
-        sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, effective_l0w, l0b,
+        if (half_ft) sfnn_hm2_one_view_half_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_half, l0b,
+            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
+        else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, effective_l0w, l0b,
             stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
         if (check_kernel_launch("FT sorted stm") != 0) return -1;
         if (cudaMemsetAsync(ctx->sfnn_ft_sort_counts, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess)
@@ -5443,7 +5523,9 @@ int launch_sfnn_forward_kernels(
         sfnn_hm2_sort_scatter<<<sort_blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_sort_counts,
             ctx->sfnn_ft_sort_positions, batch, max_active);
         if (check_kernel_launch("FT sort nstm") != 0) return -1;
-        sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
+        if (half_ft) sfnn_hm2_one_view_half_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_half, l0b,
+            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
+        else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
             nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
         if (check_kernel_launch("FT sorted nstm") != 0) return -1;
     } else {
@@ -7946,6 +8028,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         delete ctx;
         return -1;
     }
+    if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
     if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
     if (ctx->bn_qat_partials != nullptr) cudaFree(ctx->bn_qat_partials);
     if (ctx->blas != nullptr) {
@@ -7964,6 +8047,12 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     }
     delete ctx;
     return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_context_set_sfnn_ft_fp16(BulletOuCudaCppContext* ctx, int enabled) {
+    if (ctx == nullptr) return fail_message("null CUDA context");
+    ctx->sfnn_ft_fp16 = enabled != 0;
+    return 0;
 }
 
 extern "C" int bulletou_cuda_cpp_context_synchronize(BulletOuCudaCppContext* ctx) {

@@ -52,6 +52,9 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn set_sfnn_ft_fp16(&self, enabled: bool) -> Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16(self.as_ptr(), i32::from(enabled)) })
+    }
     pub fn new(device: i32) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out pointer.
@@ -9342,6 +9345,7 @@ mod ffi {
     }
 
     unsafe extern "C" {
+        pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         #[cfg(test)]
         pub fn bulletou_test_sfnn_ft_sort(ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppI32Buffer, nstm: *mut BulletOuCudaCppI32Buffer,
@@ -10278,14 +10282,15 @@ mod tests {
         }
         let stm = I32Buffer::from_host(&ctx, &stm).unwrap();
         let nstm = I32Buffer::from_host(&ctx, &nstm).unwrap();
-        let weights = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+        let weights = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 / 128.0).collect::<Vec<_>>()).unwrap();
         let bias = F32Buffer::from_host(&ctx, &vec![0.05; ft]).unwrap();
         let counts = I32Buffer::new(&ctx, 46).unwrap();
         let order = I32Buffer::new(&ctx, batch).unwrap();
         let outputs = || (F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap());
         let reference = outputs();
         let separate = outputs();
-        for (o, flag) in [(&reference, 0), (&separate, 2)] {
+        let half = outputs();
+        for (o, flag) in [(&reference, 0), (&separate, 2), (&half, 3)] {
             check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
                 weights.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
                 counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
@@ -10293,6 +10298,20 @@ mod tests {
         assert_eq!(reference.0.download(&ctx).unwrap(), separate.0.download(&ctx).unwrap());
         assert_eq!(reference.1.download(&ctx).unwrap(), separate.1.download(&ctx).unwrap());
         assert_eq!(reference.2.download(&ctx).unwrap(), separate.2.download(&ctx).unwrap());
+        assert_eq!(reference.0.download(&ctx).unwrap(), half.0.download(&ctx).unwrap());
+        assert_eq!(reference.1.download(&ctx).unwrap(), half.1.download(&ctx).unwrap());
+        assert_eq!(reference.2.download(&ctx).unwrap(), half.2.download(&ctx).unwrap());
+        let nonexact = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+        let rounded = outputs();
+        let half_nonexact = outputs();
+        for (o, flag) in [(&rounded, 4), (&half_nonexact, 3)] {
+            check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                nonexact.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
+                counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
+        }
+        assert_eq!(rounded.0.download(&ctx).unwrap(), half_nonexact.0.download(&ctx).unwrap());
+        assert_eq!(rounded.1.download(&ctx).unwrap(), half_nonexact.1.download(&ctx).unwrap());
+        assert_eq!(rounded.2.download(&ctx).unwrap(), half_nonexact.2.download(&ctx).unwrap());
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
