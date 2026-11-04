@@ -116,6 +116,10 @@ struct BulletOuCudaCppContext {
     size_t sfnn_inverse_write_counters_len = 0;
     int* sfnn_inverse_positions = nullptr;
     size_t sfnn_inverse_positions_len = 0;
+    int* sfnn_ft_sort_counts = nullptr;
+    size_t sfnn_ft_sort_counts_len = 0;
+    int* sfnn_ft_sort_positions = nullptr;
+    size_t sfnn_ft_sort_positions_len = 0;
     bool dense_qat = false;
     const float* dense_qat_l2_bias = nullptr;
     const float* dense_qat_l3_bias = nullptr;
@@ -1080,6 +1084,35 @@ __device__ bool sfnn_factorized_virtual_feature(size_t feature, size_t input_siz
     return false;
 }
 
+__device__ __forceinline__ int sfnn_hm2_king_key(const int* indices, size_t sample, size_t max_active) {
+    for (size_t slot = 0; slot < max_active; ++slot) {
+        const int feature = indices[sample * max_active + slot];
+        if (feature >= 0 && feature < static_cast<int>(SFNN_HALFKA_HM2_BASE_INPUT_SIZE))
+            return feature / static_cast<int>(SFNN_HALFKA2_PIECE_INPUTS);
+    }
+    return 45;
+}
+
+__global__ void sfnn_hm2_sort_count(const int* indices, int* counts, size_t batch, size_t max_active) {
+    const size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample < batch) atomicAdd(&counts[sfnn_hm2_king_key(indices, sample, max_active)], 1);
+}
+
+__global__ void sfnn_hm2_sort_prefix(int* counts) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    int sum = 0;
+    for (int i = 0; i < 46; ++i) { const int n = counts[i]; counts[i] = sum; sum += n; }
+}
+
+__global__ void sfnn_hm2_sort_scatter(const int* indices, int* counts, int* positions,
+    size_t batch, size_t max_active) {
+    const size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample < batch) {
+        const int key = sfnn_hm2_king_key(indices, sample, max_active);
+        positions[atomicAdd(&counts[key], 1)] = static_cast<int>(sample);
+    }
+}
+
 __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     const int* stm_indices,
     const int* nstm_indices,
@@ -1150,6 +1183,31 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     nstm_l0[l0_base + row1] = nstm1;
     combined[l0_base + pair] = stm0 * stm1 * SFNN_PAIRWISE_SCALE;
     combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
+}
+
+// Independent perspective pass, allowing both views to be sorted
+// by their own king instead of forcing the opponent view into the STM order.
+__global__ void sfnn_hm2_one_view_kernel(const int* indices, const float* weights, const float* bias,
+    float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
+    const int* order, size_t view) {
+    const size_t pairwise = ft_size / 2;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= batch * pairwise) return;
+    const size_t pair = tid % pairwise;
+    const size_t sample = static_cast<size_t>(order[tid / pairwise]);
+    float sum0 = bias[pair], sum1 = bias[pairwise + pair];
+    for (size_t slot = 0; slot < active; ++slot) {
+        const int feature = indices[sample * active + slot];
+        if (feature >= 0 && static_cast<size_t>(feature) < input_size) {
+            const size_t base = static_cast<size_t>(feature) * ft_size;
+            sum0 += weights[base + pair];
+            sum1 += weights[base + pairwise + pair];
+        }
+    }
+    const float x0 = crelu(sum0), x1 = crelu(sum1);
+    l0[sample * ft_size + pair] = x0;
+    l0[sample * ft_size + pairwise + pair] = x1;
+    combined[sample * ft_size + view * pairwise + pair] = x0 * x1 * SFNN_PAIRWISE_SCALE;
 }
 
 __global__ void sfnn_fold_halfka2_l0w_kernel(
@@ -4040,7 +4098,7 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     size_t n_features,
     size_t ft_size,
     int add_to_existing,bool skip_empty=false) {
-    size_t feature = blockIdx.x;
+    size_t feature = static_cast<size_t>(blockIdx.x) * blockDim.y + threadIdx.y;
     size_t row = blockIdx.y * blockDim.x + threadIdx.x;
     if (feature >= n_features || row >= ft_size) {
         return;
@@ -4078,6 +4136,65 @@ __global__ void sfnn_inverse_gather_l0w_gradients_kernel(
     } else {
         l0w_gradients[weight_idx] = sum;
     }
+}
+
+int validate_buffer(BulletOuCudaCppContext*, BulletOuCudaCppF32Buffer*, size_t, const char*);
+int validate_i32_buffer(BulletOuCudaCppContext*, BulletOuCudaCppI32Buffer*, size_t, const char*);
+extern "C" int bulletou_test_sfnn_ft_sort(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* stm, BulletOuCudaCppI32Buffer* nstm,
+    BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias, BulletOuCudaCppF32Buffer* a,
+    BulletOuCudaCppF32Buffer* b, BulletOuCudaCppF32Buffer* combined,
+    BulletOuCudaCppI32Buffer* counts, BulletOuCudaCppI32Buffer* order,
+    size_t batch, size_t active, size_t input, size_t ft, int sorted) {
+    if (validate_i32_buffer(ctx, stm, batch * active, "test FT stm") ||
+        validate_i32_buffer(ctx, nstm, batch * active, "test FT nstm") ||
+        validate_i32_buffer(ctx, counts, 46, "test FT counts") ||
+        validate_i32_buffer(ctx, order, batch, "test FT order") ||
+        validate_buffer(ctx, weights, input * ft, "test FT weights") ||
+        validate_buffer(ctx, bias, ft, "test FT bias") ||
+        validate_buffer(ctx, a, batch * ft, "test FT a") ||
+        validate_buffer(ctx, b, batch * ft, "test FT b") ||
+        validate_buffer(ctx, combined, batch * ft, "test FT combined")) return -1;
+    if (sorted) {
+        if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
+        const unsigned blocks = static_cast<unsigned>((batch + 255) / 256);
+        sfnn_hm2_sort_count<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, batch, active);
+        sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(counts->ptr);
+        sfnn_hm2_sort_scatter<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, order->ptr, batch, active);
+    }
+    const size_t pairs = batch * ft / 2;
+    if (sorted == 2) {
+        const unsigned ft_blocks = static_cast<unsigned>((pairs + 255) / 256);
+        sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, weights->ptr, bias->ptr,
+            a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
+        if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
+        const unsigned sort_blocks = static_cast<unsigned>((batch + 255) / 256);
+        sfnn_hm2_sort_count<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, batch, active);
+        sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(counts->ptr);
+        sfnn_hm2_sort_scatter<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, order->ptr, batch, active);
+        sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, weights->ptr, bias->ptr,
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
+        return check_kernel_launch("test FT separate perspectives");
+    }
+    sfnn_sparse_l0_pairwise_concat_kernel<<<static_cast<unsigned>((pairs + 255) / 256), 256, 0, ctx->stream>>>(
+        stm->ptr, nstm->ptr, weights->ptr, bias->ptr, a->ptr, b->ptr, combined->ptr,
+        batch, active, input, ft, 1.0f, false);
+    return check_kernel_launch("test sorted FT");
+}
+extern "C" int bulletou_test_sfnn_ft_gather(
+    BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* pre,
+    BulletOuCudaCppI32Buffer* positions, BulletOuCudaCppI32Buffer* offsets,
+    BulletOuCudaCppF32Buffer* gradients, size_t features, size_t ft, int tiled, int add) {
+    if (validate_buffer(ctx, pre, 1, "test FT pre") ||
+        validate_i32_buffer(ctx, positions, 1, "test FT positions") ||
+        validate_i32_buffer(ctx, offsets, features + 1, "test FT offsets") ||
+        validate_buffer(ctx, gradients, features * ft, "test FT gradients")) return -1;
+    dim3 block = tiled ? dim3(64, 4) : dim3(128, 1);
+    dim3 grid(static_cast<unsigned>((features + block.y - 1) / block.y),
+        static_cast<unsigned>((ft + block.x - 1) / block.x));
+    sfnn_inverse_gather_l0w_gradients_kernel<<<grid, block, 0, ctx->stream>>>(
+        pre->ptr, positions->ptr, offsets->ptr, gradients->ptr, features, ft, add, tiled != 0);
+    return check_kernel_launch("test FT gather");
 }
 
 // Ka2 has very few feature rows and long occurrence lists. Divide each list
@@ -5293,6 +5410,43 @@ int launch_sfnn_forward_kernels(
         effective_input_size = factorized_ft_base;
     }
 
+    const int* ft_sample_order = nullptr;
+    const bool sort_hm2_ft = !ctx->dense_qat && !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
+        && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
+        && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
+    if (sort_hm2_ft) {
+        if (ensure_i32_scratch(&ctx->sfnn_ft_sort_counts, &ctx->sfnn_ft_sort_counts_len, 46, "FT sort counts") != 0 ||
+            ensure_i32_scratch(&ctx->sfnn_ft_sort_positions, &ctx->sfnn_ft_sort_positions_len, batch, "FT sort positions") != 0)
+            return -1;
+        if (cudaMemsetAsync(ctx->sfnn_ft_sort_counts, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess)
+            return fail_message("FT sort counts reset failed");
+        if (block_count_1d(batch, threads, &blocks, "FT sort") != 0) return -1;
+        sfnn_hm2_sort_count<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_sort_counts, batch, max_active);
+        sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(ctx->sfnn_ft_sort_counts);
+        sfnn_hm2_sort_scatter<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_sort_counts,
+            ctx->sfnn_ft_sort_positions, batch, max_active);
+        if (check_kernel_launch("FT sort") != 0) return -1;
+        ft_sample_order = ctx->sfnn_ft_sort_positions;
+    }
+    const bool separate_hm2_views = sort_hm2_ft;
+    if (separate_hm2_views) {
+        if (block_count_1d(batch * pairwise, threads, &blocks, "FT sorted perspective") != 0) return -1;
+        sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, effective_l0w, l0b,
+            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
+        if (check_kernel_launch("FT sorted stm") != 0) return -1;
+        if (cudaMemsetAsync(ctx->sfnn_ft_sort_counts, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess)
+            return fail_message("FT sort counts reset failed");
+        int sort_blocks = 0;
+        if (block_count_1d(batch, threads, &sort_blocks, "FT sort nstm") != 0) return -1;
+        sfnn_hm2_sort_count<<<sort_blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_sort_counts, batch, max_active);
+        sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(ctx->sfnn_ft_sort_counts);
+        sfnn_hm2_sort_scatter<<<sort_blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_sort_counts,
+            ctx->sfnn_ft_sort_positions, batch, max_active);
+        if (check_kernel_launch("FT sort nstm") != 0) return -1;
+        sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
+            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
+        if (check_kernel_launch("FT sorted nstm") != 0) return -1;
+    } else {
     if (block_count_1d(batch * pairwise, threads, &blocks, "sfnn_sparse_l0_pairwise_concat_kernel") != 0) {
         return -1;
     }
@@ -5310,6 +5464,7 @@ int launch_sfnn_forward_kernels(
         ft_size, ft_factorizer_alpha, ctx->bn[0].params != nullptr);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
+    }
     }
 
     if(ctx->bn[0].params) {
@@ -6226,6 +6381,21 @@ int launch_sfnn_inverse_index_for_perspective(
     }
     constexpr int gather_threads = 128;
     const bool bn_fast=ctx->bn[0].params && !bn_use_reference();
+
+    // A block covers four independent feature rows. This reduces the number of
+    // tiny blocks in the large HalfKA_hm2 FT while retaining each element's
+    // summation order. Empty rows can be skipped when accumulating: their
+    // contribution is zero and the previous minibatch gradient must remain.
+    const bool hm2_gather = !ctx->dense_qat && n_features == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024
+        && std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr;
+    if (hm2_gather) {
+        dim3 block(64, 4);
+        dim3 grid(static_cast<unsigned>((n_features + 3) / 4), static_cast<unsigned>((ft_size + 63) / 64));
+        sfnn_inverse_gather_l0w_gradients_kernel<<<grid, block, 0, ctx->stream>>>(
+            pre_gradients, ctx->sfnn_inverse_positions, ctx->sfnn_inverse_offsets,
+            l0w_gradients, n_features, ft_size, add_to_existing, true);
+        return check_kernel_launch("sfnn hm2 FT gather launch");
+    }
 
     dim3 gather_grid(
         static_cast<unsigned int>(n_features),
@@ -7768,6 +7938,8 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         free_i32_scratch(ctx->sfnn_inverse_block_offsets, ctx->sfnn_inverse_block_offsets_len, "cudaFree sfnn inverse block offsets") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_write_counters, ctx->sfnn_inverse_write_counters_len, "cudaFree sfnn inverse write counters") != 0 ||
         free_i32_scratch(ctx->sfnn_inverse_positions, ctx->sfnn_inverse_positions_len, "cudaFree sfnn inverse positions") != 0 ||
+        free_i32_scratch(ctx->sfnn_ft_sort_counts, ctx->sfnn_ft_sort_counts_len, "cudaFree FT sort counts") != 0 ||
+        free_i32_scratch(ctx->sfnn_ft_sort_positions, ctx->sfnn_ft_sort_positions_len, "cudaFree FT sort positions") != 0 ||
         free_i32_scratch(ctx->dense_qat_l1_raw, ctx->dense_qat_l1_raw_len, "cudaFree dense QAT L1") != 0 ||
         free_i32_scratch(ctx->dense_qat_l2_raw, ctx->dense_qat_l2_raw_len, "cudaFree dense QAT L2") != 0 ||
         free_i32_scratch(ctx->dense_qat_l1_bias, ctx->dense_qat_l1_bias_len, "cudaFree dense QAT bias") != 0) {

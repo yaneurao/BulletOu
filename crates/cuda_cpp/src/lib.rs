@@ -9343,6 +9343,19 @@ mod ffi {
 
     unsafe extern "C" {
         #[cfg(test)]
+        pub fn bulletou_test_sfnn_ft_sort(ctx: *mut BulletOuCudaCppContext,
+            stm: *mut BulletOuCudaCppI32Buffer, nstm: *mut BulletOuCudaCppI32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer, bias: *mut BulletOuCudaCppF32Buffer,
+            a: *mut BulletOuCudaCppF32Buffer, b: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer, counts: *mut BulletOuCudaCppI32Buffer,
+            order: *mut BulletOuCudaCppI32Buffer, batch: usize, active: usize,
+            input: usize, ft: usize, sorted: i32) -> i32;
+        #[cfg(test)]
+        pub fn bulletou_test_sfnn_ft_gather(ctx: *mut BulletOuCudaCppContext,
+            pre: *mut BulletOuCudaCppF32Buffer, positions: *mut BulletOuCudaCppI32Buffer,
+            offsets: *mut BulletOuCudaCppI32Buffer, gradients: *mut BulletOuCudaCppF32Buffer,
+            features: usize, ft: usize, tiled: i32, add: i32) -> i32;
+        #[cfg(test)]
         pub fn bulletou_experiment_mean_penalty_test(ctx: *mut BulletOuCudaCppContext,
             z: *mut BulletOuCudaCppF32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
             weights: *mut BulletOuCudaCppF32Buffer,
@@ -10250,6 +10263,59 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn hm2_ft_sorted_forward_matches_original_order() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, active, input, ft) = (13usize, 3usize, 5000usize, 32usize);
+        let mut stm = vec![-1; batch * active];
+        let mut nstm = vec![-1; batch * active];
+        for i in 0..batch - 1 {
+            stm[i * active] = ((i * 7 % 3) * 1629 + i % 7) as i32;
+            stm[i * active + 1] = stm[i * active] + 8;
+            nstm[i * active] = ((i * 5 % 3) * 1629 + i % 11) as i32;
+        }
+        let stm = I32Buffer::from_host(&ctx, &stm).unwrap();
+        let nstm = I32Buffer::from_host(&ctx, &nstm).unwrap();
+        let weights = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
+        let bias = F32Buffer::from_host(&ctx, &vec![0.05; ft]).unwrap();
+        let counts = I32Buffer::new(&ctx, 46).unwrap();
+        let order = I32Buffer::new(&ctx, batch).unwrap();
+        let outputs = || (F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap(), F32Buffer::new(&ctx, batch*ft).unwrap());
+        let reference = outputs();
+        let separate = outputs();
+        for (o, flag) in [(&reference, 0), (&separate, 2)] {
+            check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                weights.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
+                counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
+        }
+        assert_eq!(reference.0.download(&ctx).unwrap(), separate.0.download(&ctx).unwrap());
+        assert_eq!(reference.1.download(&ctx).unwrap(), separate.1.download(&ctx).unwrap());
+        assert_eq!(reference.2.download(&ctx).unwrap(), separate.2.download(&ctx).unwrap());
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn hm2_ft_gather_matches_reference_with_empty_rows_and_accumulation() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let features = 7usize;
+        let ft = 2304usize;
+        let pre: Vec<f32> = (0..8 * ft).map(|i| ((i % 37) as f32 - 18.0) * 0.003).collect();
+        let positions = I32Buffer::from_host(&ctx, &[0, 3, 7, 1, 4, 1, 2, 6]).unwrap();
+        let offsets = I32Buffer::from_host(&ctx, &[0, 3, 3, 5, 6, 6, 8, 8]).unwrap();
+        let pre = F32Buffer::from_host(&ctx, &pre).unwrap();
+        let initial: Vec<f32> = (0..features * ft).map(|i| (i % 13) as f32 * 0.1).collect();
+        let reference = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let tiled = F32Buffer::from_host(&ctx, &initial).unwrap();
+        for add in [0, 1, 1] {
+            for (output, flag) in [(&reference, 0), (&tiled, 1)] {
+                check(unsafe { ffi::bulletou_test_sfnn_ft_gather(ctx.as_ptr(), pre.as_ptr(),
+                    positions.as_ptr(), offsets.as_ptr(), output.as_ptr(), features, ft, flag, add) }).unwrap();
+            }
+            assert_eq!(reference.download(&ctx).unwrap(), tiled.download(&ctx).unwrap());
+        }
+    }
     #[test]
     fn factorizer_rejects_pair_layout_mismatches() {
         let shape = super::SfnnForwardShape {
