@@ -52,6 +52,14 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn set_sfnn_ft_fp16_grad(&self, enabled: bool) -> Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(self.as_ptr(), i32::from(enabled)) })
+    }
+    pub fn take_ft_half_grad_clipped(&self) -> Result<u64> {
+        let mut count = 0;
+        check(unsafe { ffi::bulletou_cuda_cpp_context_take_ft_half_grad_clipped(self.as_ptr(), &mut count) })?;
+        Ok(count)
+    }
     pub fn set_sfnn_ft_fp16(&self, enabled: bool) -> Result<()> {
         check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16(self.as_ptr(), i32::from(enabled)) })
     }
@@ -9345,7 +9353,21 @@ mod ffi {
     }
 
     unsafe extern "C" {
+        #[cfg(test)]
+        #[cfg(test)]
+        pub fn bulletou_test_sfnn_half_grad_gather(ctx: *mut BulletOuCudaCppContext,
+            pre: *mut BulletOuCudaCppF32Buffer, positions: *mut BulletOuCudaCppI32Buffer,
+            offsets: *mut BulletOuCudaCppI32Buffer, out: *mut BulletOuCudaCppF32Buffer,
+            batch: usize, features: usize, ft: usize, occurrences: usize) -> i32;
+        #[cfg(test)]
+        pub fn bulletou_test_sfnn_half_grad(ctx: *mut BulletOuCudaCppContext,
+            stm: *mut BulletOuCudaCppF32Buffer, nstm: *mut BulletOuCudaCppF32Buffer,
+            combined: *mut BulletOuCudaCppF32Buffer, out_stm: *mut BulletOuCudaCppF32Buffer,
+            out_nstm: *mut BulletOuCudaCppF32Buffer, bias: *mut BulletOuCudaCppF32Buffer,
+            batch: usize, ft: usize, fused: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
+        pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
+        pub fn bulletou_cuda_cpp_context_take_ft_half_grad_clipped(ctx: *mut BulletOuCudaCppContext, out: *mut u64) -> i32;
         #[cfg(test)]
         pub fn bulletou_test_sfnn_ft_sort(ctx: *mut BulletOuCudaCppContext,
             stm: *mut BulletOuCudaCppI32Buffer, nstm: *mut BulletOuCudaCppI32Buffer,
@@ -10269,6 +10291,33 @@ mod ffi {
 mod tests {
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_fused_half_ft_pregrad_matches_scaled_rounding() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, ft) = (11usize, 2304usize);
+        let n = batch * ft;
+        let stm = F32Buffer::from_host(&ctx, &(0..n).map(|i| (i % 103) as f32 / 102.0).collect::<Vec<_>>()).unwrap();
+        let nstm = F32Buffer::from_host(&ctx, &(0..n).map(|i| (i % 79) as f32 / 78.0).collect::<Vec<_>>()).unwrap();
+        let grad = F32Buffer::from_host(&ctx, &(0..n).map(|i| ((i % 97) as f32 - 48.0) * 1e-9).collect::<Vec<_>>()).unwrap();
+        let outputs = || (F32Buffer::new(&ctx, n).unwrap(), F32Buffer::new(&ctx, n).unwrap(), F32Buffer::from_host(&ctx, &vec![0.0; ft]).unwrap());
+        let reference = outputs();
+        let fused = outputs();
+        for (o, mode) in [(&reference, 0), (&fused, 1)] {
+            check(unsafe { ffi::bulletou_test_sfnn_half_grad(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(), grad.as_ptr(),
+                o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(), batch, ft, mode) }).unwrap();
+        }
+        assert_eq!(reference.0.download(&ctx).unwrap(), fused.0.download(&ctx).unwrap());
+        assert_eq!(reference.1.download(&ctx).unwrap(), fused.1.download(&ctx).unwrap());
+        assert_close_slice("FT bias gradient", &reference.2.download(&ctx).unwrap(), &fused.2.download(&ctx).unwrap(), 1e-12);
+        assert_eq!(ctx.take_ft_half_grad_clipped().unwrap(), 0);
+        let huge_grad = F32Buffer::from_host(&ctx, &vec![1.0; n]).unwrap();
+        check(unsafe { ffi::bulletou_test_sfnn_half_grad(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(), huge_grad.as_ptr(),
+            fused.0.as_ptr(), fused.1.as_ptr(), fused.2.as_ptr(), batch, ft, 1) }).unwrap();
+        assert!(ctx.take_ft_half_grad_clipped().unwrap() > 0);
+        assert_eq!(ctx.take_ft_half_grad_clipped().unwrap(), 0);
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn hm2_ft_sorted_forward_matches_original_order() {
         use super::*;
         let ctx = Context::new(0).unwrap();
@@ -10313,6 +10362,34 @@ mod tests {
         assert_eq!(rounded.1.download(&ctx).unwrap(), half_nonexact.1.download(&ctx).unwrap());
         assert_eq!(rounded.2.download(&ctx).unwrap(), half_nonexact.2.download(&ctx).unwrap());
     }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn hm2_half_grad_gather_handles_empty_rows_and_accumulation() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, features, ft) = (8usize, 7usize, 37usize);
+        let pre: Vec<f32> = (0..batch*ft).map(|i| ((i % 37) as f32 - 18.0) / 32.0).collect();
+        let positions = [0i32, 3, 7, 1, 4, 1, 2, 6, 5, 2];
+        let offsets = [0i32, 5, 5, 7, 8, 8, 10, 10];
+        let mut expected: Vec<f32> = (0..features*ft).map(|i| (i % 13) as f32 / 8.0).collect();
+        let pre_gpu = F32Buffer::from_host(&ctx, &pre).unwrap();
+        let positions_gpu = I32Buffer::from_host(&ctx, &positions).unwrap();
+        let offsets_gpu = I32Buffer::from_host(&ctx, &offsets).unwrap();
+        let out = F32Buffer::from_host(&ctx, &expected).unwrap();
+        for _ in 0..2 {
+            check(unsafe { ffi::bulletou_test_sfnn_half_grad_gather(ctx.as_ptr(), pre_gpu.as_ptr(),
+                positions_gpu.as_ptr(), offsets_gpu.as_ptr(), out.as_ptr(), batch, features, ft, positions.len()) }).unwrap();
+            for feature in 0..features {
+                for row in 0..ft {
+                    for &pos in &positions[offsets[feature] as usize..offsets[feature+1] as usize] {
+                        expected[feature*ft+row] += pre[pos as usize*ft+row];
+                    }
+                }
+            }
+        }
+        assert_eq!(out.download(&ctx).unwrap(), expected);
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn hm2_ft_gather_matches_reference_with_empty_rows_and_accumulation() {
