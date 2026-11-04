@@ -6601,6 +6601,68 @@ __global__ void sfnn_l1_bucket_gather_gradient(
     if (axis.weights) axis.add(stack, in * outputs + out, width, out, outputs, bias, sum);
 }
 
+// Traverse each bucket's sample list for two adjacent input channels at once.
+// Each channel retains its original FP32 accumulation order.
+__global__ void sfnn_l1_bucket_gather_gradient2(
+    const float* inputs, const float* dy, const int* offsets, const int* positions,
+    float* dw, float* db, float* dfw, float* dfb,
+    size_t width, size_t outputs, float shared_alpha, CompactL1AxisGradient axis) {
+    const size_t lane = threadIdx.x % 32;
+    const size_t out = blockIdx.z * 8 + threadIdx.x / 32;
+    const size_t in = (static_cast<size_t>(blockIdx.x) * 32 + lane) * 2;
+    const size_t stack = blockIdx.y;
+    const int begin = offsets[stack], end = offsets[stack + 1];
+    // The whole block belongs to one bucket, so this return is uniform and
+    // avoids both axis setup and the barrier for buckets absent in the batch.
+    if (begin == end) return;
+    // Axis IDs and confidence coefficients depend on the bucket, not on the
+    // input or output channel. Compute them once for the entire block.
+    __shared__ size_t axis_ids[8], axis_count;
+    __shared__ float axis_alphas[8];
+    if (threadIdx.x == 0) {
+        axis_count = axis.weights ? sfnn_factorizer_axis_ids(stack, axis.stacks, axis.king_dim, axis.hand_dim,
+            axis.king, axis.hand, axis.progress, axis.kh, axis.kp, axis.hp, axis_ids) : 0;
+        if (axis_count) sfnn_factorizer_axis_alphas(axis_ids, axis_count, axis.stacks, axis.king_dim, axis.hand_dim,
+            axis.kh, axis.kp, axis.hp, axis.king_alpha, axis.hand_alpha, axis.progress_alpha,
+            axis.pair_alpha, axis.confidence, axis_alphas);
+    }
+    __syncthreads();
+    if (out >= outputs || in > width) return;
+    const bool bias = in == width;
+    float sum0 = 0.0f, sum1 = 0.0f;
+    for (int i = begin; i < end; ++i) {
+        const size_t sample = static_cast<size_t>(positions[i]);
+        const float grad = dy[sample * outputs + out];
+        if (bias) sum0 += grad;
+        else {
+            const float2 values = *reinterpret_cast<const float2*>(inputs + sample * width + in);
+            sum0 += grad * values.x;
+            sum1 += grad * values.y;
+        }
+    }
+    if (bias) {
+        if (sum0 == 0.0f) return;
+        db[stack * outputs + out] += sum0;
+        if (dfb) atomicAdd(dfb + out, shared_alpha * sum0);
+        for (size_t a = 0; a < axis_count; ++a)
+            atomicAdd(axis.biases + axis_ids[a] * outputs + out, axis_alphas[a] * sum0);
+    } else {
+        if (sum0 != 0.0f) {
+            dw[(stack * outputs + out) * width + in] += sum0;
+            if (dfw) atomicAdd(dfw + in * outputs + out, shared_alpha * sum0);
+        }
+        if (sum1 != 0.0f) {
+            dw[(stack * outputs + out) * width + in + 1] += sum1;
+            if (dfw) atomicAdd(dfw + (in + 1) * outputs + out, shared_alpha * sum1);
+        }
+        for (size_t a = 0; a < axis_count && (sum0 != 0.0f || sum1 != 0.0f); ++a) {
+            float* dst = axis.weights + axis_ids[a] * width * outputs + in * outputs + out;
+            if (sum0 != 0.0f) atomicAdd(dst, axis_alphas[a] * sum0);
+            if (sum1 != 0.0f) atomicAdd(dst + outputs, axis_alphas[a] * sum1);
+        }
+    }
+}
+
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
 template<int Stacks, bool Axis=false>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
@@ -7827,9 +7889,15 @@ int launch_sfnn_backward_kernels(
                 use_king_axis, use_hand_axis, use_progress_axis, use_king_hand_pair, use_king_progress_pair,
                 use_hand_progress_pair, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha, factorizer_axis_confidences};
-            const dim3 grid(static_cast<unsigned>((ft_size + 32) / 32),
+            const bool vector2 = axis.weights && (ft_size % 2 == 0) &&
+                std::getenv("BULLETOU_L1_BUCKET_GATHER_REFERENCE") == nullptr;
+            const dim3 grid(static_cast<unsigned>(((vector2 ? ft_size / 2 : ft_size) + 32) / 32),
                 static_cast<unsigned>(num_stacks), static_cast<unsigned>((l1_out + 7) / 8));
-            sfnn_l1_bucket_gather_gradient<<<grid, 256, 0, ctx->stream>>>(
+            if (vector2) sfnn_l1_bucket_gather_gradient2<<<grid, 256, 0, ctx->stream>>>(
+                combined, l1_gradients, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_positions,
+                l1w_gradients, l1b_gradients, has_l1f ? l1fw_gradients : nullptr,
+                has_l1f ? l1fb_gradients : nullptr, ft_size, l1_out, factorizer_shared_alpha, axis);
+            else sfnn_l1_bucket_gather_gradient<<<grid, 256, 0, ctx->stream>>>(
                 combined, l1_gradients, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_positions,
                 l1w_gradients, l1b_gradients, has_l1f ? l1fw_gradients : nullptr,
                 has_l1f ? l1fb_gradients : nullptr, ft_size, l1_out, factorizer_shared_alpha, axis);
