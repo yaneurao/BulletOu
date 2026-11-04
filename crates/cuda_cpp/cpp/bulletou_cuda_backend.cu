@@ -153,6 +153,14 @@ struct BulletOuCudaCppF32Buffer {
     float* ptr = nullptr;
 };
 
+struct BulletOuCudaCppHalfMoments {
+    int device = 0;
+    size_t len = 0;
+    __half* momentum = nullptr;
+    __half* velocity = nullptr;
+    unsigned long long* clipped = nullptr;
+};
+
 struct BulletOuCudaCppI32Buffer {
     int device = 0;
     size_t len = 0;
@@ -512,6 +520,61 @@ __global__ void radam_update_reset_gradients_kernel(
     weights[idx] = weight;
     momentum[idx] = m;
     velocity[idx] = v;
+}
+
+constexpr float FT_MOMENTUM_SCALE = 268435456.0f;       // 2^28
+constexpr float FT_VELOCITY_SCALE = 1099511627776.0f;  // 2^40
+
+__device__ __forceinline__ float ft_half_moment_scaled(float x, float scale, unsigned long long* clipped) {
+    const float value = x * scale;
+    if (!isfinite(value) || value > 65504.0f || value < -65504.0f) {
+        if (clipped) atomicAdd(clipped, 1ULL);
+        if (isnan(value)) return value;
+        return value > 0.0f ? 65504.0f : -65504.0f;
+    }
+    return value;
+}
+
+__global__ void ft_half_moments_encode(const float* momentum, const float* velocity,
+    __half* hm, __half* hv, size_t len, unsigned long long* clipped) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    hm[i] = __float2half_rn(ft_half_moment_scaled(momentum[i], FT_MOMENTUM_SCALE, clipped));
+    hv[i] = __float2half_rn(ft_half_moment_scaled(velocity[i], FT_VELOCITY_SCALE, clipped));
+}
+
+__global__ void ft_half_moments_decode(const __half* hm, const __half* hv, float* momentum,
+    float* velocity, size_t len) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    momentum[i] = __half2float(hm[i]) / FT_MOMENTUM_SCALE;
+    velocity[i] = __half2float(hv[i]) / FT_VELOCITY_SCALE;
+}
+
+__global__ void radam_update_reset_gradients_half_moments_kernel(
+    float* gradients, float* weights, __half* momentum, __half* velocity, size_t len4,
+    float gradient_factor, float learning_rate, float step_size, int use_denom, float decay,
+    float beta1, float beta2, float epsilon, float min_weight, float max_weight, unsigned long long* clipped) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len4) return;
+    const float4 grad = reinterpret_cast<const float4*>(gradients)[i];
+    float4 weight = reinterpret_cast<float4*>(weights)[i];
+    const float2 m0 = __half22float2(reinterpret_cast<const __half2*>(momentum)[2*i]);
+    const float2 m1 = __half22float2(reinterpret_cast<const __half2*>(momentum)[2*i+1]);
+    const float2 v0 = __half22float2(reinterpret_cast<const __half2*>(velocity)[2*i]);
+    const float2 v1 = __half22float2(reinterpret_cast<const __half2*>(velocity)[2*i+1]);
+    float4 m = make_float4(m0.x / FT_MOMENTUM_SCALE, m0.y / FT_MOMENTUM_SCALE, m1.x / FT_MOMENTUM_SCALE, m1.y / FT_MOMENTUM_SCALE);
+    float4 v = make_float4(v0.x / FT_VELOCITY_SCALE, v0.y / FT_VELOCITY_SCALE, v1.x / FT_VELOCITY_SCALE, v1.y / FT_VELOCITY_SCALE);
+    radam_update_one(gradient_factor*grad.x, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight.x, &m.x, &v.x);
+    radam_update_one(gradient_factor*grad.y, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight.y, &m.y, &v.y);
+    radam_update_one(gradient_factor*grad.z, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight.z, &m.z, &v.z);
+    radam_update_one(gradient_factor*grad.w, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon, min_weight, max_weight, &weight.w, &m.w, &v.w);
+    reinterpret_cast<float4*>(weights)[i] = weight;
+    reinterpret_cast<float4*>(gradients)[i] = make_float4(0,0,0,0);
+    reinterpret_cast<__half2*>(momentum)[2*i] = __floats2half2_rn(ft_half_moment_scaled(m.x,FT_MOMENTUM_SCALE,clipped),ft_half_moment_scaled(m.y,FT_MOMENTUM_SCALE,clipped));
+    reinterpret_cast<__half2*>(momentum)[2*i+1] = __floats2half2_rn(ft_half_moment_scaled(m.z,FT_MOMENTUM_SCALE,clipped),ft_half_moment_scaled(m.w,FT_MOMENTUM_SCALE,clipped));
+    reinterpret_cast<__half2*>(velocity)[2*i] = __floats2half2_rn(ft_half_moment_scaled(v.x,FT_VELOCITY_SCALE,clipped),ft_half_moment_scaled(v.y,FT_VELOCITY_SCALE,clipped));
+    reinterpret_cast<__half2*>(velocity)[2*i+1] = __floats2half2_rn(ft_half_moment_scaled(v.z,FT_VELOCITY_SCALE,clipped),ft_half_moment_scaled(v.w,FT_VELOCITY_SCALE,clipped));
 }
 
 __global__ void radam_update_reset_gradients_vec4_kernel(
@@ -9342,6 +9405,67 @@ int apply_norm_loss(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* w, si
     return check_kernel_launch("norm loss scale");
 }
 
+extern "C" int bulletou_cuda_cpp_ft_half_moments_create(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppF32Buffer* velocity, size_t len,
+    BulletOuCudaCppHalfMoments** out) {
+    if (!ctx || !out || len == 0) return fail_message("FT FP16 moments require a context, output, and nonempty state");
+    if (validate_buffer(ctx, momentum, len, "FT momentum") ||
+        validate_buffer(ctx, velocity, len, "FT velocity") || set_context_device(ctx)) return -1;
+    *out = nullptr;
+    auto* state = new BulletOuCudaCppHalfMoments();
+    state->device = ctx->device; state->len = len;
+    if (checked_malloc(&state->momentum, len, "FT FP16 momentum") ||
+        checked_malloc(&state->velocity, len, "FT FP16 velocity") ||
+        checked_malloc(&state->clipped, 1, "FT FP16 moment counter")) {
+        cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
+    }
+    cudaError_t status = cudaMemsetAsync(state->clipped, 0, sizeof(unsigned long long), ctx->stream);
+    if (status != cudaSuccess) { cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return fail("FT FP16 moment counter initialization", status); }
+    int blocks = 0;
+    if (block_count_1d(len, 256, &blocks, "FT FP16 moments encode")) {
+        cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
+    }
+    ft_half_moments_encode<<<blocks,256,0,ctx->stream>>>(momentum->ptr, velocity->ptr, state->momentum, state->velocity, len, state->clipped);
+    if (check_kernel_launch("FT FP16 moments encode")) {
+        cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
+    }
+    *out = state;
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_ft_half_moments_decode(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppHalfMoments* state, BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppF32Buffer* velocity) {
+    if (!ctx || !state || state->device != ctx->device) return fail_message("FT FP16 moments belong to a different CUDA device");
+    if (validate_buffer(ctx, momentum, state->len, "FT momentum") ||
+        validate_buffer(ctx, velocity, state->len, "FT velocity") || set_context_device(ctx)) return -1;
+    int blocks = 0;
+    if (block_count_1d(state->len, 256, &blocks, "FT FP16 moments decode")) return -1;
+    ft_half_moments_decode<<<blocks,256,0,ctx->stream>>>(state->momentum, state->velocity, momentum->ptr, velocity->ptr, state->len);
+    return check_kernel_launch("FT FP16 moments decode");
+}
+
+extern "C" int bulletou_cuda_cpp_ft_half_moments_take_clipped(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppHalfMoments* state, unsigned long long* out) {
+    if (!ctx || !state || !out || state->device != ctx->device) return fail_message("invalid FT FP16 moment counter request");
+    if (set_context_device(ctx)) return -1;
+    cudaError_t status = cudaMemcpyAsync(out, state->clipped, sizeof(*out), cudaMemcpyDeviceToHost, ctx->stream);
+    if (status != cudaSuccess) return fail("FT FP16 moment counter copy", status);
+    status = cudaStreamSynchronize(ctx->stream);
+    if (status != cudaSuccess) return fail("FT FP16 moment counter synchronize", status);
+    status = cudaMemsetAsync(state->clipped, 0, sizeof(*out), ctx->stream);
+    if (status != cudaSuccess) return fail("FT FP16 moment counter reset", status);
+    return ok();
+}
+
+extern "C" int bulletou_cuda_cpp_ft_half_moments_destroy(BulletOuCudaCppHalfMoments* state) {
+    if (!state) return 0;
+    cudaError_t status = cudaSetDevice(state->device);
+    if (status != cudaSuccess) { delete state; return fail("FT FP16 moments device", status); }
+    cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped);
+    delete state;
+    return ok();
+}
+
 extern "C" int bulletou_cuda_cpp_ranger_update_device(
     BulletOuCudaCppContext* ctx,
     float norm_loss_rate,
@@ -9364,7 +9488,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     BulletOuCudaCppF32Buffer* weights,
     BulletOuCudaCppF32Buffer* momentum,
     BulletOuCudaCppF32Buffer* velocity,
-    BulletOuCudaCppF32Buffer* slow_params) {
+    BulletOuCudaCppF32Buffer* slow_params,
+    BulletOuCudaCppHalfMoments* half_moments) {
     if (validate_buffer(ctx, gradients, len, "gradients") != 0 || validate_buffer(ctx, weights, len, "weights") != 0 ||
         validate_buffer(ctx, momentum, len, "momentum") != 0 || validate_buffer(ctx, velocity, len, "velocity") != 0 ||
         validate_buffer(ctx, slow_params, len, "slow_params") != 0) {
@@ -9373,6 +9498,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     if (set_context_device(ctx) != 0) {
         return -1;
     }
+    if (half_moments && (half_moments->device != ctx->device || half_moments->len != len || len % 4 != 0))
+        return fail_message("FT FP16 moments require matching device and vector-aligned length");
     if (len == 0) {
         return ok();
     }
@@ -9385,7 +9512,13 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
         return -1;
     }
     if (norm_loss_before && apply_norm_loss(ctx, weights, len, norm_loss_rate) != 0) return -1;
-    if (use_vec4) {
+    if (half_moments) {
+        radam_update_reset_gradients_half_moments_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            gradients->ptr, weights->ptr, half_moments->momentum, half_moments->velocity, len / 4,
+            gradient_factor, learning_rate, step_size, use_denom, decay, beta1, beta2, epsilon,
+            min_weight, max_weight, half_moments->clipped);
+        if (check_kernel_launch("radam FT FP16 moments update")) return -1;
+    } else if (use_vec4) {
         radam_update_reset_gradients_vec4_kernel<<<blocks, threads, 0, ctx->stream>>>(
             gradients->ptr,
             weights->ptr,

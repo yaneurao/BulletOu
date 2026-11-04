@@ -21,6 +21,7 @@ pub fn fold_rows(values: &mut Vec<f32>, base: usize, virtual_rows: usize, width:
 impl SfnnTrainStepRunner {
     /// At an update boundary, remove the virtual FT rows without rebuilding other layers.
     pub fn disable_ft_factorizer(&mut self, ctx: &Context, base: usize, virtual_rows: usize) -> Result<()> {
+        self.invalidate_ft_half_moments(ctx)?;
         if self.pending_gradient_batches != 0 || self.batch_norm.is_some() {
             return Err(CudaCppError::message("FT factorizer switch requires non-BN and an optimizer-update boundary"));
         }

@@ -174,6 +174,33 @@ pub struct F32Buffer {
 }
 
 #[derive(Debug)]
+struct FtHalfMoments {
+    raw: NonNull<ffi::BulletOuCudaCppHalfMoments>,
+}
+
+impl FtHalfMoments {
+    fn new(ctx: &Context, state: &RangerParamState) -> Result<Self> {
+        let mut raw = std::ptr::null_mut();
+        check(unsafe { ffi::bulletou_cuda_cpp_ft_half_moments_create(ctx.as_ptr(), state.momentum.as_ptr(),
+            state.velocity.as_ptr(), state.momentum.len(), &mut raw) })?;
+        Ok(Self { raw: NonNull::new(raw).ok_or_else(|| CudaCppError::message("FT FP16 moment allocation returned null"))? })
+    }
+    fn decode(&self, ctx: &Context, state: &RangerParamState) -> Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_ft_half_moments_decode(ctx.as_ptr(), self.raw.as_ptr(),
+            state.momentum.as_ptr(), state.velocity.as_ptr()) })
+    }
+    fn take_clipped(&self, ctx: &Context) -> Result<u64> {
+        let mut count = 0;
+        check(unsafe { ffi::bulletou_cuda_cpp_ft_half_moments_take_clipped(ctx.as_ptr(), self.raw.as_ptr(), &mut count) })?;
+        Ok(count)
+    }
+}
+
+impl Drop for FtHalfMoments {
+    fn drop(&mut self) { let _ = unsafe { ffi::bulletou_cuda_cpp_ft_half_moments_destroy(self.raw.as_ptr()) }; }
+}
+
+#[derive(Debug)]
 pub struct I32Buffer {
     raw: NonNull<ffi::BulletOuCudaCppI32Buffer>,
     len: usize,
@@ -6138,6 +6165,9 @@ impl SfnnTrainStepUploadSlot {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
+    ft_half_moments_enabled: bool,
+    ft_half_moments: Option<FtHalfMoments>,
+    ft_half_moments_clipped_pending: u64,
     pub l1_revival_flags: u8,
     /// Encoded last actual L1 reset epoch (0 = none, None = legacy unknown).
     pub l1_last_reset_epoch: Option<usize>,
@@ -6169,6 +6199,9 @@ pub struct SfnnTrainStepRunner {
     pub factorizer_axis_confidences: F32Buffer,
     pub factorizer_axis_confidences_enabled: bool,
     pub weights: SfnnForwardDeviceWeights,
+    /// With FT FP16 moments enabled, call `synchronize_ft_optimizer_moments`
+    /// before accessing the FT momentum/velocity buffers directly.
+    /// Disable FP16 moments before modifying those buffers directly.
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
     pub factorizer_alpha: SfnnFactorizerAlpha,
@@ -6380,6 +6413,42 @@ impl SfnnLayerLrMultipliers {
 }
 
 impl SfnnTrainStepRunner {
+    /// Synchronize the public FP32 FT optimizer buffers with the optional
+    /// FP16 state. `read_optimizer_states` and snapshots do this automatically.
+    pub fn synchronize_ft_optimizer_moments(&self, ctx: &Context) -> Result<()> {
+        self.sync_ft_half_moments(ctx)?;
+        ctx.synchronize()
+    }
+    fn sync_ft_half_moments(&self, ctx: &Context) -> Result<()> {
+        if let Some(half) = &self.ft_half_moments { half.decode(ctx, &self.optimizer_states.l0w)?; }
+        Ok(())
+    }
+
+    fn invalidate_ft_half_moments(&mut self, ctx: &Context) -> Result<()> {
+        if let Some(half) = &self.ft_half_moments {
+            half.decode(ctx, &self.optimizer_states.l0w)?;
+            self.ft_half_moments_clipped_pending = self.ft_half_moments_clipped_pending.saturating_add(half.take_clipped(ctx)?);
+        }
+        self.ft_half_moments = None;
+        Ok(())
+    }
+
+    pub fn set_ft_fp16_moments(&mut self, ctx: &Context, enabled: bool) -> Result<()> {
+        if self.ft_half_moments_enabled == enabled { return Ok(()); }
+        if self.pending_gradient_batches != 0 {
+            return Err(CudaCppError::message("cannot change FT FP16 moments with pending gradients"));
+        }
+        if !enabled { self.invalidate_ft_half_moments(ctx)?; }
+        self.ft_half_moments_enabled = enabled;
+        Ok(())
+    }
+
+    pub fn take_ft_fp16_moments_clipped(&mut self, ctx: &Context) -> Result<u64> {
+        let count = if let Some(half) = &self.ft_half_moments { half.take_clipped(ctx)? } else { 0 };
+        let total = self.ft_half_moments_clipped_pending.saturating_add(count);
+        self.ft_half_moments_clipped_pending = 0;
+        Ok(total)
+    }
     /// Build the quantized inference model, folding BN on-device when enabled.
     pub fn build_quantized_proxy(&self,ctx:&Context,base_input_size:usize,virtual_rows:usize,
         proxy:&SfnnForwardDeviceWeights)->Result<()> {
@@ -6522,6 +6591,9 @@ impl SfnnTrainStepRunner {
             shape,
             batch_size,
             max_active,
+            ft_half_moments_enabled: false,
+            ft_half_moments: None,
+            ft_half_moments_clipped_pending: 0,
             device_batch: SfnnForwardDeviceBatch {
                 batch_size,
                 max_active,
@@ -6888,6 +6960,7 @@ impl SfnnTrainStepRunner {
         old_shared: f32,
         new_shared: f32,
     ) -> Result<()> {
+        if old_ft != new_ft { self.invalidate_ft_half_moments(ctx)?; }
         self.forward_workspace.invalidate_l1_qat();
         shared_rebase_ratio(old_ft, new_ft)?;
         shared_rebase_ratio(old_shared, new_shared)?;
@@ -7108,6 +7181,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn snapshot_device(&self, ctx: &Context) -> Result<SfnnTrainStepRunnerSnapshot> {
+        self.sync_ft_half_moments(ctx)?;
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
             l1_revival_flags: self.l1_revival_flags,
@@ -7124,6 +7198,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
+        self.invalidate_ft_half_moments(ctx)?;
         self.layer_qat.invalidate();
         self.l1_revival_flags = src.l1_revival_flags;
         self.l1_last_reset_epoch = src.l1_last_reset_epoch;
@@ -7154,6 +7229,7 @@ impl SfnnTrainStepRunner {
         factorizer: SfnnFactorizerActive,
         factorizer_alpha: SfnnFactorizerAlpha,
     ) -> Result<()> {
+        self.invalidate_ft_half_moments(ctx)?;
         if self.batch_norm.is_some() {
             return Err(CudaCppError::message("host-only runner restore cannot restore BN state; use the complete device snapshot restore"));
         }
@@ -7775,6 +7851,7 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn read_optimizer_states(&self, ctx: &Context) -> Result<SfnnRangerOptimizerStatesReadback> {
+        self.sync_ft_half_moments(ctx)?;
         self.optimizer_states.download(ctx)
     }
 
@@ -8264,6 +8341,10 @@ impl SfnnTrainStepRunner {
         if lr_multipliers.l1_effective_weight_clip {
             l1_center::validate_effective_clip(self, lr_multipliers)?;
         }
+        if self.ft_half_moments_enabled && self.ft_half_moments.is_none() &&
+            lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight) > 0.0 {
+            self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w)?);
+        }
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
         self.apply_residual_count_gates_to_gradients(ctx, lr_multipliers, dirty_update)?;
@@ -8295,14 +8376,22 @@ impl SfnnTrainStepRunner {
             }
             experimental_l1_center::transform(self, ctx, c, true)?;
         }
-        update_param_group_with_lr_multiplier(
-            ctx,
-            lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight),
-            &self.backward_workspace.l0w_gradients,
-            &self.weights.l0w,
-            &self.optimizer_states.l0w,
-            l0w_lr,
-        )?;
+        let l0w_params = lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight);
+        if self.ft_half_moments_enabled && l0w_lr > 0.0 {
+            if !l0w_lr.is_finite() { return Err(CudaCppError::message("invalid FT learning-rate multiplier")); }
+            let mut adjusted = l0w_params;
+            adjusted.radam.learning_rate *= l0w_lr;
+            ranger_update_device_with_half_moments(ctx, adjusted, RangerDeviceStateMut {
+                gradients: &self.backward_workspace.l0w_gradients,
+                weights: &self.weights.l0w,
+                momentum: &self.optimizer_states.l0w.momentum,
+                velocity: &self.optimizer_states.l0w.velocity,
+                slow_params: &self.optimizer_states.l0w.slow_params,
+            }, self.ft_half_moments.as_ref())?;
+        } else {
+            update_param_group_with_lr_multiplier(ctx, l0w_params, &self.backward_workspace.l0w_gradients,
+                &self.weights.l0w, &self.optimizer_states.l0w, l0w_lr)?;
+        }
         update_param_group_with_lr_multiplier(
             ctx,
             lr_multipliers.clip_params(params, SfnnUpdateLayer::L0, SfnnUpdateParamKind::Bias),
@@ -9228,6 +9317,11 @@ pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: Ranger
 }
 
 pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: RangerDeviceStateMut<'_>) -> Result<()> {
+    ranger_update_device_with_half_moments(ctx, params, state, None)
+}
+
+fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdateParams,
+    state: RangerDeviceStateMut<'_>, half: Option<&FtHalfMoments>) -> Result<()> {
     params.validate()?;
     let len = state.validate()?;
     let scale = params.radam.step_scale()?;
@@ -9258,6 +9352,7 @@ pub fn ranger_update_device(ctx: &Context, params: RangerUpdateParams, state: Ra
             state.momentum.as_ptr(),
             state.velocity.as_ptr(),
             state.slow_params.as_ptr(),
+            half.map_or(std::ptr::null_mut(), |s| s.raw.as_ptr()),
         )
     })
 }
@@ -9327,6 +9422,10 @@ mod ffi {
 
     #[repr(C)]
     pub struct BulletOuCudaCppF32Buffer {
+        _private: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct BulletOuCudaCppHalfMoments {
         _private: [u8; 0],
     }
 
@@ -10280,7 +10379,17 @@ mod ffi {
             momentum: *mut BulletOuCudaCppF32Buffer,
             velocity: *mut BulletOuCudaCppF32Buffer,
             slow_params: *mut BulletOuCudaCppF32Buffer,
+            half_moments: *mut BulletOuCudaCppHalfMoments,
         ) -> i32;
+        pub fn bulletou_cuda_cpp_ft_half_moments_create(ctx: *mut BulletOuCudaCppContext,
+            momentum: *mut BulletOuCudaCppF32Buffer, velocity: *mut BulletOuCudaCppF32Buffer,
+            len: usize, out: *mut *mut BulletOuCudaCppHalfMoments) -> i32;
+        pub fn bulletou_cuda_cpp_ft_half_moments_decode(ctx: *mut BulletOuCudaCppContext,
+            state: *mut BulletOuCudaCppHalfMoments, momentum: *mut BulletOuCudaCppF32Buffer,
+            velocity: *mut BulletOuCudaCppF32Buffer) -> i32;
+        pub fn bulletou_cuda_cpp_ft_half_moments_take_clipped(ctx: *mut BulletOuCudaCppContext,
+            state: *mut BulletOuCudaCppHalfMoments, out: *mut u64) -> i32;
+        pub fn bulletou_cuda_cpp_ft_half_moments_destroy(state: *mut BulletOuCudaCppHalfMoments) -> i32;
         pub fn bulletou_cuda_cpp_ranger_update_stacked_dirty_device(
             ctx: *mut BulletOuCudaCppContext,
             norm_loss_rate: f32,
@@ -10313,6 +10422,51 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn ft_half_moments_update_roundtrip_and_clip() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let n = 64usize;
+        let initial: Vec<f32> = (0..n).map(|i| i as f32 * 0.001).collect();
+        let state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+        let half = FtHalfMoments::new(&ctx, &state).unwrap();
+        let actual_weights = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let reference_weights = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let actual_grad = F32Buffer::new(&ctx, n).unwrap();
+        let reference_grad = F32Buffer::new(&ctx, n).unwrap();
+        let reference_state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+        for step in 1..=12 {
+            half.decode(&ctx, &state).unwrap();
+            let decoded = state.download(&ctx).unwrap();
+            reference_state.upload(&ctx, n, RangerParamHostState { momentum: &decoded.momentum,
+                velocity: &decoded.velocity, slow_params: &decoded.slow_params }).unwrap();
+            reference_weights.copy_from(&ctx, &actual_weights).unwrap();
+            let grad: Vec<f32> = (0..n).map(|i| ((i * 23 % 29) as f32 - 14.0) * 1e-7).collect();
+            actual_grad.upload(&ctx, &grad).unwrap(); reference_grad.upload(&ctx, &grad).unwrap();
+            let params = RangerUpdateParams { radam: RAdamUpdateParams { step, ..Default::default() }, ..Default::default() };
+            ranger_update_device_with_half_moments(&ctx, params, RangerDeviceStateMut { gradients: &actual_grad,
+                weights: &actual_weights, momentum: &state.momentum, velocity: &state.velocity, slow_params: &state.slow_params }, Some(&half)).unwrap();
+            ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &reference_grad,
+                weights: &reference_weights, momentum: &reference_state.momentum, velocity: &reference_state.velocity,
+                slow_params: &reference_state.slow_params }).unwrap();
+            assert_eq!(actual_weights.download(&ctx).unwrap(), reference_weights.download(&ctx).unwrap());
+            assert_eq!(state.slow_params.download(&ctx).unwrap(), reference_state.slow_params.download(&ctx).unwrap());
+            assert!(actual_grad.download(&ctx).unwrap().iter().all(|&g| g == 0.0));
+        }
+        assert_eq!(half.take_clipped(&ctx).unwrap(), 0);
+        let big = vec![1.0; n];
+        let state = RangerParamState::from_host_state(&ctx, n, RangerParamHostState {
+            momentum: &big, velocity: &big, slow_params: &initial }).unwrap();
+        let clipped = FtHalfMoments::new(&ctx, &state).unwrap();
+        assert_eq!(clipped.take_clipped(&ctx).unwrap(), (2*n) as u64);
+        assert_eq!(clipped.take_clipped(&ctx).unwrap(), 0);
+        clipped.decode(&ctx, &state).unwrap();
+        let data = state.download(&ctx).unwrap();
+        assert!(data.momentum.iter().all(|&x| x == 65504.0 / 268435456.0));
+        assert!(data.velocity.iter().all(|&x| x == 65504.0 / 1099511627776.0));
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn fused_l1_ft_half_gradient_matches_separate_kernels() {

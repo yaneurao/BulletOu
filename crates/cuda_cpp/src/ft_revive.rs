@@ -87,6 +87,7 @@ impl SfnnTrainStepRunner {
             return Err(CudaCppError::message("FT revival requires calibrated non-BN SFNN, L1 none/shared/axis/pair, no residual count gates or pending gradients"));
         }
         if ids.is_empty() {return Ok(());}
+        self.invalidate_ft_half_moments(ctx)?;
         let common=revive_common::Common::read(self,ctx)?;
         // Reinitialize real feature rows. Reset virtual factorizer columns to zero.
         let mut w=self.weights.l0w.download(ctx)?;
@@ -154,6 +155,33 @@ impl SfnnTrainStepRunner {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn ft_fp16_moments_survive_snapshot_and_revive() {
+        let ctx=Context::new(0).unwrap(); let s=crate::tests::tiny_sfnn_shape();
+        let mut host=crate::tests::tiny_sfnn_weights(s);
+        host.l1fw=None;host.l1fb=None;host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,1024,1).unwrap();
+        r.optimizer_states.l0w.momentum.fill(&ctx,1.0e-6).unwrap();
+        r.optimizer_states.l0w.velocity.fill(&ctx,1.0e-12).unwrap();
+        r.set_ft_fp16_moments(&ctx,true).unwrap();
+        r.ft_half_moments=Some(FtHalfMoments::new(&ctx,&r.optimizer_states.l0w).unwrap());
+        r.optimizer_states.l0w.momentum.fill(&ctx,0.0).unwrap();
+        r.optimizer_states.l0w.velocity.fill(&ctx,0.0).unwrap();
+        let snapshot=r.snapshot_device(&ctx).unwrap();
+        assert!(snapshot.optimizer_states.l0w.momentum.download(&ctx).unwrap().iter().all(|&x|x>0.0));
+        let mut c=Calibration::new(s.ft_size,s.num_stacks);c.counts.fill(1024);c.means.fill(0.25);
+        r.revive_ft(&ctx,&c,&[0],s.input_size).unwrap();
+        assert!(r.ft_half_moments.is_none());
+        let state=r.read_optimizer_states(&ctx).unwrap();
+        for row in 0..s.input_size { for col in 0..s.ft_size {
+            let m=state.l0w.momentum[row*s.ft_size+col];
+            if col==0 || col==s.ft_size/2 {assert_eq!(m,0.0);} else {assert!(m>0.0);}
+        }}
+        r.copy_state_from_device(&ctx,&snapshot).unwrap();
+        let restored=r.read_optimizer_states(&ctx).unwrap();
+        assert!(restored.l0w.momentum.iter().all(|&x|x>0.0));
+    }
     #[test] fn gpu_reset_and_mean_compensation_preserve_other_columns() {
         let ctx=Context::new(0).unwrap();let s=crate::tests::tiny_sfnn_shape();
         let mut host=crate::tests::tiny_sfnn_weights(s);

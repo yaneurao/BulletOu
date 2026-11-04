@@ -4131,7 +4131,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -4166,7 +4166,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
             return Err(format!("superbatches.{name} must be a positive integer"));
         }
-        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_ft_fp16_moments" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -4263,7 +4263,7 @@ fn starting_epoch_settings(args: &Args) -> Result<Args, String> {
 fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
     let epoch = epoch.max(1); // Independent warmup epoch uses epoch 1 settings.
     let mut resolved = args.clone();
-    let Some(json) = args.epoch_settings_json.as_ref() else { return Ok(resolved); };
+    let Some(json) = args.epoch_settings_json.as_ref() else { resolved.apply_all_optim(); return Ok(resolved); };
     let schedules: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json).map_err(|e| format!("invalid epoch settings: {e}"))?;
     for (key, schedule) in &schedules {
         validate_epoch_setting(key, schedule)?;
@@ -4281,11 +4281,12 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         }
         assign!(superbatches, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
-            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
+            lr, lr_min, batches_per_update, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_ft_fp16_moments, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
+    resolved.apply_all_optim();
     if schedules.contains_key("ft_factorizer") {
         if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
             || resolved.sfnn_bn_ft || resolved.sfnn_bn_l1 || resolved.sfnn_bn_l2 {
@@ -5385,7 +5386,7 @@ struct Args {
     #[arg(long)]
     sfnn_qat_ft: bool,
     /// Experimental FP16 FT weights for the 2304-wide HalfKA_hm2 training path.
-    /// FP32 master weights and optimizer state are retained; this is not tatara's all-optim.
+    /// FP32 master weights are retained; optimizer moments remain FP32 unless separately enabled.
     #[arg(long)]
     sfnn_ft_fp16: bool,
     /// Use scaled FP16 temporary FT gradients in the experimental HalfKA_hm2 path.
@@ -5394,6 +5395,12 @@ struct Args {
     /// Keep FT activations in FP16 in the experimental HalfKA_hm2 training path.
     #[arg(long)]
     sfnn_ft_fp16_act: bool,
+    /// Use scaled FP16 momentum and variance for FT weights (experimental).
+    #[arg(long)]
+    sfnn_ft_fp16_moments: bool,
+    /// Enable all four experimental FT FP16 speed options (no TF32).
+    #[arg(long)]
+    all_optim: bool,
     /// Non-BN L2 weight/bias QAT (int8 weights, scale 64), identity STE. Default off.
     #[arg(long)]
     sfnn_qat_l2: bool,
@@ -5586,6 +5593,14 @@ struct Args {
 }
 
 impl Args {
+    fn apply_all_optim(&mut self) {
+        if self.all_optim {
+            self.sfnn_ft_fp16 = true;
+            self.sfnn_ft_fp16_grad = true;
+            self.sfnn_ft_fp16_act = true;
+            self.sfnn_ft_fp16_moments = true;
+        }
+    }
     fn sfnn_ft_revive_contribution_threshold(&self) -> f64 {
         self.sfnn_ft_revive_contribution_threshold.unwrap_or(0.01)
     }
@@ -5695,6 +5710,9 @@ impl Args {
         }
         if self.sfnn_ft_fp16_act && !self.sfnn_ft_fp16_grad {
             return Err("--sfnn-ft-fp16-act requires --sfnn-ft-fp16-grad and --sfnn-ft-fp16".into());
+        }
+        if self.sfnn_ft_fp16_moments && !self.sfnn_ft_fp16 {
+            return Err("--sfnn-ft-fp16-moments requires --sfnn-ft-fp16".into());
         }
         if self.sfnn_ft_fp16_grad && (!self.sfnn_ft_fp16 || self.sfnn_ft_saturation_penalty != 0.0) {
             return Err("--sfnn-ft-fp16-grad requires --sfnn-ft-fp16 and FT saturation penalty off".into());
@@ -12942,7 +12960,8 @@ fn main() {
         eprintln!("error: {e}");
         std::process::exit(2);
     });
-    let args = Args::parse_from(raw_args);
+    let mut args = Args::parse_from(raw_args);
+    args.apply_all_optim();
     // `--count-teacher` operates standalone (no training): print position
     // counts for the supplied teacher path(s) and exit.
     if args.count_teacher {
@@ -18424,7 +18443,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
             args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
         if args.sfnn_ft_fp16 {
-            print_startup_kv("SFNN FT precision", format!("FP16 forward weights; FP16 activations={}; scaled FP16 temporary gradients={}; FP32 master/optimizer and FP32 validation (experimental)", args.sfnn_ft_fp16_act, args.sfnn_ft_fp16_grad));
+            print_startup_kv("SFNN FT precision", format!("FP16 forward weights; FP16 activations={}; scaled FP16 temporary gradients={}; scaled FP16 optimizer moments={}; FP32 master and validation (experimental)", args.sfnn_ft_fp16_act, args.sfnn_ft_fp16_grad, args.sfnn_ft_fp16_moments));
         }
         if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
             print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
@@ -19187,6 +19206,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         if args.sfnn_ft_fp16 { ctx.set_sfnn_ft_fp16(true).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16_grad { ctx.set_sfnn_ft_fp16_grad(true).map_err(|e| e.to_string())?; }
         if args.sfnn_ft_fp16_act { ctx.set_sfnn_ft_fp16_act(true).map_err(|e| e.to_string())?; }
+        runner.set_ft_fp16_moments(&ctx, args.sfnn_ft_fp16_moments).map_err(|e| e.to_string())?;
         if explicit_profile_step || diagnostic_profile_step {
             let profile = runner
                 .step_profiled_no_readback_with_update_lr_multipliers_and_dirty_buckets(
@@ -19259,6 +19279,10 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if clipped != 0 {
                 eprintln!("  WARN: {clipped} scaled FT gradients exceeded FP16 range in this superbatch and were clipped");
             }
+        }
+        if progress_for_step.is_some_and(|p| p.batch_in_superbatch == p.batches_per_superbatch) {
+            let clipped = runner.take_ft_fp16_moments_clipped(&ctx).map_err(|e| e.to_string())?;
+            if clipped != 0 { eprintln!("  WARN: {clipped} scaled FT optimizer moments exceeded FP16 range and were clipped"); }
         }
         if is_optimizer_step {
             optimizer_updates += 1;
@@ -27045,6 +27069,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_ft_fp16={}", args.sfnn_ft_fp16),
         format!("sfnn_ft_fp16_grad={}", args.sfnn_ft_fp16_grad),
         format!("sfnn_ft_fp16_act={}", args.sfnn_ft_fp16_act),
+        format!("sfnn_ft_fp16_moments={}", args.sfnn_ft_fp16_moments),
         format!("sfnn_qat_l2={}", args.sfnn_qat_l2 && args.non_bn_layer_qat()),
         format!("sfnn_qat_l3={}", args.sfnn_qat_l3 && args.non_bn_layer_qat()),
         format!("sfnn_bn_qat={}", args.sfnn_bn_qat),
@@ -27343,6 +27368,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16_grad=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16_act=");
+    let signature = resume_signature_without_line(&signature, "sfnn_ft_fp16_moments=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l2=");
     let signature = resume_signature_without_line(&signature, "sfnn_qat_l3=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat=");
@@ -28791,7 +28817,8 @@ mod tests {
             "sfnn_qat_l1":{"epoch1":true,"epoch6":false},
             "sfnn_ft_fp16":{"epoch1":false,"epoch10":true},
             "sfnn_ft_fp16_grad":{"epoch1":false,"epoch10":true},
-            "sfnn_ft_fp16_act":{"epoch1":false,"epoch10":true}
+            "sfnn_ft_fp16_act":{"epoch1":false,"epoch10":true},
+            "sfnn_ft_fp16_moments":{"epoch1":false,"epoch10":true}
         }"#).unwrap();
         let raw = vec!["bulletou".into(), "--settings-file".into(), path.as_os_str().to_owned()];
         let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
@@ -28799,11 +28826,20 @@ mod tests {
         assert!(!ninth.sfnn_ft_fp16);
         assert!(!ninth.sfnn_ft_fp16_grad);
         assert!(!ninth.sfnn_ft_fp16_act);
+        assert!(!ninth.sfnn_ft_fp16_moments);
         let mut tenth = args_at_epoch(&args, 10).unwrap();
         assert!(tenth.sfnn_ft_fp16);
         assert!(tenth.sfnn_ft_fp16_grad);
         assert!(tenth.sfnn_ft_fp16_act);
+        assert!(tenth.sfnn_ft_fp16_moments);
         assert!(resume_signature_matches(&resume_signature(&ninth), &tenth));
+        let mut shortcut = ninth.clone();
+        shortcut.all_optim = true;
+        shortcut.apply_all_optim();
+        assert!(shortcut.sfnn_ft_fp16 && shortcut.sfnn_ft_fp16_grad && shortcut.sfnn_ft_fp16_act && shortcut.sfnn_ft_fp16_moments);
+        shortcut.validate_arch_flags().unwrap();
+        let shortcut_ninth = args_at_epoch(&shortcut, 9).unwrap();
+        assert!(shortcut_ninth.sfnn_ft_fp16 && shortcut_ninth.sfnn_ft_fp16_grad && shortcut_ninth.sfnn_ft_fp16_act && shortcut_ninth.sfnn_ft_fp16_moments);
         let mut dense_qat = tenth.clone();
         dense_qat.sfnn_qat_l1 = true;
         dense_qat.sfnn_qat_l2 = true;

@@ -187,7 +187,7 @@ class GridSearchTests(unittest.TestCase):
                 self.assertEqual(grid.resolve_epoch_settings(settings, epoch)[key], epoch == 3)
 
     def test_ft_fp16_epoch_settings(self):
-        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act"):
+        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"):
             settings = {key: {"epoch1": False, "epoch10": True}}
             self.assertFalse(grid.resolve_epoch_settings(settings, 9)[key])
             self.assertTrue(grid.resolve_epoch_settings(settings, 10)[key])
@@ -197,6 +197,11 @@ class GridSearchTests(unittest.TestCase):
             self.assertTrue(grid.resolve_epoch_settings({key: {"epoch3": True}}, 20)[key])
             with self.assertRaisesRegex(ValueError, "true/false"):
                 grid.resolve_epoch_settings({key: {"epoch3": 1}}, 1)
+
+    def test_all_optim_grid_setting(self):
+        plan = self.plan(["--grid", "all-optim", "false", "true"])
+        self.assertEqual({trial["settings"]["all_optim"] for trial in plan["trials"]}, {False, True})
+        self.assertIn("all_optim", grid.COMMON_COLUMNS)
 
     def test_ft_factorizer_epoch_switch(self):
         schedule={"epoch1": True, "epoch3": False}

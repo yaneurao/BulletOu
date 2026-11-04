@@ -8,4 +8,8 @@
 
 さらに `"sfnn_ft_fp16_act": true` を指定すると、FTのCReLU後の活性値をFP16で保持し、その丸め後の値をpairwise計算と逆伝播に使います。既定値は `false` で、上記2項目を有効にする必要があります。1に近い活性値が1に丸められると、そのユニットのCReLU逆伝播は飽和として扱われます。batch 65,536・FT幅2,304では、FP16勾配用とは別に約576 MiBのGPUメモリを使います。
 
-現在はFT 2304幅の HalfKA_hm2、batch 1024以上、FT factorizerなし、FT BNなしの直接学習に限ります。L1/L2/L3のQATとは併用できますが、FT自体のQATとの併用はできません。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau schedule とworker modeには対応しません。tataraの `--all-optim` とは異なり、optimizer状態のFP16化やTF32は含みません。
+`"sfnn_ft_fp16_moments": true` を併用すると、FT重みのoptimizerのmomentumとvarianceをスケーリングしてFP16で保持します。既定値は `false` で、`sfnn_ft_fp16` が必要です。tataraと同じくmomentumに2²⁸、varianceに2⁴⁰を掛けて保存します。丸め・小さい値のゼロ化・範囲を超えた値のクリップにより、学習結果はFP32と異なります。範囲超過はsuperbatchごとに警告します。FP32 masterとslow weightsは維持し、checkpoint保存時にはmomentumとvarianceをFP32に戻すため、設定を変更して再開できます。FT幅2,304・入力73,305では追加で約644 MiBのGPUメモリを使います。
+
+`--all-optim` または設定ファイルの `"all_optim": true` は、上記4つのFP16設定をまとめて有効にする実験用の省略指定です。各設定は個別にも指定できます。`all_optim` 自体はepoch別指定には対応しません。tataraの `--all-optim` と異なりTF32は有効にしません。
+
+現在はFT 2304幅の HalfKA_hm2、batch 1024以上、FT factorizerなし、FT BNなしの直接学習に限ります。L1/L2/L3のQATとは併用できますが、FT自体のQATとの併用はできません。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau schedule とworker modeには対応しません。これらの設定にはTF32は含まれません。
