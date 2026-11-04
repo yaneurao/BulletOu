@@ -19,7 +19,7 @@ use super::SparseInputType;
 use crate::shogi::{
     BonaPiece, PackedSfenValue, ShogiBoard,
     bona_piece::{E_KING, F_KING, FE_HAND_END},
-    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece},
+    types::{BOARD_PIECE_TYPES, Color, HAND_PIECE_TYPES, Piece, PieceType, Square},
 };
 
 // =============================================================================
@@ -148,6 +148,18 @@ pub(crate) fn fill_halfka_hm2_feature_indices_from_board(
     (count, count)
 }
 
+#[inline]
+fn group_board_squares(board: &ShogiBoard) -> [u128; 30] {
+    let mut groups = [0u128; 30];
+    for (square, &piece) in board.board.iter().enumerate() {
+        if piece.piece_type != PieceType::None && piece.piece_type != PieceType::King {
+            let group = (piece.piece_type as usize) * 2 + piece.color as usize;
+            groups[group] |= 1u128 << square;
+        }
+    }
+    groups
+}
+
 fn map_halfka_hm2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F) {
     let stm = board.side_to_move;
     let nstm = stm.opponent();
@@ -161,10 +173,18 @@ fn map_halfka_hm2_features<F: FnMut(usize, usize)>(board: &ShogiBoard, mut f: F)
     let stm_ksq = if stm == Color::Black { stm_king_sq.index() } else { stm_king_sq.inverse().index() };
     let nstm_ksq = if nstm == Color::Black { nstm_king_sq.index() } else { nstm_king_sq.inverse().index() };
 
+    // Group squares in one board scan, then enumerate piece type, color and
+    // square in the same order as board.pieces() did. Keeping the order also
+    // preserves the FP32 accumulation order in the FT forward pass.
+    let squares_by_piece = group_board_squares(board);
+
     // 盤上駒 (王以外)
     for &pt in &BOARD_PIECE_TYPES {
         for color in [Color::Black, Color::White] {
-            for sq in board.pieces(color, pt) {
+            let mut squares = squares_by_piece[(pt as usize) * 2 + color as usize];
+            while squares != 0 {
+                let sq = Square::from_index(squares.trailing_zeros() as usize);
+                squares &= squares - 1;
                 let piece = Piece::new(color, pt);
 
                 let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
@@ -236,6 +256,32 @@ mod tests {
     use crate::shogi::{PieceType, Square};
 
     use super::*;
+
+    #[test]
+    fn grouped_squares_match_original_board_iteration() {
+        let mut state = 0x92a1_73b5u32;
+        for _ in 0..2048 {
+            let mut board = ShogiBoard::default();
+            for piece in &mut board.board {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let pt = PieceType::from_u8(((state >> 16) % 15) as u8);
+                let color = if state & 0x8000_0000 == 0 { Color::Black } else { Color::White };
+                *piece = Piece::new(color, pt);
+            }
+            let groups = group_board_squares(&board);
+            for &pt in &BOARD_PIECE_TYPES {
+                for color in [Color::Black, Color::White] {
+                    let mut bits = groups[(pt as usize) * 2 + color as usize];
+                    let mut actual = Vec::new();
+                    while bits != 0 {
+                        actual.push(Square::from_index(bits.trailing_zeros() as usize));
+                        bits &= bits - 1;
+                    }
+                    assert_eq!(actual, board.pieces(color, pt).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_dimensions() {
