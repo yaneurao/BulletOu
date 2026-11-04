@@ -9382,6 +9382,12 @@ mod ffi {
             output: *mut BulletOuCudaCppF32Buffer, raw: *mut BulletOuCudaCppI32Buffer,
             batch: usize, inputs: usize, outputs: usize, stacks: usize, packed: i32) -> i32;
         #[cfg(test)]
+        pub fn bulletou_test_l1_to_ft_half_gradient(ctx: *mut BulletOuCudaCppContext,
+            dy: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
+            buckets: *mut BulletOuCudaCppI32Buffer, activations: *mut BulletOuCudaCppF32Buffer,
+            result: *mut BulletOuCudaCppF32Buffer, bias: *mut BulletOuCudaCppF32Buffer,
+            batch: usize, width: usize, stacks: usize, fused: i32) -> i32;
+        #[cfg(test)]
         pub fn bulletou_test_dense_l1_16(ctx: *mut BulletOuCudaCppContext,
             input: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
             bias: *mut BulletOuCudaCppF32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
@@ -10307,6 +10313,42 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn fused_l1_ft_half_gradient_matches_separate_kernels() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, width, stacks) = (1027usize, 2304usize, 8usize);
+        let dy: Vec<f32> = (0..batch*16).map(|i| if i / 16 == 2 { 1.0 } else { ((i * 73 % 101) as f32 - 50.0) * 0.000003 }).collect();
+        let weights: Vec<f32> = (0..stacks*16*width).map(|i| ((i * 31 % 127) as f32 - 63.0) / 128.0).collect();
+        let activations: Vec<f32> = (0..2*batch*width).map(|i| match i % 23 {
+            0 => 0.0, 1 => 1.0, 2 => 0.9999, _ => (i % 997) as f32 / 997.0
+        }).collect();
+        let buckets: Vec<i32> = (0..batch).map(|i| match i { 0 => -1, 1 => stacks as i32, _ => (i % stacks) as i32 }).collect();
+        let dy = F32Buffer::from_host(&ctx, &dy).unwrap();
+        let weights = F32Buffer::from_host(&ctx, &weights).unwrap();
+        let activations = F32Buffer::from_host(&ctx, &activations).unwrap();
+        let buckets = I32Buffer::from_host(&ctx, &buckets).unwrap();
+        let mut results = Vec::new();
+        let mut biases = Vec::new();
+        for fused in [0, 1, 2] {
+            let result = F32Buffer::new(&ctx, 2*batch*width).unwrap();
+            let bias = F32Buffer::new(&ctx, width).unwrap();
+            bias.fill(&ctx, 0.0).unwrap();
+            check(unsafe { ffi::bulletou_test_l1_to_ft_half_gradient(ctx.as_ptr(), dy.as_ptr(), weights.as_ptr(),
+                buckets.as_ptr(), activations.as_ptr(), result.as_ptr(), bias.as_ptr(), batch, width, stacks, fused) }).unwrap();
+            results.push(result.download(&ctx).unwrap());
+            biases.push(bias.download(&ctx).unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+        for bias in &biases[1..] {
+            for (old, new) in biases[0].iter().zip(bias) {
+                assert!((old - new).abs() <= 1e-5, "bias {old} != {new}");
+            }
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn qat_packed_l1_matches_scalar_integer_reference() {

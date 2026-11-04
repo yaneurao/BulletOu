@@ -6319,6 +6319,92 @@ __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float*
     }
     dx[j]=sum;
 }
+
+// Combine the two perspectives' L1 input gradients with pairwise/CReLU
+// backward. This avoids writing and rereading batch * FT-width floats.
+__global__ void sfnn_l1_to_ft_half_gradient(const float* dy, const float* w, const int* buckets,
+    const __half* activations, __half* gradients, float* bias, unsigned long long* clipped,
+    size_t batch, size_t width, size_t stacks) {
+    const size_t pairwise = width / 2;
+    const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (tid >= batch * pairwise) return;
+    const size_t sample = tid / pairwise, pair = tid % pairwise;
+    const int bucket = buckets[sample];
+    float stm_gradient = 0.0f, nstm_gradient = 0.0f;
+    if (bucket >= 0 && static_cast<size_t>(bucket) < stacks) {
+        #pragma unroll
+        for (size_t out = 0; out < 16; ++out) {
+            const float grad = dy[sample * 16 + out];
+            if (grad != 0.0f) {
+                const size_t weight = (static_cast<size_t>(bucket) * 16 + out) * width + pair;
+                stm_gradient += grad * w[weight];
+                nstm_gradient += grad * w[weight + pairwise];
+            }
+        }
+    }
+    const size_t i = sample * width + pair, view_size = batch * width;
+    const float s0 = __half2float(activations[i]), s1 = __half2float(activations[i + pairwise]);
+    const float n0 = __half2float(activations[view_size + i]), n1 = __half2float(activations[view_size + i + pairwise]);
+    stm_gradient *= SFNN_PAIRWISE_SCALE;
+    nstm_gradient *= SFNN_PAIRWISE_SCALE;
+    const float sg0 = crelu_pre_gradient_from_value(s0, stm_gradient * s1);
+    const float sg1 = crelu_pre_gradient_from_value(s1, stm_gradient * s0);
+    const float ng0 = crelu_pre_gradient_from_value(n0, nstm_gradient * n1);
+    const float ng1 = crelu_pre_gradient_from_value(n1, nstm_gradient * n0);
+    const float scale = 16384.0f * static_cast<float>(batch);
+    gradients[i] = sfnn_scaled_half_gradient(sg0, scale, clipped);
+    gradients[i + pairwise] = sfnn_scaled_half_gradient(sg1, scale, clipped);
+    gradients[view_size + i] = sfnn_scaled_half_gradient(ng0, scale, clipped);
+    gradients[view_size + i + pairwise] = sfnn_scaled_half_gradient(ng1, scale, clipped);
+    if (sg0 + ng0 != 0.0f) atomicAdd(&bias[pair], sg0 + ng0);
+    if (sg1 + ng1 != 0.0f) atomicAdd(&bias[pair + pairwise], sg1 + ng1);
+}
+
+extern "C" int bulletou_test_l1_to_ft_half_gradient(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* dy, BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppI32Buffer* buckets,
+    BulletOuCudaCppF32Buffer* activations, BulletOuCudaCppF32Buffer* result, BulletOuCudaCppF32Buffer* bias,
+    size_t batch, size_t width, size_t stacks, int fused) {
+    const size_t n = batch * width;
+    if (!ctx || width % 2 || validate_buffer(ctx, dy, batch * 16, "test L1 dy") ||
+        validate_buffer(ctx, weights, stacks * 16 * width, "test L1 weights") ||
+        validate_i32_buffer(ctx, buckets, batch, "test L1 buckets") ||
+        validate_buffer(ctx, activations, 2 * n, "test FT activations") ||
+        validate_buffer(ctx, result, 2 * n, "test FT result") || validate_buffer(ctx, bias, width, "test FT bias")) return -1;
+    __half *act = nullptr, *out = nullptr;
+    float* dx = nullptr;
+    cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&act), 2 * n * sizeof(__half));
+    if (status != cudaSuccess) return fail("test FT activations allocation", status);
+    status = cudaMalloc(reinterpret_cast<void**>(&out), 2 * n * sizeof(__half));
+    if (status != cudaSuccess) { cudaFree(act); return fail("test FT gradient allocation", status); }
+    status = cudaMalloc(reinterpret_cast<void**>(&dx), n * sizeof(float));
+    if (status != cudaSuccess) { cudaFree(out); cudaFree(act); return fail("test L1 gradient allocation", status); }
+    constexpr int threads = 256;
+    const unsigned blocks = static_cast<unsigned>((n + threads - 1) / threads);
+    const unsigned pairs = static_cast<unsigned>((n / 2 + threads - 1) / threads);
+    sfnn_test_half_grad_convert<<<blocks,threads,0,ctx->stream>>>(activations->ptr, act, n, 1.0f);
+    sfnn_test_half_grad_convert<<<blocks,threads,0,ctx->stream>>>(activations->ptr + n, act + n, n, 1.0f);
+    if (fused == 1) {
+        sfnn_l1_to_ft_half_gradient<<<pairs,threads,0,ctx->stream>>>(dy->ptr, weights->ptr, buckets->ptr,
+            act, out, bias->ptr, nullptr, batch, width, stacks);
+    } else {
+        if (fused == 2) {
+            sfnn_stacked_affine_backward_kernel<<<blocks,threads,0,ctx->stream>>>(nullptr, dy->ptr, weights->ptr,
+                buckets->ptr, dx, nullptr, nullptr, batch, width, 16, stacks, 0);
+        } else {
+            bn_l1_input_gradient<16><<<blocks,threads,0,ctx->stream>>>(dy->ptr, weights->ptr, nullptr,
+                buckets->ptr, dx, batch, width, stacks, 0.0f);
+        }
+        sfnn_pairwise_l0_pregrad_kernel<<<pairs,threads,0,ctx->stream>>>(activations->ptr, activations->ptr + n,
+            dx, nullptr, nullptr, bias->ptr, batch, width, FtSaturationConfig{}, false, out, out + n,
+            16384.0f * static_cast<float>(batch), nullptr, act, act + n);
+    }
+    const float inv_scale = 1.0f / (16384.0f * static_cast<float>(batch));
+    sfnn_test_half_grad_decode<<<blocks,threads,0,ctx->stream>>>(out, result->ptr, n, inv_scale);
+    sfnn_test_half_grad_decode<<<blocks,threads,0,ctx->stream>>>(out + n, result->ptr + n, n, inv_scale);
+    const int rc = check_kernel_launch("test fused L1 FT gradient");
+    cudaFree(dx); cudaFree(out); cudaFree(act);
+    return rc;
+}
 struct CompactL1AxisGradient {
     float *weights, *biases;
     size_t stacks, king_dim, hand_dim;
@@ -6969,6 +7055,24 @@ int launch_sfnn_apply_residual_count_gates_to_gradients(
 int launch_ft_guard_fused_prepare(BulletOuCudaCppContext* ctx,
     const float* a,const float* b,float* gb,size_t batch,size_t ft);
 
+int prepare_sfnn_ft_half_gradients(BulletOuCudaCppContext* ctx, size_t half_len) {
+    if (ctx->sfnn_ft_half_grad_clipped == nullptr) {
+        cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half_grad_clipped), sizeof(unsigned long long));
+        if (status != cudaSuccess) return fail("FT FP16 gradient counter allocation", status);
+        status = cudaMemsetAsync(ctx->sfnn_ft_half_grad_clipped, 0, sizeof(unsigned long long), ctx->stream);
+        if (status != cudaSuccess) return fail("FT FP16 gradient counter initialization", status);
+    }
+    if (ctx->sfnn_ft_half_grads_len < 2 * half_len) {
+        if (ctx->sfnn_ft_half_grads != nullptr) cudaFree(ctx->sfnn_ft_half_grads);
+        ctx->sfnn_ft_half_grads = nullptr;
+        ctx->sfnn_ft_half_grads_len = 0;
+        const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half_grads), 2 * half_len * sizeof(__half));
+        if (status != cudaSuccess) return fail("FT FP16 gradient allocation", status);
+        ctx->sfnn_ft_half_grads_len = 2 * half_len;
+    }
+    return 0;
+}
+
 int launch_sfnn_inverse_index_l0_backward(
     BulletOuCudaCppContext* ctx,
     const int* stm_indices,
@@ -6983,7 +7087,7 @@ int launch_sfnn_inverse_index_l0_backward(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size, float ft_factorizer_alpha) {
+    size_t ft_size, float ft_factorizer_alpha, bool prepared_l1_gradients = false) {
     constexpr int threads = 256;
     int blocks = 0;
     if(launch_ft_guard_fused_prepare(ctx,stm_l0,nstm_l0,l0b_gradients,batch,ft_size)) return -1;
@@ -6992,21 +7096,10 @@ int launch_sfnn_inverse_index_l0_backward(
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr && ctx->sfnn_ft_fp16_grad;
     if (ctx->sfnn_ft_fp16_grad && !half_grad) return fail_message("FT FP16 gradients requested for an unsupported training path");
     const size_t half_len = batch * ft_size;
-    if (half_grad && ctx->sfnn_ft_half_grad_clipped == nullptr) {
-        cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half_grad_clipped), sizeof(unsigned long long));
-        if (status != cudaSuccess) return fail("FT FP16 gradient counter allocation", status);
-        status = cudaMemsetAsync(ctx->sfnn_ft_half_grad_clipped, 0, sizeof(unsigned long long), ctx->stream);
-        if (status != cudaSuccess) return fail("FT FP16 gradient counter initialization", status);
-    }
-    if (half_grad && ctx->sfnn_ft_half_grads_len < 2 * half_len) {
-        if (ctx->sfnn_ft_half_grads != nullptr) cudaFree(ctx->sfnn_ft_half_grads);
-        ctx->sfnn_ft_half_grads = nullptr;
-        ctx->sfnn_ft_half_grads_len = 0;
-        const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half_grads), 2 * half_len * sizeof(__half));
-        if (status != cudaSuccess) return fail("FT FP16 gradient allocation", status);
-        ctx->sfnn_ft_half_grads_len = 2 * half_len;
-    }
+    if (half_grad && prepare_sfnn_ft_half_gradients(ctx, half_len)) return -1;
+    if (prepared_l1_gradients && !half_grad) return fail_message("fused L1 gradients require FT FP16 gradients");
     const float half_scale = 16384.0f * static_cast<float>(batch);
+    if (!prepared_l1_gradients) {
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
         return -1;
     }
@@ -7026,6 +7119,7 @@ int launch_sfnn_inverse_index_l0_backward(
         half_grad && ctx->sfnn_ft_fp16_act ? ctx->sfnn_ft_half_activations + half_len : nullptr);
     if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
         return -1;
+    }
     }
 
     if(ctx->bn[0].params) {
@@ -7484,6 +7578,24 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
 
+    bool prepared_l1_gradients = false;
+    const bool can_fuse_l1_ft = fuse_pairwise_l0 && ctx->sfnn_ft_fp16 && ctx->sfnn_ft_fp16_grad &&
+        ctx->sfnn_ft_fp16_act && !ctx->bn[0].params && !ctx->ft_guard.weights &&
+        input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 && l1_out == 16 &&
+        std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr &&
+        std::getenv("BULLETOU_FUSED_L1_FT_REFERENCE") == nullptr;
+    const auto launch_l1_ft = [&](const float* effective_weights) -> int {
+        if (prepare_sfnn_ft_half_gradients(ctx, batch * ft_size)) return -1;
+        int fused_blocks = 0;
+        if (block_count_1d(batch * (ft_size / 2), threads, &fused_blocks, "fused L1 FT gradient")) return -1;
+        sfnn_l1_to_ft_half_gradient<<<fused_blocks, threads, 0, ctx->stream>>>(
+            l1_gradients, effective_weights, buckets, ctx->sfnn_ft_half_activations,
+            ctx->sfnn_ft_half_grads, l0b_gradients, ctx->sfnn_ft_half_grad_clipped, batch, ft_size, num_stacks);
+        if (check_kernel_launch("fused L1 FT gradient")) return -1;
+        prepared_l1_gradients = true;
+        return 0;
+    };
+
     if (common_shard_l1 && !has_l1f && !has_l1ax && !qat_l1w) {
         const size_t group_output = l1_out / l1_group_count;
         const size_t row_input = l1_common_size + l1_shard_size;
@@ -7543,11 +7655,15 @@ int launch_sfnn_backward_kernels(
             && qat_l1w && num_stacks == 648 && batch >= 1024 && l1_out == 16;
         if (bucket_gather) {
             if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, num_stacks) != 0) return -1;
-            int input_blocks = 0;
-            if (block_count_1d(batch * ft_size, threads, &input_blocks, "sfnn L1 input gradient") != 0) return -1;
-            bn_l1_input_gradient<16><<<input_blocks, threads, 0, ctx->stream>>>(
-                l1_gradients, qat_l1w, nullptr, buckets, combined_gradients, batch, ft_size, num_stacks, 1.0f);
-            if (check_kernel_launch("sfnn L1 input gradient") != 0) return -1;
+            if (can_fuse_l1_ft) {
+                if (launch_l1_ft(qat_l1w)) return -1;
+            } else {
+                int input_blocks = 0;
+                if (block_count_1d(batch * ft_size, threads, &input_blocks, "sfnn L1 input gradient") != 0) return -1;
+                bn_l1_input_gradient<16><<<input_blocks, threads, 0, ctx->stream>>>(
+                    l1_gradients, qat_l1w, nullptr, buckets, combined_gradients, batch, ft_size, num_stacks, 1.0f);
+                if (check_kernel_launch("sfnn L1 input gradient") != 0) return -1;
+            }
             const CompactL1AxisGradient axis={has_l1ax ? l1axw_gradients : nullptr,
                 has_l1ax ? l1axb_gradients : nullptr, num_stacks, factorizer_king_axis_dim, factorizer_hand_axis_dim,
                 use_king_axis, use_hand_axis, use_progress_axis, use_king_hand_pair, use_king_progress_pair,
@@ -7674,7 +7790,9 @@ int launch_sfnn_backward_kernels(
         if (block_count_1d(l1_threads, threads, &blocks, "sfnn_stacked_affine_backward_kernel") != 0) {
             return -1;
         }
-        sfnn_stacked_affine_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
+        if (can_fuse_l1_ft && reduce_l1_params) {
+            if (launch_l1_ft(qat_l1w ? qat_l1w : l1w)) return -1;
+        } else sfnn_stacked_affine_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
             combined,
             l1_gradients,
             qat_l1w != nullptr ? qat_l1w : l1w,
@@ -7749,7 +7867,7 @@ int launch_sfnn_backward_kernels(
                 batch,
                 max_active,
                 input_size,
-                ft_size, ft_factorizer_alpha) != 0) {
+                ft_size, ft_factorizer_alpha, prepared_l1_gradients) != 0) {
             return -1;
         }
     } else {
