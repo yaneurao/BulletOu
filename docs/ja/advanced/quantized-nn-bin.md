@@ -101,6 +101,7 @@ CUDA SFNNでは次を個別に指定できます。すべてデフォルトOFF�
 - L2/L3: weightを64倍してint8範囲、biasを8128倍してint32範囲で丸めます。
 - L1・L2・L3のいずれかがOFFの場合、選択した層の重みだけを丸め、活性値はf32で計算します。
 - **L1・L2・L3をすべてON**にすると、tatara方式のdense QATになります。FTの出力を1/127刻みに切り捨て、L1〜L3を整数積和、整数活性化、L1 skipの整数加算で計算します。逆伝播は量子化後の重みと丸め前の連続活性値を使うSTEです。FT演算自体は浮動小数点で、エンジンの最後のFV_SCALE除算は含みません。
+- HalfKA_hm2・FT幅2304・batch 1024以上の非compact L1では、対応GPU上で整数L1を自動的に4要素ずつ計算します。整数出力とSTEは従来と同じです。batch 65,536・648 bucket・L1出力16の場合、追加GPUメモリは約167 MiBです。compact/grouped L1や非対応GPUでは従来のL1経路を使います。
 - FTのQAT指定は独立です。tataraと同様にFTを浮動小数点のままにするなら `sfnn_qat_ft: false` とし、L1・L2・L3を `true` にしてください。
 - 通常学習・worker・profiling・batches_per_updateに対応します。checkpointはFP32重みとoptimizer stateを保持し、既存checkpointからの再開時にも切り替えられます。
 - `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}` のようなepoch別指定にも対応します。

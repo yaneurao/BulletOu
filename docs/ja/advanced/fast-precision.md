@@ -8,4 +8,4 @@
 
 さらに `"sfnn_ft_fp16_act": true` を指定すると、FTのCReLU後の活性値をFP16で保持し、その丸め後の値をpairwise計算と逆伝播に使います。既定値は `false` で、上記2項目を有効にする必要があります。1に近い活性値が1に丸められると、そのユニットのCReLU逆伝播は飽和として扱われます。batch 65,536・FT幅2,304では、FP16勾配用とは別に約576 MiBのGPUメモリを使います。
 
-現在はFT 2304幅の HalfKA_hm2、batch 1024以上、FT factorizerなし、FT BNなし、QATなしの直接学習に限ります。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau schedule とworker modeには対応しません。tataraの `--all-optim` とは異なり、optimizer状態のFP16化やTF32は含みません。
+現在はFT 2304幅の HalfKA_hm2、batch 1024以上、FT factorizerなし、FT BNなしの直接学習に限ります。L1/L2/L3のQATとは併用できますが、FT自体のQATとの併用はできません。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau schedule とworker modeには対応しません。tataraの `--all-optim` とは異なり、optimizer状態のFP16化やTF32は含みません。

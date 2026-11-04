@@ -9373,6 +9373,15 @@ mod ffi {
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_take_ft_half_grad_clipped(ctx: *mut BulletOuCudaCppContext, out: *mut u64) -> i32;
         #[cfg(test)]
+        pub fn bulletou_test_qat_ft_lattice(ctx: *mut BulletOuCudaCppContext,
+            values: *mut BulletOuCudaCppF32Buffer, n: usize, fast: i32) -> i32;
+        #[cfg(test)]
+        pub fn bulletou_test_qat_packed_l1(ctx: *mut BulletOuCudaCppContext,
+            input: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
+            bias: *mut BulletOuCudaCppI32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer, raw: *mut BulletOuCudaCppI32Buffer,
+            batch: usize, inputs: usize, outputs: usize, stacks: usize, packed: i32) -> i32;
+        #[cfg(test)]
         pub fn bulletou_test_dense_l1_16(ctx: *mut BulletOuCudaCppContext,
             input: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
             bias: *mut BulletOuCudaCppF32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
@@ -10298,6 +10307,93 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn qat_packed_l1_matches_scalar_integer_reference() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, outputs, stacks) = (19usize, 16usize, 3usize);
+        for inputs in [4usize, 12, 2304] {
+            let values: Vec<f32> = (0..batch*inputs).map(|i| {
+                let n = ((i*37) % 128) as f32;
+                let base = n / 127.0;
+                match i % 5 {
+                    0 => f32::from_bits(base.to_bits().saturating_sub(1)),
+                    1 => f32::from_bits(base.to_bits().saturating_add(1)),
+                    2 => -0.25,
+                    3 => 1.25,
+                    _ => base,
+                }
+            }).collect();
+            let weight_int: Vec<i32> = (0..stacks*outputs*inputs).map(|i| ((i*73 % 256) as i32) - 128).collect();
+            let weights: Vec<f32> = weight_int.iter().map(|&v| v as f32 / 64.0).collect();
+            let bias: Vec<i32> = (0..stacks*outputs).map(|i| match i % 3 { 0 => 2_147_483_000, 1 => -2_147_483_000, _ => (i as i32)*19 }).collect();
+            let buckets: Vec<i32> = (0..batch).map(|i| if i == 0 { -1 } else if i == 1 { stacks as i32 } else { (i % stacks) as i32 }).collect();
+            let weights_gpu = F32Buffer::from_host(&ctx, &weights).unwrap();
+            let bias_gpu = I32Buffer::from_host(&ctx, &bias).unwrap();
+            let buckets_gpu = I32Buffer::from_host(&ctx, &buckets).unwrap();
+            let a = F32Buffer::from_host(&ctx, &values).unwrap();
+            let b = F32Buffer::from_host(&ctx, &values).unwrap();
+            let scalar_out = F32Buffer::new(&ctx, batch*outputs).unwrap();
+            let packed_out = F32Buffer::new(&ctx, batch*outputs).unwrap();
+            let scalar_raw = I32Buffer::new(&ctx, batch*outputs).unwrap();
+            let packed_raw = I32Buffer::new(&ctx, batch*outputs).unwrap();
+            for (x, out, raw, mode) in [(&a, &scalar_out, &scalar_raw, 0), (&b, &packed_out, &packed_raw, 1)] {
+                check(unsafe { ffi::bulletou_test_qat_packed_l1(ctx.as_ptr(), x.as_ptr(), weights_gpu.as_ptr(),
+                    bias_gpu.as_ptr(), buckets_gpu.as_ptr(), out.as_ptr(), raw.as_ptr(),
+                    batch, inputs, outputs, stacks, mode) }).unwrap();
+            }
+            assert_eq!(a.download(&ctx).unwrap(), b.download(&ctx).unwrap());
+            let scalar_raw = scalar_raw.download(&ctx).unwrap();
+            let packed_raw = packed_raw.download(&ctx).unwrap();
+            assert_eq!(scalar_raw, packed_raw);
+            assert_eq!(scalar_out.download(&ctx).unwrap(), packed_out.download(&ctx).unwrap());
+            for sample in 0..batch {
+                for unit in 0..outputs {
+                    let bucket = buckets[sample];
+                    let expected = if bucket < 0 || bucket as usize >= stacks { 0 } else {
+                        let base = (bucket as usize*outputs+unit)*inputs;
+                        let sum: i64 = (0..inputs).map(|j| {
+                            let x = (f64::from(values[sample*inputs+j]) * 127.0).clamp(0.0,127.0).floor() as i64;
+                            x * i64::from(weight_int[base+j])
+                        }).sum();
+                        (sum + i64::from(bias[bucket as usize*outputs+unit])) as i32
+                    };
+                    assert_eq!(packed_raw[sample*outputs+unit], expected);
+                }
+            }
+        }
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn qat_ft_lattice_fast_matches_double_precision_at_boundaries() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let mut values = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0, 0.0, 1.0];
+        for n in 0..=127 {
+            let center = (n as f32) / 127.0;
+            for delta in -3i64..=3 {
+                let bits = (center.to_bits() as i64 + delta).clamp(0, u32::MAX as i64) as u32;
+                values.push(f32::from_bits(bits));
+            }
+        }
+        let mut state = 0x1234_5678u32;
+        for _ in 0..200_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            values.push(f32::from_bits(state));
+            values.push((state >> 8) as f32 / 16_777_216.0);
+        }
+        let reference = F32Buffer::from_host(&ctx, &values).unwrap();
+        let fast = F32Buffer::from_host(&ctx, &values).unwrap();
+        for (buffer, flag) in [(&reference, 0), (&fast, 1)] {
+            check(unsafe { ffi::bulletou_test_qat_ft_lattice(ctx.as_ptr(), buffer.as_ptr(), values.len(), flag) }).unwrap();
+        }
+        let expected = reference.download(&ctx).unwrap();
+        let actual = fast.download(&ctx).unwrap();
+        for (i, (&a, &b)) in expected.iter().zip(&actual).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "input={:?} bits={:08x}, index={i}", values[i], values[i].to_bits());
+        }
+    }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn dense_l1_16_reuses_input_without_changing_outputs() {

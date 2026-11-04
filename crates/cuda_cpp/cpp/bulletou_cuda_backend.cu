@@ -140,6 +140,11 @@ struct BulletOuCudaCppContext {
     size_t dense_qat_l2_raw_len = 0;
     int* dense_qat_l1_bias = nullptr;
     size_t dense_qat_l1_bias_len = 0;
+    int* dense_qat_packed_input = nullptr;
+    size_t dense_qat_packed_input_len = 0;
+    int* dense_qat_packed_weights = nullptr;
+    size_t dense_qat_packed_weights_len = 0;
+    int dense_qat_dp4a_available = -1;
 };
 
 struct BulletOuCudaCppF32Buffer {
@@ -5558,9 +5563,88 @@ int launch_nnue_forward_kernels(
     return 0;
 }
 
-__global__ void dense_qat_ft_lattice_kernel(float* values, size_t n) {
+__global__ void dense_qat_ft_lattice_reference_kernel(float* values, size_t n) {
     const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(i<n) values[i]=static_cast<float>(floor(fmin(127.0,fmax(0.0,static_cast<double>(values[i])*127.0))))/127.0f;
+}
+
+__device__ __forceinline__ int dense_qat_lattice_integer(float value) {
+    const float x = fminf(1.0f, fmaxf(0.0f, value));
+    const float scaled = __fmul_rn(x, 127.0f);
+    int integer = __float2int_rd(scaled);
+    // A rounded FP32 product can land exactly on the next integer. The FMA
+    // recovers the sign of the residual without a slow FP64 operation.
+    if (__fmaf_rn(x, 127.0f, -static_cast<float>(integer)) < 0.0f) --integer;
+    return integer;
+}
+
+__global__ void dense_qat_ft_lattice_kernel(float* values, size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) values[i] = static_cast<float>(dense_qat_lattice_integer(values[i])) / 127.0f;
+}
+
+extern "C" int bulletou_test_qat_ft_lattice(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* values,
+    size_t n, int fast) {
+    if (!ctx || validate_buffer(ctx, values, n, "test QAT FT lattice")) return -1;
+    const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+    if (fast) dense_qat_ft_lattice_kernel<<<blocks,256,0,ctx->stream>>>(values->ptr, n);
+    else dense_qat_ft_lattice_reference_kernel<<<blocks,256,0,ctx->stream>>>(values->ptr, n);
+    return check_kernel_launch("test QAT FT lattice");
+}
+
+__global__ void dense_qat_lattice_pack(float* values, int* packed, size_t words) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= words) return;
+    const float4 x = reinterpret_cast<const float4*>(values)[i];
+    const int a = dense_qat_lattice_integer(x.x), b = dense_qat_lattice_integer(x.y);
+    const int c = dense_qat_lattice_integer(x.z), d = dense_qat_lattice_integer(x.w);
+    reinterpret_cast<float4*>(values)[i] = make_float4(static_cast<float>(a)/127.0f, static_cast<float>(b)/127.0f,
+        static_cast<float>(c)/127.0f, static_cast<float>(d)/127.0f);
+    packed[i] = static_cast<int>(static_cast<unsigned>(a) | (static_cast<unsigned>(b) << 8) |
+        (static_cast<unsigned>(c) << 16) | (static_cast<unsigned>(d) << 24));
+}
+
+__global__ void dense_qat_weights_pack(const float* weights, int* packed, size_t words) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= words) return;
+    const float4 w = reinterpret_cast<const float4*>(weights)[i];
+    const unsigned a = static_cast<unsigned>(__float2int_rn(w.x * 64.0f)) & 255u;
+    const unsigned b = static_cast<unsigned>(__float2int_rn(w.y * 64.0f)) & 255u;
+    const unsigned c = static_cast<unsigned>(__float2int_rn(w.z * 64.0f)) & 255u;
+    const unsigned d = static_cast<unsigned>(__float2int_rn(w.w * 64.0f)) & 255u;
+    packed[i] = static_cast<int>(a | (b << 8) | (c << 16) | (d << 24));
+}
+
+__device__ __forceinline__ int dense_qat_dp4a(int a, int b, int sum) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, sum);
+#else
+    const unsigned ua = static_cast<unsigned>(a), ub = static_cast<unsigned>(b);
+    for (int shift = 0; shift < 32; shift += 8)
+        sum += static_cast<int>(static_cast<signed char>(ua >> shift)) * static_cast<int>(static_cast<signed char>(ub >> shift));
+    return sum;
+#endif
+}
+
+__global__ void dense_qat_l1_packed(const int* input, const int* weights, const int* bias,
+    const int* buckets, float* output, int* raw, size_t batch, size_t inputs, size_t outputs, size_t stacks) {
+    const unsigned lane = threadIdx.x & 31u;
+    const size_t i = static_cast<size_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (i >= batch * outputs) return;
+    const size_t sample = i / outputs, unit = i % outputs;
+    const int bucket = buckets[sample];
+    if (bucket < 0 || static_cast<size_t>(bucket) >= stacks) { if (lane == 0) { raw[i] = 0; output[i] = 0; } return; }
+    const size_t words = inputs / 4, stack = static_cast<size_t>(bucket);
+    const int* x = input + sample * words;
+    const int* w = weights + (stack * outputs + unit) * words;
+    int sum = 0;
+    for (size_t j = lane; j < words; j += 32) sum = dense_qat_dp4a(x[j], w[j], sum);
+    for (unsigned shift = 16; shift; shift >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, shift);
+    if (lane == 0) {
+        const int v = static_cast<int>(static_cast<long long>(sum) + static_cast<long long>(bias[stack * outputs + unit]));
+        raw[i] = v;
+        output[i] = static_cast<float>(static_cast<double>(v) / 8128.0);
+    }
 }
 
 __global__ void dense_qat_l1_warp_kernel(const float* input,const float* weights,const int* bias,
@@ -5585,6 +5669,38 @@ __global__ void dense_qat_l1_warp_kernel(const float* input,const float* weights
         const int v=static_cast<int>(sum+static_cast<long long>(bias[stack*outputs+unit]));
         raw[i]=v; output[i]=static_cast<float>(static_cast<double>(v)/8128.0);
     }
+}
+
+extern "C" int bulletou_test_qat_packed_l1(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* input,
+    BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppI32Buffer* bias, BulletOuCudaCppI32Buffer* buckets,
+    BulletOuCudaCppF32Buffer* output, BulletOuCudaCppI32Buffer* raw,
+    size_t batch, size_t inputs, size_t outputs, size_t stacks, int packed) {
+    if (!ctx || inputs % 4 || validate_buffer(ctx, input, batch*inputs, "test QAT input") ||
+        validate_buffer(ctx, weights, stacks*outputs*inputs, "test QAT weights") ||
+        validate_i32_buffer(ctx, bias, stacks*outputs, "test QAT bias") ||
+        validate_i32_buffer(ctx, buckets, batch, "test QAT buckets") ||
+        validate_buffer(ctx, output, batch*outputs, "test QAT output") ||
+        validate_i32_buffer(ctx, raw, batch*outputs, "test QAT raw")) return -1;
+    int* packed_input = nullptr;
+    int* packed_weights = nullptr;
+    if (packed) {
+        cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&packed_input), batch*inputs);
+        if (status != cudaSuccess) return fail("test QAT packed input allocation", status);
+        status = cudaMalloc(reinterpret_cast<void**>(&packed_weights), stacks*outputs*inputs);
+        if (status != cudaSuccess) { cudaFree(packed_input); return fail("test QAT packed weights allocation", status); }
+        const size_t input_words = batch*inputs/4, weight_words = stacks*outputs*inputs/4;
+        dense_qat_lattice_pack<<<static_cast<unsigned>((input_words+255)/256),256,0,ctx->stream>>>(input->ptr, packed_input, input_words);
+        dense_qat_weights_pack<<<static_cast<unsigned>((weight_words+255)/256),256,0,ctx->stream>>>(weights->ptr, packed_weights, weight_words);
+    } else dense_qat_ft_lattice_reference_kernel<<<static_cast<unsigned>((batch*inputs+255)/256),256,0,ctx->stream>>>(input->ptr, batch*inputs);
+    const unsigned blocks = static_cast<unsigned>((batch*outputs+7)/8);
+    if (packed) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(packed_input, packed_weights, bias->ptr,
+        buckets->ptr, output->ptr, raw->ptr, batch, inputs, outputs, stacks);
+    else dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(input->ptr, weights->ptr, bias->ptr,
+        buckets->ptr, output->ptr, raw->ptr, batch, inputs, outputs, stacks, 1, 0, 0);
+    const int result = check_kernel_launch("test QAT packed L1");
+    if (packed_input) cudaFree(packed_input);
+    if (packed_weights) cudaFree(packed_weights);
+    return result;
 }
 
 __global__ void dense_qat_l1_activations_kernel(const int* raw,float* output,size_t batch,size_t hidden,int skip) {
@@ -5743,7 +5859,7 @@ int launch_sfnn_forward_kernels(
     }
 
     const int* ft_sample_order = nullptr;
-    const bool sort_hm2_ft = !ctx->dense_qat && !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
+    const bool sort_hm2_ft = !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
         && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
     if (ctx->sfnn_ft_fp16 && !sort_hm2_ft) return fail_message("FT FP16 requested for an unsupported forward shape");
@@ -5839,13 +5955,40 @@ int launch_sfnn_forward_kernels(
     if (ctx->dense_qat) {
         if(ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params || has_l1f || has_l1ax || has_l2f || has_l2ax || has_l3f || has_l3ax)
             return fail_message("dense QAT requires folded L1 and unfactorized L2/L3 without BN");
-        if(block_count_1d(batch*ft_size,threads,&blocks,"dense QAT FT lattice"))return -1;
-        dense_qat_ft_lattice_kernel<<<blocks,threads,0,ctx->stream>>>(combined,batch*ft_size);
+        // The packed dot product uses i32 partial sums: 2304*127*128 fits i32.
+        // Compact/grouped layouts use the original coordinate-aware kernel.
+        const bool packed_candidate = input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
+            l1_group_count == 1 && l1_common_size == 0 && l1_shard_size == 0;
+        if (packed_candidate && ctx->dense_qat_dp4a_available < 0) {
+            int major = 0, minor = 0;
+            cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, ctx->device);
+            if (status != cudaSuccess) return fail("query CUDA compute capability", status);
+            status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, ctx->device);
+            if (status != cudaSuccess) return fail("query CUDA compute capability", status);
+            ctx->dense_qat_dp4a_available = major > 6 || (major == 6 && minor >= 1);
+        }
+        const bool packed_qat = packed_candidate && ctx->dense_qat_dp4a_available != 0;
+        if (packed_qat) {
+            const size_t input_words = batch * ft_size / 4;
+            const size_t weight_words = num_stacks * l1_out * ft_size / 4;
+            if (ensure_i32_scratch(&ctx->dense_qat_packed_input, &ctx->dense_qat_packed_input_len, input_words, "packed QAT input") ||
+                ensure_i32_scratch(&ctx->dense_qat_packed_weights, &ctx->dense_qat_packed_weights_len, weight_words, "packed QAT weights")) return -1;
+            if (block_count_1d(input_words, threads, &blocks, "packed QAT lattice")) return -1;
+            dense_qat_lattice_pack<<<blocks,threads,0,ctx->stream>>>(combined, ctx->dense_qat_packed_input, input_words);
+            if (check_kernel_launch("packed QAT lattice")) return -1;
+            if (block_count_1d(weight_words, threads, &blocks, "packed QAT weights")) return -1;
+            dense_qat_weights_pack<<<blocks,threads,0,ctx->stream>>>(l1w, ctx->dense_qat_packed_weights, weight_words);
+        } else {
+            if (block_count_1d(batch*ft_size,threads,&blocks,"dense QAT FT lattice")) return -1;
+            dense_qat_ft_lattice_kernel<<<blocks,threads,0,ctx->stream>>>(combined,batch*ft_size);
+        }
         if(check_kernel_launch("dense QAT FT lattice"))return -1;
         constexpr size_t warps=8;
         if(batch*l1_out > static_cast<size_t>(INT_MAX)*warps) return fail_message("dense QAT L1 grid overflow");
         blocks=static_cast<int>((batch*l1_out+warps-1)/warps);
-        dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(combined,l1w,ctx->dense_qat_l1_bias,buckets,
+        if (packed_qat) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(ctx->dense_qat_packed_input,
+            ctx->dense_qat_packed_weights,ctx->dense_qat_l1_bias,buckets,l1,ctx->dense_qat_l1_raw,batch,ft_size,l1_out,num_stacks);
+        else dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(combined,l1w,ctx->dense_qat_l1_bias,buckets,
             l1,ctx->dense_qat_l1_raw,batch,ft_size,l1_out,num_stacks,l1_group_count,l1_common_size,l1_shard_size);
         if(check_kernel_launch("dense QAT L1"))return -1;
         if(block_count_1d(batch*l1_hidden,threads,&blocks,"dense QAT L1 activation"))return -1;
@@ -6753,7 +6896,7 @@ int launch_sfnn_inverse_index_for_perspective(
     // tiny blocks in the large HalfKA_hm2 FT while retaining each element's
     // summation order. Empty rows can be skipped when accumulating: their
     // contribution is zero and the previous minibatch gradient must remain.
-    const bool hm2_gather = !ctx->dense_qat && n_features == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024
+    const bool hm2_gather = n_features == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024
         && std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr;
     if (hm2_gather) {
         dim3 block(64, 4);
@@ -6845,7 +6988,7 @@ int launch_sfnn_inverse_index_l0_backward(
     int blocks = 0;
     if(launch_ft_guard_fused_prepare(ctx,stm_l0,nstm_l0,l0b_gradients,batch,ft_size)) return -1;
     const bool half_grad = ctx->sfnn_ft_fp16 && !ctx->bn[0].params && !ctx->ft_guard.weights &&
-        !ctx->dense_qat && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
+        input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr && ctx->sfnn_ft_fp16_grad;
     if (ctx->sfnn_ft_fp16_grad && !half_grad) return fail_message("FT FP16 gradients requested for an unsupported training path");
     const size_t half_len = batch * ft_size;
@@ -8347,6 +8490,8 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (ctx->sfnn_ft_half_grads != nullptr) cudaFree(ctx->sfnn_ft_half_grads);
     if (ctx->sfnn_ft_half_grad_clipped != nullptr) cudaFree(ctx->sfnn_ft_half_grad_clipped);
     if (ctx->sfnn_ft_half_activations != nullptr) cudaFree(ctx->sfnn_ft_half_activations);
+    if (ctx->dense_qat_packed_input != nullptr) cudaFree(ctx->dense_qat_packed_input);
+    if (ctx->dense_qat_packed_weights != nullptr) cudaFree(ctx->dense_qat_packed_weights);
     if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
     if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
     if (ctx->bn_qat_partials != nullptr) cudaFree(ctx->bn_qat_partials);

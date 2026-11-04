@@ -5701,9 +5701,8 @@ impl Args {
         }
         if self.sfnn_ft_fp16 && (self.backend != BackendKind::CudaCpp || self.arch().feature != NnueArchFeature::Halfkahm2
             || self.arch().l1 != 2304 || effective_batch_size(self) < 1024 || self.lr_schedule == LrScheduleKind::Plateau
-            || self.ft_factorizer || self.sfnn_bn_ft || self.sfnn_qat_ft
-            || self.effective_sfnn_qat_l1() || self.sfnn_qat_l2 || self.sfnn_qat_l3) {
-            return Err("--sfnn-ft-fp16 requires 2304-wide HalfKA_hm2, batch >= 1024, FT BN/factorizer off and QAT off".into());
+            || self.ft_factorizer || self.sfnn_bn_ft || self.sfnn_qat_ft) {
+            return Err("--sfnn-ft-fp16 requires 2304-wide HalfKA_hm2, batch >= 1024, FT BN/factorizer and FT QAT off".into());
         }
         if !self.sfnn_bn_affine_lr_multiplier.is_finite() || self.sfnn_bn_affine_lr_multiplier < 0.0 {
             return Err("--sfnn-bn-affine-lr-multiplier must be finite and non-negative".into());
@@ -28786,7 +28785,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{
-            "teacher":"teacher.bin", "arch":"SFNN_halfkahm2_2304_15_64_k9k9_progress8",
+            "teacher":"teacher.bin", "backend":"cuda-cpp", "batch_size":65536,
+            "arch":"SFNN_halfkahm2_2304_15_64_k9k9_progress8",
             "sfnn_ft_factorizer":{"epoch1":true,"epoch5":false},
             "sfnn_qat_l1":{"epoch1":true,"epoch6":false},
             "sfnn_ft_fp16":{"epoch1":false,"epoch10":true},
@@ -28804,6 +28804,11 @@ mod tests {
         assert!(tenth.sfnn_ft_fp16_grad);
         assert!(tenth.sfnn_ft_fp16_act);
         assert!(resume_signature_matches(&resume_signature(&ninth), &tenth));
+        let mut dense_qat = tenth.clone();
+        dense_qat.sfnn_qat_l1 = true;
+        dense_qat.sfnn_qat_l2 = true;
+        dense_qat.sfnn_qat_l3 = true;
+        dense_qat.validate_arch_flags().unwrap();
         tenth.sfnn_ft_fp16_grad = false;
         assert!(tenth.validate_arch_flags().is_err());
         tenth.sfnn_ft_fp16_grad = true;
