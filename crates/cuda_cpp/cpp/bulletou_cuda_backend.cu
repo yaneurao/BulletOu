@@ -128,6 +128,9 @@ struct BulletOuCudaCppContext {
     unsigned long long* sfnn_ft_half_grad_clipped = nullptr;
     __half* sfnn_ft_half_activations = nullptr;
     size_t sfnn_ft_half_activations_len = 0;
+    const float* sfnn_ft_half_activation_stm_owner = nullptr;
+    const float* sfnn_ft_half_activation_nstm_owner = nullptr;
+    size_t sfnn_ft_half_activation_batch = 0;
     bool sfnn_ft_fp16 = false;
     bool sfnn_ft_fp16_grad = false;
     bool sfnn_ft_fp16_act = false;
@@ -1363,10 +1366,12 @@ __global__ void sfnn_hm2_one_view_half2_kernel(const int* indices, const __half*
         *reinterpret_cast<__half2*>(half_l0 + base) = h0;
         *reinterpret_cast<__half2*>(half_l0 + base + pairwise) = h1;
         x0 = __half22float2(h0); x1 = __half22float2(h1);
-    } else {
-        *reinterpret_cast<float2*>(l0 + base) = x0;
-        *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
     }
+    // Workspaces expose these values to the non-training backward API and
+    // diagnostics. They must correspond to this forward even when cached in
+    // FP16 for the fast training path.
+    *reinterpret_cast<float2*>(l0 + base) = x0;
+    *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
     *reinterpret_cast<float2*>(combined + base + view * pairwise) =
         make_float2(x0.x * x1.x * SFNN_PAIRWISE_SCALE, x0.y * x1.y * SFNN_PAIRWISE_SCALE);
 }
@@ -5877,6 +5882,10 @@ int launch_sfnn_forward_kernels(
     float* l2_input,
     float* l2,
     float* output) {
+    if (!ctx) return fail_message("null CUDA context");
+    ctx->sfnn_ft_half_activation_stm_owner = nullptr;
+    ctx->sfnn_ft_half_activation_nstm_owner = nullptr;
+    ctx->sfnn_ft_half_activation_batch = 0;
     if (validate_sfnn_shape(
             input_size,
             ft_size,
@@ -5988,6 +5997,11 @@ int launch_sfnn_forward_kernels(
         else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
             nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
         if (check_kernel_launch("FT sorted nstm") != 0) return -1;
+        if (half_act) {
+            ctx->sfnn_ft_half_activation_stm_owner = stm_l0;
+            ctx->sfnn_ft_half_activation_nstm_owner = nstm_l0;
+            ctx->sfnn_ft_half_activation_batch = batch;
+        }
     } else {
     if (block_count_1d(batch * pairwise, threads, &blocks, "sfnn_sparse_l0_pairwise_concat_kernel") != 0) {
         return -1;
@@ -7161,6 +7175,9 @@ int launch_sfnn_inverse_index_l0_backward(
     const size_t half_len = batch * ft_size;
     if (half_grad && prepare_sfnn_ft_half_gradients(ctx, half_len)) return -1;
     if (prepared_l1_gradients && !half_grad) return fail_message("fused L1 gradients require FT FP16 gradients");
+    const bool cached_activations = half_grad && ctx->sfnn_ft_fp16_act &&
+        ctx->sfnn_ft_half_activation_stm_owner == stm_l0 &&
+        ctx->sfnn_ft_half_activation_nstm_owner == nstm_l0 && ctx->sfnn_ft_half_activation_batch == batch;
     const float half_scale = 16384.0f * static_cast<float>(batch);
     if (!prepared_l1_gradients) {
     if (block_count_1d(batch * (ft_size / 2), threads, &blocks, "sfnn_pairwise_l0_pregrad_kernel") != 0) {
@@ -7178,8 +7195,8 @@ int launch_sfnn_inverse_index_l0_backward(
         half_grad ? ctx->sfnn_ft_half_grads : nullptr,
         half_grad ? ctx->sfnn_ft_half_grads + half_len : nullptr, half_scale,
         half_grad ? ctx->sfnn_ft_half_grad_clipped : nullptr,
-        half_grad && ctx->sfnn_ft_fp16_act ? ctx->sfnn_ft_half_activations : nullptr,
-        half_grad && ctx->sfnn_ft_fp16_act ? ctx->sfnn_ft_half_activations + half_len : nullptr);
+        cached_activations ? ctx->sfnn_ft_half_activations : nullptr,
+        cached_activations ? ctx->sfnn_ft_half_activations + half_len : nullptr);
     if (check_kernel_launch("sfnn_pairwise_l0_pregrad_kernel launch") != 0) {
         return -1;
     }
@@ -7644,6 +7661,8 @@ int launch_sfnn_backward_kernels(
     bool prepared_l1_gradients = false;
     const bool can_fuse_l1_ft = fuse_pairwise_l0 && ctx->sfnn_ft_fp16 && ctx->sfnn_ft_fp16_grad &&
         ctx->sfnn_ft_fp16_act && !ctx->bn[0].params && !ctx->ft_guard.weights &&
+        ctx->sfnn_ft_half_activation_stm_owner == stm_l0 &&
+        ctx->sfnn_ft_half_activation_nstm_owner == nstm_l0 && ctx->sfnn_ft_half_activation_batch == batch &&
         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 && l1_out == 16 &&
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr &&
         std::getenv("BULLETOU_FUSED_L1_FT_REFERENCE") == nullptr;
@@ -8723,6 +8742,43 @@ extern "C" int bulletou_cuda_cpp_context_take_ft_half_grad_clipped(BulletOuCudaC
 extern "C" int bulletou_cuda_cpp_context_set_sfnn_ft_fp16(BulletOuCudaCppContext* ctx, int enabled) {
     if (ctx == nullptr) return fail_message("null CUDA context");
     ctx->sfnn_ft_fp16 = enabled != 0;
+    return 0;
+}
+
+// Flags are switched around every training batch, so releasing in the setters
+// would synchronize and reallocate on every step. Call this at a real mode
+// transition, after disabling the corresponding flags.
+extern "C" int bulletou_cuda_cpp_context_release_sfnn_ft_fp16_scratch(
+    BulletOuCudaCppContext* ctx, int release_weights, int release_gradients, int release_activations) {
+    if (!ctx) return fail_message("null CUDA context");
+    if ((release_weights && ctx->sfnn_ft_fp16) || (release_gradients && ctx->sfnn_ft_fp16_grad) ||
+        (release_activations && ctx->sfnn_ft_fp16_act))
+        return fail_message("disable FT FP16 flags before releasing their scratch buffers");
+    if (set_context_device(ctx)) return -1;
+    const auto release = [](auto*& ptr, size_t& len, const char* label) -> int {
+        if (ptr) {
+            const cudaError_t status = cudaFree(ptr);
+            if (status != cudaSuccess) return fail(label, status);
+        }
+        ptr = nullptr; len = 0; return 0;
+    };
+    if (release_weights && release(ctx->sfnn_ft_half, ctx->sfnn_ft_half_len, "FT FP16 weights release")) return -1;
+    if (release_gradients && release(ctx->sfnn_ft_half_grads, ctx->sfnn_ft_half_grads_len, "FT FP16 gradients release")) return -1;
+    if (release_activations) {
+        if (release(ctx->sfnn_ft_half_activations, ctx->sfnn_ft_half_activations_len, "FT FP16 activations release")) return -1;
+        ctx->sfnn_ft_half_activation_stm_owner = nullptr;
+        ctx->sfnn_ft_half_activation_nstm_owner = nullptr;
+        ctx->sfnn_ft_half_activation_batch = 0;
+    }
+    return ok();
+}
+
+extern "C" int bulletou_test_sfnn_ft_fp16_scratch_sizes(
+    BulletOuCudaCppContext* ctx, size_t* weights, size_t* gradients, size_t* activations) {
+    if (!ctx || !weights || !gradients || !activations) return -1;
+    *weights = ctx->sfnn_ft_half_len;
+    *gradients = ctx->sfnn_ft_half_grads_len;
+    *activations = ctx->sfnn_ft_half_activations_len;
     return 0;
 }
 

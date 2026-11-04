@@ -19056,6 +19056,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
                 ctx.synchronize().map_err(|e| e.to_string())?;
                 let next_args = args_at_epoch(base_args, progress.epoch)?;
+                let release_ft_weights = epoch_args.sfnn_ft_fp16 && !next_args.sfnn_ft_fp16;
+                let release_ft_gradients = epoch_args.sfnn_ft_fp16_grad && !next_args.sfnn_ft_fp16_grad;
+                let release_ft_activations = epoch_args.sfnn_ft_fp16_act && !next_args.sfnn_ft_fp16_act;
+                if release_ft_weights || release_ft_gradients || release_ft_activations {
+                    ctx.release_sfnn_ft_fp16_scratch(release_ft_weights, release_ft_gradients, release_ft_activations)
+                        .map_err(|e| e.to_string())?;
+                }
                 if effective_sfnn_factorizer_spec(&next_args) != effective_sfnn_factorizer_spec(&epoch_args) {
                     upload_ctx.synchronize().map_err(|e|e.to_string())?;
                     let next_active = cuda_cpp_sfnn_factorizer_active(&next_args);

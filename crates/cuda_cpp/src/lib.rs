@@ -66,6 +66,12 @@ impl Context {
     pub fn set_sfnn_ft_fp16(&self, enabled: bool) -> Result<()> {
         check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16(self.as_ptr(), i32::from(enabled)) })
     }
+    /// Release disabled FT FP16 caches at a mode boundary, not between batches.
+    /// The selected flags must be disabled first. The clipping counter is kept.
+    pub fn release_sfnn_ft_fp16_scratch(&self, weights: bool, gradients: bool, activations: bool) -> Result<()> {
+        check(unsafe { ffi::bulletou_cuda_cpp_context_release_sfnn_ft_fp16_scratch(
+            self.as_ptr(), i32::from(weights), i32::from(gradients), i32::from(activations)) })
+    }
     pub fn new(device: i32) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `raw` is a valid out pointer.
@@ -9470,6 +9476,8 @@ mod ffi {
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
+        pub fn bulletou_cuda_cpp_context_release_sfnn_ft_fp16_scratch(ctx: *mut BulletOuCudaCppContext,
+            weights: i32, gradients: i32, activations: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_take_ft_half_grad_clipped(ctx: *mut BulletOuCudaCppContext, out: *mut u64) -> i32;
         #[cfg(test)]
         pub fn bulletou_test_qat_ft_lattice(ctx: *mut BulletOuCudaCppContext,
@@ -10422,6 +10430,78 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA GPU and the full HalfKA_hm2 FT allocation"]
+    fn fp16_ft_activations_remain_correct_for_public_workspaces() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let shape = SfnnForwardShape {
+            input_size: 73305, ft_size: 2304, l1_hidden: 15, l1_skip: true, l2_size: 64,
+            num_stacks: 8, l1_group_count: 1, l1_common_size: 0, l1_shard_size: 0,
+            factorizer_king_axis_dim: 0, factorizer_hand_axis_dim: 0, factorizer_progress_axis: false,
+            factorizer_king_hand_pair: false, factorizer_king_progress_pair: false, factorizer_hand_progress_pair: false,
+        };
+        let weights = SfnnForwardDeviceWeights::new_dense(&ctx, shape).unwrap();
+        weights.l0w.fill(&ctx, 0.0).unwrap(); weights.l0b.fill(&ctx, 0.2501).unwrap();
+        weights.l1w.fill(&ctx, 0.001).unwrap(); weights.l1b.fill(&ctx, 0.1).unwrap();
+        weights.l2w.fill(&ctx, 0.001).unwrap(); weights.l2b.fill(&ctx, 0.1).unwrap();
+        weights.l3w.fill(&ctx, 0.001).unwrap(); weights.l3b.fill(&ctx, 0.0).unwrap();
+        let indices = vec![0; 1024];
+        let batch = SfnnForwardDeviceBatch::from_host(&ctx, SfnnForwardHostBatch {
+            stm_indices: &indices, nstm_indices: &indices, buckets: &indices, batch_size: 1024, max_active: 1,
+        }).unwrap();
+        let a = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 1024)).unwrap();
+        let b = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 1024)).unwrap();
+        let backward = SfnnBackwardWorkspace::new(&ctx, SfnnBackwardWorkspaceLayout::new(shape, 1024, 1)).unwrap();
+        let loss = ScalarLossWorkspace::new(&ctx, ScalarLossWorkspaceLayout::new(1024)).unwrap();
+        loss.mean_output_gradients.fill(&ctx, 1.0 / 1024.0).unwrap();
+        a.stm_l0.fill(&ctx, -99.0).unwrap(); a.nstm_l0.fill(&ctx, -99.0).unwrap();
+        ctx.set_sfnn_ft_fp16(true).unwrap(); ctx.set_sfnn_ft_fp16_grad(true).unwrap();
+        ctx.set_sfnn_ft_fp16_act(true).unwrap();
+        sfnn_forward_device(&ctx, &batch, &weights, &a).unwrap();
+        assert_eq!(a.stm_l0.download(&ctx).unwrap()[0], 0.25);
+        assert_eq!(a.nstm_l0.download(&ctx).unwrap()[0], 0.25);
+        sfnn_backward_device(&ctx, &batch, &weights, &a, &loss, &backward).unwrap();
+        let generic = backward.l0b_gradients.download(&ctx).unwrap()[0];
+        assert!(generic > 0.0, "generic FT backward used stale activations");
+        backward.l0b_gradients.fill(&ctx, 0.0).unwrap();
+        sfnn_backward_train_device(&ctx, &batch, &weights, &a, &loss, &backward).unwrap();
+        let expected = backward.l0b_gradients.download(&ctx).unwrap()[0];
+        assert!((expected - generic).abs() < 1e-6);
+        backward.l0b_gradients.fill(&ctx, 0.0).unwrap();
+        sfnn_forward_device(&ctx, &batch, &weights, &a).unwrap();
+        weights.l0b.fill(&ctx, 0.7501).unwrap();
+        sfnn_forward_device(&ctx, &batch, &weights, &b).unwrap();
+        weights.l0b.fill(&ctx, 0.2501).unwrap();
+        sfnn_backward_train_device(&ctx, &batch, &weights, &a, &loss, &backward).unwrap();
+        let interleaved = backward.l0b_gradients.download(&ctx).unwrap()[0];
+        assert!((interleaved - expected).abs() < 1e-6, "workspace A used workspace B's cached activations: {interleaved} vs {expected}");
+        unsafe extern "C" {
+            fn bulletou_test_sfnn_ft_fp16_scratch_sizes(ctx: *mut ffi::BulletOuCudaCppContext,
+                weights: *mut usize, gradients: *mut usize, activations: *mut usize) -> i32;
+        }
+        let sizes = || {
+            let (mut w, mut g, mut a) = (0, 0, 0);
+            assert_eq!(unsafe { bulletou_test_sfnn_ft_fp16_scratch_sizes(ctx.as_ptr(), &mut w, &mut g, &mut a) }, 0);
+            (w, g, a)
+        };
+        let allocated = sizes();
+        assert!(allocated.0 > 0 && allocated.1 > 0 && allocated.2 > 0);
+        assert!(ctx.release_sfnn_ft_fp16_scratch(true, true, true).is_err());
+        assert_eq!(sizes(), allocated);
+        ctx.set_sfnn_ft_fp16_act(false).unwrap();
+        ctx.release_sfnn_ft_fp16_scratch(false, false, true).unwrap();
+        assert_eq!(sizes(), (allocated.0, allocated.1, 0));
+        ctx.set_sfnn_ft_fp16_grad(false).unwrap(); ctx.set_sfnn_ft_fp16(false).unwrap();
+        ctx.release_sfnn_ft_fp16_scratch(true, true, true).unwrap();
+        assert_eq!(sizes(), (0, 0, 0));
+        ctx.set_sfnn_ft_fp16(true).unwrap(); ctx.set_sfnn_ft_fp16_grad(true).unwrap();
+        ctx.set_sfnn_ft_fp16_act(true).unwrap();
+        sfnn_forward_device(&ctx, &batch, &weights, &a).unwrap();
+        sfnn_backward_train_device(&ctx, &batch, &weights, &a, &loss, &backward).unwrap();
+        assert!(sizes().0 > 0 && sizes().1 > 0 && sizes().2 > 0);
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn ft_half_moments_update_roundtrip_and_clip() {
