@@ -15,7 +15,7 @@ FT・L1・L2のBNは `--grid sfnn_bn_ft false true`、`--grid sfnn_bn_l1 false t
 ## 共通設定を編集せずに短い実験を行う
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-short `
   --max-epochs 1 --superbatches 32 `
@@ -26,7 +26,7 @@ python .\grid_search.py `
 
 ## 飽和率の詳細表示
 
-通常は学習中の `[qstats]` / `[qstats-unit]` をコンソールに表示しません。表示したいときは `python .\grid_search.py ... --verbose` を指定してください。子プロセスのBulletOuに `--verbose` を渡します。本体を直接起動するときも `--verbose`、学習JSONでは `"verbose": true` を指定できます。
+通常は学習中の `[qstats]` / `[qstats-unit]` をコンソールに表示しません。表示したいときは `python .\scripts\grid_search.py ... --verbose` を指定してください。子プロセスのBulletOuに `--verbose` を渡します。本体を直接起動するときも `--verbose`、学習JSONでは `"verbose": true` を指定できます。
 
 表示の有無だけを変更し、飽和率の計測・既存CSV列への記録、acc/loss/qacc/qlossの表示は変えません。gridの `--verbose` は実験条件・trial識別には含めず、resume時にも変更できます。共通JSON側で `verbose: true` とした場合も詳細を表示します。
 
@@ -47,7 +47,7 @@ JSONの `"warmup_sb": 1`（CLI: `--warmup-sb 1`）で、epoch 0を1sb実行し�
 比較例（共通設定で`superbatches: 16`、`max_epochs: 1`を確認してください）：
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260922-progress8-bceloss-16sb.json `
   --output-folder D:\BulletOu-snapshots\20260922\grid-progress8-warmup `
   --grid loss_bce_with_logits true `
@@ -75,7 +75,7 @@ SFNNのノルム正則化も `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 
 `--wrm-target-epsilon`（JSON: `wrm_target_epsilon`）は、従来のWRM変換後の教師勝率 `t` を `ε + (1 - 2ε) * t` に変換します。既定値は **0（無効）**、範囲は有限の `0 <= ε < 0.5` です。例えばε=0.01なら、0→0.01、0.5→0.5、1→0.99です。端だけをclipするのではなく、全域を0.5へ寄せます。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
   --output-folder D:\BulletOu-snapshots\grid-target-epsilon `
   --wrm-target-epsilons 0 0.005 0.01
@@ -102,7 +102,7 @@ BulletOuフォルダで実行する例です。
 検証局面を全件使う場合は、JSONに `"test_positions": "all"` と書けます。省略・`null` でも同じ全件検証です。件数を制限する場合は `"test_positions": 300000` のように正の整数を指定します。古い実行ファイルで `all` がエラーになる場合は、本体を再ビルドしてください。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\docs\examples\grid-search-bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-target-scale `
   --lrs 0.000875 0.000400 `
@@ -152,7 +152,7 @@ LR 2通り × 教師側scaling 2通り = **4条件**です。`--dry-run` は実�
 その他のオプションは `--grid 名前 値1 値2 ...` を繰り返して指定します。名前はBulletOuのオプションから `--` を取ったものです。ハイフンでもアンダースコアでも書けます。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-shared `
   --checkpoint C:\path\to\0033 `
@@ -239,7 +239,7 @@ CSVは **1行＝1条件×1集計epoch** です。主な列は次の通りです�
 例えば600／1200／1800を各5epochで計画した既存gridで、600／1200だけをさらに5epoch、**通算10epochまで**学習するには、同じ出力先を指定します。共通JSONの `max_epochs: 5` は書き換えなくて構いません。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-k3k3-b65536-sb40m `
   --wrm-target-scalings 600 1200 `
@@ -262,7 +262,7 @@ python .\grid_search.py `
 同じgridを実行中のrunnerがある場合は、先にそちらを停止してください。同じ出力先への実行・更新はファイルロックで排他します。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --output-folder D:\BulletOu-snapshots\20260911\grid-target-scale `
   --summary-only
 ```
@@ -284,7 +284,7 @@ python .\grid_search.py `
 ロック解消後、学習を実行せずに再生成できます（同じgridのrunnerが動いている間は実行しないでください）。
 
 ```powershell
-python .\grid_search.py --output-folder <既存gridフォルダ> --summary-only
+python .\scripts\grid_search.py --output-folder <既存gridフォルダ> --summary-only
 ```
 
 `--summary-only`はCSV生成自体が目的なので、書き出せない場合はエラー終了します。修正前から稼働中のPythonプロセスには変更が反映されません。通常の再開は元のコマンドに`--resume`を付けます。

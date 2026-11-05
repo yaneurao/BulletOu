@@ -16,7 +16,7 @@
 共通設定でQAT・中心化を揃えて、別のgridフォルダで比較できます：
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <新しい比較フォルダ> `
   --grid sfnn_l1_effective_weight_clip false true
@@ -29,7 +29,7 @@ acc/qaccの差を減らすだけでは成功とは言えません。量子化側
 `--sfnn-l1-center`（JSON: `"sfnn_l1_center": true`、デフォルトOFF）で、L1にも同じoptimizer座標の中心化を適用できます。L2/L3中心化とは独立しており、併用も可能です。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <新しい比較フォルダ> `
   --grid sfnn_l2_l3_center true `
@@ -68,7 +68,7 @@ CLIでは `--sfnn-l2-l3-center --batches-per-update 1 --optimizer-weight-clip 0`
 比較用の共通JSONを上記の対応条件にした上で、次のgrid指定が使えます。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <共通設定.json> `
   --output-folder <比較結果フォルダ> `
   --grid sfnn_l2_l3_center false true
@@ -111,7 +111,7 @@ FT Glorotがfalseの場合、FT本体は従来の±`init_scale / sqrt(特徴数)
 4通りの比較例：
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <新規学習用の共通設定.json> `
   --output-folder <新しい比較結果フォルダ> `
   --grid sfnn_init_ft_glorot false true `

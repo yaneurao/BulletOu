@@ -13,7 +13,7 @@ Only L1 weights are affected. Biases, FT/L2/L3, momentum/variance states, and id
 Epoch boolean schedules and resume toggling are supported. The option is recorded in the startup output and resume signature. A/B test in a new grid root:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <new-grid-root> `
   --grid sfnn_l1_effective_weight_clip false true
@@ -26,7 +26,7 @@ Keep other conditions identical. Judge quantized accuracy/loss, saturation, and 
 `--sfnn-l1-center` (JSON: `"sfnn_l1_center": true`, default OFF) applies the same optimizer-coordinate transformation to L1. It is independent of, and can be combined with, L2/L3 centering.
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <new-comparison-folder> `
   --grid sfnn_l2_l3_center true `
@@ -65,7 +65,7 @@ CLI: `--sfnn-l2-l3-center --batches-per-update 1 --optimizer-weight-clip 0`, als
 With a compatible common JSON, compare using:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <common-settings.json> `
   --output-folder <comparison-folder> `
   --grid sfnn_l2_l3_center false true
@@ -108,7 +108,7 @@ Without FT Glorot, base FT retains ±`init_scale / sqrt(feature_count)`. HalfKA2
 Four-way comparison:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file <scratch-common-settings.json> `
   --output-folder <new-comparison-folder> `
   --grid sfnn_init_ft_glorot false true `

@@ -36,20 +36,6 @@ NNUE training, counting and validation use `round(w * 65536)` (clamped to i32). 
 
 Deploy both files with an engine supporting external progress files and the matching architecture. The old embedded-progress engine format is not supported. BulletOu's quantized diagnostics load `progress.bin` from the same directory as `nn.bin` for progress architectures.
 
-### Migrating the current checkpoint
-
-Normal file loading accepts only the new format. A one-time converter is available:
-
-```powershell
-.\convert_progress_format.ps1 `
-  -InputPath C:\path\to\progress.bin `
-  -OutputPath C:\path\to\progress.bin
-```
-
-An in-place conversion backs up the source as `.q16-with-bias.bak`. Instead of discarding the old bias, it adds `bias_q16 / 4` to rook-related weights: two rooks (including dragons and held rooks) contribute four KP terms across both perspectives. Integer sums remain exact when the bias is divisible by four. **This guarantee does not apply to rook-odds games.** Fresh `progress-train` runs do not use this migration or any fixed offset.
-
-To continue the current older `state.bin`, its bias-prefixed progress record is migrated the same way. Value-network weights, their optimizer state and the dataloader cursor are preserved. Use the converted `--sfnn-progress-bin` and normal `--resume`. Newly saved progress records contain weights only. `export-progress-bin` now accepts `--state-bin` only; `nn.bin` no longer contains a classifier to extract.
-
 ## Why `.pack` is required
 
 The target requires both ends of each game. Use a YaneuraOu `.pack` file because it preserves complete game boundaries.

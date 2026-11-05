@@ -47,7 +47,7 @@ dL/dy = (p-t) * wrm_nnue2score / wrm_in_scaling
 共通JSONを `wrm_in_offset: 0`、`win_rate_model: false`、`loss_sigmoid_mse: false` として、次で二乗誤差とBCEを比較できます。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-bce `
   --grid loss_bce_with_logits false true
@@ -75,7 +75,7 @@ gradient_i = entry_weight_i * a_i * (p_i - t_i) * nnue2score / in_scaling / batc
 共通JSONでBCEを有効にし、`wrm_in_offset: 0`、`win_rate_model: false`、`loss_sigmoid_mse: false` として実行します。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-bce-error-weight `
   --grid bce_error_weight_k 0 1 2

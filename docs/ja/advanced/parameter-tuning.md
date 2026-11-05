@@ -226,14 +226,14 @@ workerではL1 residual count gateの変更にも対応する変換を行いま�
 ## 実行
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 中断後に再開する場合:
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
@@ -355,7 +355,7 @@ TPE sampler は良かった trial と悪かった trial の分布を比べて次
 途中で設定を変えたい場合は、変更したい generation を開始前の状態へ戻してから再開します。
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume `
   --reset-generation 17
@@ -366,7 +366,7 @@ python .\tuning_parameters.py `
 状態だけ戻して、学習はまだ始めたくない場合は `--reset-only` を付けます。
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume `
   --reset-generation 17 `

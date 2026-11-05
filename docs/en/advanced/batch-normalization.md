@@ -14,7 +14,7 @@ Lookahead and projection mean the actual parameter displacement need not scale e
 CLI, JSON, epoch schedules and grid search are supported:
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
 ```
 
 ```json
@@ -90,7 +90,7 @@ Do not use `sfnn_bn_*` for ordinary NNUE.
 Grid example (use an ordinary NNUE architecture in `settings.json`):
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\settings.json `
   --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
   --grid nnue_bn_ft false true `
@@ -173,7 +173,7 @@ Smaller values smooth fluctuations but also lag behind changing weights; strengt
 For separate grid conditions:
 
 ```powershell
-python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
+python .\scripts\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
 ```
 
 To continue an existing trial, change the common settings JSON and reuse the original
@@ -263,7 +263,7 @@ Use a new output directory. Explicitly disable unsupported options for **all**
 conditions, including the non-BN baseline:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260923-progress8-bceloss.json `
   --output-folder D:\BulletOu-snapshots\20260925\grid-progress8-bn `
   --grid sfnn_bn_ft false true `
@@ -355,7 +355,7 @@ Settings files are never rewritten automatically.
 For a scratch comparison, use common settings with BN enabled and no `initial_state`, and a new grid root:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
   --grid sfnn_bn_qat false true

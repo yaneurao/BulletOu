@@ -49,7 +49,7 @@ Checkpoint markers prevent duplicate mid-epoch revival; each new enabled epoch r
 Interruption before saving the modified checkpoint repeats calibration from the original checkpoint.
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results `
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
   --grid sfnn_l1_revive true --grid sfnn_l1_revive_contribution_threshold 0.005 0.01 0.02
 ```
 
@@ -187,6 +187,6 @@ FT outgoing residuals compensate both shared and axis terms so effective new con
 BN, residual count gates and worker trials are unsupported.
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results `
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
   --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
 ```

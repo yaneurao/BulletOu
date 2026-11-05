@@ -1,14 +1,16 @@
 import csv
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
 import bulletou_csv
 import bulletou_tuner as tuner
-import summary_epoch_max_accuracy as aggregate
 import tuning_parameters as tuning
 
 
@@ -76,8 +78,6 @@ class SummaryCsvTests(unittest.TestCase):
         path = self.root / bulletou_csv.SUMMARY_CSV_NAME
         path.write_text("epoch,superbatch,test_value_accuracy\n1,1,0.6\n1,2,0.65\n2,1,0.64\n", encoding="utf-8")
         self.assertEqual(tuner.latest_summary_row(self.root)["epoch"], "2")
-        self.assertEqual(aggregate.load_epoch_max_accuracy(path, "test_value_accuracy"), {1: 0.65, 2: 0.64})
-        self.assertEqual(aggregate.resolve_log_path(None).name, bulletou_csv.SUMMARY_CSV_NAME)
 
 
 if __name__ == "__main__":

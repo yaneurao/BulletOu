@@ -175,7 +175,7 @@ Sometimes you want to keep using the `parameters.current` values from `tuning-se
 Then launch the runner:
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```

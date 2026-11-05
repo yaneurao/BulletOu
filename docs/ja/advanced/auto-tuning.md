@@ -18,13 +18,13 @@ runner は 2 つの JSON ファイルを使います。
 `tuning-settings.json` の中に `bulletou-settings.json` の path を書きます。普段は runner に `--settings-file` だけを渡します。
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 同じ runner を再開するときは `--resume` を付けます。
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json --resume
 ```
 
 ## `tuning-settings.json` の例
@@ -285,7 +285,7 @@ population search で調整済みの `parameters.current` だけを使い、popu
 その状態で runner を 1 回起動します。
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 この使い方では、13 個の `parameters.current` を手で `bulletou-settings.json` に転記する必要はありません。runner が `parameters.current` を読み、`--sfnn-l1-factorizer-alpha` と count confidence オプションに変換して `bulletou.exe` に渡します。

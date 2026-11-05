@@ -137,7 +137,7 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0], allow_abbrev=False)
     p.add_argument("--settings-file", type=Path, help="Common bulletou-settings.json; not tuning-settings.json")
     p.add_argument("--output-folder", type=Path, required=True, help="Dedicated grid root containing trial directories and grid_summary.csv")
-    p.add_argument("--exe", type=Path, default=Path(__file__).resolve().parent / "target/release/examples/bulletou.exe")
+    p.add_argument("--exe", type=Path, default=Path(__file__).resolve().parent.parent / "target/release/examples/bulletou.exe")
     p.add_argument("--checkpoint", type=Path, help="Common initial checkpoint DIRECTORY (state.bin + dataloader_pos.txt)")
     p.add_argument("--epochs", type=int, nargs="+", help="Epochs to report, e.g. 1 2 5; train each condition once through max=5")
     p.add_argument("--max-epochs", type=int, help="Override common max_epochs (total epochs, not additional epochs)")

@@ -41,7 +41,7 @@ optimizer更新ごとに適用するため、bpu=4なら4batchごとです。fre
 
 ```powershell
 cargo build --release --features cuda-cpp-backend --example bulletou
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260915\grid-norm-loss `
   --grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001

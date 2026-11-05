@@ -13,7 +13,7 @@ Lookaheadやclipがあるため、実際の重み変化量が毎回厳密にそ�
 CLI、JSON、epoch指定、grid searchに対応します。例:
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results --grid sfnn_ft_lr_mult 1.0 0.25
 ```
 
 ```json
@@ -73,7 +73,7 @@ L1/L2はbucketなしでunitごとに統計を持ちます。計算式・統計�
 grid searchの例（`settings.json` のarchには通常NNUEを指定）：
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\settings.json `
   --output-folder D:\BulletOu-snapshots\grid-nnue-bn `
   --grid nnue_bn_ft false true `
@@ -165,7 +165,7 @@ grid_searchの既存コマンドに追加して比較できます:
 新規の条件比較はgrid searchでも指定できます。
 
 ```powershell
-python .\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
+python .\scripts\grid_search.py --settings-file .\settings.json --output-folder D:\BulletOu-snapshots\grid-bn-ema --grid sfnn_bn_momentum 0.1 0.01 0.001
 ```
 
 **既存trialを続けたい場合はgrid軸を追加せず、共通設定JSONの値を変更し、元のgrid指定に `--resume` を付けます。**
@@ -235,7 +235,7 @@ BN OFFならこれらの追加領域・経路は使いません。加算順序�
 既存設定にQAT等があれば、比較全条件で明示的にOFFにします。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260923-progress8-bceloss.json `
   --output-folder D:\BulletOu-snapshots\20260925\grid-progress8-bn `
   --grid sfnn_bn_ft false true `
@@ -334,7 +334,7 @@ resumeは再開epochの値を使用します。warmupのepoch 0はepoch1の値�
 ゼロからの共通設定（BN層ON、`initial_state`なし）から、新しいgrid rootで比較できます。
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bn-training.json `
   --output-folder D:\BulletOu-snapshots\grid-bn-qat `
   --grid sfnn_bn_qat false true

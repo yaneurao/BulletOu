@@ -51,7 +51,7 @@ L1とL2を両方指定するとL1を先に処理し、変更後のネットワ�
 校正後のcheckpoint保存前に中断すると、保存元から再実行されます。
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results `
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
   --grid sfnn_l1_revive true --grid sfnn_l1_revive_contribution_threshold 0.005 0.01 0.02
 ```
 
@@ -189,6 +189,6 @@ FTのL1への新接続も、shared・axis・pairを合算した実効接続が±
 BN、residual count gate、workerは未対応です。
 
 ```powershell
-python .\grid_search.py --settings-file settings.json --output-folder results `
+python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
   --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
 ```

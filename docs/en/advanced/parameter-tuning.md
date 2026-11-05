@@ -226,14 +226,14 @@ The worker also transforms L1 residual terms when count gates change. FT alpha a
 ## Run
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json
 ```
 
 Resume:
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
@@ -344,7 +344,7 @@ With `commit_source: "best"`, the commit run uses the parameters from the best m
 To change these settings safely, reset the generation you want to restart:
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume `
   --reset-generation 17
@@ -355,7 +355,7 @@ This discards trial results from generation 17 onward and restarts generation 17
 If you only want to rewind the state and logs without starting training, add `--reset-only`:
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume `
   --reset-generation 17 `

@@ -36,20 +36,6 @@ loss = (prediction - i / (L - 1))²
 
 探索で使うときは、外部分類器形式に対応したやねうら王と、arch の一致する `nn.bin` / `progress.bin` をセットで使ってください。旧「nn.bin に分類器を埋め込む」実装には対応しません。BulletOu の `quantized-test` なども、progress 付き arch なら `nn.bin` と同じディレクトリの `progress.bin` を読みます。
 
-### 旧形式から現在の学習を継続する場合
-
-通常の読み込みは新形式だけに対応します。既存の進行度を維持して移行するための一度限りの変換は、次のスクリプトで行えます。同じ出力先なら元ファイルを `.q16-with-bias.bak` に退避します。
-
-```powershell
-.\convert_progress_format.ps1 `
-  -InputPath C:\path\to\progress.bin `
-  -OutputPath C:\path\to\progress.bin
-```
-
-単に bias を捨てると bucket が変わります。この変換では、平手で常に飛車が2枚（龍・持ち飛車を含む）あり、両視点で合計4項になることを利用して、対応する重みへ `bias_q16 / 4` を加えます。bias が4の倍数なら整数和が厳密に一致します。**飛車を落とした駒落ち局面には、この保存則は適用できません。** 学習し直す場合の `progress-train` には、この移行処理も固定の加算値もありません。
-
-現在の旧 `state.bin` からの継続に限り、先頭 bias を含む進行度レコードを同じ方法で移行します。評価 NN の重み・その optimizer state・教師読み込み位置は変更しません。変換済み `--sfnn-progress-bin` のパスと通常の `--resume` を使えます。新しく保存した state の進行度レコードには bias を含めません。`export-progress-bin` の入力は `--state-bin` です（`nn.bin` からの抽出は廃止）。
-
 ## `.pack` が必要な理由
 
 この学習には、1局の開始位置と終了位置が必要です。そのため、対局境界を保持する YaneuraOu `.pack` を指定します。

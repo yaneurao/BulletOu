@@ -18,13 +18,13 @@ The runner uses two JSON files.
 `tuning-settings.json` points to `bulletou-settings.json`. You normally pass only `--settings-file` to the runner.
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 To continue the same runner, add `--resume`.
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json --resume
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json --resume
 ```
 
 ## `tuning-settings.json` example
@@ -282,7 +282,7 @@ If you want to use the tuned `parameters.current` values without running populat
 Then launch the runner once:
 
 ```powershell
-python .\tuning_parameters.py --settings-file .\tuning-settings.json
+python .\scripts\tuning_parameters.py --settings-file .\tuning-settings.json
 ```
 
 With this path, you do not manually copy the 13 `parameters.current` values into `bulletou-settings.json`. The runner reads `parameters.current`, converts them to `--sfnn-l1-factorizer-alpha` and count-confidence options, and passes them to `bulletou.exe`.

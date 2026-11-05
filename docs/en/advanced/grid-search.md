@@ -13,7 +13,7 @@ For independent FT/L1/L2 BatchNorm switches, defaults, limitations and grid exam
 ## Short experiments without editing common settings
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-short `
   --max-epochs 1 --superbatches 32 `
@@ -24,7 +24,7 @@ Each condition trains for one epoch of 32 SB. The source JSON is not modified. P
 
 ## Verbose saturation diagnostics
 
-Training hides `[qstats]` / `[qstats-unit]` console lines by default. Use `python .\grid_search.py ... --verbose` to pass `--verbose` to BulletOu. Direct training also accepts `--verbose`, or `"verbose": true` in its settings JSON.
+Training hides `[qstats]` / `[qstats-unit]` console lines by default. Use `python .\scripts\grid_search.py ... --verbose` to pass `--verbose` to BulletOu. Direct training also accepts `--verbose`, or `"verbose": true` in its settings JSON.
 
 This only changes display: diagnostics computation, existing CSV fields, and acc/loss/qacc/qloss output are unchanged. The grid-level flag does not change trial identity and can be toggled on resume. A common JSON setting of `verbose: true` also enables detailed output.
 
@@ -45,7 +45,7 @@ Set `"warmup_sb": 1` in JSON or `--warmup-sb 1` on the CLI for a one-SB epoch 0.
 With common settings configured for 16 SB and one epoch, compare three conditions:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260922-progress8-bceloss-16sb.json `
   --output-folder D:\BulletOu-snapshots\20260922\grid-progress8-warmup `
   --grid loss_bce_with_logits true `
@@ -73,7 +73,7 @@ Use `--grid sfnn_norm_loss_strength 0 0.000001 0.00001 0.0001` to compare SFNN n
 `--wrm-target-epsilon` (JSON: `wrm_target_epsilon`) transforms the existing WRM teacher probability `t` into `epsilon + (1 - 2*epsilon) * t`. Default **0 preserves the original calculation**; valid values are finite `0 <= epsilon < 0.5`. For epsilon=0.01, 0 maps to 0.01, 0.5 stays 0.5, and 1 maps to 0.99. This compresses the entire range towards 0.5 rather than clipping only the tails.
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
   --output-folder D:\BulletOu-snapshots\grid-target-epsilon `
   --wrm-target-epsilons 0 0.005 0.01
@@ -100,7 +100,7 @@ From the BulletOu directory:
 Use `"test_positions": "all"` in the JSON to validate all positions. Omission or `null` means the same thing. To limit the sample, use a positive integer such as `"test_positions": 300000`. Rebuild BulletOu if an older executable rejects `all`.
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\docs\examples\grid-search-bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-target-scale `
   --lrs 0.000875 0.000400 `
@@ -150,7 +150,7 @@ Without `--checkpoint`, existing `initial_state`/`initial_dataloader_pos` in the
 Other scalar options use repeatable `--grid NAME VALUE1 VALUE2 ...`. Names are BulletOu option names without leading `--`; hyphens and underscores are accepted.
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file .\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-shared `
   --checkpoint C:\path\to\0033 `
@@ -237,7 +237,7 @@ Normal runs and `--resume` follow **the current command-line condition order** f
 For an existing 600/1200/1800 grid planned for five epochs each, extend only 600/1200 by five epochs, **to ten epochs total**, using the same output root:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings-20260911-k3k3-b65536-sb40m.json `
   --output-folder D:\BulletOu-snapshots\20260911\grid-k3k3-b65536-sb40m `
   --wrm-target-scalings 600 1200 `
@@ -259,7 +259,7 @@ python .\grid_search.py `
 Stop any runner already using this grid before executing the extension. The output root remains protected by an exclusive file lock.
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --output-folder D:\BulletOu-snapshots\20260911\grid-target-scale `
   --summary-only
 ```
@@ -281,7 +281,7 @@ Add `--epochs 1 2` to regenerate only those epochs. Source logs are untouched. T
 After releasing the lock, regenerate without training (do not run concurrently with the same grid runner):
 
 ```powershell
-python .\grid_search.py --output-folder <existing-grid-root> --summary-only
+python .\scripts\grid_search.py --output-folder <existing-grid-root> --summary-only
 ```
 
 `--summary-only` still fails if it cannot produce the requested CSV. Already-running Python processes do not pick up this fix. Resume normal execution with the original command plus `--resume`.

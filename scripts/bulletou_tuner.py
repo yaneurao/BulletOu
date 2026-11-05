@@ -15,7 +15,7 @@ candidate itself survives.
 
 Typical use:
 
-    python bulletou_tuner.py ^
+    python scripts/bulletou_tuner.py ^
       --tuning-settings-file .\\tuning-settings.json
 
 Use --resume to continue from the runner root described by tuning-settings.json.

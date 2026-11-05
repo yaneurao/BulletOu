@@ -11,6 +11,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
 import grid_search as grid
 
 
@@ -873,7 +875,7 @@ class GridSearchTests(unittest.TestCase):
         self.assertNotIn("test_positions", self.plan()["trials"][0]["settings"])
 
     def test_bundled_settings_use_explicit_all_positions(self):
-        example = Path(grid.__file__).parent / "docs/examples/grid-search-bulletou-settings.json"
+        example = Path(grid.__file__).resolve().parent.parent / "docs/examples/grid-search-bulletou-settings.json"
         settings = grid.read_json(example)
         grid.check_settings(settings)
         self.assertEqual(settings["test_positions"], "all")

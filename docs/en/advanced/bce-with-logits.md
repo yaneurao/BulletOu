@@ -47,7 +47,7 @@ Loss/qloss now report BCE, excluding Norm loss and other regularizers. Accuracy 
 Set `wrm_in_offset: 0`, `win_rate_model: false`, and `loss_sigmoid_mse: false` in the common JSON:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-bce `
   --grid loss_bce_with_logits false true
@@ -75,7 +75,7 @@ Both numerator and denominator are detached. Existing entry weights define the n
 Enable BCE in the common JSON, with `wrm_in_offset: 0`, `win_rate_model: false`, and `loss_sigmoid_mse: false`:
 
 ```powershell
-python .\grid_search.py `
+python .\scripts\grid_search.py `
   --settings-file D:\BulletOu-snapshots\settings\bulletou-settings.json `
   --output-folder D:\BulletOu-snapshots\grid-bce-error-weight `
   --grid bce_error_weight_k 0 1 2

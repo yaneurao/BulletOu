@@ -168,7 +168,7 @@ population search で調整した `tuning-settings.json` の `parameters.current
 この状態で `tuning_parameters.py` を起動します。
 
 ```powershell
-python .\tuning_parameters.py `
+python .\scripts\tuning_parameters.py `
   --settings-file D:\BulletOu-snapshots\settings\tuning-settings.json `
   --resume
 ```
