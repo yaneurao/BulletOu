@@ -39,6 +39,8 @@
 
 設定に `"sfnn_gptq": true` を加えると、番号付きcheckpointの通常保存後に `nn-gptq.bin` を自動生成します。省略時や `false` では生成しません。学習中に作られる `nn.bin` と `state.bin` は従来どおりです。校正はデフォルトで学習用teacherのファイル先頭262,144局面を使い、teacherがディレクトリなら対応ファイルを名前順に並べた最初のファイルを使います。`sfnn_gptq_calibration_teacher` と `sfnn_gptq_calibration_positions` で変更できます。校正用は検証とは別の代表的な学習データを選んでください。
 
+`sfnn_gptq` は `{"epoch1": true, "epoch13": false}` のようにepochごとに切り替えられます。この例ではepoch 13以降のcheckpointでGPTQを生成しません。
+
 自動生成の対象・制約は上記のL2/L3 GPTQと同じです。checkpointの保存後にGPUで校正するため、保存のたびに時間とGPUメモリが必要です。GPTQが失敗した場合は警告を出し、通常checkpointを保持して学習を続けます。
 
 自動生成後、`test_teacher` で `nn-gptq.bin` をCPUの整数演算で評価し、checkpoint内の `gptq-validation.json` に記録します。grid searchの `grid_summary.csv` ではepoch末尾のcheckpointに対する値を `gptq_qacc`、`gptq_qloss`、`gptq_mode`、`gptq_positions` 列に出します。評価値は通常のqvalidと同じ学習尺度（最終FV_SCALE除算前）です。評価できなかった場合やepoch末尾にcheckpointがない場合は空欄です。通常の `quantized_value_accuracy/loss` がGPU近似の場合、GPTQ列は整数演算なので値の差には評価方法の差も含まれます。設定した検証局面数とlossの条件は通常の検証に従います。GPTQの整数評価にもcheckpointごとの時間がかかります。

@@ -344,13 +344,14 @@ mod tests {
         std::fs::write(&path, r#"{
             "arch": "SFNN_halfkahm2_2304_15_64_k9k9_progress8",
             "teacher": "teacher.bin",
-            "sfnn_gptq": true,
+            "sfnn_gptq": {"epoch1": true, "epoch13": false},
             "sfnn_qat_l1": {"epoch1": true, "epoch6": false}
         }"#).unwrap();
         let first = training_args_for_export(&path, 1).unwrap();
         let sixth = training_args_for_export(&path, 6).unwrap();
         assert_eq!(sixth.settings_file.as_deref(), Some(path.as_path()));
         assert!(sixth.sfnn_gptq);
+        assert!(!training_args_for_export(&path, 13).unwrap().sfnn_gptq);
         assert!(first.sfnn_qat_l1);
         assert!(!sixth.sfnn_qat_l1);
         std::fs::remove_dir_all(dir).unwrap();

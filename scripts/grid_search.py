@@ -220,7 +220,7 @@ EPOCH_SETTING_KEYS = {
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
-    "lr", "lr_min", "batches_per_update", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
+    "lr", "lr_min", "batches_per_update", "sfnn_gptq", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip",
     "sfnn_l1_lr_mult", "sfnn_norm_loss_strength", "sfnn_saturation_penalty",
     "sfnn_saturation_threshold", "optimizer_weight_clip", "optimizer_weight_decay",
     "bce_error_weight_k",
@@ -259,7 +259,7 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
             elif key == "sfnn_l1_factorizer":
                 if item not in ("axis", "shared", "pair"):
                     raise ValueError(f"{key}.{name} must be axis/shared/pair")
-            elif revival or key in ("sfnn_ft_factorizer", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
+            elif revival or key in ("sfnn_ft_factorizer", "sfnn_gptq", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")
             elif type(item) not in (int, float) or not math.isfinite(item):

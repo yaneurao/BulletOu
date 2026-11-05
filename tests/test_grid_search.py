@@ -17,6 +17,13 @@ import grid_search as grid
 
 
 class GridSearchTests(unittest.TestCase):
+    def test_gptq_epoch_schedule(self):
+        settings = {"sfnn_gptq": {"epoch1": True, "epoch13": False}}
+        self.assertTrue(grid.resolve_epoch_settings(settings, 12)["sfnn_gptq"])
+        self.assertFalse(grid.resolve_epoch_settings(settings, 13)["sfnn_gptq"])
+        with self.assertRaises(ValueError):
+            grid.resolve_epoch_settings({"sfnn_gptq": {"epoch1": 1}}, 1)
+
     def test_l1_initial_lr_suppression_setting(self):
         key = "sfnn_l1_initial_lr_suppress_sb"
         grid.check_settings({**self.common, key: 32})
