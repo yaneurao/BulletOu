@@ -12510,7 +12510,9 @@ mod tests {
         let batch_size = 1031;
         let stm: Vec<i32> = (0..batch_size).map(|i| (i % 4) as i32).collect();
         let nstm: Vec<i32> = (0..batch_size).map(|i| ((i + 1) % 4) as i32).collect();
-        let buckets: Vec<i32> = (0..batch_size).map(|i| (i % 8) as i32).collect();
+        let buckets: Vec<i32> = (0..batch_size).map(|i| match i {
+            0 => -1, 1 => 8, _ if i % 3 == 0 => 0, _ => (i % 8) as i32,
+        }).collect();
         let batch = SfnnForwardHostBatch { stm_indices: &stm, nstm_indices: &nstm,
             buckets: &buckets, batch_size, max_active: 1 };
         // A batch below the dispatch threshold exercises the original kernel.
@@ -12529,9 +12531,12 @@ mod tests {
             let alpha = SfnnFactorizerAlpha { shared: alpha, ..SfnnFactorizerAlpha::ONE };
             sfnn_forward_device_with_factorizer_and_alpha(&ctx, &reference_batch, &weights, &reference, active, alpha).unwrap();
             let expected = reference.l1.download(&ctx).unwrap();
+            let expected_l2_input = reference.l2_input.download(&ctx).unwrap();
             sfnn_forward_device_with_factorizer_and_alpha(&ctx, &batch, &weights, &workspace, active, alpha).unwrap();
             let actual = workspace.l1.download(&ctx).unwrap();
             assert_close_slice("folded shared L1", &actual[..reference_size * 16], &expected, 1e-7);
+            let actual_l2_input = workspace.l2_input.download(&ctx).unwrap();
+            assert_close_slice("folded shared L2 input", &actual_l2_input[..reference_size * 30], &expected_l2_input, 1e-7);
         }
     }
 

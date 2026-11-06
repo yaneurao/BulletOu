@@ -5930,6 +5930,67 @@ int launch_dense_qat_l1_bucket_tiles(BulletOuCudaCppContext* ctx, const int* inp
     return check_kernel_launch("dense QAT L1 bucket tiles");
 }
 
+__global__ void sfnn_f32_l1_clear_invalid(const int* buckets, float* output, size_t batch, size_t stacks) {
+    const size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample >= batch) return;
+    const int b = buckets[sample];
+    if (b >= 0 && static_cast<size_t>(b) < stacks) return;
+    for (int u = 0; u < 16; ++u) output[sample * 16 + u] = 0.0f;
+}
+
+// A 16x16 L1 tile, using the folded shared weights and indirect
+// bucket permutation so FT activations need not be copied.
+__global__ void sfnn_f32_l1_bucket_tiles(const float* input, const float* weights,
+    const float* bias, const float* shared_bias, const int* offsets, const int* positions,
+    const int* tiles, float* output, size_t inputs, float alpha) {
+    constexpr unsigned TILE = 16, CHUNK = 64;
+    __shared__ __align__(16) float xs[TILE][CHUNK + 4];
+    __shared__ float ws[CHUNK][TILE + 1];
+    const int bucket = tiles[2 * blockIdx.x];
+    if (bucket < 0) return;
+    const int start = tiles[2 * blockIdx.x + 1];
+    const unsigned row = threadIdx.x / TILE, out = threadIdx.x % TILE;
+    const bool active = start + row < offsets[bucket + 1];
+    const int sample = active ? positions[start + row] : 0;
+    const unsigned load_row = threadIdx.x / TILE, load_col = (threadIdx.x % TILE) * 4;
+    const bool load_active = start + load_row < offsets[bucket + 1];
+    const int load_sample = load_active ? positions[start + load_row] : 0;
+    float sum = 0.0f;
+    for (size_t base = 0; base < inputs; base += CHUNK) {
+        const float4 x = load_active ? *reinterpret_cast<const float4*>(input + static_cast<size_t>(load_sample) * inputs + base + load_col) : make_float4(0,0,0,0);
+        const float4 w = *reinterpret_cast<const float4*>(weights + (static_cast<size_t>(bucket) * TILE + load_row) * inputs + base + load_col);
+        *reinterpret_cast<float4*>(&xs[load_row][load_col]) = x;
+        ws[load_col][load_row]=w.x; ws[load_col+1][load_row]=w.y;
+        ws[load_col+2][load_row]=w.z; ws[load_col+3][load_row]=w.w;
+        __syncthreads();
+        #pragma unroll 4
+        for (unsigned col=0; col<CHUNK; ++col) sum += xs[row][col] * ws[col][out];
+        __syncthreads();
+    }
+    if (active) {
+        sum += bias[static_cast<size_t>(bucket) * TILE + out];
+        sum += alpha * shared_bias[out];
+        output[static_cast<size_t>(sample) * TILE + out] = sum;
+    }
+}
+
+int launch_sfnn_f32_l1_bucket_tiles(BulletOuCudaCppContext* ctx, const float* input,
+    const float* weights, const float* bias, const float* shared_bias, const int* buckets,
+    float* output, size_t batch, size_t inputs, size_t stacks, float alpha) {
+    if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, stacks)) return -1;
+    const size_t max_tiles = (batch + 15) / 16 + stacks;
+    if (ensure_i32_scratch(&ctx->dense_qat_bucket_tiles, &ctx->dense_qat_bucket_tiles_len,
+            2 * max_tiles, "FP32 L1 bucket tiles")) return -1;
+    const cudaError_t status = cudaMemsetAsync(ctx->dense_qat_bucket_tiles, 0xff, 2 * max_tiles * sizeof(int), ctx->stream);
+    if (status != cudaSuccess) return fail("clear FP32 L1 tiles", status);
+    dense_qat_make_bucket_tiles<<<1, 1, 0, ctx->stream>>>(ctx->sfnn_inverse_offsets, ctx->dense_qat_bucket_tiles, stacks);
+    sfnn_f32_l1_clear_invalid<<<static_cast<unsigned>((batch + 255) / 256), 256, 0, ctx->stream>>>(buckets, output, batch, stacks);
+    sfnn_f32_l1_bucket_tiles<<<static_cast<unsigned>(max_tiles), 256, 0, ctx->stream>>>(
+        input, weights, bias, shared_bias, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_positions,
+        ctx->dense_qat_bucket_tiles, output, inputs, alpha);
+    return check_kernel_launch("FP32 L1 bucket tiles");
+}
+
 __global__ void dense_qat_l1_warp_kernel(const float* input,const float* weights,const int* bias,
     const int* buckets,float* output,int* raw,size_t batch,size_t inputs,size_t outputs,size_t stacks,
     size_t groups,size_t common,size_t shard) {
@@ -6374,7 +6435,10 @@ int launch_sfnn_forward_kernels(
             sfnn_fold_shared_l1_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, ctx->stream>>>(
                 l1w, l1fw, ctx->sfnn_folded_l1_weights, ft_size, num_stacks, factorizer_shared_alpha);
             if (check_kernel_launch("fold shared L1 weights") != 0) return -1;
-            sfnn_folded_shared_l1_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
+            if (std::getenv("BULLETOU_F32_L1_TILES_REFERENCE") == nullptr && ft_size % 64 == 0) {
+                if (launch_sfnn_f32_l1_bucket_tiles(ctx, combined, ctx->sfnn_folded_l1_weights,
+                        l1b, l1fb, buckets, l1, batch, ft_size, num_stacks, factorizer_shared_alpha)) return -1;
+            } else sfnn_folded_shared_l1_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
                 combined, ctx->sfnn_folded_l1_weights, l1b, l1fb, buckets, l1,
                 batch, ft_size, num_stacks, factorizer_shared_alpha);
         } else if (!grouped_l1 && !common_shard_l1 && !has_l1f && !has_l1ax && !bn_use_reference()) {
