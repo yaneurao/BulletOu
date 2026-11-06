@@ -145,6 +145,8 @@ struct BulletOuCudaCppContext {
     size_t dense_qat_l1_bias_len = 0;
     int* dense_qat_packed_input = nullptr;
     size_t dense_qat_packed_input_len = 0;
+    float* sfnn_fp16_folded_ft = nullptr;
+    size_t sfnn_fp16_folded_ft_len = 0;
     float* sfnn_folded_l1_weights = nullptr;
     size_t sfnn_folded_l1_weights_len = 0;
     int* dense_qat_packed_weights = nullptr;
@@ -1435,6 +1437,17 @@ __global__ void sfnn_fold_halfka2_l0w_kernel(
     const size_t piece = feature % SFNN_HALFKA2_PIECE_INPUTS;
     const size_t virtual_feature = base + piece;
     folded_weights[tid] = weights[tid] + ft_factorizer_alpha * weights[virtual_feature * ft_size + row];
+}
+
+__global__ void sfnn_fold_ft_to_half(const float* weights, __half* folded,
+    size_t ft_size, float alpha, size_t base) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= base * ft_size) return;
+    const size_t feature = i / ft_size, row = i % ft_size;
+    float value = weights[i] + alpha * weights[(base + feature % SFNN_HALFKA2_PIECE_INPUTS) * ft_size + row];
+    if (value > 65504.0f) value = 65504.0f;
+    if (value < -65504.0f) value = -65504.0f;
+    folded[i] = __float2half_rn(value);
 }
 
 __device__ __forceinline__ size_t sfnn_factorizer_axis_ids(
@@ -4460,6 +4473,33 @@ __global__ void test_packed_qat_ft_matches_combined(const float* combined, const
     const unsigned d = static_cast<unsigned>(__float2int_rn(x.w * 127.0f));
     if (static_cast<unsigned>(packed[i]) != (a | (b << 8) | (c << 16) | (d << 24))) atomicExch(mismatch, 1);
 }
+extern "C" int bulletou_test_factorized_ft_half_fold(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* output,
+    size_t base, size_t ft, float alpha, int fused) {
+    const size_t n = base * ft;
+    if (!ctx || validate_buffer(ctx, weights, (base + SFNN_HALFKA2_PIECE_INPUTS) * ft, "test factorized FT") ||
+        validate_buffer(ctx, output, n, "test FP16 fold output")) return -1;
+    __half* half = nullptr;
+    float* scratch = nullptr;
+    cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half), n * sizeof(__half));
+    if (status != cudaSuccess) return fail("test FP16 fold allocation", status);
+    if (!fused) {
+        status = cudaMalloc(reinterpret_cast<void**>(&scratch), n * sizeof(float));
+        if (status != cudaSuccess) { cudaFree(half); return fail("test FP32 fold allocation", status); }
+    }
+    const unsigned blocks = static_cast<unsigned>((n + 255) / 256);
+    if (fused) sfnn_fold_ft_to_half<<<blocks,256,0,ctx->stream>>>(weights->ptr, half, ft, alpha, base);
+    else {
+        sfnn_fold_halfka2_l0w_kernel<<<blocks,256,0,ctx->stream>>>(weights->ptr, scratch, ft, alpha, base);
+        sfnn_ft_to_half<<<blocks,256,0,ctx->stream>>>(scratch, half, n);
+    }
+    sfnn_test_ft_from_half<<<blocks,256,0,ctx->stream>>>(half, output->ptr, n);
+    const int result = check_kernel_launch("test factorized FP16 fold");
+    if (scratch) cudaFree(scratch);
+    cudaFree(half);
+    return result;
+}
+
 extern "C" int bulletou_test_sfnn_ft_sort(
     BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* stm, BulletOuCudaCppI32Buffer* nstm,
     BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias, BulletOuCudaCppF32Buffer* a,
@@ -4491,7 +4531,7 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         float* rounded_weights = nullptr;
         int* fused_pack = nullptr;
         if (sorted >= 8) {
-            if (ft != 2304) return fail_message("fused FT test requires width 2304");
+            if (ft != 1536 && ft != 2304) return fail_message("fused FT test requires width 1536 or 2304");
             const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&fused_pack), batch * ft);
             if (status != cudaSuccess) return fail("test packed FT allocation", status);
         }
@@ -6196,7 +6236,28 @@ int launch_sfnn_forward_kernels(
     const float* effective_l0w = l0w;
     size_t effective_input_size = input_size;
     const size_t factorized_ft_base = sfnn_ft_factorized_base(input_size);
-    if (folded_l0w != nullptr && factorized_ft_base != 0) {
+    const bool fused_factorized_half = factorized_ft_base == SFNN_HALFKA_HM2_BASE_INPUT_SIZE &&
+        ctx->sfnn_ft_fp16 && std::getenv("BULLETOU_FT_FP16_FOLD_REFERENCE") == nullptr;
+    if (fused_factorized_half) {
+        const size_t len = factorized_ft_base * ft_size;
+        if (ctx->sfnn_ft_half_len < len) {
+            if (ctx->sfnn_ft_half) cudaFree(ctx->sfnn_ft_half);
+            ctx->sfnn_ft_half = nullptr; ctx->sfnn_ft_half_len = 0;
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&ctx->sfnn_ft_half), len * sizeof(__half));
+            if (status != cudaSuccess) return fail("folded FT FP16 allocation", status);
+            ctx->sfnn_ft_half_len = len;
+        }
+        if (block_count_1d(len, threads, &blocks, "FT fold to FP16")) return -1;
+        sfnn_fold_ft_to_half<<<blocks,threads,0,ctx->stream>>>(l0w,ctx->sfnn_ft_half,ft_size,ft_factorizer_alpha,factorized_ft_base);
+        if (check_kernel_launch("FT fold to FP16")) return -1;
+        effective_input_size = factorized_ft_base;
+    }
+    if (!fused_factorized_half && !folded_l0w && factorized_ft_base == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ctx->sfnn_ft_fp16) {
+        if (ensure_f32_scratch(&ctx->sfnn_fp16_folded_ft, &ctx->sfnn_fp16_folded_ft_len,
+                factorized_ft_base * ft_size, "FP16 folded FT")) return -1;
+        folded_l0w = ctx->sfnn_fp16_folded_ft;
+    }
+    if (!fused_factorized_half && folded_l0w != nullptr && factorized_ft_base != 0) {
         const size_t fold_len = factorized_ft_base * ft_size;
         if (block_count_1d(fold_len, threads, &blocks, "sfnn_fold_halfka2_l0w_kernel") != 0) {
             return -1;
@@ -6212,8 +6273,8 @@ int launch_sfnn_forward_kernels(
     const int* ft_sample_order = nullptr;
     const bool sort_hm2_ft = !ctx->bn[0].params &&
         (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
-         (folded_l0w && !ctx->sfnn_ft_fp16 && effective_input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE))
-        && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
+         ((folded_l0w || fused_factorized_half) && effective_input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE))
+        && (ft_size == 2304 || (ft_size == 1536 && ctx->sfnn_ft_fp16)) && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
     const bool qat_packed_candidate = ctx->dense_qat &&
         (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
@@ -6262,8 +6323,8 @@ int launch_sfnn_forward_kernels(
             if (status != cudaSuccess) return fail("FT FP16 activation allocation", status);
             ctx->sfnn_ft_half_activations_len = 2 * act_count;
         }
-        if (half_ft) {
-            const size_t len = input_size * ft_size;
+        if (half_ft && !fused_factorized_half) {
+            const size_t len = effective_input_size * ft_size;
             if (ctx->sfnn_ft_half_len < len) {
                 if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
                 ctx->sfnn_ft_half = nullptr;
@@ -7497,7 +7558,8 @@ int launch_sfnn_inverse_index_for_perspective(
     // tiny blocks in the large HalfKA_hm2 FT while retaining each element's
     // summation order. Empty rows can be skipped when accumulating: their
     // contribution is zero and the previous minibatch gradient must remain.
-    const bool hm2_gather = n_features == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024
+    const bool hm2_gather = n_features == SFNN_HALFKA_HM2_BASE_INPUT_SIZE &&
+        (ft_size == 2304 || (ft_size == 1536 && half_gradients)) && batch >= 1024
         && std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr;
     if (hm2_gather) {
         dim3 block(64, 4);
@@ -7607,7 +7669,9 @@ int launch_sfnn_inverse_index_l0_backward(
     int blocks = 0;
     if(launch_ft_guard_fused_prepare(ctx,stm_l0,nstm_l0,l0b_gradients,batch,ft_size)) return -1;
     const bool half_grad = ctx->sfnn_ft_fp16 && !ctx->bn[0].params && !ctx->ft_guard.weights &&
-        input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
+        (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
+         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) &&
+        (ft_size == 2304 || ft_size == 1536) && batch >= 1024 &&
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr && ctx->sfnn_ft_fp16_grad;
     if (ctx->sfnn_ft_fp16_grad && !half_grad) return fail_message("FT FP16 gradients requested for an unsupported training path");
     const size_t half_len = batch * ft_size;
@@ -8100,7 +8164,9 @@ int launch_sfnn_backward_kernels(
         ctx->sfnn_ft_fp16_act && !ctx->bn[0].params && !ctx->ft_guard.weights &&
         ctx->sfnn_ft_half_activation_stm_owner == stm_l0 &&
         ctx->sfnn_ft_half_activation_nstm_owner == nstm_l0 && ctx->sfnn_ft_half_activation_batch == batch &&
-        input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 && l1_out == 16 &&
+        (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
+         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) &&
+        (ft_size == 2304 || ft_size == 1536) && batch >= 1024 && l1_out == 16 &&
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr &&
         std::getenv("BULLETOU_FUSED_L1_FT_REFERENCE") == nullptr;
     const bool can_fuse_l1_ft_f32 = fuse_pairwise_l0 && !ctx->sfnn_ft_fp16_grad &&
@@ -9152,6 +9218,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (ctx->sfnn_ft_half_grad_clipped != nullptr) cudaFree(ctx->sfnn_ft_half_grad_clipped);
     if (ctx->sfnn_ft_half_activations != nullptr) cudaFree(ctx->sfnn_ft_half_activations);
     if (ctx->dense_qat_packed_input != nullptr) cudaFree(ctx->dense_qat_packed_input);
+    if (ctx->sfnn_fp16_folded_ft != nullptr) cudaFree(ctx->sfnn_fp16_folded_ft);
     if (ctx->sfnn_folded_l1_weights != nullptr) cudaFree(ctx->sfnn_folded_l1_weights);
     if (ctx->dense_qat_packed_weights != nullptr) cudaFree(ctx->dense_qat_packed_weights);
     if (ctx->dense_qat_bucket_tiles != nullptr) cudaFree(ctx->dense_qat_bucket_tiles);

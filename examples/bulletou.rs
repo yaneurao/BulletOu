@@ -5718,9 +5718,10 @@ impl Args {
             return Err("--sfnn-ft-fp16-grad requires --sfnn-ft-fp16 and FT saturation penalty off".into());
         }
         if self.sfnn_ft_fp16 && (self.backend != BackendKind::CudaCpp || self.arch().feature != NnueArchFeature::Halfkahm2
-            || self.arch().l1 != 2304 || effective_batch_size(self) < 1024 || self.lr_schedule == LrScheduleKind::Plateau
-            || self.ft_factorizer || self.sfnn_bn_ft || self.sfnn_qat_ft) {
-            return Err("--sfnn-ft-fp16 requires 2304-wide HalfKA_hm2, batch >= 1024, FT BN/factorizer and FT QAT off".into());
+            || !matches!(self.arch().l1, 1536 | 2304)
+            || effective_batch_size(self) < 1024 || self.lr_schedule == LrScheduleKind::Plateau
+            || self.sfnn_bn_ft || self.sfnn_qat_ft) {
+            return Err("--sfnn-ft-fp16 requires 1536- or 2304-wide HalfKA_hm2, batch >= 1024, FT BN and FT QAT off".into());
         }
         if !self.sfnn_bn_affine_lr_multiplier.is_finite() || self.sfnn_bn_affine_lr_multiplier < 0.0 {
             return Err("--sfnn-bn-affine-lr-multiplier must be finite and non-negative".into());
@@ -28891,7 +28892,7 @@ mod tests {
         assert!(tenth.validate_arch_flags().is_err());
         tenth.sfnn_ft_saturation_penalty = 0.0;
         tenth.ft_factorizer = true;
-        assert!(tenth.validate_arch_flags().is_err());
+        tenth.validate_arch_flags().unwrap();
         tenth.ft_factorizer = false;
         tenth.sfnn_qat_ft = true;
         assert!(tenth.validate_arch_flags().is_err());

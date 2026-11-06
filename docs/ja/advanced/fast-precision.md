@@ -12,4 +12,4 @@
 
 `--all-optim` または設定ファイルの `"all_optim": true` は、上記4つのFP16設定をまとめて有効にする実験用の省略指定です。各設定は個別にも指定できます。`all_optim` 自体はepoch別指定には対応しません。tataraの `--all-optim` と異なりTF32は有効にしません。
 
-現在はFT 2304幅の HalfKA_hm2、batch 1024以上、FT factorizerなし、FT BNなしの直接学習に限ります。L1/L2/L3のQATとは併用できますが、FT自体のQATとの併用はできません。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau schedule とworker modeには対応しません。これらの設定にはTF32は含まれません。
+現在はFT 1536幅または2304幅の HalfKA_hm2、batch 1024以上、FT BNなしの直接学習に限ります。FT factorizerはON/OFFどちらにも対応し、ONの場合は個別重みと共有成分を合成してからFP16に変換します。L1/L2/L3のQATとは併用できますが、FT自体のQATとの併用はできません。FP16勾配にはFT saturation penaltyを無効にする必要もあります。plateau scheduleとworker modeには対応しません。これらの設定にはTF32は含まれません。

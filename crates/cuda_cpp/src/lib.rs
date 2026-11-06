@@ -49,6 +49,7 @@ pub type Result<T> = std::result::Result<T, CudaCppError>;
 #[derive(Debug)]
 pub struct Context {
     raw: NonNull<ffi::BulletOuCudaCppContext>,
+    sfnn_ft_fp16: std::cell::Cell<bool>,
 }
 
 impl Context {
@@ -64,7 +65,9 @@ impl Context {
         Ok(count)
     }
     pub fn set_sfnn_ft_fp16(&self, enabled: bool) -> Result<()> {
-        check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16(self.as_ptr(), i32::from(enabled)) })
+        check(unsafe { ffi::bulletou_cuda_cpp_context_set_sfnn_ft_fp16(self.as_ptr(), i32::from(enabled)) })?;
+        self.sfnn_ft_fp16.set(enabled);
+        Ok(())
     }
     /// Release disabled FT FP16 caches at a mode boundary, not between batches.
     /// The selected flags must be disabled first. The clipping counter is kept.
@@ -77,7 +80,7 @@ impl Context {
         // SAFETY: `raw` is a valid out pointer.
         check(unsafe { ffi::bulletou_cuda_cpp_context_create(device, &mut raw) })?;
         let raw = NonNull::new(raw).ok_or_else(|| CudaCppError::message("C++/CUDA context_create returned null"))?;
-        Ok(Self { raw })
+        Ok(Self { raw, sfnn_ft_fp16: std::cell::Cell::new(false) })
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -2074,7 +2077,9 @@ fn sfnn_forward_train_device_with_factorizer(
     )?;
     // The first batch of an accumulation group may reuse the empty gradient buffer.
     // Backward adds to FT gradients, so discard the temporary weights first.
-    if matches!(weights.shape.input_size, 133_578 | 74_934) {
+    if matches!(weights.shape.input_size, 133_578 | 74_934)
+        && !(weights.shape.input_size == 74_934 && ctx.sfnn_ft_fp16.get()
+            && std::env::var_os("BULLETOU_FT_FP16_FOLD_REFERENCE").is_none()) {
         if let Some(scratch) = folded_l0w_scratch { scratch.fill(ctx, 0.0)?; }
     }
     Ok(())
@@ -10806,6 +10811,31 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn factorized_ft_fp16_fused_fold_matches_two_pass() {
+        unsafe extern "C" {
+            fn bulletou_test_factorized_ft_half_fold(ctx: *mut ffi::BulletOuCudaCppContext,
+                weights: *mut ffi::BulletOuCudaCppF32Buffer, output: *mut ffi::BulletOuCudaCppF32Buffer,
+                base: usize, ft: usize, alpha: f32, fused: i32) -> i32;
+        }
+        let ctx = Context::new(0).unwrap();
+        let (base, virtual_rows, ft) = (3258usize, 1629usize, 16usize);
+        let mut weights: Vec<f32> = (0..(base + virtual_rows)*ft)
+            .map(|i| ((i * 37 % 1009) as f32 - 504.0) * 0.0013).collect();
+        weights[3] = 90000.0; weights[7] = -90000.0;
+        let weights = F32Buffer::from_host(&ctx, &weights).unwrap();
+        for alpha in [0.0, 0.37, 1.0, 1.75] {
+            let reference = F32Buffer::new(&ctx, base*ft).unwrap();
+            let actual = F32Buffer::new(&ctx, base*ft).unwrap();
+            for (out, fused) in [(&reference, 0), (&actual, 1)] {
+                assert_eq!(unsafe { bulletou_test_factorized_ft_half_fold(
+                    ctx.as_ptr(), weights.as_ptr(), out.as_ptr(), base, ft, alpha, fused) }, 0);
+            }
+            assert_eq!(reference.download(&ctx).unwrap(), actual.download(&ctx).unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn hm2_ft_sorted_forward_matches_original_order() {
         use super::*;
         let ctx = Context::new(0).unwrap();
@@ -10867,7 +10897,7 @@ mod tests {
             assert_eq!(activation_scalar.0.download(&ctx).unwrap(), activation_vector.0.download(&ctx).unwrap());
             assert_eq!(activation_scalar.1.download(&ctx).unwrap(), activation_vector.1.download(&ctx).unwrap());
             assert_eq!(activation_scalar.2.download(&ctx).unwrap(), activation_vector.2.download(&ctx).unwrap());
-            if ft == 2304 {
+            if ft == 1536 || ft == 2304 {
                 let fused_f32 = outputs();
                 let fused_half = outputs();
                 let fused_half_activation = outputs();
