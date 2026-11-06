@@ -10809,7 +10809,7 @@ mod tests {
     fn hm2_ft_sorted_forward_matches_original_order() {
         use super::*;
         let ctx = Context::new(0).unwrap();
-        for ft in [32usize, 2304] {
+        for ft in [32usize, 1536, 2304] {
             let (batch, active, input) = (13usize, 3usize, 5000usize);
             let mut stm = vec![-1; batch * active];
             let mut nstm = vec![-1; batch * active];
@@ -10839,6 +10839,14 @@ mod tests {
             assert_eq!(reference.0.download(&ctx).unwrap(), half.0.download(&ctx).unwrap());
             assert_eq!(reference.1.download(&ctx).unwrap(), half.1.download(&ctx).unwrap());
             assert_eq!(reference.2.download(&ctx).unwrap(), half.2.download(&ctx).unwrap());
+            let fused_pair = outputs();
+            check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                weights.as_ptr(), bias.as_ptr(), fused_pair.0.as_ptr(), fused_pair.1.as_ptr(), fused_pair.2.as_ptr(),
+                counts.as_ptr(), order.as_ptr(), batch, active, input, ft, 11) }).unwrap();
+            check(unsafe { ffi::bulletou_test_qat_ft_lattice(ctx.as_ptr(), reference.2.as_ptr(), batch * ft, 1) }).unwrap();
+            assert_eq!(reference.0.download(&ctx).unwrap(), fused_pair.0.download(&ctx).unwrap());
+            assert_eq!(reference.1.download(&ctx).unwrap(), fused_pair.1.download(&ctx).unwrap());
+            assert_eq!(reference.2.download(&ctx).unwrap(), fused_pair.2.download(&ctx).unwrap());
             let nonexact = F32Buffer::from_host(&ctx, &(0..input*ft).map(|i| (i % 29) as f32 * 0.01).collect::<Vec<_>>()).unwrap();
             let rounded = outputs();
             let half_nonexact = outputs();

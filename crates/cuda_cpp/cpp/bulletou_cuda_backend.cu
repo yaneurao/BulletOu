@@ -1199,6 +1199,8 @@ __global__ void sfnn_hm2_sort_scatter(const int* indices, int* counts, int* posi
     }
 }
 
+__device__ __forceinline__ int dense_qat_lattice_integer(float value);
+
 __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     const int* stm_indices,
     const int* nstm_indices,
@@ -1210,7 +1212,7 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     size_t batch,
     size_t max_active,
     size_t input_size,
-    size_t ft_size, float ft_factorizer_alpha, bool bn_raw=false) {
+    size_t ft_size, float ft_factorizer_alpha, bool bn_raw=false, int* qat_packed=nullptr) {
     size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t pairwise = ft_size / 2;
     size_t total = batch * pairwise;
@@ -1267,11 +1269,30 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     stm_l0[l0_base + row1] = stm1;
     nstm_l0[l0_base + row0] = nstm0;
     nstm_l0[l0_base + row1] = nstm1;
-    combined[l0_base + pair] = stm0 * stm1 * SFNN_PAIRWISE_SCALE;
-    combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
+    const float stm_value = stm0 * stm1 * SFNN_PAIRWISE_SCALE;
+    const float nstm_value = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
+    // The packed path only dispatches FT widths whose half-width is a
+    // multiple of four, so each shuffle group belongs to one sample/view.
+    if (qat_packed) {
+        const unsigned a = static_cast<unsigned>(dense_qat_lattice_integer(stm_value));
+        const unsigned b = static_cast<unsigned>(dense_qat_lattice_integer(nstm_value));
+        combined[l0_base + pair] = static_cast<float>(a) / 127.0f;
+        combined[l0_base + pairwise + pair] = static_cast<float>(b) / 127.0f;
+        const unsigned a1 = __shfl_down_sync(0xffffffffu, a, 1, 4);
+        const unsigned a2 = __shfl_down_sync(0xffffffffu, a, 2, 4);
+        const unsigned a3 = __shfl_down_sync(0xffffffffu, a, 3, 4);
+        const unsigned b1 = __shfl_down_sync(0xffffffffu, b, 1, 4);
+        const unsigned b2 = __shfl_down_sync(0xffffffffu, b, 2, 4);
+        const unsigned b3 = __shfl_down_sync(0xffffffffu, b, 3, 4);
+        if ((pair & 3) == 0) {
+            qat_packed[(l0_base + pair) / 4] = static_cast<int>(a | (a1 << 8) | (a2 << 16) | (a3 << 24));
+            qat_packed[(l0_base + pairwise + pair) / 4] = static_cast<int>(b | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        }
+    } else {
+        combined[l0_base + pair] = stm_value;
+        combined[l0_base + pairwise + pair] = nstm_value;
+    }
 }
-
-__device__ __forceinline__ int dense_qat_lattice_integer(float value);
 
 // Independent perspective pass, allowing both views to be sorted
 // by their own king instead of forcing the opponent view into the STM order.
@@ -4454,7 +4475,7 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         validate_buffer(ctx, a, batch * ft, "test FT a") ||
         validate_buffer(ctx, b, batch * ft, "test FT b") ||
         validate_buffer(ctx, combined, batch * ft, "test FT combined")) return -1;
-    if (sorted) {
+    if (sorted && sorted != 11) {
         if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
         const unsigned blocks = static_cast<unsigned>((batch + 255) / 256);
         sfnn_hm2_sort_count<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, batch, active);
@@ -4530,10 +4551,29 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         if (half_weights != nullptr) cudaFree(half_weights);
         return result;
     }
+    int* packed = nullptr;
+    if (sorted == 11) {
+        if (ft % 8 != 0) return fail_message("fused paired FT test requires width divisible by 8");
+        const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&packed), batch * ft);
+        if (status != cudaSuccess) return fail("test paired FT packed allocation", status);
+    }
     sfnn_sparse_l0_pairwise_concat_kernel<<<static_cast<unsigned>((pairs + 255) / 256), 256, 0, ctx->stream>>>(
         stm->ptr, nstm->ptr, weights->ptr, bias->ptr, a->ptr, b->ptr, combined->ptr,
-        batch, active, input, ft, 1.0f, false);
-    return check_kernel_launch("test sorted FT");
+        batch, active, input, ft, 1.0f, false, packed);
+    int result = check_kernel_launch("test paired FT");
+    if (packed && result == 0) {
+        cudaMemsetAsync(counts->ptr, 0, sizeof(int), ctx->stream);
+        const size_t words = batch * ft / 4;
+        test_packed_qat_ft_matches_combined<<<static_cast<unsigned>((words + 255) / 256), 256, 0, ctx->stream>>>(
+            combined->ptr, packed, words, counts->ptr);
+        int mismatch = 0;
+        cudaError_t status = cudaMemcpyAsync(&mismatch, counts->ptr, sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
+        if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+        if (status != cudaSuccess) result = fail("test paired FT packed output", status);
+        else if (mismatch) result = fail_message("paired FT packed bytes differ from activations");
+    }
+    if (packed) cudaFree(packed);
+    return result;
 }
 extern "C" int bulletou_test_sfnn_ft_gather(
     BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* pre,
@@ -6126,7 +6166,7 @@ int launch_sfnn_forward_kernels(
         if (status != cudaSuccess) return fail("query CUDA compute capability", status);
         ctx->dense_qat_dp4a_available = major > 6 || (major == 6 && minor >= 1);
     }
-    const bool fused_qat_ft_pack = sort_hm2_ft && qat_packed_candidate && ctx->dense_qat_dp4a_available != 0 &&
+    const bool fused_qat_ft_pack = qat_packed_candidate && ctx->dense_qat_dp4a_available != 0 &&
         std::getenv("BULLETOU_FUSED_QAT_FT_PACK_REFERENCE") == nullptr;
     if (fused_qat_ft_pack && ensure_i32_scratch(&ctx->dense_qat_packed_input, &ctx->dense_qat_packed_input_len,
             batch * ft_size / 4, "fused FT packed QAT input")) return -1;
@@ -6213,7 +6253,8 @@ int launch_sfnn_forward_kernels(
         batch,
         max_active,
         effective_input_size,
-        ft_size, ft_factorizer_alpha, ctx->bn[0].params != nullptr);
+        ft_size, ft_factorizer_alpha, ctx->bn[0].params != nullptr,
+        fused_qat_ft_pack ? ctx->dense_qat_packed_input : nullptr);
     if (check_kernel_launch("sfnn_sparse_l0_pairwise_concat_kernel launch") != 0) {
         return -1;
     }
