@@ -26,6 +26,7 @@ CUDA SFNN supports independent `sfnn_qat_ft`, `sfnn_qat_l2`, and `sfnn_qat_l3` b
 - L2/L3 weights use scale 64 and int8 bounds; biases use scale 8128 and int32 bounds.
 - When any of L1/L2/L3 is off, selected layers use weight-only fake quantization and floating-point activations.
 - Enabling **all of L1, L2 and L3** selects tatara-style dense QAT: the FT output is floored to the 1/127 grid, followed by integer dense products, activations and L1 skip addition. Backward uses quantized weights and continuous activation STEs. FT arithmetic remains floating point and the final engine FV_SCALE division is excluded.
+- For HalfKA_hm2 with FT width 2304, 16 L1 outputs and 8 or 648 buckets, the CUDA backend groups samples by bucket to reuse L1 integer weights. This preserves the integer output and export format. Set `BULLETOU_QAT_L1_BUCKET_TILES_REFERENCE=1` to use the previous path for diagnostics.
 - FT QAT is independent. Set `sfnn_qat_ft` to `false` and enable L1/L2/L3 to retain floating-point FT precision as in tatara.
 - Direct, worker, profiling and gradient accumulation paths are supported. Checkpoints retain FP32 masters and optimizer state; export format is unchanged. Toggle on resume or use an epoch schedule such as `"sfnn_qat_l2": {"epoch1": false, "epoch6": true}`.
 - With BN enabled, a warning is printed and these three flags are disabled. Use `sfnn_bn_qat` instead.

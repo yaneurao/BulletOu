@@ -10633,20 +10633,26 @@ mod tests {
             let buckets_gpu = I32Buffer::from_host(&ctx, &buckets).unwrap();
             let a = F32Buffer::from_host(&ctx, &values).unwrap();
             let b = F32Buffer::from_host(&ctx, &values).unwrap();
+            let c = F32Buffer::from_host(&ctx, &values).unwrap();
             let scalar_out = F32Buffer::new(&ctx, batch*outputs).unwrap();
             let packed_out = F32Buffer::new(&ctx, batch*outputs).unwrap();
+            let tiled_out = F32Buffer::new(&ctx, batch*outputs).unwrap();
             let scalar_raw = I32Buffer::new(&ctx, batch*outputs).unwrap();
             let packed_raw = I32Buffer::new(&ctx, batch*outputs).unwrap();
-            for (x, out, raw, mode) in [(&a, &scalar_out, &scalar_raw, 0), (&b, &packed_out, &packed_raw, 1)] {
+            let tiled_raw = I32Buffer::new(&ctx, batch*outputs).unwrap();
+            for (x, out, raw, mode) in [(&a, &scalar_out, &scalar_raw, 0), (&b, &packed_out, &packed_raw, 1), (&c, &tiled_out, &tiled_raw, 2)] {
                 check(unsafe { ffi::bulletou_test_qat_packed_l1(ctx.as_ptr(), x.as_ptr(), weights_gpu.as_ptr(),
                     bias_gpu.as_ptr(), buckets_gpu.as_ptr(), out.as_ptr(), raw.as_ptr(),
                     batch, inputs, outputs, stacks, mode) }).unwrap();
             }
             assert_eq!(a.download(&ctx).unwrap(), b.download(&ctx).unwrap());
+            assert_eq!(a.download(&ctx).unwrap(), c.download(&ctx).unwrap());
             let scalar_raw = scalar_raw.download(&ctx).unwrap();
             let packed_raw = packed_raw.download(&ctx).unwrap();
             assert_eq!(scalar_raw, packed_raw);
+            assert_eq!(scalar_raw, tiled_raw.download(&ctx).unwrap());
             assert_eq!(scalar_out.download(&ctx).unwrap(), packed_out.download(&ctx).unwrap());
+            assert_eq!(scalar_out.download(&ctx).unwrap(), tiled_out.download(&ctx).unwrap());
             for sample in 0..batch {
                 for unit in 0..outputs {
                     let bucket = buckets[sample];
@@ -10662,6 +10668,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn qat_bucket_tiled_l1_matches_packed_for_648_sparse_buckets() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let (batch, inputs, outputs, stacks) = (1093usize, 2304usize, 16usize, 648usize);
+        let values: Vec<f32> = (0..batch * inputs).map(|i| ((i * 17 % 128) as f32) / 127.0).collect();
+        let weights: Vec<f32> = (0..stacks * outputs * inputs)
+            .map(|i| ((i * 73 % 256) as i32 - 128) as f32 / 64.0).collect();
+        let bias: Vec<i32> = (0..stacks * outputs).map(|i| i as i32 * 17 - 500).collect();
+        let buckets: Vec<i32> = (0..batch).map(|i| match i % 7 {
+            0 => -1, 1 => stacks as i32, 2 | 3 | 4 => 42, _ => (i % stacks) as i32,
+        }).collect();
+        let weights_gpu = F32Buffer::from_host(&ctx, &weights).unwrap();
+        let bias_gpu = I32Buffer::from_host(&ctx, &bias).unwrap();
+        let buckets_gpu = I32Buffer::from_host(&ctx, &buckets).unwrap();
+        let a = F32Buffer::from_host(&ctx, &values).unwrap();
+        let b = F32Buffer::from_host(&ctx, &values).unwrap();
+        let out_a = F32Buffer::new(&ctx, batch * outputs).unwrap();
+        let out_b = F32Buffer::new(&ctx, batch * outputs).unwrap();
+        let raw_a = I32Buffer::new(&ctx, batch * outputs).unwrap();
+        let raw_b = I32Buffer::new(&ctx, batch * outputs).unwrap();
+        for (x, out, raw, mode) in [(&a, &out_a, &raw_a, 1), (&b, &out_b, &raw_b, 2)] {
+            check(unsafe { ffi::bulletou_test_qat_packed_l1(ctx.as_ptr(), x.as_ptr(), weights_gpu.as_ptr(),
+                bias_gpu.as_ptr(), buckets_gpu.as_ptr(), out.as_ptr(), raw.as_ptr(), batch, inputs, outputs, stacks, mode) }).unwrap();
+        }
+        assert_eq!(raw_a.download(&ctx).unwrap(), raw_b.download(&ctx).unwrap());
+        assert_eq!(out_a.download(&ctx).unwrap(), out_b.download(&ctx).unwrap());
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]

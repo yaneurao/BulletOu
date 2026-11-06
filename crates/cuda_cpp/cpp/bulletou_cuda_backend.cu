@@ -147,6 +147,8 @@ struct BulletOuCudaCppContext {
     size_t dense_qat_packed_input_len = 0;
     int* dense_qat_packed_weights = nullptr;
     size_t dense_qat_packed_weights_len = 0;
+    int* dense_qat_bucket_tiles = nullptr;
+    size_t dense_qat_bucket_tiles_len = 0;
     int dense_qat_dp4a_available = -1;
 };
 
@@ -5715,6 +5717,91 @@ __global__ void dense_qat_l1_packed(const int* input, const int* weights, const 
     }
 }
 
+int launch_sfnn_build_inverse_index(BulletOuCudaCppContext*, const int*, size_t, size_t, size_t);
+
+// Index tiles rather than physically permuting the FT activations. The extra
+// capacity of one tile per bucket covers padding at bucket boundaries.
+__global__ void dense_qat_make_bucket_tiles(const int* offsets, int* tiles, size_t stacks) {
+    if (blockIdx.x || threadIdx.x) return;
+    size_t tile = 0;
+    for (size_t b = 0; b < stacks; ++b) {
+        const int end = offsets[b + 1];
+        for (int i = offsets[b]; i < end; i += 16) {
+            tiles[2 * tile] = static_cast<int>(b);
+            tiles[2 * tile + 1] = i;
+            ++tile;
+        }
+    }
+}
+
+__global__ void dense_qat_clear_invalid_buckets(const int* buckets, float* output, int* raw,
+    size_t batch, size_t stacks) {
+    const size_t sample = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (sample >= batch) return;
+    const int b = buckets[sample];
+    if (b >= 0 && static_cast<size_t>(b) < stacks) return;
+    for (size_t u = 0; u < 16; ++u) { output[sample * 16 + u] = 0; raw[sample * 16 + u] = 0; }
+}
+
+__global__ void dense_qat_l1_bucket_tiles(const int* input, const int* weights, const int* bias,
+    const int* offsets, const int* positions, const int* tiles, float* output, int* raw,
+    size_t words) {
+    constexpr int GROUP = 16, CHUNK = 128;
+    __shared__ int tile_weights[GROUP][CHUNK];
+    const int bucket = tiles[2 * blockIdx.x];
+    if (bucket < 0) return;
+    const int start = tiles[2 * blockIdx.x + 1];
+    const int row = threadIdx.x / GROUP, lane = threadIdx.x % GROUP;
+    const bool active = start + row < offsets[bucket + 1];
+    const int sample = active ? positions[start + row] : 0;
+    const int* x = input + static_cast<size_t>(sample) * words;
+    const int* w = weights + static_cast<size_t>(bucket) * GROUP * words;
+    int sums[GROUP] = {};
+    for (size_t base = 0; base < words; base += CHUNK) {
+        const size_t width = min(static_cast<size_t>(CHUNK), words - base);
+        for (int k = threadIdx.x; k < GROUP * CHUNK; k += blockDim.x) {
+            const int unit = k / CHUNK, j = k % CHUNK;
+            tile_weights[unit][j] = static_cast<size_t>(j) < width ? w[static_cast<size_t>(unit) * words + base + j] : 0;
+        }
+        __syncthreads();
+        if (active) {
+            for (size_t j = lane; j < width; j += GROUP) {
+                const int v = x[base + j];
+                #pragma unroll
+                for (int u = 0; u < GROUP; ++u) sums[u] = dense_qat_dp4a(v, tile_weights[u][j], sums[u]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int u = 0; u < GROUP; ++u) {
+        int sum = sums[u];
+        for (int shift = 8; shift; shift >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, shift, GROUP);
+        if (active && lane == 0) {
+            const int v = static_cast<int>(static_cast<long long>(sum) + static_cast<long long>(bias[bucket * GROUP + u]));
+            raw[static_cast<size_t>(sample) * GROUP + u] = v;
+            output[static_cast<size_t>(sample) * GROUP + u] = static_cast<float>(static_cast<double>(v) / 8128.0);
+        }
+    }
+}
+
+int launch_dense_qat_l1_bucket_tiles(BulletOuCudaCppContext* ctx, const int* input, const int* weights,
+    const int* bias, const int* buckets, float* output, int* raw, size_t batch, size_t inputs, size_t stacks) {
+    if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, stacks) != 0) return -1;
+    const size_t max_tiles = (batch + 15) / 16 + stacks;
+    if (ensure_i32_scratch(&ctx->dense_qat_bucket_tiles, &ctx->dense_qat_bucket_tiles_len,
+            2 * max_tiles, "dense QAT bucket tiles")) return -1;
+    cudaError_t status = cudaMemsetAsync(ctx->dense_qat_bucket_tiles, 0xff, 2 * max_tiles * sizeof(int), ctx->stream);
+    if (status != cudaSuccess) return fail("clear dense QAT bucket tiles", status);
+    dense_qat_make_bucket_tiles<<<1, 1, 0, ctx->stream>>>(ctx->sfnn_inverse_offsets, ctx->dense_qat_bucket_tiles, stacks);
+    dense_qat_clear_invalid_buckets<<<static_cast<unsigned>((batch + 255) / 256), 256, 0, ctx->stream>>>(
+        buckets, output, raw, batch, stacks);
+    dense_qat_l1_bucket_tiles<<<static_cast<unsigned>(max_tiles), 256, 0, ctx->stream>>>(
+        input, weights, bias, ctx->sfnn_inverse_offsets, ctx->sfnn_inverse_positions,
+        ctx->dense_qat_bucket_tiles, output, raw, inputs / 4);
+    return check_kernel_launch("dense QAT L1 bucket tiles");
+}
+
 __global__ void dense_qat_l1_warp_kernel(const float* input,const float* weights,const int* bias,
     const int* buckets,float* output,int* raw,size_t batch,size_t inputs,size_t outputs,size_t stacks,
     size_t groups,size_t common,size_t shard) {
@@ -5761,7 +5848,10 @@ extern "C" int bulletou_test_qat_packed_l1(BulletOuCudaCppContext* ctx, BulletOu
         dense_qat_weights_pack<<<static_cast<unsigned>((weight_words+255)/256),256,0,ctx->stream>>>(weights->ptr, packed_weights, weight_words);
     } else dense_qat_ft_lattice_reference_kernel<<<static_cast<unsigned>((batch*inputs+255)/256),256,0,ctx->stream>>>(input->ptr, batch*inputs);
     const unsigned blocks = static_cast<unsigned>((batch*outputs+7)/8);
-    if (packed) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(packed_input, packed_weights, bias->ptr,
+    if (packed == 2 && outputs == 16) {
+        if (launch_dense_qat_l1_bucket_tiles(ctx, packed_input, packed_weights, bias->ptr, buckets->ptr,
+                output->ptr, raw->ptr, batch, inputs, stacks)) return -1;
+    } else if (packed) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(packed_input, packed_weights, bias->ptr,
         buckets->ptr, output->ptr, raw->ptr, batch, inputs, outputs, stacks);
     else dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(input->ptr, weights->ptr, bias->ptr,
         buckets->ptr, output->ptr, raw->ptr, batch, inputs, outputs, stacks, 1, 0, 0);
@@ -6063,7 +6153,11 @@ int launch_sfnn_forward_kernels(
         constexpr size_t warps=8;
         if(batch*l1_out > static_cast<size_t>(INT_MAX)*warps) return fail_message("dense QAT L1 grid overflow");
         blocks=static_cast<int>((batch*l1_out+warps-1)/warps);
-        if (packed_qat) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(ctx->dense_qat_packed_input,
+        if (packed_qat && l1_out == 16 && (num_stacks == 8 || num_stacks == 648) &&
+            std::getenv("BULLETOU_QAT_L1_BUCKET_TILES_REFERENCE") == nullptr) {
+            if (launch_dense_qat_l1_bucket_tiles(ctx, ctx->dense_qat_packed_input, ctx->dense_qat_packed_weights,
+                    ctx->dense_qat_l1_bias, buckets, l1, ctx->dense_qat_l1_raw, batch, ft_size, num_stacks)) return -1;
+        } else if (packed_qat) dense_qat_l1_packed<<<blocks,256,0,ctx->stream>>>(ctx->dense_qat_packed_input,
             ctx->dense_qat_packed_weights,ctx->dense_qat_l1_bias,buckets,l1,ctx->dense_qat_l1_raw,batch,ft_size,l1_out,num_stacks);
         else dense_qat_l1_warp_kernel<<<blocks,256,0,ctx->stream>>>(combined,l1w,ctx->dense_qat_l1_bias,buckets,
             l1,ctx->dense_qat_l1_raw,batch,ft_size,l1_out,num_stacks,l1_group_count,l1_common_size,l1_shard_size);
@@ -8836,6 +8930,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (ctx->sfnn_ft_half_activations != nullptr) cudaFree(ctx->sfnn_ft_half_activations);
     if (ctx->dense_qat_packed_input != nullptr) cudaFree(ctx->dense_qat_packed_input);
     if (ctx->dense_qat_packed_weights != nullptr) cudaFree(ctx->dense_qat_packed_weights);
+    if (ctx->dense_qat_bucket_tiles != nullptr) cudaFree(ctx->dense_qat_bucket_tiles);
     if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
     if (ctx->norm_loss_scratch != nullptr) cudaFree(ctx->norm_loss_scratch);
     if (ctx->bn_qat_partials != nullptr) cudaFree(ctx->bn_qat_partials);
