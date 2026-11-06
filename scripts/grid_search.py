@@ -211,7 +211,7 @@ def positive_int(settings: dict, key: str) -> int:
 
 
 EPOCH_SETTING_KEYS = {
-    "superbatches", "sfnn_l1_revive_lr_suppress_sb",
+    "superbatches", "save_rate", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
@@ -253,7 +253,7 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
             if key == "superbatches":
                 if type(item) is not int or item < 1:
                     raise ValueError(f"{key}.{name} must be a positive integer")
-            elif key == "sfnn_l1_revive_lr_suppress_sb":
+            elif key in ("save_rate", "sfnn_l1_revive_lr_suppress_sb"):
                 if type(item) is not int or item < 0:
                     raise ValueError(f"{key}.{name} must be a nonnegative integer")
             elif key == "sfnn_l1_factorizer":
@@ -567,7 +567,7 @@ def is_complete(directory: Path, trial: dict, state: dict, rows=None) -> bool:
 
 
 def has_resume_checkpoint(directory: Path) -> bool:
-    return any(p.parent.name.isdigit() and p.stat().st_size > 0
+    return any((p.parent.name.isdigit() or re.fullmatch(r"[0-9]{4,}-[0-9]{4,}sb", p.parent.name)) and p.stat().st_size > 0
                and (p.parent / "dataloader_pos.txt").is_file()
                and (p.parent / "dataloader_pos.txt").stat().st_size > 0
                for p in directory.glob("*/state.bin"))

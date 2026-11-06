@@ -94,6 +94,15 @@ epoch 3の最初のbatchより前に、共有FT重みを個別FT重みへfoldし
 
 未対応項目のオブジェクト指定はエラーです。arch、batch size、教師データ、FT以外のfactorizer構造、loss種類などは途中切替できません。worker/tuning、direct-step smoke、plateauにも未対応です。
 
+## epochごとの保存間隔
+
+```json
+"superbatches": {"epoch1": 64, "epoch10": 324},
+"save_rate": {"epoch1": 16, "epoch10": 81}
+```
+
+epoch 1〜9は64 sb中16 sbごと、epoch 10以降は324 sb中81 sbごとに保存します。`save_rate`は0以上の整数で、0なら定期保存を無効にします。`save_epoch_end`が有効なら、0でもepoch末は保存されます。`validation_rate`を省略した場合の検証間隔も各epochの`save_rate`に従います。独立warmup epoch 0はepoch 1の`save_rate`を使用します。通常のcuda-cpp SFNN学習とgrid searchで利用できます。
+
 ## bpu変更時の丸め
 
 保存時に未反映の累積勾配を残さないため、batches/sbは**そのepochで有効なbpuだけ**で割り切れる数に切り下げます。将来のepochの設定は、現在のbatch数・LR周期・勾配更新境界に影響しません。

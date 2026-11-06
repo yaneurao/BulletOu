@@ -670,10 +670,15 @@ def latest_learn_log_metric(checkpoint: Path) -> Metric:
 
 
 def latest_checkpoint_dir(output_dir: Path) -> Path:
-    candidates: list[tuple[int, Path]] = []
+    candidates: list[tuple[tuple[int, int], Path]] = []
     for child in output_dir.iterdir():
-        if child.is_dir() and child.name.isdigit() and (child / "state.bin").exists():
-            candidates.append((int(child.name), child))
+        if not child.is_dir() or not (child / "state.bin").exists():
+            continue
+        parts = child.name.removesuffix("sb").split("-")
+        if child.name.endswith("sb") and len(parts) == 2 and all(p.isdigit() and len(p) >= 4 for p in parts):
+            candidates.append(((int(parts[0]), int(parts[1])), child))
+        elif child.name.isdigit():
+            candidates.append(((0, int(child.name)), child))
     if not candidates:
         raise RuntimeError(f"no checkpoint directory containing state.bin found under {output_dir}")
     return max(candidates, key=lambda item: item[0])[1]

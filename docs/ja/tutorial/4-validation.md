@@ -79,6 +79,8 @@
 
 ## 4.5 保存頻度とは別に考える
 
+checkpointフォルダ名は `0001-0032sb` のように、epoch番号とそのepoch内のsuperbatch番号を表します（例はepoch 1のsb 32）。
+
 `save_rate` / `--save-rate` は checkpoint を保存する頻度（単位: sb）です。正の整数ならその間隔で保存し、`0` または `"none"` なら途中の定期保存を行いません。省略時は `20` です。
 
 `validation_rate` / `--validation-rate` は accuracy / loss を測る頻度です。

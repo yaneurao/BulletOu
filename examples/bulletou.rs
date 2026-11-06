@@ -4122,7 +4122,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 }
 
 const EPOCH_SETTING_KEYS: &[&str] = &[
-    "superbatches", "sfnn_l1_revive_lr_suppress_sb",
+    "superbatches", "save_rate", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "ft_factorizer",
@@ -4160,7 +4160,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
             }
             continue;
         }
-        if key == "sfnn_l1_revive_lr_suppress_sb" && !v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()) {
+        if matches!(key, "save_rate" | "sfnn_l1_revive_lr_suppress_sb") && !v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()) {
             return Err(format!("{key}.{name} must be a nonnegative integer"));
         }
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
@@ -4279,7 +4279,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
                 _ => unreachable!(),
             }};
         }
-        assign!(superbatches, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
+        assign!(superbatches, save_rate, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
             lr, lr_min, batches_per_update, sfnn_gptq, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_ft_fp16_moments, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
@@ -20439,7 +20439,7 @@ fn write_cuda_cpp_nnue_numbered_checkpoint(
     completed_steps: usize,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
-    let (output_dir, idx, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args)?;
+    let (output_dir, name, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args, log.epoch, log.superbatch)?;
     let write_result = (|| -> Result<(), String> {
         write_cuda_cpp_nnue_nn_bin(&tmp_dir.join("nn.bin"), feature_kind, shape, weights)?;
         write_cuda_cpp_halfkp_weights_bin(&tmp_dir.join("state.bin"), weights, optimizer_states, completed_steps)?;
@@ -20451,7 +20451,7 @@ fn write_cuda_cpp_nnue_numbered_checkpoint(
         return Err(err);
     }
     commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
-    append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
+    append_cuda_cpp_direct_checkpoint_summary(&output_dir, &name, args)?;
     Ok(dir)
 }
 
@@ -20470,7 +20470,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     factorizer_axis_confidences: Option<&[f32]>,
     log: CudaCppCheckpointLog,
 ) -> Result<std::path::PathBuf, String> {
-    let (output_dir, idx, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args)?;
+    let (output_dir, name, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args, log.epoch, log.superbatch)?;
     let write_result = (|| -> Result<(), String> {
         write_cuda_cpp_sfnn_nn_bin(
             &tmp_dir.join("nn.bin"),
@@ -20503,7 +20503,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         return Err(err);
     }
     commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
-    append_cuda_cpp_direct_checkpoint_summary(&output_dir, idx, args)?;
+    append_cuda_cpp_direct_checkpoint_summary(&output_dir, &name, args)?;
     if args.sfnn_gptq {
         if let Err(err) = gptq::run_automatic(args, &dir, log.epoch, log.superbatch) {
             eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", dir.display());
@@ -20555,10 +20555,10 @@ fn write_cuda_cpp_direct_checkpoint_metadata_files(
 #[cfg(feature = "cuda-cpp-backend")]
 fn append_cuda_cpp_direct_checkpoint_summary(
     output_dir: &std::path::Path,
-    idx: usize,
+    name: &str,
     args: &Args,
 ) -> Result<(), String> {
-    append_to_top_level_log(output_dir, idx, Some(args))
+    append_to_top_level_log(output_dir, name, Some(args))
         .map_err(|err| format!("failed to update {}: {err}", output_dir.join(SUMMARY_LEARN_LOG_NAME).display()))
 }
 
@@ -20571,17 +20571,17 @@ fn write_cuda_cpp_direct_checkpoint_metadata(
     log: CudaCppCheckpointLog,
 ) -> Result<(), String> {
     write_cuda_cpp_direct_checkpoint_metadata_files(dir, args, log)?;
-    append_cuda_cpp_direct_checkpoint_summary(output_dir, idx, args)
+    append_cuda_cpp_direct_checkpoint_summary(output_dir, &format!("{idx:04}"), args)
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn prepare_cuda_cpp_numbered_checkpoint_dir(
-    args: &Args,
-) -> Result<(std::path::PathBuf, usize, std::path::PathBuf, std::path::PathBuf), String> {
+    args: &Args, epoch: usize, superbatch: usize,
+) -> Result<(std::path::PathBuf, String, std::path::PathBuf, std::path::PathBuf), String> {
     let output_dir = args.output_dir();
     std::fs::create_dir_all(&output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
-    let idx = next_numbered_checkpoint_idx(&output_dir);
-    let dir = output_dir.join(format!("{idx:04}"));
+    let name = checkpoint_dir_name(epoch, superbatch);
+    let dir = output_dir.join(&name);
     if dir.exists() {
         if is_complete_checkpoint_dir(&dir) {
             return Err(format!("refusing to overwrite existing numbered checkpoint {}", dir.display()));
@@ -20590,12 +20590,12 @@ fn prepare_cuda_cpp_numbered_checkpoint_dir(
     }
 
     for attempt in 0..1000usize {
-        let tmp_dir = output_dir.join(format!("{idx:04}.tmp-{}-{attempt}", std::process::id()));
+        let tmp_dir = output_dir.join(format!("{name}.tmp-{}-{attempt}", std::process::id()));
         if tmp_dir.exists() {
             continue;
         }
         std::fs::create_dir(&tmp_dir).map_err(|err| format!("failed to create {}: {err}", tmp_dir.display()))?;
-        return Ok((output_dir, idx, dir, tmp_dir));
+        return Ok((output_dir, name, dir, tmp_dir));
     }
     Err(format!("failed to choose temporary checkpoint directory for {}", dir.display()))
 }
@@ -26620,20 +26620,20 @@ fn cuda_cpp_run_schedule(args: &Args) -> Result<CudaCppRunSchedule, String> {
 
     let mut chunks = Vec::new();
     let mut cumulative_steps = 0usize;
-    let save_rate = effective_save_rate(args);
-    let save_period_sbs = Some(save_rate).filter(|&rate| rate > 0);
-    let validation_enabled = cuda_cpp_should_schedule_validation(args);
-    let validation_period_sbs = if validation_enabled { validation_period(args) } else { None };
-    let validation_epoch_end_only = validation_enabled && validation_is_epoch_end_only(args);
-    let quantized_validation_enabled = cuda_cpp_should_schedule_quantized_validation(args);
-    let quantized_validation_period_sbs =
-        if quantized_validation_enabled { quantized_validation_period(args, save_rate) } else { None };
-    let quantized_validation_epoch_end_only =
-        quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
-    let save_epoch_end = effective_save_epoch_end(args);
     for epoch in start_epoch..=max_epochs {
         let epoch_args = args_at_epoch(args, epoch)?;
         let args = &epoch_args;
+        let save_rate = effective_save_rate(args);
+        let save_period_sbs = Some(save_rate).filter(|&rate| rate > 0);
+        let validation_enabled = cuda_cpp_should_schedule_validation(args);
+        let validation_period_sbs = if validation_enabled { validation_period(args) } else { None };
+        let validation_epoch_end_only = validation_enabled && validation_is_epoch_end_only(args);
+        let quantized_validation_enabled = cuda_cpp_should_schedule_quantized_validation(args);
+        let quantized_validation_period_sbs =
+            if quantized_validation_enabled { quantized_validation_period(args, save_rate) } else { None };
+        let quantized_validation_epoch_end_only =
+            quantized_validation_enabled && quantized_validation_is_epoch_end_only(args);
+        let save_epoch_end = effective_save_epoch_end(args);
         let superbatches = configured_epoch_superbatches(args, epoch);
         let batches_per_superbatch = effective_batches_per_superbatch(args)?;
         let lr_step_gamma = effective_lr_step_gamma(args, batches_per_superbatch)?.0;
@@ -26908,6 +26908,7 @@ fn write_cuda_cpp_state_records_atomic<'a>(
 /// lower than the latest checkpoint and breaks auto-resume. Conversely, if a
 /// failed save left `0075/` with only `nn.bin`, the next successful save should
 /// still be `0075/`, not `0076/`.
+#[cfg(test)]
 fn next_numbered_checkpoint_idx(output_dir: &std::path::Path) -> usize {
     numbered_checkpoint_dirs_desc(output_dir)
         .into_iter()
@@ -27448,6 +27449,7 @@ fn resume_signature_matches(stored: &str, args: &Args) -> bool {
     stored_candidate.trim_end() == candidate.trim_end()
 }
 
+#[cfg(test)]
 fn numbered_checkpoint_dirs_desc(output_dir: &std::path::Path) -> Vec<(usize, std::path::PathBuf)> {
     let mut dirs = Vec::new();
     let Ok(rd) = std::fs::read_dir(output_dir) else { return dirs };
@@ -27474,11 +27476,34 @@ fn is_complete_checkpoint_dir(dir: &std::path::Path) -> bool {
 /// `state.bin` truncated by `ERROR_DISK_FULL`). Such directories are not
 /// resumable, so auto-resume requires the checkpoint payload plus the metadata
 /// files written after a successful save.
+fn checkpoint_dir_name(epoch: usize, superbatch: usize) -> String {
+    format!("{epoch:04}-{superbatch:04}sb")
+}
+
+fn parse_checkpoint_dir_name(name: &str) -> Option<(usize, usize)> {
+    let (epoch, sb) = name.strip_suffix("sb")?.split_once('-')?;
+    if epoch.len() < 4 || sb.len() < 4 || !epoch.bytes().all(|b| b.is_ascii_digit())
+        || !sb.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    Some((epoch.parse().ok()?, sb.parse().ok()?))
+}
+
 fn latest_complete_checkpoint_dir_raw(output_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    numbered_checkpoint_dirs_desc(output_dir)
-        .into_iter()
-        .map(|(_, path)| path)
-        .find(|path| is_complete_checkpoint_dir(path))
+    let mut named = Vec::new();
+    let mut legacy = Vec::new();
+    for entry in std::fs::read_dir(output_dir).ok()?.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        if !is_complete_checkpoint_dir(&path) { continue; }
+        if let Some(position) = parse_checkpoint_dir_name(name) {
+            named.push((position, path));
+        } else if let Ok(number) = name.parse::<usize>() {
+            legacy.push((number, path));
+        }
+    }
+    let latest_named = named.into_iter().max_by_key(|(position, _)| *position);
+    let latest_legacy = legacy.into_iter().max_by_key(|(number, _)| *number)
+        .and_then(|(_, path)| read_checkpoint_epoch_superbatch(&path).map(|position| (position, path)));
+    latest_named.into_iter().chain(latest_legacy).max_by_key(|(position, _)| *position).map(|(_, path)| path)
 }
 
 /// Find the latest complete numbered subdirectory under `output_dir` and return
@@ -28367,9 +28392,10 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-fn append_to_top_level_log(output_dir: &std::path::Path, last_idx: usize, args: Option<&Args>) -> std::io::Result<()> {
+fn append_to_top_level_log(output_dir: &std::path::Path, checkpoint: impl std::fmt::Display, args: Option<&Args>) -> std::io::Result<()> {
     use std::io::Write;
-    let checkpoint_name = format!("{last_idx:04}");
+    let checkpoint_name = checkpoint.to_string();
+    let checkpoint_name = checkpoint_name.parse::<usize>().map(|n| format!("{n:04}")).unwrap_or(checkpoint_name);
     let latest_log = output_dir.join(&checkpoint_name).join("learn.log");
     let body = std::fs::read_to_string(&latest_log)?;
     let mut lines = body.lines();
@@ -28574,20 +28600,15 @@ fn run_kppt_component_dirs_final_validation(
 
 /// Walk the per-component checkpoint subdirs (`kk-*` / `kkp-*` / `kpp-*`)
 /// produced by the cuda-cpp KPPT component trainers, and assemble them into
-/// flat `<output>/0001/`, `0002/`, ... directories each containing the
-/// three `.bin` files. Removes the per-component subdirs after assembly so
-/// the user sees a clean numbered layout.
-///
-/// Returns `(first_idx, last_idx)` of the numbered dirs written in this run
-/// (1-based, inclusive). On resume the range starts above the previously
-/// existing count, so the caller can locate the latest dir to inspect.
+/// `<output>/<epoch>-<superbatch>sb/` directories containing the three
+/// `.bin` files. Returns the first and last checkpoint names.
 fn assemble_numbered_dirs(
     output_dir: &std::path::Path,
     ctx: &LogContext,
     prior_positions: &std::collections::BTreeMap<String, usize>,
     state_backend: &str,
     validation_args: Option<&Args>,
-) -> std::io::Result<(usize, usize)> {
+) -> std::io::Result<(String, String)> {
     let kk_dirs = list_component_checkpoints_sorted(output_dir, "kk");
     let kkp_dirs = list_component_checkpoints_sorted(output_dir, "kkp");
     let kpp_dirs = list_component_checkpoints_sorted(output_dir, "kpp");
@@ -28614,22 +28635,26 @@ fn assemble_numbered_dirs(
         );
     }
 
-    // When resuming, do not overwrite the previous run's numbered dirs.
-    let first_idx = next_numbered_checkpoint_idx(output_dir);
-
     let prior_kk = prior_positions.get("kk").copied().unwrap_or(0);
     let prior_kkp = prior_positions.get("kkp").copied().unwrap_or(0);
     let prior_kpp = prior_positions.get("kpp").copied().unwrap_or(0);
 
-    eprintln!("\n=== assembling {n} checkpoint dir(s) under {} (starting at #{}) ===", output_dir.display(), first_idx);
+    eprintln!("\n=== assembling {n} checkpoint dir(s) under {} ===", output_dir.display());
+    let mut first_name = String::new();
+    let mut last_name = String::new();
     let validation_cache = validation_args.and_then(TestPositionsCache::try_load);
     for i in 0..n {
-        let idx = first_idx + i;
-        let dst = output_dir.join(format!("{idx:04}"));
-        std::fs::create_dir_all(&dst)?;
-        let (kk_epoch, _kk_sb, kk_dir) = &kk_dirs[i];
-        let (kkp_epoch, _kkp_sb, kkp_dir) = &kkp_dirs[i];
-        let (kpp_epoch, _kpp_sb, kpp_dir) = &kpp_dirs[i];
+        let (kk_epoch, kk_sb, kk_dir) = &kk_dirs[i];
+        let (kkp_epoch, kkp_sb, kkp_dir) = &kkp_dirs[i];
+        let (kpp_epoch, kpp_sb, kpp_dir) = &kpp_dirs[i];
+        if (kk_epoch, kk_sb) != (kkp_epoch, kkp_sb) || (kk_epoch, kk_sb) != (kpp_epoch, kpp_sb) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "KPPT component checkpoint positions differ"));
+        }
+        let name = checkpoint_dir_name(*kk_epoch, *kk_sb);
+        let dst = output_dir.join(&name);
+        std::fs::create_dir(&dst)?;
+        if i == 0 { first_name = name.clone(); }
+        last_name = name;
         // engine-facing quantised .bin files
         std::fs::copy(kk_dir.join("KK_synthesized.bin"), dst.join("KK_synthesized.bin"))?;
         std::fs::copy(kkp_dir.join("KKP_synthesized.bin"), dst.join("KKP_synthesized.bin"))?;
@@ -28683,7 +28708,7 @@ fn assemble_numbered_dirs(
         }
     }
 
-    Ok((first_idx, first_idx + n - 1))
+    Ok((first_name, last_name))
 }
 
 /// Cache of test-set positions used for validation events. Loaded
@@ -30751,6 +30776,47 @@ mod tests {
         } else {
             "cuda-cpp-backend"
         }));
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn scheduled_epoch_lengths_and_save_rates_control_checkpoints() {
+        let mut args = Args::try_parse_from([
+            "bulletou", "--teacher", "/dev/null", "--arch", "SFNN_halfka2_1024_7_64_k3k3",
+            "--backend", "cuda-cpp", "--superbatches", "5", "--save-rate", "2",
+            "--max-epochs", "3", "--batch-size", "64", "--positions-per-superbatch", "128",
+            "--save-epoch-end", "false",
+        ]).unwrap();
+        args.epoch_settings_json = Some(serde_json::json!({
+            "superbatches": {"epoch1": 5, "epoch2": 4, "epoch3": 3},
+            "save_rate": {"epoch1": 2, "epoch2": 3, "epoch3": 0}
+        }).to_string());
+        let schedule = cuda_cpp_run_schedule(&args).unwrap();
+        let saved: Vec<_> = schedule.chunks.iter().filter(|c| c.save_checkpoint)
+            .map(|c| (c.epoch, c.superbatch)).collect();
+        assert_eq!(saved, vec![(1, 2), (1, 4), (2, 3)]);
+        assert_eq!(schedule.total_steps, 24);
+        assert!(validate_epoch_setting("save_rate", &serde_json::json!({"epoch1": -1})).is_err());
+        assert!(validate_epoch_setting("save_rate", &serde_json::json!({"epoch1": 1.5})).is_err());
+    }
+
+    #[test]
+    fn checkpoint_names_sort_by_epoch_and_superbatch_and_skip_incomplete() {
+        assert_eq!(checkpoint_dir_name(1, 32), "0001-0032sb");
+        assert_eq!(parse_checkpoint_dir_name("0001-0032sb"), Some((1, 32)));
+        assert_eq!(parse_checkpoint_dir_name("0001-0032sb.tmp-1"), None);
+        let tmp = std::env::temp_dir().join(format!("bulletou-checkpoint-name-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        for (epoch, sb) in [(1, 5000), (2, 32), (10, 1)] {
+            let dir = tmp.join(checkpoint_dir_name(epoch, sb));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("state.bin"), b"state").unwrap();
+            std::fs::write(dir.join("dataloader_pos.txt"), b"0,0").unwrap();
+            std::fs::write(dir.join("learn.log"), format!("{LEARN_LOG_HEADER}\nSFNN,{epoch},{sb},1,-,-,-,-,0.1,0.1,1,64,teacher\n")).unwrap();
+        }
+        std::fs::create_dir(tmp.join("0010-0002sb")).unwrap();
+        assert_eq!(latest_complete_checkpoint_dir_raw(&tmp), Some(tmp.join("0010-0001sb")));
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
