@@ -2896,7 +2896,10 @@ fn prepare_sfnn_fast_batch_from_board_features(
         }),
     };
     let threads = config.threads.max(1);
-    let chunk_size = batch_size.div_ceil(threads).max(1);
+    // More tasks than workers lets Rayon balance position-dependent decode and
+    // feature extraction costs, especially when workers outnumber CPU cores.
+    let chunks = if threads > 1 { threads.saturating_mul(4) } else { 1 };
+    let chunk_size = batch_size.div_ceil(chunks).max(1);
     let sparse_chunk_size = max_active * chunk_size;
     let target_blend = 1.0 - config.lambda;
     let rscale = 1.0 / config.scale;

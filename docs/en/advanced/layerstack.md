@@ -36,7 +36,7 @@ BulletOu's SFNN LayerStack selection is the product of three independent axes.
 | Split | What it looks at | Architecture-name parts | Bucket count |
 |---|---|---|---:|
 | hand | side-to-move / non-side hand pieces | omitted, `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 1 / 4 / 16 / 64 / 64 / 256 / 1024 |
-| king | side-to-move / non-side king positions | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 841 |
+| king | side-to-move / non-side king positions | omitted, `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k21k21z`, `k29k29` | 1 / 9 / 81 / 81 / 169 / 441 / 441 / 841 |
 | progress | game progress | omitted, `progress2`, `progress3`, `progress4`, `progress8`, `progress16`, `progress32` | 1 / 2 / 3 / 4 / 8 / 16 / 32 |
 
 The final stack count is a product.
@@ -150,11 +150,12 @@ King bucket variants choose how much position detail to keep.
 | `k3k3` | 3 | 9 | coarse rank grouping |
 | `k9k9` | 9 | 81 | exact king rank, no file information |
 | `k9k9z` | 9 | 81 | same 81 stacks as `k9k9`, but spends detail on home-rank file zones |
+| `k21k21z` | 21 | 441 | identical partition and numbering to `k21k21`; ranks 1-3, 4-6 and 7 are merged, and ranks 8-9 retain each file |
 | `k13k13z` | 13 | 169 | ranks 1-7 exact, ranks 8-9 split by file/3 |
 | `k21k21` | 21 | 441 | ranks 8-9 keep full square detail |
 | `k29k29` | 29 | 841 | ranks 7-9 keep full square detail |
 
-The `z` in `k9k9z` / `k13k13z` means zone. These are not plain rank splits; they spend resolution on areas expected to matter more.
+The `z` in `k9k9z` / `k13k13z` / `k21k21z` means zone. These are not plain rank splits; they spend resolution on areas expected to matter more. `k21k21z` uses the same partition as the existing `k21k21`.
 
 Long aliases are also accepted, such as `king9_by_king9`, `king9z_by_king9z`, `king9zone_by_king9zone`, `king13z_by_king13z`, `king13zone_by_king13zone`, `king21_by_king21`, and `king29_by_king29`.
 

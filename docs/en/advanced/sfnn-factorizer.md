@@ -175,7 +175,7 @@ If an architecture does not have an axis, that axis has one bucket.
 | Axis | Examples | Meaning |
 |---|---|---|
 | hand | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | hand-piece state for side-to-move and opponent |
-| king | `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | king-position bucket |
+| king | `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k21k21z`, `k29k29` | king-position bucket |
 | progress | `progress2`, `progress4`, `progress8`, `progress16`, `progress32` | game-progress bucket |
 
 The factorizer uses these hand / king / progress axes to decide which stacks share components.

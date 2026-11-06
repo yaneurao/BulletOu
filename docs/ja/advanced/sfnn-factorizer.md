@@ -174,7 +174,7 @@ architecture にその軸がない場合、その軸の bucket 数は1として�
 | 軸 | 例 | 意味 |
 |---|---|---|
 | hand | `hand4`, `hand16`, `hand64`, `hand64z`, `hand256`, `hand1024` | 手番側と非手番側の手駒状態 |
-| king | `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k29k29` | 玉位置 bucket |
+| king | `k3k3`, `k9k9`, `k9k9z`, `k13k13z`, `k21k21`, `k21k21z`, `k29k29` | 玉位置 bucket |
 | progress | `progress2`, `progress4`, `progress8`, `progress16`, `progress32` | 進行度 bucket |
 
 factorizer は、この hand / king / progress の軸を使って、どの stack 同士で成分を共有するかを決めます。

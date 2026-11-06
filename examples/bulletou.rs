@@ -384,6 +384,7 @@ impl LayerStackMode {
                     ShogiSfnnKingBucketKind::King9ZoneByKing9Zone => parts.push("k9k9z"),
                     ShogiSfnnKingBucketKind::King13ZoneByKing13Zone => parts.push("k13k13z"),
                     ShogiSfnnKingBucketKind::King21ByKing21 => parts.push("k21k21"),
+                    ShogiSfnnKingBucketKind::King21ZoneByKing21Zone => parts.push("k21k21z"),
                     ShogiSfnnKingBucketKind::King29ByKing29 => parts.push("k29k29"),
                 }
                 match progress {
@@ -554,6 +555,8 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
         .replace("king9_by_king9", "k9k9")
         .replace("king9z_by_king9z", "k9k9z")
         .replace("king9zone_by_king9zone", "k9k9z")
+        .replace("king21z_by_king21z", "k21k21z")
+        .replace("king21zone_by_king21zone", "k21k21z")
         .replace("king13z_by_king13z", "k13k13z")
         .replace("king13zone_by_king13zone", "k13k13z")
         .replace("king21_by_king21", "k21k21")
@@ -579,7 +582,7 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
                     _ => unreachable!(),
                 };
             }
-            "k3k3" | "k9k9" | "k9k9z" | "k13k13z" | "k21k21" | "k29k29" => {
+            "k3k3" | "k9k9" | "k9k9z" | "k13k13z" | "k21k21" | "k21k21z" | "k29k29" => {
                 if king != ShogiSfnnKingBucketKind::None {
                     return Err(format!("invalid arch `{arch}`: duplicate SFNN king bucket token in `{raw}`"));
                 }
@@ -589,6 +592,7 @@ fn parse_sfnn_layerstack_spec(raw: &str, arch: &str) -> Result<LayerStackMode, S
                     "k9k9z" => ShogiSfnnKingBucketKind::King9ZoneByKing9Zone,
                     "k13k13z" => ShogiSfnnKingBucketKind::King13ZoneByKing13Zone,
                     "k21k21" => ShogiSfnnKingBucketKind::King21ByKing21,
+                    "k21k21z" => ShogiSfnnKingBucketKind::King21ZoneByKing21Zone,
                     "k29k29" => ShogiSfnnKingBucketKind::King29ByKing29,
                     _ => unreachable!(),
                 };
@@ -914,7 +918,7 @@ impl std::fmt::Display for NnueArch {
     }
 }
 
-const SFNN_LAYERSTACK_EXPECTED: &str = "[hand4|hand16|hand64|hand64z|hand256|hand1024] [k3k3|k9k9|k9k9z|k13k13z|k21k21|k29k29] [progress2|progress3|progress4|progress8|progress16|progress32]";
+const SFNN_LAYERSTACK_EXPECTED: &str = "[hand4|hand16|hand64|hand64z|hand256|hand1024] [k3k3|k9k9|k9k9z|k13k13z|k21k21|k21k21z|k29k29] [progress2|progress3|progress4|progress8|progress16|progress32]";
 const SFNN_ARCH_EXPECTED: &str = "SFNN_<feature>_<FT>_<H1>_<H2>[_cN_sMxG][_<hand*>][_<k*>][_<progress*>]";
 
 impl std::str::FromStr for NnueArch {
@@ -29428,6 +29432,14 @@ mod tests {
         assert_eq!(k9k9z.expected_eval_type(), EvalType::SfnnHalfka2);
         assert_eq!(k9k9z.layerstack.unwrap().num_stacks(), 81);
         assert_eq!(k9k9z.cli_name(), "SFNN_halfka2_1024_7_64_k9k9z");
+        for name in ["k21k21z", "king21z_by_king21z", "king21zone_by_king21zone"] {
+            let arch = NnueArch::from_str(&format!("SFNN_halfka2_1024_7_64_{name}")).unwrap();
+            assert_eq!(arch.layerstack.unwrap().num_stacks(), 441);
+            assert_eq!(arch.cli_name(), "SFNN_halfka2_1024_7_64_k21k21z");
+        }
+        let combined = NnueArch::from_str("SFNN_halfka2_1024_7_64_k21k21z_hand256_progress8").unwrap();
+        assert_eq!(combined.layerstack.unwrap().num_stacks(), 256 * 441 * 8);
+        assert_eq!(combined.cli_name(), "SFNN_halfka2_1024_7_64_hand256_k21k21z_progress8");
         let king9z_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king9z_by_king9z").unwrap();
         assert_eq!(king9z_alias.cli_name(), "SFNN_halfka2_1024_7_64_k9k9z");
         let king9zone_alias = NnueArch::from_str("SFNN_halfka2_1024_7_64_king9zone_by_king9zone").unwrap();

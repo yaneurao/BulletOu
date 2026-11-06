@@ -95,6 +95,7 @@ YaneuraOu-compatible LayerStack bucket algorithm:
 - `k9k9z`: 81 buckets by 9-way king zones.
 - `k13k13z`: 169 buckets by 13-way king zones.
 - `k21k21` / `king21_by_king21`: 441 buckets by 21-way friend/enemy king-square buckets.
+- `k21k21z` / `king21z_by_king21z`: 441 buckets; exactly the same partition and index order as `k21k21`.
 - `k29k29` / `king29_by_king29`: 841 buckets by 29-way friend/enemy king-square buckets.
 - `hand4`: 4 buckets by side-to-move / non-side bishop-in-hand presence.
 - `hand16`: 16 buckets by side-to-move / non-side pawn/bishop-in-hand presence.

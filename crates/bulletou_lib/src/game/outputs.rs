@@ -895,6 +895,7 @@ pub enum ShogiSfnnKingBucketKind {
     King9ZoneByKing9Zone,
     King13ZoneByKing13Zone,
     King21ByKing21,
+    King21ZoneByKing21Zone,
     King29ByKing29,
 }
 
@@ -906,7 +907,7 @@ impl ShogiSfnnKingBucketKind {
             Self::KingRank81 => 81,
             Self::King9ZoneByKing9Zone => 81,
             Self::King13ZoneByKing13Zone => 169,
-            Self::King21ByKing21 => 441,
+            Self::King21ByKing21 | Self::King21ZoneByKing21Zone => 441,
             Self::King29ByKing29 => 841,
         }
     }
@@ -918,7 +919,7 @@ impl ShogiSfnnKingBucketKind {
             Self::KingRank81 => 9,
             Self::King9ZoneByKing9Zone => 9,
             Self::King13ZoneByKing13Zone => 13,
-            Self::King21ByKing21 => 21,
+            Self::King21ByKing21 | Self::King21ZoneByKing21Zone => 21,
             Self::King29ByKing29 => 29,
         }
     }
@@ -930,7 +931,9 @@ impl ShogiSfnnKingBucketKind {
             Self::KingRank81 => ShogiKingRankBucket::<81>.bucket(pos),
             Self::King9ZoneByKing9Zone => ShogiKing9ZoneByKing9ZoneBucket::bucket_index(pos),
             Self::King13ZoneByKing13Zone => ShogiKing13ZoneByKing13ZoneBucket::bucket_index(pos),
-            Self::King21ByKing21 => ShogiKing21ByKing21Bucket::bucket_index(pos),
+            Self::King21ByKing21 | Self::King21ZoneByKing21Zone => {
+                ShogiKing21ByKing21Bucket::bucket_index(pos)
+            }
             Self::King29ByKing29 => ShogiKing29ByKing29Bucket::bucket_index(pos),
         }
     }
@@ -959,7 +962,9 @@ impl ShogiSfnnKingBucketKind {
             Self::King13ZoneByKing13Zone => {
                 shogi_king13_zone_single_bucket(f_sq) * 13 + shogi_king13_zone_single_bucket(e_sq)
             }
-            Self::King21ByKing21 => shogi_king21_single_bucket(f_sq) * 21 + shogi_king21_single_bucket(e_sq),
+            Self::King21ByKing21 | Self::King21ZoneByKing21Zone => {
+                shogi_king21_single_bucket(f_sq) * 21 + shogi_king21_single_bucket(e_sq)
+            }
             Self::King29ByKing29 => shogi_king29_single_bucket(f_sq) * 29 + shogi_king29_single_bucket(e_sq),
         }
     }
@@ -1060,6 +1065,11 @@ impl ShogiSfnnLayerStackBucketKind {
     pub const King21ByKing21: Self = Self::new(
         ShogiSfnnHandBucketKind::None,
         ShogiSfnnKingBucketKind::King21ByKing21,
+        ShogiSfnnProgressBucketKind::None,
+    );
+    pub const King21ZoneByKing21Zone: Self = Self::new(
+        ShogiSfnnHandBucketKind::None,
+        ShogiSfnnKingBucketKind::King21ZoneByKing21Zone,
         ShogiSfnnProgressBucketKind::None,
     );
     pub const King29ByKing29: Self = Self::new(
@@ -2433,6 +2443,7 @@ mod tests {
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank9.num_stacks(), 9);
         assert_eq!(ShogiSfnnLayerStackBucketKind::KingRank81.num_stacks(), 81);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King9ZoneByKing9Zone.num_stacks(), 81);
+        assert_eq!(ShogiSfnnLayerStackBucketKind::King21ZoneByKing21Zone.num_stacks(), 441);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King13ZoneByKing13Zone.num_stacks(), 169);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King21ByKing21.num_stacks(), 441);
         assert_eq!(ShogiSfnnLayerStackBucketKind::King29ByKing29.num_stacks(), 841);
@@ -2653,6 +2664,7 @@ mod tests {
             ShogiSfnnLayerStackBucketKind::KingRank81,
             ShogiSfnnLayerStackBucketKind::King9ZoneByKing9Zone,
             ShogiSfnnLayerStackBucketKind::King13ZoneByKing13Zone,
+            ShogiSfnnLayerStackBucketKind::King21ZoneByKing21Zone,
             ShogiSfnnLayerStackBucketKind::King21ByKing21,
             ShogiSfnnLayerStackBucketKind::King29ByKing29,
             ShogiSfnnLayerStackBucketKind::Hand1024,
@@ -2752,6 +2764,40 @@ mod tests {
             ShogiKing21ByKing21Bucket::bucket_index(&pos),
             shogi_king21_single_bucket(Square::new(0, 7)) * 21 + shogi_king21_single_bucket(Square::new(0, 7))
         );
+    }
+
+    #[test]
+    fn test_king21_zone_all_squares_and_perspectives() {
+        let kind = ShogiSfnnKingBucketKind::King21ZoneByKing21Zone;
+        assert_eq!(kind.axis_dim(), 21);
+        assert_eq!(kind.bucket_count(), 441);
+        for rank in 0..9 {
+            for file in 0..9 {
+                let sq = Square::new(file, rank);
+                let expected = match rank {
+                    0..=2 => 0,
+                    3..=5 => 1,
+                    6 => 2,
+                    7 => 3 + file as usize,
+                    _ => 12 + file as usize,
+                };
+                assert_eq!(shogi_king21_single_bucket(sq), expected);
+                for stm in [Color::Black, Color::White] {
+                    let other = if rank == 0 && file == 4 { Square::new(3, 0) } else { Square::new(4, 0) };
+                    let pos = psv_with_kings(stm, sq, other);
+                    let board = pos.decode();
+                    let other_bucket = shogi_king21_single_bucket(other.inverse());
+                    let expected_index = if stm == Color::Black {
+                        expected * 21 + other_bucket
+                    } else {
+                        other_bucket * 21 + expected
+                    };
+                    assert_eq!(kind.bucket(&pos), expected_index);
+                    assert_eq!(kind.bucket(&pos), kind.bucket_from_board(&board));
+                    assert_eq!(kind.bucket(&pos), ShogiSfnnKingBucketKind::King21ByKing21.bucket(&pos));
+                }
+            }
+        }
     }
 
     #[test]
