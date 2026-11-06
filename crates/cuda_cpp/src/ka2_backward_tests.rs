@@ -364,6 +364,11 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                         assert!(!fast.forward_workspace.qat_l1.as_ref().expect("FP32 folded scratch").quantized);
                         assert!(reference.forward_workspace.qat_l1.is_none());
                     }
+                    if stacks == 3528 && qat {
+                        let a = fast.forward_workspace.qat_l1.as_ref().unwrap().weights.download(&ctx).unwrap();
+                        let b = reference.forward_workspace.qat_l1.as_ref().unwrap().weights.download(&ctx).unwrap();
+                        assert_eq!(a, b, "folded and quantized L1 weights must match exactly");
+                    }
                     for (&x, &y) in fast_output.iter().zip(&reference_output) {
                         assert!((x - y).abs() < 1e-6 + y.abs() * 1e-5,
                             "forward stacks={stacks} qat={qat} shared={shared} micro={micro}: {x} vs {y}");

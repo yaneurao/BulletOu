@@ -10509,6 +10509,75 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn l1_bucket_fold_matches_reference_at_full_width() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_l1_bucket_fold(ctx: *mut ffi::BulletOuCudaCppContext,
+                w: *mut ffi::BulletOuCudaCppF32Buffer, shared: *mut ffi::BulletOuCudaCppF32Buffer,
+                axis: *mut ffi::BulletOuCudaCppF32Buffer, gates: *mut ffi::BulletOuCudaCppF32Buffer,
+                confidence: *mut ffi::BulletOuCudaCppF32Buffer, out: *mut ffi::BulletOuCudaCppF32Buffer,
+                fast: i32) -> i32;
+        }
+        let ctx = Context::new(0).unwrap();
+        let cells = 2304 * 16;
+        let values = |n: usize, scale: f32| (0..n).map(|i| ((i*97%511) as f32 - 255.0)*scale).collect::<Vec<_>>();
+        let w = F32Buffer::from_host(&ctx, &values(36*cells, 0.0008)).unwrap();
+        let shared = F32Buffer::from_host(&ctx, &values(cells, 0.0007)).unwrap();
+        let axis = F32Buffer::from_host(&ctx, &values(46*cells, 0.0006)).unwrap();
+        let gates = F32Buffer::from_host(&ctx, &(0..36).map(|i| (i%7) as f32/6.0).collect::<Vec<_>>()).unwrap();
+        let confidence = F32Buffer::from_host(&ctx, &(0..46).map(|i| (i%9) as f32/8.0).collect::<Vec<_>>()).unwrap();
+        let a = F32Buffer::new(&ctx, 36*cells).unwrap();
+        let b = F32Buffer::new(&ctx, 36*cells).unwrap();
+        for (out, fast) in [(&a, 0), (&b, 1)] {
+            check(unsafe { bulletou_test_l1_bucket_fold(ctx.as_ptr(),w.as_ptr(),shared.as_ptr(),axis.as_ptr(),
+                gates.as_ptr(),confidence.as_ptr(),out.as_ptr(),fast) }).unwrap();
+        }
+        let a = a.download(&ctx).unwrap();
+        let b = b.download(&ctx).unwrap();
+        assert!(a.iter().any(|&v| v != 0.0));
+        assert_eq!(a.iter().map(|v|v.to_bits()).collect::<Vec<_>>(), b.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn zero_radam_update_skip_matches_reference() {
+        use super::*;
+        struct Reset;
+        impl Drop for Reset { fn drop(&mut self) { unsafe {
+            std::env::remove_var("BULLETOU_ZERO_UPDATE_TEST");
+            std::env::remove_var("BULLETOU_ZERO_UPDATE_REFERENCE");
+        } } }
+        let _reset = Reset;
+        let ctx = Context::new(0).unwrap();
+        let n = 128;
+        let mut weights: Vec<f32> = (0..n).map(|i| 0.1 + i as f32 * 0.002).collect();
+        weights[4] = 2.0; weights[8] = -0.0; weights[12] = f32::from_bits(1);
+        let mut grad = vec![0.0; n]; grad[16] = -0.0; grad[20] = 0.1;
+        let mut momentum = vec![0.0; n]; momentum[24] = 0.2;
+        let mut velocity = vec![0.0; n]; velocity[28] = 0.3;
+        for step in [1, 6, 12] {
+            let mut results = Vec::new();
+            for reference in [false, true] {
+                unsafe { std::env::set_var("BULLETOU_ZERO_UPDATE_TEST", "1");
+                    if reference { std::env::set_var("BULLETOU_ZERO_UPDATE_REFERENCE", "1"); }
+                    else { std::env::remove_var("BULLETOU_ZERO_UPDATE_REFERENCE"); } }
+                let w = F32Buffer::from_host(&ctx, &weights).unwrap();
+                let g = F32Buffer::from_host(&ctx, &grad).unwrap();
+                let state = RangerParamState::from_host_state(&ctx, n, RangerParamHostState {
+                    momentum: &momentum, velocity: &velocity, slow_params: &weights }).unwrap();
+                let params = RangerUpdateParams { radam: RAdamUpdateParams { step, min_weight: -1.0, max_weight: 1.0, ..Default::default() }, ..Default::default() };
+                ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &g, weights: &w,
+                    momentum: &state.momentum, velocity: &state.velocity, slow_params: &state.slow_params }).unwrap();
+                let data = state.download(&ctx).unwrap();
+                results.push([w.download(&ctx).unwrap(), g.download(&ctx).unwrap(), data.momentum, data.velocity, data.slow_params]
+                    .map(|v| v.into_iter().map(f32::to_bits).collect::<Vec<_>>()));
+            }
+            assert_eq!(results[0], results[1], "step {step}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn ft_half_moments_update_roundtrip_and_clip() {
         use super::*;
         let ctx = Context::new(0).unwrap();

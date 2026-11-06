@@ -601,7 +601,8 @@ __global__ void radam_update_reset_gradients_vec4_kernel(
     float beta2,
     float epsilon,
     float min_weight,
-    float max_weight) {
+    float max_weight,
+    bool skip_unchanged_zero) {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= len4) {
         return;
@@ -611,6 +612,18 @@ __global__ void radam_update_reset_gradients_vec4_kernel(
     float4 weight4 = reinterpret_cast<const float4*>(weights)[idx];
     float4 momentum4 = reinterpret_cast<const float4*>(momentum)[idx];
     float4 velocity4 = reinterpret_cast<const float4*>(velocity)[idx];
+
+    // All four values are strictly unchanged under the guarded zero-decay
+    // RAdam update. Check bit patterns to preserve signed-zero behaviour.
+    if (skip_unchanged_zero &&
+        (__float_as_uint(gradient4.x) | __float_as_uint(gradient4.y) | __float_as_uint(gradient4.z) | __float_as_uint(gradient4.w) |
+         __float_as_uint(momentum4.x) | __float_as_uint(momentum4.y) | __float_as_uint(momentum4.z) | __float_as_uint(momentum4.w) |
+         __float_as_uint(velocity4.x) | __float_as_uint(velocity4.y) | __float_as_uint(velocity4.z) | __float_as_uint(velocity4.w)) == 0 &&
+        isfinite(weight4.x) && isfinite(weight4.y) && isfinite(weight4.z) && isfinite(weight4.w) &&
+        fabsf(weight4.x) >= FLT_MIN && fabsf(weight4.y) >= FLT_MIN &&
+        fabsf(weight4.z) >= FLT_MIN && fabsf(weight4.w) >= FLT_MIN &&
+        weight4.x >= min_weight && weight4.x <= max_weight && weight4.y >= min_weight && weight4.y <= max_weight &&
+        weight4.z >= min_weight && weight4.z <= max_weight && weight4.w >= min_weight && weight4.w <= max_weight) return;
 
     radam_update_one(
         gradient_factor * gradient4.x,
@@ -1807,6 +1820,39 @@ __global__ void sfnn_build_quantized_proxy_stacked_weights_kernel(
 
     const float folded=bn_fold_weight(value,bn,stack,out_col);
     dst[tid] = quantize ? sfnn_quantize_dequant_clamped(folded, scale, -128.0f, 127.0f, precise) : folded;
+}
+
+// One block owns a bucket and output row. Reuse the bucket's factorizer
+// coordinates across its input channels without changing the folding order.
+__global__ void sfnn_fold_l1_by_bucket_kernel(
+    const float* weights, const float* shared_weights, const float* axis_weights, float* dst,
+    size_t input_dim, size_t output_dim, size_t num_stacks, size_t king_dim, size_t hand_dim,
+    int has_shared, int has_axis, int king, int hand, int progress, int kh, int kp, int hp,
+    float shared_alpha, float king_alpha, float hand_alpha, float progress_alpha, float pair_alpha,
+    const float* gates, const float* confidences, bool quantize) {
+    const size_t stack = blockIdx.y;
+    const size_t chunks = (input_dim + blockDim.x - 1) / blockDim.x;
+    const size_t out = blockIdx.x / chunks;
+    const size_t in = (blockIdx.x % chunks) * blockDim.x + threadIdx.x;
+    __shared__ size_t axis_ids[8], axis_count;
+    __shared__ float axis_alphas[8], gate;
+    if (threadIdx.x == 0) {
+        gate = sfnn_residual_count_gate(gates, stack, has_shared, has_axis);
+        axis_count = has_axis ? sfnn_factorizer_axis_ids(stack, num_stacks, king_dim, hand_dim,
+            king, hand, progress, kh, kp, hp, axis_ids) : 0;
+        if (axis_count) sfnn_factorizer_axis_alphas(axis_ids, axis_count, num_stacks, king_dim, hand_dim,
+            kh, kp, hp, king_alpha, hand_alpha, progress_alpha, pair_alpha, confidences, axis_alphas);
+    }
+    __syncthreads();
+    if (in >= input_dim) return;
+    const size_t index = (stack * output_dim + out) * input_dim + in;
+    const size_t factor_index = in * output_dim + out;
+    float value = gate * weights[index];
+    if (has_shared) value = __fadd_rn(value, __fmul_rn(shared_alpha, shared_weights[factor_index]));
+    for (size_t i = 0; i < axis_count; ++i) {
+        value = __fadd_rn(value, __fmul_rn(axis_alphas[i], axis_weights[axis_ids[i] * input_dim * output_dim + factor_index]));
+    }
+    dst[index] = quantize ? sfnn_quantize_dequant_clamped(value, 64.0f, -128.0f, 127.0f, false) : value;
 }
 
 __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
@@ -5485,6 +5531,34 @@ int block_count_1d(size_t len, int threads, int* blocks, const char* label) {
     }
     *blocks = static_cast<int>(computed);
     return 0;
+}
+
+// Test the production-width fold with a smaller number of buckets.
+extern "C" int bulletou_test_l1_bucket_fold(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* shared, BulletOuCudaCppF32Buffer* axis,
+    BulletOuCudaCppF32Buffer* gates, BulletOuCudaCppF32Buffer* confidence,
+    BulletOuCudaCppF32Buffer* out, int fast) {
+    constexpr size_t width = 2304, outputs = 16, stacks = 36, king_dim = 3, axes = 46;
+    const size_t cells = width * outputs;
+    if (validate_buffer(ctx, w, stacks*cells, "test fold weights") ||
+        validate_buffer(ctx, shared, cells, "test fold shared") ||
+        validate_buffer(ctx, axis, axes*cells, "test fold axes") ||
+        validate_buffer(ctx, gates, stacks, "test fold gates") ||
+        validate_buffer(ctx, confidence, axes, "test fold confidence") ||
+        validate_buffer(ctx, out, stacks*cells, "test fold output") || set_context_device(ctx)) return -1;
+    constexpr int threads = 256;
+    if (fast) {
+        const dim3 grid(static_cast<unsigned>(outputs * ((width + threads - 1) / threads)), stacks);
+        sfnn_fold_l1_by_bucket_kernel<<<grid,threads,0,ctx->stream>>>(w->ptr,shared->ptr,axis->ptr,out->ptr,
+            width,outputs,stacks,king_dim,0,1,1,1,0,1,0,1,0,
+            0.7f,0.6f,0.8f,0.9f,0.4f,gates->ptr,confidence->ptr,true);
+    } else {
+        const size_t len = stacks*cells;
+        sfnn_build_quantized_proxy_stacked_weights_kernel<<<static_cast<unsigned>((len+threads-1)/threads),threads,0,ctx->stream>>>(
+            w->ptr,shared->ptr,axis->ptr,out->ptr,width,outputs,stacks,king_dim,0,1,1,1,1,0,1,0,1,0,
+            0.7f,0.6f,0.8f,0.9f,0.4f,gates->ptr,confidence->ptr,64.0f,{},false,1,0,0,true,true);
+    }
+    return check_kernel_launch("test L1 bucket fold");
 }
 
 constexpr size_t SFNN_BACKWARD_PROFILE_MS_LEN = 7;
@@ -10121,7 +10195,14 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
             beta2,
             epsilon,
             min_weight,
-            max_weight);
+            max_weight,
+            (len >= (1u << 24) || std::getenv("BULLETOU_ZERO_UPDATE_TEST") != nullptr) &&
+                std::getenv("BULLETOU_ZERO_UPDATE_REFERENCE") == nullptr && decay == 0.0f &&
+                std::isfinite(gradient_factor) && gradient_factor > 0.0f &&
+                std::isfinite(learning_rate) && learning_rate > 0.0f && std::isfinite(step_size) && step_size > 0.0f &&
+                std::isfinite(learning_rate * step_size) && beta1 >= 0.0f && beta1 <= 1.0f && !std::signbit(beta1) &&
+                beta2 >= 0.0f && beta2 <= 1.0f && !std::signbit(beta2) &&
+                (!use_denom || (std::isfinite(epsilon) && epsilon >= FLT_MIN)));
         if (check_kernel_launch("radam_update_reset_gradients_vec4_kernel launch") != 0) {
             return -1;
         }
@@ -10997,7 +11078,20 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             constexpr int threads = 256;
             int blocks = 0;
             if (block_count_1d(l1w_len, threads, &blocks, "QAT L1 weights") != 0) return -1;
-            sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
+            if (num_stacks == 3528 && l1_out == 16 && l1_group_count == 1 &&
+                l1_common_size == 0 && l1_shard_size == 0 && !bn_use_reference() &&
+                std::getenv("BULLETOU_L1_FOLD_BUCKET_REFERENCE") == nullptr) {
+                const dim3 grid(static_cast<unsigned>(l1_out * ((ft_size + threads - 1) / threads)),
+                    static_cast<unsigned>(num_stacks));
+                sfnn_fold_l1_by_bucket_kernel<<<grid, threads, 0, ctx->stream>>>(
+                    l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
+                    qat_l1w->ptr, ft_size, l1_out, num_stacks, factorizer_king_axis_dim, factorizer_hand_axis_dim,
+                    has_l1f, has_l1ax, use_king_axis, use_hand_axis, use_progress_axis,
+                    use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
+                    factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
+                    factorizer_progress_axis_alpha, factorizer_pair_alpha,
+                    residual_count_gates_ptr, factorizer_axis_confidences_ptr, quantize_l1);
+            } else sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
                 l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
                 qat_l1w->ptr, ft_size, l1_out, num_stacks,
                 factorizer_king_axis_dim, factorizer_hand_axis_dim,
