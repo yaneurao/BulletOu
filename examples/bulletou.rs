@@ -19570,10 +19570,14 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     );
                     let progress = schedule.progress_for_step(seen_steps);
                     let positions = seen_steps.saturating_mul(batch_size);
+                    ctx.synchronize().map_err(|e| e.to_string())?;
                     let (train_elapsed_sec, _positions_per_sec) =
                         cuda_cpp_train_timing(positions, &started, excluded_elapsed);
                     let progress_stats =
                         progress_meter.sample(positions, started.elapsed().as_secs_f64(), train_elapsed_sec);
+                    print_cuda_cpp_superbatch_progress(
+                        "cuda-cpp SFNN", progress, batch_size, schedule.display_positions(positions), progress_stats,
+                    );
                     if let Some(progress) = progress {
                         append_cuda_cpp_superbatch_summary_log_row(
                             args,
