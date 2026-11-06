@@ -231,7 +231,8 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
     let targets: Vec<f32> = (0..N).map(|i| (i % 11) as f32 / 10.0).collect();
     let entries: Vec<f32> = (0..N).map(|i| if i % 5 == 0 { 0.0 } else { 1.0 }).collect();
     for (stacks, king, hand, progress, pairs, hidden) in
-        [(648, 9, 0, true, false, 15), (81, 9, 0, false, false, 15), (1024, 0, 32, false, false, 15)]
+        [(648, 9, 0, true, false, 15), (3528, 21, 0, true, false, 15),
+         (81, 9, 0, false, false, 15), (1024, 0, 32, false, false, 15)]
     {
         let shape = SfnnForwardShape {
             input_size: 4,
@@ -283,17 +284,17 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
             l2b: &b2,
             l3w: &w3,
             l3b: &b3,
-            l2fw: Some(&f2w),
-            l2fb: Some(&f2b),
-            l2axw: Some(&a2w),
-            l2axb: Some(&a2b),
-            l3fw: Some(&f3w),
-            l3fb: Some(&f3b),
-            l3axw: Some(&a3w),
-            l3axb: Some(&a3b),
+            l2fw: (stacks != 3528).then_some(&f2w),
+            l2fb: (stacks != 3528).then_some(&f2b),
+            l2axw: (stacks != 3528).then_some(&a2w),
+            l2axb: (stacks != 3528).then_some(&a2b),
+            l3fw: (stacks != 3528).then_some(&f3w),
+            l3fb: (stacks != 3528).then_some(&f3b),
+            l3axw: (stacks != 3528).then_some(&a3w),
+            l3axb: (stacks != 3528).then_some(&a3b),
             ..tiny_sfnn_weights(tiny_sfnn_shape())
         };
-        let buckets: Vec<i32> = (0..N).map(|i| if i % 2 == 0 { 42 } else { (i % (stacks - 1)) as i32 }).collect();
+        let buckets: Vec<i32> = (0..N).map(|i| if i % 2 == 0 { 42 } else { (i * 41 % stacks) as i32 }).collect();
         let batch = SfnnTrainStepHostBatch {
             stm_indices: &indices,
             nstm_indices: &indices,
@@ -331,7 +332,12 @@ fn many_bucket_l1_gather_matches_reference_and_accumulates() {
                         r.set_residual_count_gates_by_stack(&ctx, Some(&gates)).unwrap();
                     }
                 }
-                let policy = SfnnLayerLrMultipliers { qat_l1: qat, ..Default::default() };
+                let policy = SfnnLayerLrMultipliers {
+                    qat_l1: qat,
+                    qat_l2: qat && stacks == 3528,
+                    qat_l3: qat && stacks == 3528,
+                    ..Default::default()
+                };
                 for micro in 1..=1 {
                     for (r, old) in [(&mut fast, false), (&mut reference, true)] {
                         unsafe {

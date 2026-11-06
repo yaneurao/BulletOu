@@ -8250,7 +8250,8 @@ int launch_sfnn_backward_kernels(
     } else if (common_shard_l1 || grouped_l1 || has_l1f != 0 || has_l1ax != 0) {
         const bool compact=common_shard_l1 || grouped_l1;
         const bool bucket_gather = !compact && !ctx->bn[1].params && !bn_use_reference()
-            && qat_l1w && num_stacks == 648 && batch >= 1024 && l1_out == 16;
+            && qat_l1w && (num_stacks == 648 || num_stacks == 3528) && batch >= 1024 && l1_out == 16
+            && std::getenv("BULLETOU_L1_BUCKET_GATHER_DISABLE") == nullptr;
         if (bucket_gather) {
             if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, num_stacks) != 0) return -1;
             if (can_fuse_l1_ft) {
