@@ -2072,8 +2072,8 @@ fn sfnn_forward_train_device_with_factorizer(
         factorizer_axis_confidences,
         true,
     )?;
-    // Only single-batch updates may reuse the gradient buffer for folded weights.
-    // Backward now adds to FT gradients, so discard those temporary weights first.
+    // The first batch of an accumulation group may reuse the empty gradient buffer.
+    // Backward adds to FT gradients, so discard the temporary weights first.
     if matches!(weights.shape.input_size, 133_578 | 74_934) {
         if let Some(scratch) = folded_l0w_scratch { scratch.fill(ctx, 0.0)?; }
     }
@@ -7400,7 +7400,7 @@ impl SfnnTrainStepRunner {
             &self.forward_workspace,
             self.factorizer,
             self.factorizer_alpha,
-            (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
+            (self.pending_gradient_batches == 0 && (update_weights || std::env::var_os("BULLETOU_FT_PREFOLD_REFERENCE").is_none())).then_some(&self.backward_workspace.l0w_gradients),
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
@@ -7586,7 +7586,7 @@ impl SfnnTrainStepRunner {
                 &self.forward_workspace,
                 self.factorizer,
                 self.factorizer_alpha,
-                (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
+                (self.pending_gradient_batches == 0 && (update_weights || std::env::var_os("BULLETOU_FT_PREFOLD_REFERENCE").is_none())).then_some(&self.backward_workspace.l0w_gradients),
                 self.residual_count_gates(),
                 self.factorizer_axis_confidences(),
             )?;
@@ -7745,7 +7745,7 @@ impl SfnnTrainStepRunner {
             &self.forward_workspace,
             self.factorizer,
             self.factorizer_alpha,
-            (update_weights && self.pending_gradient_batches == 0).then_some(&self.backward_workspace.l0w_gradients),
+            (self.pending_gradient_batches == 0 && (update_weights || std::env::var_os("BULLETOU_FT_PREFOLD_REFERENCE").is_none())).then_some(&self.backward_workspace.l0w_gradients),
             self.residual_count_gates(),
             self.factorizer_axis_confidences(),
         )?;
@@ -11196,6 +11196,15 @@ mod tests {
                 &tiny_sfnn_forward_cpu(batch, folded_host),
                 1e-6,
             );
+            scalar_loss_device_from_buffers(
+                &ctx, ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0, 2,
+                &forward.output, &target, &ew, &loss,
+            ).unwrap();
+            backward.zero_parameter_gradients(&ctx).unwrap();
+            sfnn_backward_train_device_with_factorizer_and_alpha(
+                &ctx, &device_batch, &device_weights, &forward, &loss, &backward, active, a,
+            ).unwrap();
+            let direct_gradients = backward.l0w_gradients.download(&ctx).unwrap();
             sfnn_forward_train_device_with_factorizer(
                 &ctx,
                 &device_batch,
@@ -11228,6 +11237,7 @@ mod tests {
             // Both the diagnostic and the production backward paths must scale
             // only the virtual gradient, including repeated piece features.
             for train in [false, true] {
+                backward.zero_parameter_gradients(&ctx).unwrap();
                 if train {
                     sfnn_backward_train_device_with_factorizer_and_alpha(
                         &ctx,
@@ -11254,6 +11264,30 @@ mod tests {
                     .unwrap();
                 }
                 let grad = backward.download(&ctx).unwrap().l0w_gradients;
+                assert_close_slice("prefold versus direct FT gradients", &grad, &direct_gradients, 1e-6);
+                if train {
+                    for step in [1, 6] {
+                        let params = RangerUpdateParams { radam: RAdamUpdateParams { step, learning_rate: 0.001,
+                            ..Default::default() }, ..Default::default() };
+                        let update = |gradient: &[f32]| {
+                            let weights = F32Buffer::from_host(&ctx, &l0w).unwrap();
+                            let gradients = F32Buffer::from_host(&ctx, gradient).unwrap();
+                            let state = RangerParamState::from_host_weights(&ctx, &l0w).unwrap();
+                            ranger_update_device(&ctx, params, RangerDeviceStateMut {
+                                gradients: &gradients, weights: &weights, momentum: &state.momentum,
+                                velocity: &state.velocity, slow_params: &state.slow_params,
+                            }).unwrap();
+                            (weights.download(&ctx).unwrap(), state.momentum.download(&ctx).unwrap(),
+                                state.velocity.download(&ctx).unwrap(), state.slow_params.download(&ctx).unwrap())
+                        };
+                        let direct = update(&direct_gradients);
+                        let prefold = update(&grad);
+                        for (label, lhs, rhs) in [
+                            ("weight", &direct.0, &prefold.0), ("momentum", &direct.1, &prefold.1),
+                            ("velocity", &direct.2, &prefold.2), ("slow", &direct.3, &prefold.3),
+                        ] { assert_close_slice(label, lhs, rhs, 1e-6); }
+                    }
+                }
                 let mut expected = vec![0.0; VIRTUAL * shape.ft_size];
                 for (i, g) in grad[..BASE * shape.ft_size].iter().enumerate() {
                     expected[i % (VIRTUAL * shape.ft_size)] += alpha * g;
