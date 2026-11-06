@@ -6112,8 +6112,12 @@ int launch_sfnn_forward_kernels(
     const bool sort_hm2_ft = !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
         && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
-    const bool qat_packed_candidate = ctx->dense_qat && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
-        l1_group_count == 1 && l1_common_size == 0 && l1_shard_size == 0;
+    const bool qat_packed_candidate = ctx->dense_qat &&
+        (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
+         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) &&
+        (ft_size == 1536 || ft_size == 2304) && batch >= 1024 &&
+        l1_group_count == 1 && l1_common_size == 0 && l1_shard_size == 0 &&
+        std::getenv("BULLETOU_QAT_PACKED_REFERENCE") == nullptr;
     if (qat_packed_candidate && ctx->dense_qat_dp4a_available < 0) {
         int major = 0, minor = 0;
         cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, ctx->device);
