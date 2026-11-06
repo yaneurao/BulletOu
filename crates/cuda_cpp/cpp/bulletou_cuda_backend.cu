@@ -7995,7 +7995,7 @@ int launch_sfnn_backward_kernels(
     const bool can_fuse_l1_ft_f32 = fuse_pairwise_l0 && !ctx->sfnn_ft_fp16_grad &&
         !ctx->bn[0].params && !ctx->ft_guard.weights &&
         (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
-         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) && ft_size == 2304 && batch >= 1024 && l1_out == 16 &&
+         input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) && (ft_size == 1536 || ft_size == 2304) && batch >= 1024 && l1_out == 16 &&
         std::getenv("BULLETOU_HM2_FT_GATHER_REFERENCE") == nullptr &&
         std::getenv("BULLETOU_FUSED_L1_FT_REFERENCE") == nullptr;
     const bool can_fuse_l1_ft = can_fuse_l1_ft_half || can_fuse_l1_ft_f32;
@@ -8118,8 +8118,11 @@ int launch_sfnn_backward_kernels(
         if(compact_input_fast) {
             const float* effective = qat_l1w ? qat_l1w : l1w;
             const float* shared = !qat_l1w && has_l1f ? l1fw : nullptr;
-            if (can_fuse_l1_ft && qat_l1w) {
-                if (launch_l1_ft(qat_l1w)) return -1;
+            const bool folded_shared = !qat_l1w && has_l1f && !has_l1ax && !residual_count_gates &&
+                num_stacks == 8 && l1_out == 16 && ctx->sfnn_folded_l1_weights &&
+                std::getenv("BULLETOU_SHARED_L1_FOLD_REFERENCE") == nullptr;
+            if (can_fuse_l1_ft && (qat_l1w || folded_shared)) {
+                if (launch_l1_ft(qat_l1w ? qat_l1w : ctx->sfnn_folded_l1_weights)) return -1;
             } else if(l1_out==8)bn_l1_input_gradient<8><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
             else if(l1_out==9)bn_l1_input_gradient<9><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
             else bn_l1_input_gradient<16><<<blocks,threads,0,ctx->stream>>>(l1_gradients,effective,shared,buckets,combined_gradients,batch,ft_size,num_stacks,factorizer_shared_alpha);
