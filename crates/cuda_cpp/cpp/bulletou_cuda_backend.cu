@@ -1269,11 +1269,13 @@ __global__ void sfnn_sparse_l0_pairwise_concat_kernel(
     combined[l0_base + pairwise + pair] = nstm0 * nstm1 * SFNN_PAIRWISE_SCALE;
 }
 
+__device__ __forceinline__ int dense_qat_lattice_integer(float value);
+
 // Independent perspective pass, allowing both views to be sorted
 // by their own king instead of forcing the opponent view into the STM order.
 __global__ void sfnn_hm2_one_view_kernel(const int* indices, const float* weights, const float* bias,
     float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
-    const int* order, size_t view) {
+    const int* order, size_t view, int* qat_packed = nullptr) {
     const size_t pairwise = ft_size / 2;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= batch * pairwise) return;
@@ -1291,7 +1293,16 @@ __global__ void sfnn_hm2_one_view_kernel(const int* indices, const float* weight
     const float x0 = crelu(sum0), x1 = crelu(sum1);
     l0[sample * ft_size + pair] = x0;
     l0[sample * ft_size + pairwise + pair] = x1;
-    combined[sample * ft_size + view * pairwise + pair] = x0 * x1 * SFNN_PAIRWISE_SCALE;
+    const size_t output_index = sample * ft_size + view * pairwise + pair;
+    const float activation = x0 * x1 * SFNN_PAIRWISE_SCALE;
+    if (qat_packed) {
+        const unsigned value = static_cast<unsigned>(dense_qat_lattice_integer(activation));
+        combined[output_index] = static_cast<float>(value) / 127.0f;
+        const unsigned b = __shfl_down_sync(0xffffffffu, value, 1, 4);
+        const unsigned c = __shfl_down_sync(0xffffffffu, value, 2, 4);
+        const unsigned d = __shfl_down_sync(0xffffffffu, value, 3, 4);
+        if ((pair & 3) == 0) qat_packed[output_index / 4] = static_cast<int>(value | (b << 8) | (c << 16) | (d << 24));
+    } else combined[output_index] = activation;
 }
 
 __global__ void sfnn_ft_to_half(const float* weights, __half* out, size_t n) {
@@ -1342,7 +1353,7 @@ __global__ void sfnn_hm2_one_view_half_kernel(const int* indices, const __half* 
 // Adjacent channels share feature indices; half2 loads halve index traffic.
 __global__ void sfnn_hm2_one_view_half2_kernel(const int* indices, const __half* weights, const float* bias,
     float* l0, float* combined, size_t batch, size_t active, size_t input_size, size_t ft_size,
-    const int* order, size_t view, __half* half_l0) {
+    const int* order, size_t view, __half* half_l0, int* qat_packed = nullptr) {
     const size_t pairwise = ft_size / 2;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= batch * (pairwise / 2)) return;
@@ -1374,8 +1385,16 @@ __global__ void sfnn_hm2_one_view_half2_kernel(const int* indices, const __half*
     // FP16 for the fast training path.
     *reinterpret_cast<float2*>(l0 + base) = x0;
     *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
-    *reinterpret_cast<float2*>(combined + base + view * pairwise) =
-        make_float2(x0.x * x1.x * SFNN_PAIRWISE_SCALE, x0.y * x1.y * SFNN_PAIRWISE_SCALE);
+    const size_t output_index = base + view * pairwise;
+    const float2 activation = make_float2(x0.x * x1.x * SFNN_PAIRWISE_SCALE, x0.y * x1.y * SFNN_PAIRWISE_SCALE);
+    if (qat_packed) {
+        const unsigned a = static_cast<unsigned>(dense_qat_lattice_integer(activation.x));
+        const unsigned b = static_cast<unsigned>(dense_qat_lattice_integer(activation.y));
+        *reinterpret_cast<float2*>(combined + output_index) = make_float2(static_cast<float>(a) / 127.0f, static_cast<float>(b) / 127.0f);
+        const unsigned word = a | (b << 8);
+        const unsigned next = __shfl_down_sync(0xffffffffu, word, 1, 2);
+        if ((pair & 3) == 0) qat_packed[output_index / 4] = static_cast<int>(word | (next << 16));
+    } else *reinterpret_cast<float2*>(combined + output_index) = activation;
 }
 
 __global__ void sfnn_fold_halfka2_l0w_kernel(
@@ -4370,6 +4389,16 @@ extern "C" int bulletou_test_dense_l1_16(BulletOuCudaCppContext* ctx,
         input->ptr, weights->ptr, bias->ptr, buckets->ptr, output->ptr, batch, input_dim, 16, stacks);
     return check_kernel_launch("test dense L1 16");
 }
+__global__ void test_packed_qat_ft_matches_combined(const float* combined, const int* packed, size_t words, int* mismatch) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= words) return;
+    const float4 x = reinterpret_cast<const float4*>(combined)[i];
+    const unsigned a = static_cast<unsigned>(__float2int_rn(x.x * 127.0f));
+    const unsigned b = static_cast<unsigned>(__float2int_rn(x.y * 127.0f));
+    const unsigned c = static_cast<unsigned>(__float2int_rn(x.z * 127.0f));
+    const unsigned d = static_cast<unsigned>(__float2int_rn(x.w * 127.0f));
+    if (static_cast<unsigned>(packed[i]) != (a | (b << 8) | (c << 16) | (d << 24))) atomicExch(mismatch, 1);
+}
 extern "C" int bulletou_test_sfnn_ft_sort(
     BulletOuCudaCppContext* ctx, BulletOuCudaCppI32Buffer* stm, BulletOuCudaCppI32Buffer* nstm,
     BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* bias, BulletOuCudaCppF32Buffer* a,
@@ -4393,17 +4422,24 @@ extern "C" int bulletou_test_sfnn_ft_sort(
         sfnn_hm2_sort_scatter<<<blocks, 256, 0, ctx->stream>>>(stm->ptr, counts->ptr, order->ptr, batch, active);
     }
     const size_t pairs = batch * ft / 2;
-    if (sorted >= 2 && sorted <= 7) {
-        const unsigned ft_blocks = static_cast<unsigned>((((sorted == 5 || sorted == 7) ? pairs / 2 : pairs) + 255) / 256);
+    if (sorted >= 2 && sorted <= 10) {
+        const bool vector_half = sorted == 5 || sorted == 7 || sorted == 9 || sorted == 10;
+        const unsigned ft_blocks = static_cast<unsigned>(((vector_half ? pairs / 2 : pairs) + 255) / 256);
         __half* half_weights = nullptr;
         __half* half_activations = nullptr;
         float* rounded_weights = nullptr;
-        if (sorted >= 3) {
+        int* fused_pack = nullptr;
+        if (sorted >= 8) {
+            if (ft != 2304) return fail_message("fused FT test requires width 2304");
+            const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&fused_pack), batch * ft);
+            if (status != cudaSuccess) return fail("test packed FT allocation", status);
+        }
+        if (sorted >= 3 && sorted != 8) {
             const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half_weights), input * ft * sizeof(__half));
             if (status != cudaSuccess) return fail("test half allocation", status);
             sfnn_ft_to_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(weights->ptr, half_weights, input*ft);
         }
-        if (sorted == 6 || sorted == 7) {
+        if (sorted == 6 || sorted == 7 || sorted == 10) {
             const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&half_activations), 2 * batch * ft * sizeof(__half));
             if (status != cudaSuccess) { cudaFree(half_weights); return fail("test half activation allocation", status); }
         }
@@ -4412,31 +4448,43 @@ extern "C" int bulletou_test_sfnn_ft_sort(
             if (status != cudaSuccess) { cudaFree(half_weights); return fail("test rounded allocation", status); }
             sfnn_test_ft_from_half<<<static_cast<unsigned>((input*ft+255)/256), 256, 0, ctx->stream>>>(half_weights, rounded_weights, input*ft);
         }
-        if (sorted == 5 || sorted == 7) {
+        if (vector_half) {
             sfnn_hm2_one_view_half2_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, half_weights, bias->ptr,
-                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, half_activations);
+                a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, half_activations, fused_pack);
         } else if (sorted == 3 || sorted == 6) {
             sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, half_weights, bias->ptr,
                 a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, half_activations);
         } else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(stm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
-            a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0);
+            a->ptr, combined->ptr, batch, active, input, ft, order->ptr, 0, fused_pack);
         if (cudaMemsetAsync(counts->ptr, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess) return -1;
         const unsigned sort_blocks = static_cast<unsigned>((batch + 255) / 256);
         sfnn_hm2_sort_count<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, batch, active);
         sfnn_hm2_sort_prefix<<<1, 1, 0, ctx->stream>>>(counts->ptr);
         sfnn_hm2_sort_scatter<<<sort_blocks, 256, 0, ctx->stream>>>(nstm->ptr, counts->ptr, order->ptr, batch, active);
-        if (sorted == 5 || sorted == 7) sfnn_hm2_one_view_half2_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
-            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, half_activations ? half_activations + batch * ft : nullptr);
+        if (vector_half) sfnn_hm2_one_view_half2_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, half_activations ? half_activations + batch * ft : nullptr, fused_pack);
         else if (sorted == 3 || sorted == 6) sfnn_hm2_one_view_half_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, half_weights, bias->ptr,
             b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, half_activations ? half_activations + batch * ft : nullptr);
         else sfnn_hm2_one_view_kernel<<<ft_blocks, 256, 0, ctx->stream>>>(nstm->ptr, rounded_weights ? rounded_weights : weights->ptr, bias->ptr,
-            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1);
+            b->ptr, combined->ptr, batch, active, input, ft, order->ptr, 1, fused_pack);
         if (half_activations) {
             const unsigned blocks = static_cast<unsigned>((batch*ft+255)/256);
             sfnn_test_ft_from_half<<<blocks,256,0,ctx->stream>>>(half_activations, a->ptr, batch*ft);
             sfnn_test_ft_from_half<<<blocks,256,0,ctx->stream>>>(half_activations + batch*ft, b->ptr, batch*ft);
         }
-        const int result = check_kernel_launch("test FT separate perspectives");
+        int result = check_kernel_launch("test FT separate perspectives");
+        if (fused_pack && result == 0) {
+            cudaMemsetAsync(counts->ptr, 0, sizeof(int), ctx->stream);
+            const size_t words = batch * ft / 4;
+            test_packed_qat_ft_matches_combined<<<static_cast<unsigned>((words + 255) / 256), 256, 0, ctx->stream>>>(
+                combined->ptr, fused_pack, words, counts->ptr);
+            int mismatch = 0;
+            cudaError_t status = cudaMemcpyAsync(&mismatch, counts->ptr, sizeof(int), cudaMemcpyDeviceToHost, ctx->stream);
+            if (status == cudaSuccess) status = cudaStreamSynchronize(ctx->stream);
+            if (status != cudaSuccess) result = fail("test packed QAT FT", status);
+            else if (mismatch) result = fail_message("fused FT packed bytes differ from activations");
+        }
+        if (fused_pack != nullptr) cudaFree(fused_pack);
         if (half_activations != nullptr) cudaFree(half_activations);
         if (rounded_weights != nullptr) cudaFree(rounded_weights);
         if (half_weights != nullptr) cudaFree(half_weights);
@@ -6024,6 +6072,20 @@ int launch_sfnn_forward_kernels(
     const bool sort_hm2_ft = !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
         && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
+    const bool qat_packed_candidate = ctx->dense_qat && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
+        l1_group_count == 1 && l1_common_size == 0 && l1_shard_size == 0;
+    if (qat_packed_candidate && ctx->dense_qat_dp4a_available < 0) {
+        int major = 0, minor = 0;
+        cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, ctx->device);
+        if (status != cudaSuccess) return fail("query CUDA compute capability", status);
+        status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, ctx->device);
+        if (status != cudaSuccess) return fail("query CUDA compute capability", status);
+        ctx->dense_qat_dp4a_available = major > 6 || (major == 6 && minor >= 1);
+    }
+    const bool fused_qat_ft_pack = sort_hm2_ft && qat_packed_candidate && ctx->dense_qat_dp4a_available != 0 &&
+        std::getenv("BULLETOU_FUSED_QAT_FT_PACK_REFERENCE") == nullptr;
+    if (fused_qat_ft_pack && ensure_i32_scratch(&ctx->dense_qat_packed_input, &ctx->dense_qat_packed_input_len,
+            batch * ft_size / 4, "fused FT packed QAT input")) return -1;
     if (ctx->sfnn_ft_fp16 && !sort_hm2_ft) return fail_message("FT FP16 requested for an unsupported forward shape");
     if (sort_hm2_ft) {
         if (ensure_i32_scratch(&ctx->sfnn_ft_sort_counts, &ctx->sfnn_ft_sort_counts_len, 46, "FT sort counts") != 0 ||
@@ -6069,9 +6131,9 @@ int launch_sfnn_forward_kernels(
         }
         if (block_count_1d(batch * (half_ft ? pairwise / 2 : pairwise), threads, &blocks, "FT sorted perspective") != 0) return -1;
         if (half_ft) sfnn_hm2_one_view_half2_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, ctx->sfnn_ft_half, l0b,
-            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0, half_act ? ctx->sfnn_ft_half_activations : nullptr);
+            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0, half_act ? ctx->sfnn_ft_half_activations : nullptr, fused_qat_ft_pack ? ctx->dense_qat_packed_input : nullptr);
         else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(stm_indices, effective_l0w, l0b,
-            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0);
+            stm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 0, fused_qat_ft_pack ? ctx->dense_qat_packed_input : nullptr);
         if (check_kernel_launch("FT sorted stm") != 0) return -1;
         if (cudaMemsetAsync(ctx->sfnn_ft_sort_counts, 0, 46 * sizeof(int), ctx->stream) != cudaSuccess)
             return fail_message("FT sort counts reset failed");
@@ -6083,9 +6145,9 @@ int launch_sfnn_forward_kernels(
             ctx->sfnn_ft_sort_positions, batch, max_active);
         if (check_kernel_launch("FT sort nstm") != 0) return -1;
         if (half_ft) sfnn_hm2_one_view_half2_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, ctx->sfnn_ft_half, l0b,
-            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1, half_act ? ctx->sfnn_ft_half_activations + act_count : nullptr);
+            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1, half_act ? ctx->sfnn_ft_half_activations + act_count : nullptr, fused_qat_ft_pack ? ctx->dense_qat_packed_input : nullptr);
         else sfnn_hm2_one_view_kernel<<<blocks, threads, 0, ctx->stream>>>(nstm_indices, effective_l0w, l0b,
-            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1);
+            nstm_l0, combined, batch, max_active, effective_input_size, ft_size, ft_sample_order, 1, fused_qat_ft_pack ? ctx->dense_qat_packed_input : nullptr);
         if (check_kernel_launch("FT sorted nstm") != 0) return -1;
         if (half_act) {
             ctx->sfnn_ft_half_activation_stm_owner = stm_l0;
@@ -6124,25 +6186,17 @@ int launch_sfnn_forward_kernels(
             return fail_message("dense QAT requires folded L1 and unfactorized L2/L3 without BN");
         // The packed dot product uses i32 partial sums: 2304*127*128 fits i32.
         // Compact/grouped layouts use the original coordinate-aware kernel.
-        const bool packed_candidate = input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE && ft_size == 2304 && batch >= 1024 &&
-            l1_group_count == 1 && l1_common_size == 0 && l1_shard_size == 0;
-        if (packed_candidate && ctx->dense_qat_dp4a_available < 0) {
-            int major = 0, minor = 0;
-            cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, ctx->device);
-            if (status != cudaSuccess) return fail("query CUDA compute capability", status);
-            status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, ctx->device);
-            if (status != cudaSuccess) return fail("query CUDA compute capability", status);
-            ctx->dense_qat_dp4a_available = major > 6 || (major == 6 && minor >= 1);
-        }
-        const bool packed_qat = packed_candidate && ctx->dense_qat_dp4a_available != 0;
+        const bool packed_qat = qat_packed_candidate && ctx->dense_qat_dp4a_available != 0;
         if (packed_qat) {
             const size_t input_words = batch * ft_size / 4;
             const size_t weight_words = num_stacks * l1_out * ft_size / 4;
             if (ensure_i32_scratch(&ctx->dense_qat_packed_input, &ctx->dense_qat_packed_input_len, input_words, "packed QAT input") ||
                 ensure_i32_scratch(&ctx->dense_qat_packed_weights, &ctx->dense_qat_packed_weights_len, weight_words, "packed QAT weights")) return -1;
-            if (block_count_1d(input_words, threads, &blocks, "packed QAT lattice")) return -1;
-            dense_qat_lattice_pack<<<blocks,threads,0,ctx->stream>>>(combined, ctx->dense_qat_packed_input, input_words);
-            if (check_kernel_launch("packed QAT lattice")) return -1;
+            if (!fused_qat_ft_pack) {
+                if (block_count_1d(input_words, threads, &blocks, "packed QAT lattice")) return -1;
+                dense_qat_lattice_pack<<<blocks,threads,0,ctx->stream>>>(combined, ctx->dense_qat_packed_input, input_words);
+                if (check_kernel_launch("packed QAT lattice")) return -1;
+            }
             if (block_count_1d(weight_words, threads, &blocks, "packed QAT weights")) return -1;
             dense_qat_weights_pack<<<blocks,threads,0,ctx->stream>>>(l1w, ctx->dense_qat_packed_weights, weight_words);
         } else {

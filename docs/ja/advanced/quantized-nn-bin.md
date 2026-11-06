@@ -81,6 +81,8 @@ QATのON/OFFは起動ログと保存設定に記録されます。再開時に�
 QATをONにしても指標の定義や教師のscale、loss target、LRは変わりません。
 
 HalfKA_hm2・FT幅2304・L1出力16のdense QATでは、progress8単独またはk9k9_progress8のとき、同じbucketの局面でL1の整数重みを共有するGPU経路を使います。整数出力は従来経路と一致し、保存形式も変わりません。診断のため従来経路に戻す場合は環境変数 `BULLETOU_QAT_L1_BUCKET_TILES_REFERENCE=1` を設定できます。
+
+同じFT幅のpacked dense QATでは、FTの出力時に整数化とpackを融合します。従来の別カーネルに切り替える診断用環境変数は `BULLETOU_FUSED_QAT_FT_PACK_REFERENCE=1` です。
 FP32と量子化後の差が縮まるだけでなく、量子化後の精度そのものが改善するか確認してください。
 
 A/Bでは、同一の `state.bin` と `dataloader_pos.txt` から、教師局面・LR・bpu・学習量を揃え、QATだけをON/OFFにします。

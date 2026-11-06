@@ -10859,6 +10859,31 @@ mod tests {
             assert_eq!(activation_scalar.0.download(&ctx).unwrap(), activation_vector.0.download(&ctx).unwrap());
             assert_eq!(activation_scalar.1.download(&ctx).unwrap(), activation_vector.1.download(&ctx).unwrap());
             assert_eq!(activation_scalar.2.download(&ctx).unwrap(), activation_vector.2.download(&ctx).unwrap());
+            if ft == 2304 {
+                let fused_f32 = outputs();
+                let fused_half = outputs();
+                let fused_half_activation = outputs();
+                for (o, flag) in [(&fused_f32, 8), (&fused_half, 9), (&fused_half_activation, 10)] {
+                    check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                        nonexact.as_ptr(), bias.as_ptr(), o.0.as_ptr(), o.1.as_ptr(), o.2.as_ptr(),
+                        counts.as_ptr(), order.as_ptr(), batch, active, input, ft, flag) }).unwrap();
+                }
+                let plain = outputs();
+                check(unsafe { ffi::bulletou_test_sfnn_ft_sort(ctx.as_ptr(), stm.as_ptr(), nstm.as_ptr(),
+                    nonexact.as_ptr(), bias.as_ptr(), plain.0.as_ptr(), plain.1.as_ptr(), plain.2.as_ptr(),
+                    counts.as_ptr(), order.as_ptr(), batch, active, input, ft, 2) }).unwrap();
+                for buffer in [&plain.2, &half_vector.2, &activation_vector.2] {
+                    check(unsafe { ffi::bulletou_test_qat_ft_lattice(ctx.as_ptr(), buffer.as_ptr(), batch * ft, 1) }).unwrap();
+                }
+                assert_eq!(plain.2.download(&ctx).unwrap(), fused_f32.2.download(&ctx).unwrap());
+                assert_eq!(half_vector.2.download(&ctx).unwrap(), fused_half.2.download(&ctx).unwrap());
+                assert_eq!(activation_vector.2.download(&ctx).unwrap(), fused_half_activation.2.download(&ctx).unwrap());
+                assert_eq!(plain.0.download(&ctx).unwrap(), fused_f32.0.download(&ctx).unwrap());
+                assert_eq!(half_vector.0.download(&ctx).unwrap(), fused_half.0.download(&ctx).unwrap());
+                assert_eq!(half_vector.1.download(&ctx).unwrap(), fused_half.1.download(&ctx).unwrap());
+                assert_eq!(activation_vector.0.download(&ctx).unwrap(), fused_half_activation.0.download(&ctx).unwrap());
+                assert_eq!(activation_vector.1.download(&ctx).unwrap(), fused_half_activation.1.download(&ctx).unwrap());
+            }
         }
     }
     #[test]
