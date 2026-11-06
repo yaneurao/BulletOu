@@ -6210,7 +6210,9 @@ int launch_sfnn_forward_kernels(
     }
 
     const int* ft_sample_order = nullptr;
-    const bool sort_hm2_ft = !ctx->bn[0].params && input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE
+    const bool sort_hm2_ft = !ctx->bn[0].params &&
+        (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
+         (folded_l0w && !ctx->sfnn_ft_fp16 && effective_input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE))
         && ft_size == 2304 && batch >= 1024 && batch <= static_cast<size_t>(INT_MAX)
         && std::getenv("BULLETOU_HM2_FT_SORT_REFERENCE") == nullptr;
     const bool qat_packed_candidate = ctx->dense_qat &&
