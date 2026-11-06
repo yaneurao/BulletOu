@@ -212,6 +212,20 @@ class GridSearchTests(unittest.TestCase):
         self.assertEqual({trial["settings"]["all_optim"] for trial in plan["trials"]}, {False, True})
         self.assertIn("all_optim", grid.COMMON_COLUMNS)
 
+    def test_all_optim_epoch_schedule(self):
+        keys = ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments")
+        settings = {"all_optim": {"epoch1": True, "epoch5": False, "epoch8": True}}
+        for epoch, enabled in ((1, True), (4, True), (5, False), (7, False), (8, True)):
+            resolved = grid.resolve_epoch_settings(settings, epoch)
+            self.assertEqual(resolved["all_optim"], enabled)
+            self.assertTrue(all(resolved.get(key, False) == enabled for key in keys))
+        settings[keys[0]] = {"epoch1": False, "epoch6": True}
+        self.assertTrue(grid.resolve_epoch_settings(settings, 6)[keys[0]])
+        self.assertFalse(grid.resolve_epoch_settings(settings, 6).get(keys[1], False))
+        for bad in ({"epoch1": 1}, {"epoch5": False}):
+            with self.assertRaises(ValueError):
+                grid.resolve_epoch_settings({"all_optim": bad}, 1)
+
     def test_all_optim_reports_effective_fp16_settings(self):
         keys = ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments")
         settings = {"all_optim": True, **{key: {"epoch1": False, "epoch3": True} for key in keys}}

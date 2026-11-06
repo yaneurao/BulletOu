@@ -215,7 +215,7 @@ EPOCH_SETTING_KEYS = {
     "sfnn_l1_factorizer",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
-    "sfnn_ft_factorizer",
+    "sfnn_ft_factorizer", "all_optim",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
@@ -259,7 +259,7 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
             elif key == "sfnn_l1_factorizer":
                 if item not in ("axis", "shared", "pair"):
                     raise ValueError(f"{key}.{name} must be axis/shared/pair")
-            elif revival or key in ("sfnn_ft_factorizer", "sfnn_gptq", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
+            elif revival or key in ("all_optim", "sfnn_ft_factorizer", "sfnn_gptq", "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats", "sfnn_qat_l1", "sfnn_qat_ft", "sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments", "sfnn_qat_l2", "sfnn_qat_l3", "sfnn_freeze_l1", "sfnn_l1_center", "sfnn_l2_l3_center", "sfnn_l1_effective_weight_clip"):
                 if type(item) is not bool:
                     raise ValueError(f"{key}.{name} must be true/false")
             elif type(item) not in (int, float) or not math.isfinite(item):
@@ -278,6 +278,9 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
     if resolved.get("all_optim") is True:
         for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"):
             resolved[key] = True
+    elif isinstance(settings.get("all_optim"), dict):
+        for key in ("sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"):
+            resolved.setdefault(key, False)
     return resolved
 
 
@@ -770,7 +773,8 @@ def summarize(root: Path, plan: dict, epochs=None, *, trial_rows=None) -> tuple[
                                      *[e["settings"] for e in trial.get("epoch_settings", {}).values()]]]
     all_optim_keys = {"sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"}
     parameter_columns = [key for key in parameter_columns
-                         if any(key in settings or (key in all_optim_keys and settings.get("all_optim") is True)
+                         if any(key in settings or (key in all_optim_keys and (settings.get("all_optim") is True
+                                or isinstance(settings.get("all_optim"), dict)))
                                 for settings in all_settings)]
     parameter_columns = list(dict.fromkeys([*parameter_columns, *changed_setting_columns(plan)]))
     parameter_columns = list(dict.fromkeys([*parameter_columns,

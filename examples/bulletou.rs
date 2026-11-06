@@ -4106,7 +4106,44 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
         root.as_object().ok_or_else(|| format!("--settings-file {} must contain a JSON object", path.display()))?;
     let mut out = Vec::new();
     let mut schedules = serde_json::Map::new();
+    // Expand the scheduled shortcut to individual schedules. This keeps each
+    // epoch self-contained even after startup resolves and applies epoch 1.
+    let fp16_keys = ["sfnn_ft_fp16", "sfnn_ft_fp16_grad", "sfnn_ft_fp16_act", "sfnn_ft_fp16_moments"];
+    let all_optim_schedule = root.iter().find(|(k, v)| k.replace('-', "_") == "all_optim" && v.is_object());
+    if let Some((_, shortcut)) = all_optim_schedule {
+        validate_epoch_setting("all_optim", shortcut)?;
+        for key in fp16_keys {
+            let individual = root.iter().find(|(k, _)| k.replace('-', "_") == key).map(|(_, v)| v);
+            let mut epochs = std::collections::BTreeSet::new();
+            for name in shortcut.as_object().unwrap().keys() { epochs.insert(name[5..].parse::<usize>().unwrap()); }
+            if let Some(value) = individual {
+                if value.is_object() {
+                    validate_epoch_setting(key, value)?;
+                    for name in value.as_object().unwrap().keys() { epochs.insert(name[5..].parse::<usize>().unwrap()); }
+                } else if !value.is_boolean() {
+                    return Err(format!("{key} must be true/false when all_optim is scheduled"));
+                }
+            }
+            let mut combined = serde_json::Map::new();
+            for epoch in epochs {
+                let shortcut_enabled = epoch_setting_value(shortcut, epoch)?.as_bool().unwrap();
+                let individual_enabled = match individual {
+                    Some(v) if v.is_object() => epoch_setting_value(v, epoch)?.as_bool().unwrap(),
+                    Some(v) => v.as_bool().unwrap(),
+                    None => false,
+                };
+                combined.insert(format!("epoch{epoch}"), (shortcut_enabled || individual_enabled).into());
+            }
+            let combined = serde_json::Value::Object(combined);
+            bulletou_settings_json_value_to_args(path, key, epoch_setting_value(&combined, 1)?, &mut out)?;
+            schedules.insert(key.to_string(), combined);
+        }
+    }
     for (key, value) in root {
+        let normalized_key = key.replace('-', "_");
+        if all_optim_schedule.is_some() && (normalized_key == "all_optim" || fp16_keys.contains(&normalized_key.as_str())) {
+            continue;
+        }
         if value.is_object() {
             let key = key.replace('-', "_");
             let key = if key == "sfnn_ft_factorizer" { "ft_factorizer".to_string() } else { key };
@@ -4129,7 +4166,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "superbatches", "save_rate", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
-    "ft_factorizer",
+    "ft_factorizer", "all_optim",
     "sfnn_l1_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
@@ -4170,7 +4207,7 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
             return Err(format!("superbatches.{name} must be a positive integer"));
         }
-        let boolean = is_revival_setting(key) || matches!(key, "ft_factorizer" | "sfnn_gptq" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_ft_fp16_moments" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
+        let boolean = is_revival_setting(key) || matches!(key, "all_optim" | "ft_factorizer" | "sfnn_gptq" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_ft_fp16_moments" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
             return Err(format!("epoch schedule `{key}.{name}` requires {}", if boolean { "true/false" } else { "a number" }));
         }
@@ -28845,6 +28882,38 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn all_optim_schedule_expands_and_survives_epoch_resolution() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("bulletou-all-optim-schedule-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{
+            "teacher":"teacher.bin", "backend":"cuda-cpp", "batch_size":65536,
+            "arch":"SFNN_halfkahm2_2304_15_64_k21k21_progress8",
+            "all_optim":{"epoch1":true,"epoch5":false,"epoch8":true}
+        }"#).unwrap();
+        let raw = vec!["bulletou".into(), "--settings-file".into(), path.as_os_str().to_owned()];
+        let args = Args::try_parse_from(expand_settings_file_args(raw.clone()).unwrap()).unwrap();
+        let start = args_at_epoch(&args, 1).unwrap();
+        let flags = |a: &Args| [a.sfnn_ft_fp16, a.sfnn_ft_fp16_grad, a.sfnn_ft_fp16_act, a.sfnn_ft_fp16_moments];
+        assert_eq!(flags(&start), [true; 4]);
+        assert_eq!(flags(&args_at_epoch(&start, 4).unwrap()), [true; 4]);
+        let fifth = args_at_epoch(&start, 5).unwrap();
+        assert_eq!(flags(&fifth), [false; 4]);
+        assert_eq!(flags(&args_at_epoch(&fifth, 8).unwrap()), [true; 4]);
+        assert!(resume_signature_matches(&resume_signature(&start), &fifth));
+        std::fs::write(&path, r#"{
+            "teacher":"teacher.bin", "backend":"cuda-cpp", "batch_size":65536,
+            "arch":"SFNN_halfkahm2_2304_15_64_k21k21_progress8",
+            "all_optim":{"epoch1":true,"epoch5":false},
+            "sfnn_ft_fp16":{"epoch1":false,"epoch6":true}
+        }"#).unwrap();
+        let args = Args::try_parse_from(expand_settings_file_args(raw).unwrap()).unwrap();
+        assert_eq!(flags(&args_at_epoch(&args, 5).unwrap()), [false; 4]);
+        assert_eq!(flags(&args_at_epoch(&args, 6).unwrap()), [true, false, false, false]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn sfnn_ft_fp16_epoch_schedule_rejects_incompatible_options() {
         use super::*;
