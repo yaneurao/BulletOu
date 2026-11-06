@@ -12449,6 +12449,52 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_folded_shared_l1_matches_reference() {
+        let shape = SfnnForwardShape { input_size: 4, ft_size: 64, l1_hidden: 15,
+            l1_skip: true, l2_size: 4, num_stacks: 8, ..tiny_sfnn_shape() };
+        let seq = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i * 17 % 101) as f32 - 50.0) * scale).collect()
+        };
+        let l0w = seq(4 * 64, 0.002); let l0b = seq(64, 0.001);
+        let l1w = seq(8 * 16 * 64, 0.003); let l1b = seq(8 * 16, 0.002);
+        let l1fw = seq(16 * 64, 0.004); let l1fb = seq(16, 0.005);
+        let l2w = seq(8 * 4 * 30, 0.002); let l2b = seq(8 * 4, 0.002);
+        let l3w = seq(8 * 4, 0.003); let l3b = seq(8, 0.003);
+        let weights = SfnnForwardHostWeights { shape, l0w: &l0w, l0b: &l0b,
+            l1w: &l1w, l1b: &l1b, l1fw: Some(&l1fw), l1fb: Some(&l1fb),
+            l1axw: None, l1axb: None, l2w: &l2w, l2b: &l2b,
+            l2fw: None, l2fb: None, l2axw: None, l2axb: None,
+            l3w: &l3w, l3b: &l3b, l3fw: None, l3fb: None, l3axw: None, l3axb: None };
+        let batch_size = 1031;
+        let stm: Vec<i32> = (0..batch_size).map(|i| (i % 4) as i32).collect();
+        let nstm: Vec<i32> = (0..batch_size).map(|i| ((i + 1) % 4) as i32).collect();
+        let buckets: Vec<i32> = (0..batch_size).map(|i| (i % 8) as i32).collect();
+        let batch = SfnnForwardHostBatch { stm_indices: &stm, nstm_indices: &nstm,
+            buckets: &buckets, batch_size, max_active: 1 };
+        // A batch below the dispatch threshold exercises the original kernel.
+        let reference_size = 1023;
+        let reference_batch = SfnnForwardHostBatch { stm_indices: &stm[..reference_size],
+            nstm_indices: &nstm[..reference_size], buckets: &buckets[..reference_size],
+            batch_size: reference_size, max_active: 1 };
+        let ctx = Context::new(0).unwrap();
+        let batch = SfnnForwardDeviceBatch::from_host(&ctx, batch).unwrap();
+        let reference_batch = SfnnForwardDeviceBatch::from_host(&ctx, reference_batch).unwrap();
+        let weights = SfnnForwardDeviceWeights::from_host(&ctx, weights).unwrap();
+        let workspace = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, batch_size)).unwrap();
+        let reference = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, reference_size)).unwrap();
+        let active = SfnnFactorizerActive::from_available(&weights);
+        for alpha in [0.0, 0.37, 1.0, 1.75] {
+            let alpha = SfnnFactorizerAlpha { shared: alpha, ..SfnnFactorizerAlpha::ONE };
+            sfnn_forward_device_with_factorizer_and_alpha(&ctx, &reference_batch, &weights, &reference, active, alpha).unwrap();
+            let expected = reference.l1.download(&ctx).unwrap();
+            sfnn_forward_device_with_factorizer_and_alpha(&ctx, &batch, &weights, &workspace, active, alpha).unwrap();
+            let actual = workspace.l1.download(&ctx).unwrap();
+            assert_close_slice("folded shared L1", &actual[..reference_size * 16], &expected, 1e-7);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sfnn_l1_only_factorizer_training_and_quantization() {
         let ctx = Context::new(0).unwrap();
         let upload_ctx = Context::new(0).unwrap();

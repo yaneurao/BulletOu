@@ -145,6 +145,8 @@ struct BulletOuCudaCppContext {
     size_t dense_qat_l1_bias_len = 0;
     int* dense_qat_packed_input = nullptr;
     size_t dense_qat_packed_input_len = 0;
+    float* sfnn_folded_l1_weights = nullptr;
+    size_t sfnn_folded_l1_weights_len = 0;
     int* dense_qat_packed_weights = nullptr;
     size_t dense_qat_packed_weights_len = 0;
     int* dense_qat_bucket_tiles = nullptr;
@@ -2016,6 +2018,44 @@ __global__ void sfnn_dense_l1_16_warp(const float* input, const float* weights, 
         float sum = sums[o];
         for (int offset=16; offset>0; offset>>=1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
         if (lane == 0) output[sample*16+o] = sum + bias[static_cast<size_t>(bucket)*16+o];
+    }
+}
+
+// Fold the shared L1 factorizer once per forward pass. The residual weights
+// are output-major; shared weights are input-major.
+__global__ void sfnn_fold_shared_l1_kernel(const float* weights, const float* shared,
+    float* folded, size_t inputs, size_t stacks, float alpha) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t n = stacks * 16 * inputs;
+    if (i < n) {
+        const size_t unit = (i / inputs) % 16, col = i % inputs;
+        folded[i] = weights[i] + alpha * shared[col * 16 + unit];
+    }
+}
+
+// Preserve the original warp reduction and the two separate bias additions.
+__global__ void sfnn_folded_shared_l1_warp_kernel(const float* input, const float* weights,
+    const float* bias, const float* shared_bias, const int* buckets, float* output,
+    size_t batch, size_t inputs, size_t stacks, float alpha) {
+    const unsigned lane = threadIdx.x & 31U;
+    const size_t i = static_cast<size_t>(blockIdx.x) * 8 + (threadIdx.x >> 5);
+    if (i >= batch * 16) return;
+    const size_t unit = i % 16, sample = i / 16;
+    const int bucket = buckets[sample];
+    if (bucket < 0 || static_cast<size_t>(bucket) >= stacks) {
+        if (lane == 0) output[i] = 0.0f;
+        return;
+    }
+    const size_t base = (static_cast<size_t>(bucket) * 16 + unit) * inputs;
+    float sum = 0.0f;
+    for (size_t col = lane; col < inputs; col += 32)
+        sum += input[sample * inputs + col] * weights[base + col];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xffffffffU, sum, offset);
+    if (lane == 0) {
+        sum += bias[static_cast<size_t>(bucket) * 16 + unit];
+        sum += alpha * shared_bias[unit];
+        output[i] = sum;
     }
 }
 
@@ -6280,7 +6320,19 @@ int launch_sfnn_forward_kernels(
             return fail_message("sfnn_stacked_l1_warp_kernel grid overflow");
         }
         blocks = static_cast<int>((l1_warps + l1_warps_per_block - 1) / l1_warps_per_block);
-        if (!grouped_l1 && !common_shard_l1 && !has_l1f && !has_l1ax && !bn_use_reference()) {
+        if (!grouped_l1 && !common_shard_l1 && has_l1f && !has_l1ax &&
+            !residual_count_gates && l1_out == 16 && num_stacks == 8 && batch >= 1024 &&
+            std::getenv("BULLETOU_SHARED_L1_FOLD_REFERENCE") == nullptr) {
+            const size_t n = num_stacks * l1_out * ft_size;
+            if (ensure_f32_scratch(&ctx->sfnn_folded_l1_weights, &ctx->sfnn_folded_l1_weights_len,
+                    n, "folded shared L1 weights")) return -1;
+            sfnn_fold_shared_l1_kernel<<<static_cast<unsigned>((n + 255) / 256), 256, 0, ctx->stream>>>(
+                l1w, l1fw, ctx->sfnn_folded_l1_weights, ft_size, num_stacks, factorizer_shared_alpha);
+            if (check_kernel_launch("fold shared L1 weights") != 0) return -1;
+            sfnn_folded_shared_l1_warp_kernel<<<blocks, l1_warp_threads, 0, ctx->stream>>>(
+                combined, ctx->sfnn_folded_l1_weights, l1b, l1fb, buckets, l1,
+                batch, ft_size, num_stacks, factorizer_shared_alpha);
+        } else if (!grouped_l1 && !common_shard_l1 && !has_l1f && !has_l1ax && !bn_use_reference()) {
             if (l1_out == 16 && ft_size == 2304 && batch >= 1024) {
                 const unsigned sample_blocks = static_cast<unsigned>((batch + 7) / 8);
                 sfnn_dense_l1_16_warp<<<sample_blocks, l1_warp_threads, 0, ctx->stream>>>(
@@ -8983,6 +9035,7 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
     if (ctx->sfnn_ft_half_grad_clipped != nullptr) cudaFree(ctx->sfnn_ft_half_grad_clipped);
     if (ctx->sfnn_ft_half_activations != nullptr) cudaFree(ctx->sfnn_ft_half_activations);
     if (ctx->dense_qat_packed_input != nullptr) cudaFree(ctx->dense_qat_packed_input);
+    if (ctx->sfnn_folded_l1_weights != nullptr) cudaFree(ctx->sfnn_folded_l1_weights);
     if (ctx->dense_qat_packed_weights != nullptr) cudaFree(ctx->dense_qat_packed_weights);
     if (ctx->dense_qat_bucket_tiles != nullptr) cudaFree(ctx->dense_qat_bucket_tiles);
     if (ctx->sfnn_ft_half != nullptr) cudaFree(ctx->sfnn_ft_half);
