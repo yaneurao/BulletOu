@@ -153,6 +153,20 @@ pub struct Row {
 }
 
 impl RevivalAudit {
+    pub fn append_ft_saturation(&self, hits: &[u64], perspectives: u64, threshold: f64, selected: &[usize]) -> Result<(), String> {
+        use std::io::Write;
+        let path = self.path.with_file_name("ft-revive-saturation.csv");
+        fs::create_dir_all(path.parent().unwrap()).map_err(|e|e.to_string())?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path).map_err(|e|e.to_string())?;
+        if file.metadata().map_err(|e|e.to_string())?.len()==0 {
+            writeln!(file,"epoch,run,unit,perspectives,upper_hits,upper_ratio,selected,saturation_threshold").map_err(|e|e.to_string())?;
+        }
+        for (unit,&count) in hits.iter().enumerate() {
+            writeln!(file,"{},{},{},{},{},{:.10},{},{}",self.epoch,self.run,unit,perspectives,count,
+                count as f64/perspectives as f64,selected.contains(&unit),threshold).map_err(|e|e.to_string())?;
+        }
+        file.flush().map_err(|e|e.to_string())
+    }
     pub fn new(output: &Path, epoch: usize) -> Result<Self, String> {
         let path = output.join("revive.csv");
         let mut max_run = 0usize;
@@ -193,6 +207,24 @@ impl RevivalAudit {
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        let ft_path=output.join("ft-revive-saturation.csv");
+        match File::open(&ft_path) {
+            Ok(file) => {
+                for (i,line) in BufReader::new(file).lines().enumerate().skip(1) {
+                    let line=line.map_err(|e|format!("{}: {e}",ft_path.display()))?;
+                    if line.is_empty() {continue;}
+                    let mut fields=line.split(',');
+                    let saved_epoch=fields.next().and_then(|x|x.parse::<usize>().ok());
+                    let saved_run=fields.next().and_then(|x|x.parse::<usize>().ok());
+                    match (saved_epoch,saved_run) {
+                        (Some(e),Some(r)) => if e==epoch {max_run=max_run.max(r);},
+                        _ => return Err(format!("{}: invalid FT record at line {}",ft_path.display(),i+1)),
+                    }
+                }
+            }
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("{}: {e}",ft_path.display())),
         }
         let run = max_run.checked_add(1).ok_or("revival run number overflow")?;
         Ok(Self { path, epoch, run, summaries: RefCell::new(BTreeMap::new()) })
@@ -334,6 +366,19 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+    #[test]
+    fn ft_saturation_audit_numbers_repeated_runs_without_legacy_rows() {
+        let t=Temp::new();
+        let first=RevivalAudit::new(&t.0,3).unwrap();
+        first.append_ft_saturation(&[99,100],100,0.99,&[0,1]).unwrap();
+        let second=RevivalAudit::new(&t.0,3).unwrap();
+        assert_eq!(second.run,2);
+        second.append_ft_saturation(&[0,1],100,0.99,&[]).unwrap();
+        let text=fs::read_to_string(t.0.join("ft-revive-saturation.csv")).unwrap();
+        assert_eq!(text.lines().count(),5);
+        assert!(text.contains("3,1,0,100,99,0.9900000000,true,0.99"));
+        assert!(text.contains("3,2,0,100,0,0.0000000000,false,0.99"));
     }
     #[test]
     fn startup_summary_header_is_created_once_and_preserves_records() {

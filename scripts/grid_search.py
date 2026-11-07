@@ -58,7 +58,7 @@ COMMON_COLUMNS = (
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_l2_revive",
     "sfnn_l1_revive", "sfnn_l1_revive_lr_suppress_sb", "sfnn_l1_initial_lr_suppress_sb",
-    "sfnn_ft_revive",
+    "sfnn_ft_revive", "sfnn_ft_revive_saturation_threshold", "sfnn_ft_revive_batches",
     "sfnn_bn_qat_freeze_stats",
     "sfnn_bn_l2_effective_weight_clip",
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",
@@ -213,7 +213,7 @@ def positive_int(settings: dict, key: str) -> int:
 EPOCH_SETTING_KEYS = {
     "superbatches", "save_rate", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_factorizer",
-    "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
+    "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold", "sfnn_ft_revive_saturation_threshold", "sfnn_ft_revive_batches",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
     "sfnn_ft_factorizer", "all_optim",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -250,7 +250,7 @@ def resolve_epoch_settings(settings: dict, epoch: int, *, historical: bool = Fal
         for name, item in value.items():
             if not re.fullmatch(r"epoch[1-9][0-9]*", name):
                 raise ValueError(f"{key}: invalid epoch key {name!r}")
-            if key == "superbatches":
+            if key in ("superbatches", "sfnn_ft_revive_batches"):
                 if type(item) is not int or item < 1:
                     raise ValueError(f"{key}.{name} must be a positive integer")
             elif key in ("save_rate", "sfnn_l1_revive_lr_suppress_sb"):
@@ -320,7 +320,7 @@ def check_settings(settings: dict) -> None:
     if suppress_sb and settings.get("lr_schedule", "step") == "plateau":
         raise ValueError("sfnn_l1_revive_lr_suppress_sb does not support plateau LR")
     warmup = settings.get("warmup_sb", 0)
-    for key in ("sfnn_ft_revive_contribution_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
+    for key in ("sfnn_ft_revive_contribution_threshold", "sfnn_ft_revive_saturation_threshold", "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold"):
         value = settings.get(key, 0.01)
         if type(value) not in (float, int) or not math.isfinite(value) or not 0 < value <= 1:
             raise ValueError(f"{key} must be finite and in (0, 1]")
@@ -334,6 +334,8 @@ def check_settings(settings: dict) -> None:
     for key in ("batch_size", "batches_per_update", "positions_per_superbatch"):
         if key in settings:
             positive_int(settings, key)
+    if "sfnn_ft_revive_batches" in settings:
+        positive_int(settings, "sfnn_ft_revive_batches")
     for key in ("lr", "lr_min", "wrm_target_scaling", "wrm_in_scaling", "wrm_nnue2score"):
         if key in settings and (type(settings[key]) not in (float, int) or settings[key] <= 0):
             raise ValueError(f"{key} must be positive")

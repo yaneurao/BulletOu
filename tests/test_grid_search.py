@@ -207,6 +207,15 @@ class GridSearchTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "true/false"):
                 grid.resolve_epoch_settings({key: {"epoch3": 1}}, 1)
 
+    def test_ft_saturation_revive_epoch_settings(self):
+        settings = {"sfnn_ft_revive_saturation_threshold": {"epoch1": 0.99, "epoch3": 0.95},
+                    "sfnn_ft_revive_batches": {"epoch1": 16, "epoch3": 256}}
+        self.assertEqual(grid.resolve_epoch_settings(settings, 2)["sfnn_ft_revive_batches"], 16)
+        self.assertEqual(grid.resolve_epoch_settings(settings, 3)["sfnn_ft_revive_batches"], 256)
+        self.assertEqual(grid.resolve_epoch_settings(settings, 3)["sfnn_ft_revive_saturation_threshold"], 0.95)
+        with self.assertRaises(ValueError):
+            grid.resolve_epoch_settings({"sfnn_ft_revive_batches": {"epoch1": 0}}, 1)
+
     def test_all_optim_grid_setting(self):
         plan = self.plan(["--grid", "all-optim", "false", "true"])
         self.assertEqual({trial["settings"]["all_optim"] for trial in plan["trials"]}, {False, True})

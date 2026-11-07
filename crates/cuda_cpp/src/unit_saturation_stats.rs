@@ -27,6 +27,11 @@ impl SfnnUnitSaturationStats {
         self.positions = 0;
     }
 
+    /// Counts are shared across both perspectives and independent of L1 buckets.
+    pub fn ft_upper_counts(&self) -> (&[u64], u64) {
+        (&self.totals[..self.shape.ft_size], 2 * self.positions)
+    }
+
     pub fn accumulate(&mut self, ctx: &Context, w: &SfnnForwardWorkspace, buckets: &I32Buffer) -> Result<()> {
         w.validate()?;
         if w.layout.shape != self.shape {

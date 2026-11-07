@@ -134,17 +134,12 @@ fn compact_revival_gpu_proxy_matches_export_and_preserves_structural_zeros() {
             expand(s, &compact).into_iter().map(|x| (x * 64.0).round().clamp(-128.0, 127.0) / 64.0).collect();
         assert_eq!(proxy.l1w.download(&ctx).unwrap(), expected);
         assert_eq!(r.weights.l1w.download(&ctx).unwrap(), compact);
-        // FT contribution must count only existing outgoing connections, including skip.
+        // FT compensation uses the observed mean independently of connection layout.
         let mut c = ft_revive::Calibration::new(s.ft_size, s.num_stacks);
-        for mad in [false, true] {
-            c.add(&[0, 1], &vec![0.25; 2 * s.ft_size], &[1.0; 2], mad).unwrap();
-            c.add(&[0, 1], &vec![0.75; 2 * s.ft_size], &[1.0; 2], mad).unwrap();
-            if !mad {
-                c.finish_means();
-            }
-        }
-        c.finish(&proxy.l1w.download(&ctx).unwrap(), s.l1_out()).unwrap();
-        assert!(c.utility.iter().all(|x| *x > 0.0));
+        c.add(&[0, 1], &vec![0.25; 2 * s.ft_size], &[1.0; 2]).unwrap();
+        c.add(&[0, 1], &vec![0.75; 2 * s.ft_size], &[1.0; 2]).unwrap();
+        c.finish_means();
+        assert!(c.means.iter().all(|x| *x == 0.5));
         // Quantization of only the weights does not alter the compact master layout.
         assert_eq!(r.weights.l1w.len(), s.l1w_len().unwrap());
     }

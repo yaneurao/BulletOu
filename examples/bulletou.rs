@@ -4165,7 +4165,7 @@ fn bulletou_settings_json_args(path: &std::path::Path) -> Result<Vec<std::ffi::O
 const EPOCH_SETTING_KEYS: &[&str] = &[
     "superbatches", "save_rate", "sfnn_l1_revive_lr_suppress_sb",
     "sfnn_l1_revive_contribution_threshold", "sfnn_l2_revive_contribution_threshold",
-    "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold",
+    "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold", "sfnn_ft_revive_saturation_threshold", "sfnn_ft_revive_batches",
     "ft_factorizer", "all_optim",
     "sfnn_l1_factorizer",
     "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
@@ -4204,8 +4204,8 @@ fn validate_epoch_setting(key: &str, value: &serde_json::Value) -> Result<(), St
         if matches!(key, "save_rate" | "sfnn_l1_revive_lr_suppress_sb") && !v.as_u64().is_some_and(|n| usize::try_from(n).is_ok()) {
             return Err(format!("{key}.{name} must be a nonnegative integer"));
         }
-        if key == "superbatches" && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
-            return Err(format!("superbatches.{name} must be a positive integer"));
+        if matches!(key, "superbatches" | "sfnn_ft_revive_batches") && !v.as_u64().is_some_and(|n| n > 0 && usize::try_from(n).is_ok()) {
+            return Err(format!("{key}.{name} must be a positive integer"));
         }
         let boolean = is_revival_setting(key) || matches!(key, "all_optim" | "ft_factorizer" | "sfnn_gptq" | "sfnn_bn_qat" | "sfnn_bn_qat_freeze_stats" | "sfnn_qat_l1" | "sfnn_qat_ft" | "sfnn_ft_fp16" | "sfnn_ft_fp16_grad" | "sfnn_ft_fp16_act" | "sfnn_ft_fp16_moments" | "sfnn_qat_l2" | "sfnn_qat_l3" | "sfnn_freeze_l1" | "sfnn_l2_l3_center" | "sfnn_l1_center" | "sfnn_l1_effective_weight_clip");
         if (boolean && !v.is_boolean()) || (!boolean && !v.is_number()) {
@@ -4321,7 +4321,7 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             }};
         }
         assign!(superbatches, save_rate, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
-            sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold,
+            sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold, sfnn_ft_revive_saturation_threshold, sfnn_ft_revive_batches,
             lr, lr_min, batches_per_update, sfnn_gptq, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_ft_fp16_moments, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
             sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
@@ -5511,13 +5511,18 @@ struct Args {
     /// After L1 revival, multiply L1 learning rate by 0.1 for this many superbatches.
     #[arg(long, default_value_t = 0)]
     sfnn_l1_revive_lr_suppress_sb: usize,
-    /// Reset low-contribution shared FT product pairs at each enabled epoch boundary.
+    /// Reset upper-saturated shared FT units at each enabled epoch boundary.
     #[arg(long)]
     sfnn_ft_revive: bool,
-    /// Require contribution below this fraction in every bucket; default 1%.
-    /// Explicit input also measures reset candidates when FT revival is off.
+    /// Legacy FT contribution threshold, ignored with a warning.
     #[arg(long)]
     sfnn_ft_revive_contribution_threshold: Option<f64>,
+    /// FT unit upper saturation fraction for revival (default 0.99).
+    #[arg(long)]
+    sfnn_ft_revive_saturation_threshold: Option<f64>,
+    /// Maximum number of validation batches used for FT revival.
+    #[arg(long, default_value_t = 16)]
+    sfnn_ft_revive_batches: usize,
     /// Reset when relative contribution is strictly below this fraction (0, 1]; default 1%.
     /// Explicit input also measures reset candidates when revival is off.
     #[arg(long)]
@@ -5647,7 +5652,7 @@ impl Args {
     }
 
     fn sfnn_ft_revival_requested(&self) -> bool {
-        self.sfnn_ft_revive || self.sfnn_ft_revive_contribution_threshold.is_some()
+        self.sfnn_ft_revive || self.sfnn_ft_revive_saturation_threshold.is_some() || self.sfnn_ft_revive_contribution_threshold.is_some()
     }
 
     fn sfnn_l1_revive_contribution_threshold(&self) -> f64 {
@@ -5782,6 +5787,9 @@ impl Args {
             if !value.is_finite() || value<=0.0 || value>1.0 {
                 return Err(format!("{name} must be finite and in (0, 1]"));
             }
+        }
+        if self.sfnn_ft_revive_batches == 0 || self.sfnn_ft_revive_saturation_threshold.is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1.0) {
+            return Err("FT revival requires positive sfnn_ft_revive_batches and saturation threshold in (0, 1]".into());
         }
         if self.sfnn_l2_revival_requested()
             && (self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2)
@@ -17857,58 +17865,59 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     if runner.batch_norm.is_some() || runner.residual_count_gates_enabled {
         return Err("FT revival requires non-BN SFNN, L1 none/shared/axis/pair and no residual count gates".into());
     }
-    let mut cfg=config.clone();cfg.teacher_shuffle_buffer_batches=0;
+    if args.sfnn_ft_revive_contribution_threshold.is_some() {
+        eprintln!("  WARNING: sfnn_ft_revive_contribution_threshold is ignored; FT revival now uses sfnn_ft_revive_saturation_threshold (default 0.99)");
+    }
+    let cache = TestPositionsCache::try_load(args).ok_or("FT revival requires a readable --test-teacher validation set")?;
+    let batch_size = args.test_batch_size.max(1);
+    let limit = args.sfnn_ft_revive_batches.saturating_mul(batch_size).min(cache.positions.len());
+    if limit == 0 { return Err("FT revival validation set is empty".into()); }
+    let positions = &cache.positions[..limit];
+    let layerstack = args.effective_layerstack().unwrap_or(LayerStackMode::Kingrank3by3);
+    if layerstack.progress_bucket_count()>1 && config.hard_progress_params.is_none() {
+        return Err("FT revival requires fixed progress parameters for validation bucket selection".into());
+    }
     let shape=cuda_cpp_sfnn_quantized_proxy_shape(args,feature_kind,runner.shape);
     let proxy=SfnnForwardDeviceWeights::new_dense(ctx,shape).map_err(|e|e.to_string())?;
     runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
-    let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,cfg.batch_size)).map_err(|e|e.to_string())?;
-    let measure=|c:&mut ft_revive::Calibration,mad:bool| -> std::result::Result<(),String> {
-        for_each_cuda_cpp_sfnn_teacher_batch(feature_kind,&cfg,16,|teacher| {
-            let fast=teacher.batch;
-            let strip=|src:&[i32]|src.iter().map(|&i|if i>=shape.input_size as i32 {-1} else {i}).collect::<Vec<_>>();
-            let stm=strip(&fast.stm);let nstm=strip(&fast.nstm);
-            let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch{stm_indices:&stm,nstm_indices:&nstm,
+    let measure=|c:&mut ft_revive::Calibration, stats:&mut SfnnUnitSaturationStats, means:bool| -> std::result::Result<(),String> {
+        for chunk in positions.chunks(batch_size) {
+            let fast=build_sfnn_validation_fast_batch(feature_kind,layerstack,chunk,config.hard_progress_params.as_ref())?;
+            let batch=SfnnForwardDeviceBatch::from_host(ctx,SfnnForwardHostBatch{stm_indices:&fast.stm,nstm_indices:&fast.nstm,
                 buckets:&fast.buckets,batch_size:fast.layout.batch_size,max_active:fast.layout.max_active}).map_err(|e|e.to_string())?;
+            let workspace=SfnnForwardWorkspace::new(ctx,SfnnForwardWorkspaceLayout::new(shape,chunk.len())).map_err(|e|e.to_string())?;
             sfnn_forward_device(ctx,&batch,&proxy,&workspace).map_err(|e|e.to_string())?;
-            c.add(&fast.buckets,&workspace.combined.download(ctx).map_err(|e|e.to_string())?,&fast.weights,mad).map_err(|e|e.to_string())
-        })?;
-        if !mad {c.finish_means();}
+            stats.accumulate(ctx,&workspace,&batch.buckets).map_err(|e|e.to_string())?;
+            if means { c.add(&fast.buckets,&workspace.combined.download(ctx).map_err(|e|e.to_string())?,&fast.weights).map_err(|e|e.to_string())?; }
+        }
+        if means {c.finish_means();}
         Ok(())
     };
     let mut c=ft_revive::Calibration::new(shape.ft_size,shape.num_stacks);
-    eprintln!("  [FT REVIVE] 16 teacher batches, two-pass MAD; min 1024 positions in EVERY bucket; contribution < {}% in EVERY bucket; cursor unchanged",100.0*args.sfnn_ft_revive_contribution_threshold());
-    measure(&mut c,false)?;measure(&mut c,true)?;
-    c.finish(&proxy.l1w.download(ctx).map_err(|e|e.to_string())?,shape.l1_out()).map_err(|e|e.to_string())?;
-    let ids=c.selected(args.sfnn_ft_revive_contribution_threshold()).map_err(|e|e.to_string())?;
+    let mut stats=SfnnUnitSaturationStats::new(ctx,shape).map_err(|e|e.to_string())?;
+    let threshold=args.sfnn_ft_revive_saturation_threshold.unwrap_or(0.99);
+    eprintln!("  [FT REVIVE] validation positions={}, upper saturation >= {:.2}% across both views",limit,threshold*100.0);
+    measure(&mut c,&mut stats,args.sfnn_ft_revive)?;
+    let (hits,perspectives)=stats.ft_upper_counts();
+    let units=ft_revive::saturated_units(hits,perspectives,threshold).map_err(|e|e.to_string())?;
     let pairs=shape.ft_size/2;
-    let mut rows=Vec::new();
-    for b in 0..shape.num_stacks {for i in 0..pairs {
-        rows.push(revival_audit::Row {bucket:b,unit:None,pair:Some(i),positions:c.counts[b],
-            upper_hits:None,zero_hits:None,contribution:c.utility[b*pairs+i],relative_contribution:c.relative[b*pairs+i],
-            selected:ids.contains(&i),threshold:args.sfnn_ft_revive_contribution_threshold()});
-    }}
-    audit.append("FT",rows)?;
+    let ids:Vec<usize>=units.iter().map(|&u|u%pairs).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    audit.append_ft_saturation(hits,perspectives,threshold,&units)?;
     if !args.sfnn_ft_revive {
-        audit.complete_layer("FT",0)?;
-        eprintln!("  [FT REVIVE] measurement only: {} reset candidates; revived=0",ids.len());
+        eprintln!("  [FT REVIVE] measurement only: {} saturated units; revived=0",units.len());
         return Ok(());
     }
-    let path=&audit.path;
-    if c.counts.iter().any(|&n|n<1024) {
-        eprintln!("{}",paint(&format!("  WARNING: FT revival skipped: under-sampled bucket(s), counts={:?}; shared FT cannot be judged safely",c.counts),ConsoleColor::BoldYellow));
-    }
     if !ids.is_empty() {
-        runner.revive_ft(ctx,&c,&ids,feature_kind.base_input_size()).map_err(|e|e.to_string())?;
+        runner.revive_ft_units(ctx,&c,&units,feature_kind.base_input_size()).map_err(|e|e.to_string())?;
         runner.build_quantized_proxy(ctx,feature_kind.base_input_size(),feature_kind.virtual_rows(),&proxy).map_err(|e|e.to_string())?;
         let mut new=ft_revive::Calibration::new(shape.ft_size,shape.num_stacks);
-        measure(&mut new,false)?;
+        let mut new_stats=SfnnUnitSaturationStats::new(ctx,shape).map_err(|e|e.to_string())?;
+        measure(&mut new,&mut new_stats,true)?;
         if new.counts!=c.counts {return Err("FT revival replay bucket counts changed".into());}
         runner.compensate_ft_revival_mean(ctx,&ids,&new).map_err(|e|e.to_string())?;
-        eprintln!("{}",paint("  WARNING: FT revival compensates the measured mean, not pointwise outputs; accuracy can change.",ConsoleColor::BoldYellow));
+        eprintln!("  WARNING: FT revival uses global mean for unobserved buckets; compensation is approximate.");
     }
-    eprintln!("  [FT REVIVE] complete: {}/{} pairs; quantization-visible FT initialization, bias=0.5, virtual columns=0, outgoing +/-1/64, mean compensation, selected optimizer moments reset; audit={}",ids.len(),pairs,path.display());
-    audit.complete_layer("FT",ids.len())?;
-    for i in ids {eprintln!("  [FT REVIVE] pair={i} units={i},{} max_bucket_contribution={:.6}%",i+pairs,100.0*(0..shape.num_stacks).map(|b|c.relative[b*pairs+i]).fold(0.0,f64::max));}
+    eprintln!("  [FT REVIVE] complete: {}/{} units, {} affected pairs; audit=ft-revive-saturation.csv",units.len(),shape.ft_size,ids.len());
     Ok(())
 }
 
@@ -34032,6 +34041,23 @@ mod tests {
             assert_eq!(e.sfnn_ft_revive,epoch==5 || (9..13).contains(&epoch));
             assert_eq!(e.sfnn_ft_revive_contribution_threshold(),if epoch<9 {0.01} else {0.02});
         }
+    }
+
+    #[test]
+    fn ft_saturation_revive_epoch_settings() {
+        use super::*;
+        let mut args=Args::try_parse_from(["bulletou","--teacher","dummy.bin","--backend","cuda-cpp",
+            "--arch","SFNN_halfkahm2_2304_15_64_k21k21_progress8"]).unwrap();
+        args.epoch_settings_json=Some(serde_json::json!({
+            "sfnn_ft_revive_saturation_threshold":{"epoch1":0.99,"epoch3":0.95},
+            "sfnn_ft_revive_batches":{"epoch1":16,"epoch3":256}
+        }).to_string());
+        let before=args_at_epoch(&args,2).unwrap();
+        let after=args_at_epoch(&args,3).unwrap();
+        assert_eq!(before.sfnn_ft_revive_saturation_threshold,Some(0.99));
+        assert_eq!(before.sfnn_ft_revive_batches,16);
+        assert_eq!(after.sfnn_ft_revive_saturation_threshold,Some(0.95));
+        assert_eq!(after.sfnn_ft_revive_batches,256);
     }
 
     #[test]

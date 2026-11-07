@@ -95,7 +95,7 @@ run before the first training batch of each epoch where enabled. A scalar true r
 
 This example applies only at epoch3. Only these two settings may omit epoch1; the default before the first entry is false. Omitting epoch4:false keeps revival enabled for all later epochs.
 
-Order is FT, L1, L2, with fresh 16-teacher-batch calibration using current weights. Require at least 1,024 positions per bucket and relative contribution strictly below the threshold. FT pairs must qualify in every bucket. See [contribution-based revival](l1-revive.md).
+Order is FT, L1, L2. FT units are selected by upper saturation over both perspectives of validation positions. L1/L2 use 16 teacher batches, requiring 1,024 positions per bucket and relative contribution below the threshold. See [revival](l1-revive.md).
 
 Mid-epoch resume skips revival; resume from the previous epoch end performs it. Interruption before saving recalibrates when restarting from the old checkpoint. FT factorizer and BN QAT transitions are applied before revival. Warmup epoch0 uses epoch1 settings.
 

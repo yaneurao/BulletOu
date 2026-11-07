@@ -116,15 +116,14 @@ Previous schemas are rearranged while retaining historical rows: actual resets m
 recorded candidate counts move into the layer blocks, and candidate rates are recalculated.
 Unknown historical candidate counts and rates remain blank.
 
-FT counts unique shared pairs. Its mean is the mean across pairs of each pair's maximum
-relative contribution over buckets. FT has zero eligible pairs unless every bucket has
-at least 1,024 positions. L1/L2 count bucket-specific units in sufficiently sampled buckets;
+FT saturation is not a relative contribution, so FT columns in this legacy summary remain blank.
+Per-unit FT results are in `ft-revive-saturation.csv`. L1/L2 count bucket-specific units in sufficiently sampled buckets;
 their mean is an unweighted unit average. L1 combines its two branches into one unit.
 L1 is measured after FT revival, L2 after L1 revival. Unmeasured layers are blank.
 With zero eligible targets, counts (including candidates) are zero and rate/mean are blank. Fractions and thresholds
 use ten decimal places. Relative contribution is not a fraction of playing strength.
 Summary aggregation reuses calibration results. Measuring a disabled layer adds 16 teacher batches
-of calibration (two passes for FT mean/MAD), without changing weights, optimizer state, revival RNG
+of calibration; FT uses validation positions. Measurement does not change weights, optimizer state, revival RNG
 or the learning cursor. Measurement has the same support restrictions as revival. Processing order
 is FT, L1, L2 using current weights: downstream candidates can differ if disabled upstream layers
 are also enabled and reset. Failed measurement/revival emits no completion row.
@@ -148,45 +147,16 @@ FT revival is described below. Checkpoint/nn.bin formats are unchanged.
 Their presence produces a migration error. Remove them and use 0.01 above; do not carry over 0.99.
 Existing checkpoints remain readable; remove obsolete keys from launch settings.
 
-## Shared FT product-pair revival
+## FT upper-saturation revival
 
 ```json
-"sfnn_ft_revive": {"epoch5": true, "epoch6": false, "epoch9": true, "epoch13": false},
-"sfnn_ft_revive_contribution_threshold": 0.01
+"sfnn_ft_revive": {"epoch2": true, "epoch4": false},
+"sfnn_ft_revive_saturation_threshold": 0.99,
+"sfnn_ft_revive_batches": 16
 ```
 
-Runs at the start of epoch5 and epochs9–12. Use epoch10:false for epoch9 only.
-Disabled by default and before the first schedule entry. The threshold defaults to 0.01,
-must be finite in (0,1], and also supports an epoch schedule (epoch1 required).
-Mid-epoch resume does not run it; the next enabled epoch boundary does.
+Quantized proxy FT upper saturation is measured per unit over both perspectives of validation positions from `test_teacher`. Only units at or above the threshold are reset; their FT partners remain intact. No per-bucket minimum is used to select units.
 
-Measure product pairs i × (i+FT width/2), not individual FT activations.
-For each bucket, sum both perspectives' MAD(product) × sum(abs(outgoing L1 weights)),
-including L1 skip. Normalize by that bucket's maximum pair utility (all zero => relative zero).
-Select only pairs strictly below the threshold in EVERY bucket, not a frequency-weighted average.
-If ANY bucket has fewer than 1,024 usable positions, warn and skip all FT revival.
+The batch limit uses `test_batch_size`. It defaults to 16 and may be set to 256. Revival replays the same positions for mean compensation. Unobserved buckets use the global mean, so compensation is approximate.
 
-Replay the same 16 teacher batches twice for exact empirical mean/MAD with the quantized GPU proxy;
-ignore zero sample weights, do not use validation data, and do not advance the training cursor.
-Only bucket×width aggregates are kept on CPU, not all FT activations.
-Proxy/workspace VRAM and CPU weight/optimizer readback are still required, as in existing revival.
-
-Reinitialize both selected FT columns: real feature weights are uniform within
-max(sqrt(6/(real input count+FT width)),1/127), rounded to the 1/127 grid;
-bias is 0.5 and selected virtual factorizer columns are zeroed. This is a revival-specific
-initialization, not ordinary scratch initialization. Both perspectives' outgoing L1 connections
-become signed 1/64; compensate L1 shared weights through the residual columns.
-Transfer the measured old mean to L1 bias, replay the same teacher sample a third time,
-and subtract the new mean contribution. Reset affected moments and compensate Lookahead separately.
-This is approximate mean compensation, NOT pointwise-equivalent or guaranteed to preserve strength.
-
-Order: FT, then L1, then L2. Audit: the shared `revive.csv` in the training output directory (`layer=FT`), fractions in CSV,
-percentages on stdout. Counts may differ from offline validation-set integer nn.bin analysis.
-Supports non-BN SFNN (dense and grouped/common-shard L1), L1 none/shared/axis/pair, FT factorizer on/off, per-layer QAT, standalone/grid.
-FT outgoing residuals compensate both shared and axis terms so effective new connections are signed 1/64.
-BN, residual count gates and worker trials are unsupported.
-
-```powershell
-python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
-  --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
-```
+Results are recorded in `ft-revive-saturation.csv`. The old `sfnn_ft_revive_contribution_threshold` is ignored with a warning because its meaning differs.

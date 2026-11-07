@@ -1,23 +1,26 @@
-//! Shared FT product-pair revival. Exact two-pass empirical MAD; bounded CPU storage.
+//! Shared FT unit revival and per-bucket output-mean compensation.
 use super::*;
+
+/// Select individual FT units, not L1 buckets or pairs.
+pub fn saturated_units(hits:&[u64],perspectives:u64,threshold:f64)->Result<Vec<usize>> {
+    if perspectives==0 || !threshold.is_finite() || threshold<=0.0 || threshold>1.0 || hits.iter().any(|&h|h>perspectives) {
+        return Err(CudaCppError::message("invalid FT saturation counts or threshold"));
+    }
+    Ok(hits.iter().enumerate().filter_map(|(i,&h)|((h as f64/perspectives as f64)>=threshold).then_some(i)).collect())
+}
 
 pub struct Calibration {
     pub width: usize,
     pub counts: Vec<usize>,
     pub means: Vec<f64>,
-    pub utility: Vec<f64>,
-    pub relative: Vec<f64>,
     sums: Vec<f64>,
-    deviations: Vec<f64>,
-    replay_counts: Vec<usize>,
 }
 impl Calibration {
     pub fn new(width:usize,groups:usize)->Self {
         Self {width,counts:vec![0;groups],means:vec![0.0;width*groups],
-            utility:vec![0.0;width/2*groups],relative:vec![0.0;width/2*groups],
-            sums:vec![0.0;width*groups],deviations:vec![0.0;width*groups],replay_counts:vec![0;groups]}
+            sums:vec![0.0;width*groups]}
     }
-    pub fn add(&mut self,buckets:&[i32],x:&[f32],weights:&[f32],mad:bool)->Result<()> {
+    pub fn add(&mut self,buckets:&[i32],x:&[f32],weights:&[f32])->Result<()> {
         expect_len("FT calibration",buckets.len()*self.width,x.len())?;
         expect_len("FT calibration mask",buckets.len(),weights.len())?;
         if self.width==0 || self.width%2!=0 || x.iter().any(|v|!v.is_finite())
@@ -28,49 +31,25 @@ impl Calibration {
         for (row,&bucket) in buckets.iter().enumerate() {
             if weights[row]==0.0 {continue;}
             let b=bucket as usize;
-            if mad {self.replay_counts[b]+=1;} else {self.counts[b]+=1;}
+            self.counts[b]+=1;
             for j in 0..self.width {
                 let i=b*self.width+j;let v=x[row*self.width+j] as f64;
-                if mad {self.deviations[i]+=(v-self.means[i]).abs();} else {self.sums[i]+=v;}
+                self.sums[i]+=v;
             }
         }
         Ok(())
     }
     pub fn finish_means(&mut self) {
+        let total: usize = self.counts.iter().sum();
+        let global: Vec<f64> = (0..self.width).map(|j| {
+            if total == 0 { 0.0 } else {
+                (0..self.counts.len()).map(|b| self.sums[b*self.width+j]).sum::<f64>() / total as f64
+            }
+        }).collect();
         for b in 0..self.counts.len() {for j in 0..self.width {
             let i=b*self.width+j;
-            self.means[i]=if self.counts[b]>0 {self.sums[i]/self.counts[b] as f64} else {0.0};
+            self.means[i]=if self.counts[b]>0 {self.sums[i]/self.counts[b] as f64} else {global[j]};
         }}
-    }
-    pub fn finish(&mut self,w:&[f32],out:usize)->Result<()> {
-        expect_len("FT outgoing weights",self.counts.len()*out*self.width,w.len())?;
-        if self.replay_counts!=self.counts || w.iter().any(|v|!v.is_finite()) {
-            return Err(CudaCppError::message("FT calibration replay changed or non-finite weights"));
-        }
-        let pairs=self.width/2;
-        self.utility.fill(0.0);self.relative.fill(0.0);
-        for b in 0..self.counts.len() {
-            if self.counts[b]==0 {continue;}
-            for j in 0..self.width {
-                let norm=(0..out).map(|u|w[(b*out+u)*self.width+j].abs() as f64).sum::<f64>();
-                self.utility[b*pairs+j%pairs]+=self.deviations[b*self.width+j]/self.counts[b] as f64*norm;
-            }
-            let max=self.utility[b*pairs..(b+1)*pairs].iter().copied().fold(0.0,f64::max);
-            if max>0.0 {for i in b*pairs..(b+1)*pairs {self.relative[i]=self.utility[i]/max;}}
-        }
-        if self.utility.iter().chain(&self.relative).any(|v|!v.is_finite()) {
-            return Err(CudaCppError::message("non-finite FT contribution"));
-        }
-        Ok(())
-    }
-    pub fn selected(&self,threshold:f64)->Result<Vec<usize>> {
-        if !threshold.is_finite() || threshold<=0.0 || threshold>1.0 {
-            return Err(CudaCppError::message("FT contribution threshold must be in (0,1]"));
-        }
-        // FT is shared: never infer irrelevance from an unmeasured/under-sampled bucket.
-        if self.counts.is_empty() || self.counts.iter().any(|&n|n<1024) {return Ok(vec![]);}
-        let pairs=self.width/2;
-        Ok((0..pairs).filter(|&i|(0..self.counts.len()).all(|b|self.relative[b*pairs+i]<threshold)).collect())
     }
 }
 fn reset(s:&mut RangerParamStateReadback,i:usize,v:f32) {
@@ -78,15 +57,22 @@ fn reset(s:&mut RangerParamStateReadback,i:usize,v:f32) {
 }
 impl SfnnTrainStepRunner {
     pub fn revive_ft(&mut self,ctx:&Context,c:&Calibration,ids:&[usize],base_inputs:usize)->Result<()> {
+        let pairs=self.shape.ft_size/2;
+        if ids.iter().any(|&i|i>=pairs) {return Err(CudaCppError::message("invalid FT pair"));}
+        let units: Vec<usize> = ids.iter().flat_map(|&i| [i,i+pairs]).collect();
+        self.revive_ft_units(ctx,c,&units,base_inputs)
+    }
+    pub fn revive_ft_units(&mut self,ctx:&Context,c:&Calibration,units:&[usize],base_inputs:usize)->Result<()> {
         let s=self.shape;let pairs=s.ft_size/2;
         if self.pending_gradient_batches!=0 || self.batch_norm.is_some() || self.bn_qat.is_some()
             || self.residual_count_gates_enabled
             || self.weights.l2fw.is_some() || self.weights.l3fw.is_some()
             || c.width!=s.ft_size || c.counts.len()!=s.num_stacks || base_inputs==0 || base_inputs>s.input_size
-            || ids.iter().any(|&i|i>=pairs) || c.counts.iter().any(|&n|n<1024) {
+            || units.iter().any(|&i|i>=s.ft_size) || c.counts.iter().sum::<usize>()==0 {
             return Err(CudaCppError::message("FT revival requires calibrated non-BN SFNN, L1 none/shared/axis/pair, no residual count gates or pending gradients"));
         }
-        if ids.is_empty() {return Ok(());}
+        if units.is_empty() {return Ok(());}
+        let ids: Vec<usize> = units.iter().map(|&u| u%pairs).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         self.invalidate_ft_half_moments(ctx)?;
         let common=revive_common::Common::read(self,ctx)?;
         // Reinitialize real feature rows. Reset virtual factorizer columns to zero.
@@ -94,17 +80,17 @@ impl SfnnTrainStepRunner {
         let mut state=self.optimizer_states.l0w.download(ctx)?;
         let bound=(6.0/(base_inputs+s.ft_size) as f32).sqrt().max(1.0/127.0);
         let mut rng=self.revival_rng;
-        for &id in ids {for col in [id,id+pairs] {
+        for &col in units {
             for row in 0..s.input_size {
                 let v=if row<base_inputs {(rng.signed_uniform()*bound*127.0).round()/127.0} else {0.0};
                 let i=row*s.ft_size+col;w[i]=v;reset(&mut state,i,v);
             }
-        }}
+        }
         self.weights.l0w.upload(ctx,&w)?;
         self.optimizer_states.l0w.upload(ctx,w.len(),RangerParamHostState{momentum:&state.momentum,velocity:&state.velocity,slow_params:&state.slow_params})?;
         drop(w);drop(state);
         let mut b=self.weights.l0b.download(ctx)?;let mut state=self.optimizer_states.l0b.download(ctx)?;
-        for &id in ids {for col in [id,id+pairs] {b[col]=0.5;reset(&mut state,col,0.5);}}
+        for &col in units {b[col]=0.5;reset(&mut state,col,0.5);}
         self.weights.l0b.upload(ctx,&b)?;
         self.optimizer_states.l0b.upload(ctx,b.len(),RangerParamHostState{momentum:&state.momentum,velocity:&state.velocity,slow_params:&state.slow_params})?;
         let mut w=self.weights.l1w.download(ctx)?;let mut b=self.weights.l1b.download(ctx)?;
@@ -112,7 +98,7 @@ impl SfnnTrainStepRunner {
         for bucket in 0..s.num_stacks {for u in 0..s.l1_out() {
             let row=bucket*s.l1_out()+u;
             let mut touched=false;
-            for &id in ids {for col in [id,id+pairs] {
+            for &id in &ids {for col in [id,id+pairs] {
                 let Some(i)=revive_common::weight_index(s,bucket,u,col) else {continue;};
                 touched=true;
                 let old=w[i]+common.weight(bucket,u,col,false);let old_slow=ws.slow_params[i]+common.weight(bucket,u,col,true);
@@ -132,7 +118,7 @@ impl SfnnTrainStepRunner {
     }
     pub fn compensate_ft_revival_mean(&mut self,ctx:&Context,ids:&[usize],c:&Calibration)->Result<()> {
         let s=self.shape;
-        if c.width!=s.ft_size || c.counts.len()!=s.num_stacks || c.counts.iter().any(|&n|n==0)
+        if c.width!=s.ft_size || c.counts.len()!=s.num_stacks || c.counts.iter().sum::<usize>()==0
             || ids.iter().any(|&i|i>=s.ft_size/2) || c.means.iter().any(|v|!v.is_finite()) {
             return Err(CudaCppError::message("invalid FT mean compensation"));
         }
@@ -155,6 +141,18 @@ impl SfnnTrainStepRunner {
 
 #[cfg(test)] mod tests {
     use super::*;
+    #[test] fn saturation_is_per_unit_and_includes_threshold() {
+        assert_eq!(saturated_units(&[99,100,98,0],100,0.99).unwrap(),vec![0,1]);
+        assert!(saturated_units(&[0],0,0.99).is_err());
+        assert!(saturated_units(&[101],100,0.99).is_err());
+    }
+    #[test] fn unobserved_bucket_mean_uses_global_mean() {
+        let mut c=Calibration::new(2,2);
+        c.add(&[0,0],&[0.2,0.4,0.6,0.8],&[1.0,1.0]).unwrap();
+        c.finish_means();
+        assert!((c.means[2]-0.4).abs()<1e-6);
+        assert!((c.means[3]-0.6).abs()<1e-6);
+    }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn ft_fp16_moments_survive_snapshot_and_revive() {
@@ -219,17 +217,22 @@ impl SfnnTrainStepRunner {
         r.revive_ft(&ctx,&c,&[0],s.input_size).unwrap();
         assert_eq!(second,r.read_weights(&ctx).unwrap());
     }
-    #[test] fn pair_mad_and_all_bucket_guard() {
-        let mut c=Calibration::new(4,2);
-        for mad in [false,true] {
-            for b in 0..2 {for n in 0..1024 {c.add(&[b],&[0.0,(n%2) as f32,0.25,(n%2) as f32],&[1.0],mad).unwrap();}}
-            if !mad {c.finish_means();}
-        }
-        c.finish(&[1.0;8],1).unwrap();
-        assert_eq!(c.selected(0.01).unwrap(),vec![0]);
-        c.relative[2]=0.01;assert!(c.selected(0.01).unwrap().is_empty());
-        c.relative[2]=0.0;c.counts[1]=1023;assert!(c.selected(0.01).unwrap().is_empty());
-        assert!(c.selected(0.0).is_err());
+    #[test]
+    #[ignore = "requires CUDA; checks individual FT revival"]
+    fn revive_one_saturated_unit_preserves_partner() {
+        let ctx=Context::new(0).unwrap();let s=crate::tests::tiny_sfnn_shape();
+        let mut host=crate::tests::tiny_sfnn_weights(s);
+        host.l1fw=None;host.l1fb=None;host.l2fw=None;host.l2fb=None;host.l3fw=None;host.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,host,1024,1).unwrap();
+        let mut c=Calibration::new(s.ft_size,s.num_stacks);c.counts[0]=1;c.means.fill(0.25);
+        let old=r.read_weights(&ctx).unwrap();
+        r.revive_ft_units(&ctx,&c,&[0],s.input_size).unwrap();
+        let new=r.read_weights(&ctx).unwrap();
+        for row in 0..s.input_size { for col in 1..s.ft_size {
+            assert_eq!(old.l0w[row*s.ft_size+col],new.l0w[row*s.ft_size+col]);
+        }}
+        assert_eq!(&old.l0b[1..],&new.l0b[1..]);
+        assert_eq!(new.l0b[0],0.5);
     }
     #[test] fn gpu_shared_and_virtual_columns() {
         let ctx=Context::new(0).unwrap();let s=crate::tests::tiny_sfnn_shape();

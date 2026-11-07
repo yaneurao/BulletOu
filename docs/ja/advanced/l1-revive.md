@@ -117,14 +117,13 @@ revive有効時はthreshold未指定でも従来どおりデフォルト`0.01`�
 旧形式の集計CSVは過去の行を保持して並べ替えます。実reset数は末尾へ移し、
 記録済みの候補数は各層の列へ移して候補率を再計算します。過去の候補数が不明なら候補数・率は空欄にします。
 
-FTは共有ペア数で重複を除去。各ペアの相対貢献度のbucket最大値を取り、そのペア平均を出します。
-全bucketで1,024局面以上なければFTの判定対象数は0です。
+FT の飽和率は相対貢献度と異なるため、この旧形式集計の FT 欄は空欄です。unit 別の結果は `ft-revive-saturation.csv` に記録します。
 L1/L2は1,024局面以上のbucketのunit数で、平均は局面数で重み付けしないunit単純平均です。
 L1の通常枝・二乗枝は合わせて1unit。L1はFT処理後、L2はL1処理後の判定結果です。
 未判定の層は空欄。対象0なら候補数を含む数は0、率と平均は空欄。
 率・平均・閾値は0～1の小数10桁。平均は最大unitとの相対値であり、棋力への貢献割合ではありません。
 集計は校正結果を再利用します。無効な層の判定には追加で教師16batchの校正が必要です
-（FTは平均とMADの2pass）。判定のみなら重み・optimizer・revive乱数・学習cursorは変更しません。
+FT は検証局面を使います。判定のみなら重み・optimizer・revive乱数・学習cursorは変更しません。
 判定の対応範囲はreviveと同じです。FT→L1→L2の順で、その時点の重みを使うため、
 無効な上流層も有効にしてリセットした場合の後段候補数とは異なることがあります。
 処理途中の失敗は完了行にしません。
@@ -145,50 +144,16 @@ FTの対応は下記を参照してください。nn.bin/checkpoint形式は変�
 指定が残っていると移行エラーになります。旧0.99を新閾値へ転記せず、冒頭の0.01へ変更してください。
 古いcheckpointは読めますが、起動設定の旧項目は削除が必要です。
 
-## FTの積ペアをリセットする
+## FT unit の上限飽和による revive
 
 ```json
-"sfnn_ft_revive": {
-  "epoch5": true,
-  "epoch6": false,
-  "epoch9": true,
-  "epoch13": false
-},
-"sfnn_ft_revive_contribution_threshold": 0.01
+"sfnn_ft_revive": {"epoch2": true, "epoch4": false},
+"sfnn_ft_revive_saturation_threshold": 0.99,
+"sfnn_ft_revive_batches": 16
 ```
 
-epoch5とepoch9〜12の開始時に再判定します。epoch9だけならepoch10をfalseにしてください。
-最初の指定まではfalse。既定は無効、閾値の既定は0.01、範囲は有限の `(0,1]` です。
-閾値もepoch指定できます（epoch1必須）。epoch途中の再開では実行せず、次の有効epoch開始時に実行します。
+`test_teacher` の検証局面について、量子化 proxy の FT 上限到達率を両視点で unit ごとに集計します。閾値以上の unit のみ再初期化し、積の相方の FT unit は維持します。候補判定に bucket の最低局面数は使いません。
 
-FT単体ではなく `i × (i + FT幅/2)` の積を対象とします。FT幅1024なら512組です。
-両視点の積について、bucket別にMAD×L1接続重み絶対値和を求めて合算します。
-FTからの接続にはL1 skipも含みます。bucket内の最大を1として正規化し、
-**すべてのbucketで閾値未満**のペアだけをリセットします。全bucketの局面数加重平均は判定に使いません。
-全組の貢献度が0なら、そのbucketの相対値は0です。
+バッチ数は `test_batch_size` 単位の上限です。既定16で、256も指定できます。再初期化の前後に検証局面の平均を測り、後段 bias を補償します。未観測 bucket には全局面の平均を代用するため、補償は近似です。
 
-教師の現在位置から同じ16batchを2回読み、平均とMADを求めます。sample weight=0は除外。
-**1,024局面未満のbucketが一つでもあれば、警告を出してFTリセット全体を見送ります。**
-FTは全bucket共通なので、観測不足のbucketを無視してリセットしません。
-GPU量子化proxyを使用し、検証セットは使用せず、学習cursorは進めません。
-MADのために全局面のFT出力をRAMに保持せず、bucket×FT幅の集計だけを保持します。
-既存revive同様にGPU proxy/workspaceと重み・optimizerのCPU readbackが必要です。
-
-対象ペアの両FT列を再初期化します。実特徴の重みは
-`max(sqrt(6/(実入力数+FT幅)), 1/127)` を幅とする一様乱数を1/127刻みに丸め、
-biasは0.5、FT factorizerの仮想行は対象列だけ0にします。これは通常の初期学習の初期化とは別の再生用初期化です。
-L1の両視点への接続は元の符号の±1/64とし、L1 shared分は個別重み側で相殺します。
-旧積の実測平均寄与をL1 biasへ加算し、同じ16batchをもう一度推論して新しい平均寄与を差し引きます。
-対象のmomentum/velocityは0、Lookaheadのslow側も別の接続重みで補償します。
-**平均の近似補償であり、局面ごとの出力・棋力が維持される保証はありません。**
-
-処理順はFT→L1→L2です。監査は学習出力フォルダの共通`revive.csv`に`layer=FT`として追記されます。
-貢献度と閾値はCSVで0〜1、stdoutで%です。以前のepoch9検証セットの測定とは局面・GPU proxyが異なるため、選択個数は一致するとは限りません。
-対応はnon-BN SFNN（dense・grouped/common-shard L1）、L1 none/shared/axis/pair、FT factorizer on/off、層別QAT、standalone/grid searchです。
-FTのL1への新接続も、shared・axis・pairを合算した実効接続が±1/64になるよう個別重みで補償します。
-BN、residual count gate、workerは未対応です。
-
-```powershell
-python .\scripts\grid_search.py --settings-file settings.json --output-folder results `
-  --grid sfnn_ft_revive true --grid sfnn_ft_revive_contribution_threshold 0.005 0.01
-```
+結果は `ft-revive-saturation.csv` に記録します。旧 `sfnn_ft_revive_contribution_threshold` は意味が異なるため無視し、警告を出します。

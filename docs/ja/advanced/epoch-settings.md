@@ -126,7 +126,7 @@ epoch 1〜9は64 sb中16 sbごと、epoch 10以降は324 sb中81 sbごとに保�
 
 この例はepoch3だけに適用します。この2項目に限りepoch1を省略でき、最初の指定まではfalseです。epoch4:falseを省略するとepoch3以降の毎epochで適用します。
 
-FT→L1→L2の順に、その時点の重みを使って教師16batchで再判定します。bucket内1,024局面以上かつ相対貢献度が閾値未満のunitを選びます。FTは全bucketでこの条件を満たす積ペアのみ対象です。詳細は[貢献度ベースの再初期化](l1-revive.md)を参照してください。
+FT→L1→L2の順に判定します。FT は検証局面の両視点で上限飽和率を測り、unit 単位で選びます。L1/L2 は教師16batchを使い、bucket内1,024局面以上かつ相対貢献度が閾値未満のunitを選びます。詳細は[再初期化](l1-revive.md)を参照してください。
 
 epoch途中からresumeした場合は重複処理せず、次のepoch開始を待ちます。前epoch末尾からresumeする場合は実施します。保存前に中断して古いcheckpointへ戻った場合は再判定します。FT factorizer切り替えやBN QAT設定変更が同時にある場合は、それらの適用後に処理します。warmup epoch0はepoch1設定を使用します。
 
