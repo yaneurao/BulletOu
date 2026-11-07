@@ -10995,6 +10995,70 @@ mod tests {
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn l1_gather2_matches_cpu_with_empty_bucket_and_accumulation() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_l1_gather2(ctx: *mut ffi::BulletOuCudaCppContext,
+                inputs: *mut ffi::BulletOuCudaCppF32Buffer, dy: *mut ffi::BulletOuCudaCppF32Buffer,
+                offsets: *mut ffi::BulletOuCudaCppI32Buffer, positions: *mut ffi::BulletOuCudaCppI32Buffer,
+                dw: *mut ffi::BulletOuCudaCppF32Buffer, db: *mut ffi::BulletOuCudaCppF32Buffer,
+                dfw: *mut ffi::BulletOuCudaCppF32Buffer, dfb: *mut ffi::BulletOuCudaCppF32Buffer,
+                batch: usize, width: usize, outputs: usize, stacks: usize, alpha: f32) -> i32;
+        }
+        let ctx = Context::new(0).unwrap();
+        let (batch, width, outputs, stacks, alpha) = (97usize, 64usize, 16usize, 8usize, 0.375f32);
+        let inputs: Vec<f32> = (0..batch * width)
+            .map(|i| (((i / width) * 7 + (i % width) * 11) % 31) as f32 * 0.01 - 0.15).collect();
+        let dy: Vec<f32> = (0..batch * outputs)
+            .map(|i| (((i / outputs) * 5 + (i % outputs) * 3) % 29) as f32 * 0.02 - 0.28).collect();
+        let mut positions = Vec::new();
+        let mut offsets = Vec::new();
+        for stack in 0..stacks {
+            offsets.push(positions.len() as i32);
+            positions.extend((0..batch).filter(|row| row % 7 == stack).map(|row| row as i32));
+        }
+        offsets.push(positions.len() as i32);
+        let input_gpu = F32Buffer::from_host(&ctx, &inputs).unwrap();
+        let dy_gpu = F32Buffer::from_host(&ctx, &dy).unwrap();
+        let offsets_gpu = I32Buffer::from_host(&ctx, &offsets).unwrap();
+        let positions_gpu = I32Buffer::from_host(&ctx, &positions).unwrap();
+        let mut dw = vec![0.125f32; stacks * outputs * width];
+        let mut db = vec![0.125f32; stacks * outputs];
+        let mut dfw = vec![0.125f32; width * outputs];
+        let mut dfb = vec![0.125f32; outputs];
+        let dw_gpu = F32Buffer::from_host(&ctx, &dw).unwrap();
+        let db_gpu = F32Buffer::from_host(&ctx, &db).unwrap();
+        let dfw_gpu = F32Buffer::from_host(&ctx, &dfw).unwrap();
+        let dfb_gpu = F32Buffer::from_host(&ctx, &dfb).unwrap();
+        for _ in 0..2 {
+            check(unsafe { bulletou_test_l1_gather2(ctx.as_ptr(), input_gpu.as_ptr(), dy_gpu.as_ptr(),
+                offsets_gpu.as_ptr(), positions_gpu.as_ptr(), dw_gpu.as_ptr(), db_gpu.as_ptr(),
+                dfw_gpu.as_ptr(), dfb_gpu.as_ptr(), batch, width, outputs, stacks, alpha) }).unwrap();
+            for row in 0..batch {
+                let stack = row % 7;
+                for out in 0..outputs {
+                    let grad = dy[row * outputs + out];
+                    db[stack * outputs + out] += grad;
+                    dfb[out] += alpha * grad;
+                    for col in 0..width {
+                        let value = grad * inputs[row * width + col];
+                        dw[(stack * outputs + out) * width + col] += value;
+                        dfw[col * outputs + out] += alpha * value;
+                    }
+                }
+            }
+        }
+        for (name, expected, actual) in [("weight", dw, dw_gpu.download(&ctx).unwrap()),
+            ("bias", db, db_gpu.download(&ctx).unwrap()), ("shared weight", dfw, dfw_gpu.download(&ctx).unwrap()),
+            ("shared bias", dfb, dfb_gpu.download(&ctx).unwrap())] {
+            for (i, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+                assert!((expected - actual).abs() < 1.0e-4, "{name}[{i}]: {expected} != {actual}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn hm2_half_grad_gather_handles_empty_rows_and_accumulation() {
         use super::*;
         let ctx = Context::new(0).unwrap();

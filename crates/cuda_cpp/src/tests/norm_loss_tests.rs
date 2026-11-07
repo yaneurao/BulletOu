@@ -77,3 +77,32 @@ fn norm_loss_gpu_matches_reference() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires a CUDA-capable NVIDIA GPU"]
+fn norm_loss_gpu_handles_small_and_large_tensor_boundaries() {
+    let ctx = Context::new(0).unwrap();
+    // Exercise both paths and reuse the same context after a large tensor.
+    for len in [65_537usize, 1, 255, 256, 257, 1_536, 2_048, 2_049, 3] {
+        let initial: Vec<f32> = (0..len).map(|i| (i % 29) as f32 * 0.01 + 0.1).collect();
+        let norm = initial.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>().sqrt() as f32;
+        let scale = 1.0 - 2.0 * 0.1 * 0.01 * (1.0 - 1.0 / (norm + 1.0e-7));
+        let p = RangerUpdateParams {
+            norm_loss_strength: 0.1, norm_loss_before: true,
+            radam: RAdamUpdateParams { step: 1, learning_rate: 0.01, decay: 0.0,
+                min_weight: -10.0, max_weight: 10.0, ..Default::default() },
+            ..Default::default()
+        };
+        let w = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let g = F32Buffer::from_host(&ctx, &vec![0.0; len]).unwrap();
+        let m = F32Buffer::from_host(&ctx, &vec![0.0; len]).unwrap();
+        let v = F32Buffer::from_host(&ctx, &vec![0.0; len]).unwrap();
+        let s = F32Buffer::from_host(&ctx, &initial).unwrap();
+        ranger_update_device(&ctx, p, RangerDeviceStateMut {
+            gradients: &g, weights: &w, momentum: &m, velocity: &v, slow_params: &s,
+        }).unwrap();
+        for (&got, &value) in w.download(&ctx).unwrap().iter().zip(&initial) {
+            assert!((got - value * scale).abs() < 2.0e-6, "len={len}: {got} != {}", value * scale);
+        }
+    }
+}

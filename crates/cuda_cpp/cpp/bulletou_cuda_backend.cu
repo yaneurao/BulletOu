@@ -103,6 +103,7 @@ struct BulletOuCudaCppContext {
     float* bn_qat_partials = nullptr; // double partial sums, allocated in float-sized units
     size_t bn_qat_partials_len = 0;
     int device = 0;
+    int l1_gather8_supported = -1;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
     int* sfnn_inverse_counts = nullptr;
@@ -7109,6 +7110,30 @@ __global__ void sfnn_l1_bucket_gather_gradient2(
     }
 }
 
+// Exercise the actual two-channel gather with prebuilt bucket lists in GPU tests.
+extern "C" int bulletou_test_l1_gather2(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* inputs, BulletOuCudaCppF32Buffer* dy,
+    BulletOuCudaCppI32Buffer* offsets, BulletOuCudaCppI32Buffer* positions,
+    BulletOuCudaCppF32Buffer* dw, BulletOuCudaCppF32Buffer* db,
+    BulletOuCudaCppF32Buffer* dfw, BulletOuCudaCppF32Buffer* dfb,
+    size_t batch, size_t width, size_t outputs, size_t stacks, float alpha) {
+    if (!ctx || width % 2 || validate_buffer(ctx, inputs, batch * width, "test L1 inputs") ||
+        validate_buffer(ctx, dy, batch * outputs, "test L1 dy") ||
+        validate_i32_buffer(ctx, offsets, stacks + 1, "test L1 offsets") ||
+        validate_i32_buffer(ctx, positions, batch, "test L1 positions") ||
+        validate_buffer(ctx, dw, stacks * outputs * width, "test L1 dw") ||
+        validate_buffer(ctx, db, stacks * outputs, "test L1 db") ||
+        validate_buffer(ctx, dfw, width * outputs, "test L1 shared dw") ||
+        validate_buffer(ctx, dfb, outputs, "test L1 shared db")) return -1;
+    const CompactL1AxisGradient axis{};
+    const dim3 grid(static_cast<unsigned>((width / 2 + 32) / 32),
+        static_cast<unsigned>(stacks), static_cast<unsigned>((outputs + 7) / 8));
+    sfnn_l1_bucket_gather_gradient2<<<grid, 256, 0, ctx->stream>>>(inputs->ptr, dy->ptr,
+        offsets->ptr, positions->ptr, dw->ptr, db->ptr, dfw->ptr, dfb->ptr,
+        width, outputs, alpha, axis);
+    return check_kernel_launch("test L1 gather");
+}
+
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
 template<int Stacks, bool Axis=false>
 __global__ void bn_l1_param_reduce(const float* inputs,const float* dy,const int* buckets,
@@ -8323,8 +8348,21 @@ int launch_sfnn_backward_kernels(
         }
     } else if (common_shard_l1 || grouped_l1 || has_l1f != 0 || has_l1ax != 0) {
         const bool compact=common_shard_l1 || grouped_l1;
+        // The 8-bucket inverse gather is faster on the tested RTX 4090 at the
+        // release benchmark's batch/widths. Keep the existing reduction on
+        // other devices and shapes until they have been measured separately.
+        const bool gather8_shape = !compact && !ctx->bn[1].params && qat_l1w &&
+            has_l1f && !has_l1ax && !residual_count_gates && num_stacks == 8 &&
+            batch == 65536 && (ft_size == 1536 || ft_size == 2304) && l1_out == 16;
+        if (gather8_shape && ctx->l1_gather8_supported < 0) {
+            cudaDeviceProp properties{};
+            const cudaError_t status = cudaGetDeviceProperties(&properties, ctx->device);
+            if (status != cudaSuccess) return fail("query L1 gather device", status);
+            ctx->l1_gather8_supported = std::strcmp(properties.name, "NVIDIA GeForce RTX 4090") == 0;
+        }
+        const bool gather8 = gather8_shape && ctx->l1_gather8_supported == 1;
         const bool bucket_gather = !compact && !ctx->bn[1].params && !bn_use_reference()
-            && qat_l1w && (num_stacks == 648 || num_stacks == 3528) && batch >= 1024 && l1_out == 16
+            && qat_l1w && (num_stacks == 648 || num_stacks == 3528 || gather8) && batch >= 1024 && l1_out == 16
             && std::getenv("BULLETOU_L1_BUCKET_GATHER_DISABLE") == nullptr;
         if (bucket_gather) {
             if (launch_sfnn_build_inverse_index(ctx, buckets, batch, 1, num_stacks) != 0) return -1;
@@ -8342,7 +8380,7 @@ int launch_sfnn_backward_kernels(
                 use_king_axis, use_hand_axis, use_progress_axis, use_king_hand_pair, use_king_progress_pair,
                 use_hand_progress_pair, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha, factorizer_axis_confidences};
-            const bool vector2 = axis.weights && (ft_size % 2 == 0) &&
+            const bool vector2 = (axis.weights || gather8) && (ft_size % 2 == 0) &&
                 std::getenv("BULLETOU_L1_BUCKET_GATHER_REFERENCE") == nullptr;
             const dim3 grid(static_cast<unsigned>(((vector2 ? ft_size / 2 : ft_size) + 32) / 32),
                 static_cast<unsigned>(num_stacks), static_cast<unsigned>((l1_out + 7) / 8));
@@ -10054,8 +10092,28 @@ __global__ void norm_loss_scale_kernel(float* w, size_t n, const float* sums, fl
     for (size_t i = static_cast<size_t>(blockIdx.x) * 256 + threadIdx.x; i < n; i += static_cast<size_t>(gridDim.x) * 256)
         w[i] *= scale;
 }
+// Small tensors fit in one block, allowing the norm and scaling to share a
+// kernel launch. The reduction order differs from the multi-block path.
+__global__ void norm_loss_small_kernel(float* w, size_t n, float rate) {
+    __shared__ float values[256];
+    float sum = 0.0f;
+    for (size_t i = threadIdx.x; i < n; i += 256) sum += w[i] * w[i];
+    values[threadIdx.x] = sum;
+    __syncthreads();
+    for (int d = 128; d; d /= 2) {
+        if (threadIdx.x < d) values[threadIdx.x] += values[threadIdx.x + d];
+        __syncthreads();
+    }
+    const float scale = 1.0f - rate * (1.0f - 1.0f / (sqrtf(values[0]) + 1.0e-7f));
+    for (size_t i = threadIdx.x; i < n; i += 256) w[i] *= scale;
+}
+
 int apply_norm_loss(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* w, size_t n, float rate) {
     if (rate == 0.0f || n == 0) return 0;
+    if (n <= 2048) {
+        norm_loss_small_kernel<<<1, 256, 0, ctx->stream>>>(w->ptr, n, rate);
+        return check_kernel_launch("small norm loss");
+    }
     if (ctx->norm_loss_scratch == nullptr) {
         auto err = cudaMalloc(reinterpret_cast<void**>(&ctx->norm_loss_scratch), 256 * sizeof(float));
         if (err != cudaSuccess) return fail("cudaMalloc norm loss scratch", err);
