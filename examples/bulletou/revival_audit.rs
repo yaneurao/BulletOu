@@ -18,7 +18,7 @@ struct LayerSummary {
     eligible: usize,
     reset_candidates: usize,
     mean: Option<f64>,
-    threshold: f64,
+    threshold: Option<f64>,
     revived: Option<usize>,
 }
 
@@ -165,7 +165,18 @@ impl RevivalAudit {
             writeln!(file,"{},{},{},{},{},{:.10},{},{}",self.epoch,self.run,unit,perspectives,count,
                 count as f64/perspectives as f64,selected.contains(&unit),threshold).map_err(|e|e.to_string())?;
         }
-        file.flush().map_err(|e|e.to_string())
+        file.flush().map_err(|e|e.to_string())?;
+        // FT is selected globally per unit by saturation, not by the
+        // bucket contribution criterion used for L1/L2. The detailed file
+        // records the saturation threshold; contribution fields stay empty.
+        self.summaries.borrow_mut().insert("FT".to_string(), LayerSummary {
+            eligible: hits.len(),
+            reset_candidates: selected.len(),
+            mean: None,
+            threshold: None,
+            revived: None,
+        });
+        Ok(())
     }
     pub fn new(output: &Path, epoch: usize) -> Result<Self, String> {
         let path = output.join("revive.csv");
@@ -261,7 +272,7 @@ impl RevivalAudit {
             eligible: values.len(),
             reset_candidates,
             mean: (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64),
-            threshold,
+            threshold: Some(threshold),
             revived: None,
         };
         let optional = |v: Option<usize>| v.map(|v| v.to_string()).unwrap_or_default();
@@ -328,7 +339,8 @@ impl RevivalAudit {
                 let rate =
                     if s.eligible == 0 { String::new() } else { format!("{:.10}", s.reset_candidates as f64 / s.eligible as f64) };
                 let mean = s.mean.map(|v| format!("{v:.10}")).unwrap_or_default();
-                record.push_str(&format!(",{},{},{rate},{mean},{:.10}", s.eligible, s.reset_candidates, s.threshold));
+                let threshold = s.threshold.map(|v| format!("{v:.10}")).unwrap_or_default();
+                record.push_str(&format!(",{},{},{rate},{mean},{threshold}", s.eligible, s.reset_candidates));
             } else {
                 record.push_str(",,,,,");
             }
@@ -379,6 +391,28 @@ mod tests {
         assert_eq!(text.lines().count(),5);
         assert!(text.contains("3,1,0,100,99,0.9900000000,true,0.99"));
         assert!(text.contains("3,2,0,100,0,0.0000000000,false,0.99"));
+    }
+
+    #[test]
+    fn ft_saturation_summary_counts_units_and_only_completed_resets() {
+        let t = Temp::new();
+        for (epoch, revived) in [(1, 0), (2, 1)] {
+            let audit = RevivalAudit::new(&t.0, epoch).unwrap();
+            audit.append_ft_saturation(&[99, 50, 100, 0], 100, 0.99, &[0, 2]).unwrap();
+            assert!(audit.append_summary().is_err());
+            audit.complete_layer("FT", revived).unwrap();
+            let text = fs::read_to_string(audit.append_summary().unwrap()).unwrap();
+            let fields: Vec<_> = text.lines().last().unwrap().split(',').collect();
+            assert_eq!(&fields[2..7], &["4", "2", "0.5000000000", "", ""]);
+            assert_eq!(fields[17], revived.to_string());
+        }
+        let audit = RevivalAudit::new(&t.0, 3).unwrap();
+        audit.append_ft_saturation(&[1, 2, 3], 100, 0.99, &[]).unwrap();
+        audit.complete_layer("FT", 0).unwrap();
+        let text = fs::read_to_string(audit.append_summary().unwrap()).unwrap();
+        let fields: Vec<_> = text.lines().last().unwrap().split(',').collect();
+        assert_eq!(&fields[2..7], &["3", "0", "0.0000000000", "", ""]);
+        assert_eq!(fields[17], "0");
     }
     #[test]
     fn startup_summary_header_is_created_once_and_preserves_records() {

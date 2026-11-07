@@ -17904,6 +17904,7 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
     let ids:Vec<usize>=units.iter().map(|&u|u%pairs).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     audit.append_ft_saturation(hits,perspectives,threshold,&units)?;
     if !args.sfnn_ft_revive {
+        audit.complete_layer("FT", 0)?;
         eprintln!("  [FT REVIVE] measurement only: {} saturated units; revived=0",units.len());
         return Ok(());
     }
@@ -17917,6 +17918,7 @@ fn run_sfnn_ft_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
         runner.compensate_ft_revival_mean(ctx,&ids,&new).map_err(|e|e.to_string())?;
         eprintln!("  WARNING: FT revival uses global mean for unobserved buckets; compensation is approximate.");
     }
+    audit.complete_layer("FT", units.len())?;
     eprintln!("  [FT REVIVE] complete: {}/{} units, {} affected pairs; audit=ft-revive-saturation.csv",units.len(),shape.ft_size,ids.len());
     Ok(())
 }
