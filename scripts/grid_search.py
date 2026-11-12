@@ -18,6 +18,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -691,6 +692,79 @@ def remember_completed_epoch_settings(directory: Path, trial: dict) -> None:
             }
 
 
+def latest_resume_checkpoint(directory: Path):
+    """Follow the trainer's checkpoint ordering and read its actual position."""
+    named, legacy = [], []
+    if not directory.is_dir():
+        return None
+    for path in directory.iterdir():
+        if not path.is_dir() or not all((path / name).is_file() for name in
+                                        ("state.bin", "learn.log", "dataloader_pos.txt")):
+            continue
+        match = re.fullmatch(r"([0-9]{4,})-([0-9]{4,})sb", path.name)
+        if match:
+            named.append(((int(match[1]), int(match[2])), path))
+        elif path.name.isdigit():
+            legacy.append((int(path.name), path))
+    candidates = [max(named, default=(None, None))] if named else []
+    if legacy:
+        _, path = max(legacy)
+        try:
+            with (path / "learn.log").open(newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+            candidates.append(((int(rows[-1]["epoch"]), int(rows[-1]["superbatch"])), path))
+        except (OSError, ValueError, KeyError, IndexError, csv.Error):
+            pass
+    if not candidates:
+        return None
+    _, path = max(candidates, key=lambda item: item[0])
+    try:
+        with (path / "learn.log").open(newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.DictReader(f))
+        row = rows[-1]
+        position = (int(row["epoch"]), int(row["superbatch"]))
+        if (path / "state.bin").stat().st_size == 0 or (path / "dataloader_pos.txt").stat().st_size == 0:
+            return None
+        return path, position
+    except (OSError, ValueError, KeyError, IndexError, csv.Error):
+        return None
+
+
+def ft_factorizer_schedule_compatible(directory: Path, requested: dict) -> bool:
+    """A retained ON checkpoint may stay ON or fold OFF; OFF cannot become ON."""
+    checkpoint = latest_resume_checkpoint(directory)
+    if checkpoint is None:
+        return False
+    path, (epoch, sb) = checkpoint
+    try:
+        saved = canonical_factorizer_names(read_json(path / "bulletou-settings.json"))
+        saved_on = resolve_epoch_settings(saved, epoch, historical=True).get("sfnn_ft_factorizer", True)
+        saved_sbs_path = path / "epoch_superbatches.txt"
+        saved_sbs = int(saved_sbs_path.read_text().strip()) if saved_sbs_path.is_file() else resolve_epoch_settings(saved, epoch, historical=True)["superbatches"]
+        requested_sbs = resolve_epoch_settings(requested, epoch)["superbatches"]
+        start_epoch = epoch if sb < saved_sbs and sb < requested_sbs else epoch + 1
+        requested_on = resolve_epoch_settings(requested, start_epoch).get("sfnn_ft_factorizer", True)
+        return type(saved_on) is bool and type(requested_on) is bool and (saved_on or not requested_on)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def backup_summary_before_rollback(directory: Path) -> Path | None:
+    checkpoint = latest_resume_checkpoint(directory)
+    summary = directory / SUMMARY_CSV_NAME
+    if checkpoint is None or not summary.is_file():
+        return None
+    _, anchor = checkpoint
+    if not any((int(row["epoch"]), int(row["superbatch"])) > anchor for row in log_rows(directory)):
+        return None
+    backup = directory / f"{summary.stem}.before-rollback-{time.time_ns()}{summary.suffix}"
+    with summary.open("rb") as src, backup.open("xb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+    return backup
+
+
 def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[int]]:
     """Read-only reconciliation. Preserve IDs, folders and unselected conditions."""
     stored = canonical_factorizer_names(stored)
@@ -738,15 +812,17 @@ def plan_resume(root: Path, stored: dict, requested: dict) -> tuple[dict, set[in
         layout_keys = ["arch", "backend"]
         if not str(candidate["settings"].get("arch", "")).startswith("SFNN_halfka2_"):
             layout_keys.append("sfnn_ft_factorizer")
+        directory = trial_dir(root, trial)
         incompatible = [k for k in layout_keys
-                        if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))]
+                        if trial["settings"].get(k, defaults.get(k)) != candidate["settings"].get(k, defaults.get(k))
+                        and not (k == "sfnn_ft_factorizer" and
+                                 ft_factorizer_schedule_compatible(directory, candidate["settings"]))]
         if incompatible:
             raise ValueError(
                 f"trial {trial['id']}: checkpoint-incompatible settings changed: {', '.join(incompatible)}\n"
                 + settings_diff({k: trial["settings"].get(k, defaults.get(k)) for k in incompatible},
                                 {k: candidate["settings"].get(k, defaults.get(k)) for k in incompatible})
                 + "\nUse a new grid root for a different network layout. Nothing was overwritten.")
-        directory = trial_dir(root, trial)
         check_trial_settings_file(directory, trial)
         updated = {**candidate["settings"], "output": trial["settings"]["output"], "tag": trial["settings"]["tag"]}
         if trial["settings"] != updated:
@@ -1089,6 +1165,9 @@ def main(argv=None) -> int:
             if not settings_path.exists():
                 atomic_json(settings_path, trial.get("initial_settings", trial["settings"]))
             if resume:
+                backup = backup_summary_before_rollback(directory)
+                if backup is not None:
+                    print(f"[BACKUP] summary before checkpoint rollback: {backup}", flush=True)
                 atomic_json(directory / "bulletou-resume-settings.json", resume_settings(trial["settings"]))
             else:
                 atomic_json(directory / "bulletou-run-settings.json", trial["settings"])
