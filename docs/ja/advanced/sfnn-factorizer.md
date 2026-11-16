@@ -490,7 +490,7 @@ count-aware な追加学習では、count.bin を作ったときと同じ分類�
   --validate
 ```
 
-出力先は新しいフォルダを使ってください。`--progress-bin` は checkpoint に保存された `progress.bin` と一致することを確認します。count の生成に使った progress 分類器の情報は `count.bin` に含まれないため、同じものを使ったかは利用者が確認してください。GPTQ は residual 除去後の重みで較正し、`--validate` は settings の `test_teacher` と検証条件で CPU 整数検証した qacc / qloss を表示します。GPTQ 較正には GPU が必要です。現状の `export-gptq` と同様に、FT factorizer 有効、BN、count gate、有効な L2/L3 factorizer などには対応しません。
+出力先は新しいフォルダを使ってください。`--progress-bin` は checkpoint に保存された `progress.bin` と一致することを確認します。count の生成に使った progress 分類器の情報は `count.bin` に含まれないため、同じものを使ったかは利用者が確認してください。GPTQ は residual 除去後の重みで較正し、`--validate` は settings の `test_teacher` と検証条件で CPU 整数検証した qacc / qloss を表示します。GPTQ 較正には GPU が必要です。FT factorizer が有効な場合は、共有成分をFTの重みに畳み込んでから較正・出力します。BN、count gate、有効な L2/L3 factorizer などには対応しません。
 
 `.psv` / `.bin` は固定長レコードなので、BulletOu は専用の高速経路で読みます。読み込み用 buffer を複数個用意し、片方を count している間に別の buffer へディスク読み込みします。実装上は queue で buffer を回しますが、動作としては ring buffer です。
 

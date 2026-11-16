@@ -90,11 +90,10 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     if args.validate && validation_path.exists() { return Err("GPTQ validation output already exists; choose a new directory".into()); }
     let train=training_args_for_export(&args.settings_file,args.epoch)?;
     if train.arch().cli_name()!=args.arch.cli_name() { return Err("--arch disagrees with settings".into()); }
-    if train.ft_factorizer { return Err("export-gptq currently requires a checkpoint with FT factorizer off".into()); }
     // This first implementation does not silently ignore per-axis gates or BN.
     if train.sfnn_bucket_counts.is_some() { return Err("export-gptq does not yet support count gates".into()); }
     let alpha=effective_sfnn_factorizer_alpha(&train);
-    if [alpha.ft,alpha.shared,alpha.king_axis,alpha.hand_axis,alpha.progress_axis,
+    if [alpha.shared,alpha.king_axis,alpha.hand_axis,alpha.progress_axis,
         alpha.king_hand_pair,alpha.king_progress_pair,alpha.hand_progress_pair].iter().any(|&v|v!=1.0) {
         return Err("export-gptq currently requires unit factorizer coefficients".into());
     }
@@ -102,6 +101,16 @@ pub(super) fn run(args: &ExportArgs) -> Result<(), String> {
     let stack=train.effective_layerstack().ok_or("SFNN layerstack required")?;
     eprintln!("export-gptq: loading checkpoint and calibration positions; L2/L3 only");
     let mut state=load_cuda_cpp_sfnn_initial_state(&args.state_bin,&train,feature)?;
+    // Calibration uses base features only. Fold FT's virtual rows exactly as
+    // the normal network exporter does, without changing the checkpoint.
+    state.optimizer_states = None;
+    if train.ft_factorizer {
+        let base = feature.base_input_size();
+        bulletou_cuda_cpp::ft_factorizer_switch::fold_rows(
+            &mut state.weights.l0w, base, feature.virtual_rows(), state.weights.shape.ft_size, alpha.ft,
+        ).map_err(|e| e.to_string())?;
+        state.weights.shape.input_size = base;
+    }
     let shape=state.weights.shape;
     if state.weights.batch_norm.0.iter().any(Option::is_some)
         || state.weights.l2fw.is_some() || state.weights.l2axw.is_some()
@@ -319,6 +328,16 @@ fn cholesky(a: &[f64], n: usize) -> Result<Vec<f64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calibration_ft_fold_matches_normal_export_with_nonunit_alpha() {
+        let (base, virtual_rows, width, alpha) = (6, 2, 3, 0.5);
+        let original: Vec<f32> = (0..(base + virtual_rows) * width)
+            .map(|i| i as f32 * 0.03125 - 0.2).collect();
+        let expected = fold_sfnn_halfka2_piece_factorized_l0w(&original, base, virtual_rows, width, alpha).unwrap();
+        let mut calibration = original;
+        bulletou_cuda_cpp::ft_factorizer_switch::fold_rows(&mut calibration, base, virtual_rows, width, alpha).unwrap();
+        assert_eq!(calibration, expected);
+    }
     #[test]
     fn rare_residual_removal_uses_inclusive_threshold_and_preserves_other_buckets() {
         let mut w = vec![1., 2., 3., 4., 5., 6.];
