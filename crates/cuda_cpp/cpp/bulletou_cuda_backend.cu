@@ -10185,6 +10185,34 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_destroy(BulletOuCudaCppHalfMome
     return ok();
 }
 
+__global__ void sgd_momentum_update_kernel(float* gradients, float* weights, float* momentum,
+    size_t len, float gradient_factor, float learning_rate, float decay, float beta,
+    float min_weight, float max_weight) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    float g = gradients[i] * gradient_factor;
+    float m = beta * momentum[i] + g;
+    momentum[i] = m;
+    weights[i] = clip_updated_weight(weights[i] * (1.0f - learning_rate * decay) - learning_rate * m,
+        min_weight, max_weight);
+    gradients[i] = 0.0f;
+}
+
+extern "C" int bulletou_cuda_cpp_sgd_momentum_update_device(
+    BulletOuCudaCppContext* ctx, size_t len, float gradient_factor, float learning_rate,
+    float decay, float beta, float min_weight, float max_weight,
+    BulletOuCudaCppF32Buffer* gradients, BulletOuCudaCppF32Buffer* weights,
+    BulletOuCudaCppF32Buffer* momentum) {
+    if (validate_buffer(ctx, gradients, len, "SGD gradients") ||
+        validate_buffer(ctx, weights, len, "SGD weights") ||
+        validate_buffer(ctx, momentum, len, "SGD momentum") || set_context_device(ctx)) return -1;
+    int blocks = 0;
+    if (block_count_1d(len, 256, &blocks, "SGD momentum")) return -1;
+    if (len) sgd_momentum_update_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr, weights->ptr,
+        momentum->ptr, len, gradient_factor, learning_rate, decay, beta, min_weight, max_weight);
+    return check_kernel_launch("SGD momentum update");
+}
+
 extern "C" int bulletou_cuda_cpp_ranger_update_device(
     BulletOuCudaCppContext* ctx,
     float norm_loss_rate,

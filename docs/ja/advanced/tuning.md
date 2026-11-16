@@ -456,3 +456,10 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 | `pos/s` | `train` から計算した学習速度 |
 
 GPUが空いているのに `pos/s` が低い場合は、教師局面の読み込み、decode、shuffle が詰まっている可能性があります。`cuda-cpp-diagnostics.log` の teacher queue wait を見てください。
+# SGD＋momentum
+
+SFNNの通常学習では `"optimizer": "sgd"` と `"optimizer_momentum": 0.9` を指定できます。momentumの既定値は0.9、範囲は0以上1未満です。更新式は `m = momentum * m + g`、`w = w * (1 - lr * weight_decay) - lr * m` で、勾配の蓄積時は平均勾配を使います。既存の学習率スケジュールと重みのクリップ設定も適用されます。
+
+RangerとSGDを切り替えてcheckpointから再開する場合、重みと学習位置は保持し、optimizer状態とoptimizerのstepを初期化します。同じSGDのcheckpointから再開する場合はmomentumを復元します。checkpointにはoptimizer種別を保存します。
+
+SGDは現時点ではSFNNの通常学習・grid_searchのみ対応です。worker、plateau、BN、dirty bucket更新、norm loss、FP16 optimizer moments、centeringとは併用できません。`all_optim` はFP16 optimizer momentsを有効にするため、SGDでは無効にしてください。

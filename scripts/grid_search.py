@@ -64,7 +64,7 @@ COMMON_COLUMNS = (
     "sfnn_bn_l2_effective_weight_clip",
     "nnue_bn_ft", "nnue_bn_l1", "nnue_bn_l2", "nnue_bn_gamma", "nnue_bn_beta", "nnue_bn_momentum", "nnue_bn_epsilon",
     "sfnn_bn_ft", "sfnn_bn_l1", "sfnn_bn_l2", "sfnn_bn_qat", "sfnn_bn_gamma", "sfnn_bn_beta", "sfnn_bn_momentum", "sfnn_bn_epsilon",
-    "arch", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
+    "arch", "optimizer", "optimizer_momentum", "lr", "lr_min", "lr_schedule", "warmup_sb", "batch_size", "batches_per_update",
     "positions_per_superbatch", "superbatches", "sfnn_l1_factorizer",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
     "sfnn_factorizer_alpha", "sfnn_norm_loss_strength", "sfnn_l2_l3_center", "sfnn_l1_center", "sfnn_l1_effective_weight_clip", "loss_bce_with_logits", "bce_error_weight_k", "wrm_nnue2score", "wrm_in_scaling",

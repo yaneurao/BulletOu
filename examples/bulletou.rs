@@ -3509,12 +3509,14 @@ impl LrScheduleKind {
 #[clap(rename_all = "lowercase")]
 enum OptimizerKind {
     Ranger,
+    Sgd,
 }
 
 impl OptimizerKind {
     fn cli_name(self) -> &'static str {
         match self {
             OptimizerKind::Ranger => "ranger",
+            OptimizerKind::Sgd => "sgd",
         }
     }
 }
@@ -4328,6 +4330,11 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     resolved.apply_all_optim();
+    if resolved.optimizer == OptimizerKind::Sgd && (resolved.sfnn_ft_fp16_moments ||
+        resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
+        resolved.sfnn_l2_l3_center || resolved.sfnn_l1_effective_weight_clip) {
+        return Err(format!("SGD does not support FP16 optimizer moments, norm loss, centering, or effective clipping at epoch {epoch}"));
+    }
     if schedules.contains_key("ft_factorizer") {
         if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
             || resolved.sfnn_bn_ft || resolved.sfnn_bn_l1 || resolved.sfnn_bn_l2 {
@@ -4938,11 +4945,13 @@ struct Args {
     #[arg(long, default_value = "0.000875")]
     lr: f32,
 
-    /// Optimizer used for training. BulletOu currently exposes Ranger
-    /// (RAdam+Lookahead), matching the tatara reference recipe and
-    /// bullet-shogi's shogi examples.
+    /// Optimizer used for training: Ranger (RAdam+Lookahead) or SGD with momentum.
     #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerKind,
+
+    /// Momentum coefficient for SGD, in [0, 1).
+    #[arg(long, default_value_t = 0.9)]
+    optimizer_momentum: f32,
 
     /// LR schedule kind. `step` applies fixed gamma drops within one epoch
     /// and warm-restarts to `--lr` at epoch boundaries. `geometric` and `cos` sweep
@@ -6345,8 +6354,14 @@ impl Args {
             effective_batches_per_superbatch(self)?
         };
         validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
-        if self.optimizer != OptimizerKind::Ranger {
-            return Err("--backend cuda-cpp direct trainer currently supports only --optimizer ranger".to_string());
+        if self.optimizer == OptimizerKind::Sgd {
+            if !self.eval_type().uses_layerstack() || self.lr_schedule == LrScheduleKind::Plateau ||
+                self.sfnn_dirty_bucket_update || self.sfnn_norm_loss_strength != 0.0 || self.sfnn_ft_fp16_moments ||
+                self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 || self.sfnn_l1_center || self.sfnn_l2_l3_center || self.sfnn_l1_effective_weight_clip || self.optimizer_beta1.is_some() ||
+                self.optimizer_beta2.is_some() || self.optimizer_epsilon.is_some() ||
+                !(self.optimizer_momentum.is_finite() && (0.0..1.0).contains(&self.optimizer_momentum)) {
+                return Err("SGD requires SFNN, momentum in [0,1), and disables plateau, BN, dirty bucket updates, norm loss, centering/effective clipping, FP16 optimizer moments, and Ranger beta/epsilon overrides".into());
+            }
         }
         if self.initial_state.is_some() && self.resume.is_some() {
             return Err(
@@ -6573,7 +6588,11 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     if args.loss_bce_with_logits {
         print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     }
-    eprintln!("  SFNN norm loss               = strength={}, target=1, per-tensor, FT weights excluded; L3 bias before RAdam, others after RAdam/before Lookahead", args.sfnn_norm_loss_strength);
+    if args.optimizer == OptimizerKind::Sgd {
+        eprintln!("  SFNN norm loss               = disabled for SGD");
+    } else {
+        eprintln!("  SFNN norm loss               = strength={}, target=1, per-tensor, FT weights excluded; L3 bias before RAdam, others after RAdam/before Lookahead", args.sfnn_norm_loss_strength);
+    }
     if effective_win_rate_model(args) {
         resolve_wrm_loss_params(args)?;
     } else {
@@ -6581,7 +6600,7 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     }
     if uses_tatara_weight_clip(args) {
         eprintln!(
-            "  optimizer weight clip        = tatara: L1/L2 weights+biases, L3 weights +/-1.984375; FT and L3 bias off (individual tensors, after RAdam)"
+            "  optimizer weight clip        = tatara: L1/L2 weights+biases, L3 weights +/-1.984375; FT and L3 bias off (individual tensors, after update)"
         );
     } else if args.sfnn_l2_l3_center || args.sfnn_l1_center || args.optimizer_weight_clip.unwrap_or(0.0) == 0.0 {
         eprintln!("  optimizer weight clip        = off");
@@ -11017,6 +11036,9 @@ struct WorkerSfnnSession {
 #[cfg(feature = "cuda-cpp-backend")]
 impl WorkerSfnnSession {
     fn open(args: Args) -> Result<Self, String> {
+        if args.optimizer == OptimizerKind::Sgd {
+            return Err("SGD is not supported in worker mode; use standalone training/grid_search".into());
+        }
         if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
             return Err("BN currently supports standalone training/grid_search, not worker mode".into());
         }
@@ -11425,6 +11447,7 @@ impl WorkerSfnnSession {
                 ],
                 &checkpoint_axis_coefficients(self.shape, effective_sfnn_factorizer_alpha(trial_args), self.factorizer_axis_confidences.as_deref()),
                 self.residual_count_gates.as_deref(),
+                trial_args.optimizer,
             )?;
             std::fs::write(
                 tmp_dir.join("dataloader_pos.txt"),
@@ -11568,6 +11591,9 @@ impl WorkerSfnnSession {
         cache_dir: Option<std::path::PathBuf>,
         borda_dominators: Vec<WorkerBordaMetric>,
     ) -> Result<WorkerSfnnTrialOutcome, String> {
+        if trial_args.optimizer == OptimizerKind::Sgd {
+            return Err("SGD is not supported in worker trials; use standalone training/grid_search".into());
+        }
         if trial_args.epoch_settings_json.is_some() {
             return Err("epoch schedules are supported by standalone SFNN training/grid_search, not worker trials".into());
         }
@@ -11697,6 +11723,7 @@ impl WorkerSfnnSession {
             };
             let learning_rate = schedule.lr_for_step(&trial_args, step_index, self.batch_size);
             let params = bulletou_cuda_cpp::RangerUpdateParams {
+                sgd_momentum: None,
                 radam: bulletou_cuda_cpp::RAdamUpdateParams {
                     step: optimizer_step as u64,
                     gradient_factor: 1.0 / batches_per_update as f32,
@@ -12185,6 +12212,7 @@ impl WorkerSfnnSession {
                     shared_coefficients_for_args(&save_args),
                     &checkpoint_axis_coefficients(self.shape, effective_sfnn_factorizer_alpha(&save_args), self.factorizer_axis_confidences.as_deref()),
                     self.residual_count_gates.as_deref(),
+                    save_args.optimizer,
                 )?;
                 write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, &save_args, log)?;
                 Ok(())
@@ -13353,6 +13381,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         bulletou_cuda_cpp::ranger_update_host(
             device,
             RangerUpdateParams {
+                sgd_momentum: None,
                 radam: RAdamUpdateParams {
                     step: 1,
                     learning_rate: 0.01,
@@ -13389,6 +13418,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
         bulletou_cuda_cpp::ranger_update_device(
             &ctx,
             RangerUpdateParams {
+                sgd_momentum: None,
                 radam: RAdamUpdateParams {
                     step: 1,
                     learning_rate: 0.01,
@@ -14300,6 +14330,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
+                sgd_momentum: None,
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     learning_rate,
@@ -15100,6 +15131,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         let fast = teacher_batch.batch;
                         let ranger = ranger_params(args);
                         let params = RangerUpdateParams {
+                            sgd_momentum: None,
                             radam: RAdamUpdateParams {
                                 step: optimizer_step as u64,
                                 learning_rate: plateau_state.current_lr,
@@ -15391,6 +15423,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             let step_index = seen_steps.saturating_sub(1);
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
+                sgd_momentum: None,
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     learning_rate,
@@ -18113,6 +18146,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ),
         ConsoleColor::BoldGreen,
     );
+    if args.optimizer == OptimizerKind::Sgd {
+        print_startup_kv("optimizer", format!("SGD with momentum={}, decoupled weight decay={}",
+            args.optimizer_momentum, args.optimizer_weight_decay));
+    }
+
     if schedule.production {
         print_startup_kv(
             "schedule",
@@ -18191,7 +18229,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     };
     if let Some(path) = args.initial_state.as_deref() {
         let state_kind = if initial_state.optimizer_states.is_some() {
-            "weights + Ranger optimizer state"
+            "weights + optimizer state"
         } else if initial_state.completed_steps > 0 {
             "weights + step counters"
         } else {
@@ -18204,7 +18242,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             format!(
                 "{} ({})",
                 paint(path.display(), ConsoleColor::Cyan),
-                paint("auto-resume weights + Ranger optimizer state", ConsoleColor::BoldGreen)
+                paint(if initial_state.optimizer_states.is_some() { "auto-resume weights + optimizer state" } else { "auto-resume weights; optimizer state reset" }, ConsoleColor::BoldGreen)
             ),
         );
     } else {
@@ -18754,6 +18792,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let fast = teacher_batch.batch;
                     let ranger = ranger_params(args);
                     let params = RangerUpdateParams {
+                        sgd_momentum: None,
                         radam: RAdamUpdateParams {
                             step: optimizer_step as u64,
                             learning_rate: plateau_state.current_lr,
@@ -19080,6 +19119,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             sfnn_factorizer_axis_confidences.as_deref(),
             None,
             sfnn_progress_params.as_ref(),
+            args.optimizer,
         )?;
         eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
         if let Some(metrics) = last_checkpoint_metrics {
@@ -19199,6 +19239,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             };
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
+                sgd_momentum: (args.optimizer == OptimizerKind::Sgd).then_some(args.optimizer_momentum),
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     gradient_factor: 1.0 / batches_per_update as f32,
@@ -19888,6 +19929,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         sfnn_factorizer_axis_confidences.as_deref(),
         sfnn_progress_train_state.as_ref(),
         final_progress_params.as_ref(),
+        args.optimizer,
     )?;
     eprintln!("  cuda-cpp SFNN direct output = {} (nn.bin, full-state weights.bin)", direct_output_dir.display());
     if checkpoint_chunk_idx != schedule.chunks.len() {
@@ -20551,6 +20593,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
             shared_coefficients_for_args(args),
             &checkpoint_axis_coefficients(shape, effective_sfnn_factorizer_alpha(args), factorizer_axis_confidences),
             residual_count_gates,
+            args.optimizer,
         )?;
         write_cuda_cpp_direct_checkpoint_metadata_files(&tmp_dir, args, log)?;
         Ok(())
@@ -22821,6 +22864,15 @@ fn switch_loaded_l1_factorizer(state: &mut CudaCppSfnnInitialState, old: &Args, 
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn sfnn_checkpoint_optimizer(train: &BTreeMap<String, Vec<f32>>) -> Result<OptimizerKind, String> {
+    match train.get("optimizer_kind").map(Vec::as_slice) {
+        Some([0.0]) | None => Ok(OptimizerKind::Ranger), // Legacy checkpoints predate SGD.
+        Some([1.0]) => Ok(OptimizerKind::Sgd),
+        Some(_) => Err("invalid checkpoint optimizer kind".into()),
+    }
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn load_cuda_cpp_sfnn_initial_state(
     path: &Path,
     args: &Args,
@@ -23083,7 +23135,12 @@ fn load_cuda_cpp_sfnn_initial_state(
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_sections(&train, &step_ranger, &weights)?;
-    let optimizer_states = if created_factorizers.any() || folded_inactive_factorizers || progress_axis_appended {
+    let checkpoint_optimizer = sfnn_checkpoint_optimizer(&train)?;
+    let optimizer_changed = checkpoint_optimizer != args.optimizer;
+    let optimizer_states = if optimizer_changed {
+        eprintln!("  initial optimizer state = reset when switching {} -> {}", checkpoint_optimizer.cli_name(), args.optimizer.cli_name());
+        None
+    } else if created_factorizers.any() || folded_inactive_factorizers || progress_axis_appended {
         if progress_axis_appended {
             if keep_optimizer_state_on_factorizer_change {
                 eprintln!("  initial optimizer state = reset because progress-axis factorizer tensors were appended");
@@ -25189,6 +25246,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
     factorizer_axis_confidences: Option<&[f32]>,
     progress_state: Option<&CudaCppSfnnProgressTrainState>,
     progress_params: Option<&ShogiSfnnProgressQ16Params>,
+    optimizer: OptimizerKind,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     write_build_info_file(dir)
@@ -25215,6 +25273,7 @@ fn write_cuda_cpp_sfnn_direct_outputs(
         [factorizer_alpha.ft, if factorizer.shared { factorizer_alpha.shared } else { 0.0 }],
         &checkpoint_axis_coefficients(shape, factorizer_alpha, factorizer_axis_confidences),
         residual_count_gates,
+        optimizer,
     )
 }
 
@@ -25242,6 +25301,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
     shared_coefficients: [f32; 2],
     axis_coefficients: &[f32],
     residual_count_gates: Option<&[f32]>,
+    optimizer: OptimizerKind,
 ) -> Result<(), String> {
     let bn_records=weights.batch_norm.0.iter().map(|s|s.as_ref().map(|s|s.encode()).transpose())
         .collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
@@ -25251,10 +25311,12 @@ fn write_cuda_cpp_sfnn_weights_bin(
     let l2_revival_record = [weights.l2_revival_flags as f32];
     let revival_rng_record = weights.revival_rng.encode();
     let completed_steps_record = [completed_steps as f32];
+    let optimizer_kind_record = [if optimizer == OptimizerKind::Sgd { 1.0 } else { 0.0 }];
     let optimizer_steps_record = [optimizer_steps as f32];
     let completed_steps_exact = encode_sfnn_exact_step(completed_steps);
     let optimizer_steps_exact = encode_sfnn_exact_step(optimizer_steps);
     let mut records: Vec<(&str, &[f32])> = vec![
+        ("nnue/train/optimizer_kind", optimizer_kind_record.as_slice()),
         ("nnue/train/completed_steps", completed_steps_record.as_slice()),
         ("nnue/train/completed_steps_u16", completed_steps_exact.as_slice()),
         ("nnue/train/optimizer_steps_u16", optimizer_steps_exact.as_slice()),
@@ -26987,7 +27049,12 @@ fn resume_signature(args: &Args) -> String {
     // The signature identifies the run, not whichever scheduled value happened
     // to be active when its last checkpoint was saved.
     if args.epoch_settings_json.is_some() {
-        if let Ok(initial) = args_at_epoch(args, 1) {
+        // Historical epoch 1 may have enabled FP16 moments before a later
+        // switch to SGD; resolving it must not reject a valid resumed run.
+        let mut signature_args = args.clone();
+        signature_args.optimizer = OptimizerKind::Ranger;
+        if let Ok(mut initial) = args_at_epoch(&signature_args, 1) {
+            initial.optimizer = args.optimizer;
             return format!("{}epoch_settings={}\n", resume_signature_values(&initial), args.epoch_settings_json.as_ref().unwrap());
         }
     }
@@ -27162,6 +27229,9 @@ fn resume_signature_values(args: &Args) -> String {
     ]
     .join("\n")
         + "\n"
+        + &if args.optimizer == OptimizerKind::Sgd {
+            format!("optimizer_momentum={:.9}\n", args.optimizer_momentum)
+        } else { String::new() }
         + &if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
             format!("sfnn_bn={},{},{};gamma={};beta={};momentum={};epsilon={}\n",
                 args.sfnn_bn_ft,args.sfnn_bn_l1,args.sfnn_bn_l2,args.sfnn_bn_gamma,args.sfnn_bn_beta,args.sfnn_bn_momentum,args.sfnn_bn_epsilon)
@@ -28893,6 +28963,56 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn checkpoint_optimizer_marker_handles_legacy_and_rejects_invalid() {
+        use super::*;
+        let mut records = BTreeMap::new();
+        assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::Ranger);
+        records.insert("optimizer_kind".to_owned(), vec![1.0]);
+        assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::Sgd);
+        records.insert("optimizer_kind".to_owned(), vec![0.0]);
+        assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::Ranger);
+        for value in [vec![], vec![2.0], vec![f32::NAN], vec![1.0, 0.0]] {
+            records.insert("optimizer_kind".to_owned(), value);
+            assert!(sfnn_checkpoint_optimizer(&records).is_err());
+        }
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn sgd_options_validate_and_reject_unsupported_modes() {
+        use super::*;
+        let base = ["bulletou", "--teacher", "unused", "--arch", "SFNN_halfka2_128_8_32_k3k3",
+            "--optimizer", "sgd", "--superbatches", "1", "--max-epochs", "1"];
+        let args = Args::try_parse_from(base).unwrap();
+        assert_eq!(args.optimizer, OptimizerKind::Sgd);
+        assert_eq!(args.optimizer_momentum, 0.9);
+        assert!(args.validate_backend_flags().is_ok());
+        for flags in [&["--optimizer-momentum", "1.0"][..], &["--sfnn-bn-ft"][..],
+            &["--sfnn-dirty-bucket-update"][..], &["--sfnn-norm-loss-strength", "0.1"][..],
+            &["--optimizer-beta1", "0.9"][..]] {
+            let parsed = Args::try_parse_from(base.into_iter().chain(flags.iter().copied())).unwrap();
+            assert!(parsed.validate_backend_flags().is_err(), "{flags:?}");
+        }
+        let mut scheduled = Args::try_parse_from(["bulletou", "--teacher", "unused", "--arch",
+            "SFNN_halfkahm2_2304_15_64_k21k21_progress8", "--optimizer", "sgd",
+            "--superbatches", "1", "--max-epochs", "1"]).unwrap();
+        scheduled.epoch_settings_json = Some(serde_json::json!({
+            "sfnn_ft_fp16": {"epoch1": true, "epoch7": false},
+            "sfnn_ft_fp16_moments": {"epoch1": true, "epoch7": false},
+            "lr": {"epoch1": 0.001, "epoch7": 0.0001}
+        }).to_string());
+        let active = args_at_epoch(&scheduled, 7).unwrap();
+        let mut historical = active.clone();
+        historical.optimizer = OptimizerKind::Ranger;
+        args_at_epoch(&historical, 1).expect("historical Ranger settings must resolve");
+        let signature = resume_signature(&active);
+        assert!(signature.contains("optimizer=sgd\n"));
+        assert!(signature.contains("optimizer_momentum=0.899999976\n"));
+        assert!(signature.contains("epoch_settings="));
+        assert_eq!(resume_signature(&args_at_epoch(&scheduled, 8).unwrap()), signature);
+    }
     #[test]
     fn all_optim_schedule_expands_and_survives_epoch_resolution() {
         use super::*;
@@ -35127,11 +35247,12 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
 
-        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11, [0.5, 0.75], &[0.25, 0.5], Some(&[0.9])).unwrap();
+        write_cuda_cpp_sfnn_weights_bin(&path, &weights, &optimizer, None, 1234, 11, [0.5, 0.75], &[0.25, 0.5], Some(&[0.9]), OptimizerKind::Sgd).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let records = parse_model_weights_bin(&bytes).unwrap();
 
+        assert_eq!(records["nnue/train/optimizer_kind"], vec![1.0]);
         assert_eq!(records["nnue/train/shared_coefficients"], vec![0.5, 0.75]);
         assert_eq!(decode_sfnn_exact_step("completed", &records["nnue/train/completed_steps_u16"]).unwrap(), 1234);
         assert_eq!(decode_sfnn_exact_step("optimizer", &records["nnue/train/optimizer_steps_u16"]).unwrap(), 11);

@@ -9132,6 +9132,8 @@ impl RAdamUpdateParams {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RangerUpdateParams {
+    /// SGD momentum coefficient; None selects the existing Ranger update.
+    pub sgd_momentum: Option<f32>,
     pub norm_loss_strength: f32,
     pub norm_loss_before: bool,
     pub radam: RAdamUpdateParams,
@@ -9144,6 +9146,7 @@ pub struct RangerUpdateParams {
 impl Default for RangerUpdateParams {
     fn default() -> Self {
         Self {
+            sgd_momentum: None,
             norm_loss_strength: 0.0,
             norm_loss_before: false,
             radam: RAdamUpdateParams { decay: 0.0, ..RAdamUpdateParams::default() },
@@ -9167,6 +9170,9 @@ impl RangerUpdateParams {
         2.0 * self.norm_loss_strength * lr
     }
     pub fn validate(self) -> Result<()> {
+        if self.sgd_momentum.is_some_and(|v| !v.is_finite() || !(0.0..1.0).contains(&v)) {
+            return Err(CudaCppError::message("SGD momentum must be finite and in [0, 1)"));
+        }
         if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
             return Err(CudaCppError::message("norm loss strength must be finite and non-negative"));
         }
@@ -9292,6 +9298,9 @@ impl RangerStackedDirtyDeviceStateMut<'_> {
 }
 
 pub fn ranger_update_host(device: i32, params: RangerUpdateParams, state: RangerStateMut<'_>) -> Result<()> {
+    if params.sgd_momentum.is_some() {
+        return Err(CudaCppError::message("SGD is not supported by the Ranger host update"));
+    }
     if params.norm_loss_strength != 0.0 {
         return Err(CudaCppError::message("Norm loss is supported by device SFNN updates only"));
     }
@@ -9335,6 +9344,15 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
     state: RangerDeviceStateMut<'_>, half: Option<&FtHalfMoments>) -> Result<()> {
     params.validate()?;
     let len = state.validate()?;
+    if let Some(momentum) = params.sgd_momentum {
+        if half.is_some() || params.norm_loss_strength != 0.0 {
+            return Err(CudaCppError::message("SGD does not support FP16 moments or norm loss"));
+        }
+        return check(unsafe { ffi::bulletou_cuda_cpp_sgd_momentum_update_device(ctx.as_ptr(), len,
+            params.radam.gradient_factor, params.radam.learning_rate, params.radam.decay, momentum,
+            params.radam.min_weight, params.radam.max_weight, state.gradients.as_ptr(),
+            state.weights.as_ptr(), state.momentum.as_ptr()) });
+    }
     let scale = params.radam.step_scale()?;
     let do_lookahead = params.should_lookahead()?;
 
@@ -9373,6 +9391,9 @@ pub fn ranger_update_stacked_dirty_device(
     params: RangerUpdateParams,
     state: RangerStackedDirtyDeviceStateMut<'_>,
 ) -> Result<()> {
+    if params.sgd_momentum.is_some() {
+        return Err(CudaCppError::message("SGD is not supported by dirty bucket updates"));
+    }
     params.validate()?;
     let len = state.validate()?;
     if state.dirty_count == 0 || len == 0 {
@@ -9466,6 +9487,10 @@ mod ffi {
     }
 
     unsafe extern "C" {
+        pub fn bulletou_cuda_cpp_sgd_momentum_update_device(ctx: *mut BulletOuCudaCppContext,
+            len: usize, gradient_factor: f32, learning_rate: f32, decay: f32, beta: f32,
+            min_weight: f32, max_weight: f32, gradients: *mut BulletOuCudaCppF32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer, momentum: *mut BulletOuCudaCppF32Buffer) -> i32;
         #[cfg(test)]
         #[cfg(test)]
         pub fn bulletou_test_sfnn_half_grad_gather(ctx: *mut BulletOuCudaCppContext,
@@ -10435,6 +10460,47 @@ mod ffi {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_momentum_matches_reference_over_multiple_updates() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let mut weights = vec![0.4f32, -0.8, 0.1, 0.0];
+        let mut moments = vec![0.0f32; weights.len()];
+        let w = F32Buffer::from_host(&ctx, &weights).unwrap();
+        let m = F32Buffer::from_host(&ctx, &moments).unwrap();
+        let g = F32Buffer::new(&ctx, weights.len()).unwrap();
+        let v = F32Buffer::from_host(&ctx, &vec![0.0; weights.len()]).unwrap();
+        let slow = F32Buffer::from_host(&ctx, &weights).unwrap();
+        for step in 1..=4 {
+            let grad = vec![0.7f32, -0.1, step as f32 * 0.2, -0.3];
+            g.upload(&ctx, &grad).unwrap();
+            let params = RangerUpdateParams { sgd_momentum: Some(0.9),
+                radam: RAdamUpdateParams { step, learning_rate: 0.05, gradient_factor: 0.5,
+                    decay: 0.01, min_weight: -1.0, max_weight: 1.0, ..Default::default() },
+                ..Default::default() };
+            ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &g, weights: &w,
+                momentum: &m, velocity: &v, slow_params: &slow }).unwrap();
+            for i in 0..weights.len() {
+                moments[i] = 0.9 * moments[i] + 0.5 * grad[i];
+                weights[i] = (weights[i] * (1.0 - 0.05 * 0.01) - 0.05 * moments[i]).clamp(-1.0, 1.0);
+            }
+        }
+        for (a,b) in w.download(&ctx).unwrap().iter().zip(weights.iter()) { assert!((a-b).abs() < 1e-6); }
+        for (a,b) in m.download(&ctx).unwrap().iter().zip(moments.iter()) { assert!((a-b).abs() < 1e-6); }
+        assert!(g.download(&ctx).unwrap().iter().all(|&x| x == 0.0));
+        let g = F32Buffer::from_host(&ctx, &[f32::NAN]).unwrap();
+        let w = F32Buffer::from_host(&ctx, &[1.0]).unwrap();
+        let m = F32Buffer::from_host(&ctx, &[0.0]).unwrap();
+        let v = F32Buffer::from_host(&ctx, &[0.0]).unwrap();
+        let slow = F32Buffer::from_host(&ctx, &[1.0]).unwrap();
+        let params = RangerUpdateParams { sgd_momentum: Some(0.9),
+            radam: RAdamUpdateParams { min_weight: -f32::MAX, max_weight: f32::MAX, ..Default::default() },
+            ..Default::default() };
+        ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &g, weights: &w,
+            momentum: &m, velocity: &v, slow_params: &slow }).unwrap();
+        assert!(w.download(&ctx).unwrap()[0].is_nan());
+    }
     #[test]
     #[ignore = "requires a CUDA GPU and the full HalfKA_hm2 FT allocation"]
     fn fp16_ft_activations_remain_correct_for_public_workspaces() {
