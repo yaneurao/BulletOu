@@ -163,7 +163,7 @@ impl SfnnTrainStepRunner {
         r.optimizer_states.l0w.momentum.fill(&ctx,1.0e-6).unwrap();
         r.optimizer_states.l0w.velocity.fill(&ctx,1.0e-12).unwrap();
         r.set_ft_fp16_moments(&ctx,true).unwrap();
-        r.ft_half_moments=Some(FtHalfMoments::new(&ctx,&r.optimizer_states.l0w).unwrap());
+        r.ft_half_moments=Some(FtHalfMoments::new(&ctx,&r.optimizer_states.l0w,false).unwrap());
         r.optimizer_states.l0w.momentum.fill(&ctx,0.0).unwrap();
         r.optimizer_states.l0w.velocity.fill(&ctx,0.0).unwrap();
         let snapshot=r.snapshot_device(&ctx).unwrap();

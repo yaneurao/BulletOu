@@ -166,6 +166,7 @@ struct BulletOuCudaCppF32Buffer {
 struct BulletOuCudaCppHalfMoments {
     int device = 0;
     size_t len = 0;
+    float momentum_scale = 0.0f;
     __half* momentum = nullptr;
     __half* velocity = nullptr;
     unsigned long long* clipped = nullptr;
@@ -533,6 +534,7 @@ __global__ void radam_update_reset_gradients_kernel(
 }
 
 constexpr float FT_MOMENTUM_SCALE = 268435456.0f;       // 2^28
+constexpr float FT_SGD_MOMENTUM_SCALE = 1048576.0f;     // 2^20; SGD momentum is not EMA-normalized
 constexpr float FT_VELOCITY_SCALE = 1099511627776.0f;  // 2^40
 
 __device__ __forceinline__ float ft_half_moment_scaled(float x, float scale, unsigned long long* clipped) {
@@ -546,18 +548,18 @@ __device__ __forceinline__ float ft_half_moment_scaled(float x, float scale, uns
 }
 
 __global__ void ft_half_moments_encode(const float* momentum, const float* velocity,
-    __half* hm, __half* hv, size_t len, unsigned long long* clipped) {
+    __half* hm, __half* hv, size_t len, float momentum_scale, unsigned long long* clipped) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= len) return;
-    hm[i] = __float2half_rn(ft_half_moment_scaled(momentum[i], FT_MOMENTUM_SCALE, clipped));
+    hm[i] = __float2half_rn(ft_half_moment_scaled(momentum[i], momentum_scale, clipped));
     hv[i] = __float2half_rn(ft_half_moment_scaled(velocity[i], FT_VELOCITY_SCALE, clipped));
 }
 
 __global__ void ft_half_moments_decode(const __half* hm, const __half* hv, float* momentum,
-    float* velocity, size_t len) {
+    float* velocity, size_t len, float momentum_scale) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= len) return;
-    momentum[i] = __half2float(hm[i]) / FT_MOMENTUM_SCALE;
+    momentum[i] = __half2float(hm[i]) / momentum_scale;
     velocity[i] = __half2float(hv[i]) / FT_VELOCITY_SCALE;
 }
 
@@ -10126,13 +10128,14 @@ int apply_norm_loss(BulletOuCudaCppContext* ctx, BulletOuCudaCppF32Buffer* w, si
 
 extern "C" int bulletou_cuda_cpp_ft_half_moments_create(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppF32Buffer* velocity, size_t len,
-    BulletOuCudaCppHalfMoments** out) {
+    int sgd, BulletOuCudaCppHalfMoments** out) {
     if (!ctx || !out || len == 0) return fail_message("FT FP16 moments require a context, output, and nonempty state");
     if (validate_buffer(ctx, momentum, len, "FT momentum") ||
         validate_buffer(ctx, velocity, len, "FT velocity") || set_context_device(ctx)) return -1;
     *out = nullptr;
     auto* state = new BulletOuCudaCppHalfMoments();
     state->device = ctx->device; state->len = len;
+    state->momentum_scale = sgd ? FT_SGD_MOMENTUM_SCALE : FT_MOMENTUM_SCALE;
     if (checked_malloc(&state->momentum, len, "FT FP16 momentum") ||
         checked_malloc(&state->velocity, len, "FT FP16 velocity") ||
         checked_malloc(&state->clipped, 1, "FT FP16 moment counter")) {
@@ -10144,7 +10147,7 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_create(BulletOuCudaCppContext* 
     if (block_count_1d(len, 256, &blocks, "FT FP16 moments encode")) {
         cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
     }
-    ft_half_moments_encode<<<blocks,256,0,ctx->stream>>>(momentum->ptr, velocity->ptr, state->momentum, state->velocity, len, state->clipped);
+    ft_half_moments_encode<<<blocks,256,0,ctx->stream>>>(momentum->ptr, velocity->ptr, state->momentum, state->velocity, len, state->momentum_scale, state->clipped);
     if (check_kernel_launch("FT FP16 moments encode")) {
         cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
     }
@@ -10159,7 +10162,7 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_decode(BulletOuCudaCppContext* 
         validate_buffer(ctx, velocity, state->len, "FT velocity") || set_context_device(ctx)) return -1;
     int blocks = 0;
     if (block_count_1d(state->len, 256, &blocks, "FT FP16 moments decode")) return -1;
-    ft_half_moments_decode<<<blocks,256,0,ctx->stream>>>(state->momentum, state->velocity, momentum->ptr, velocity->ptr, state->len);
+    ft_half_moments_decode<<<blocks,256,0,ctx->stream>>>(state->momentum, state->velocity, momentum->ptr, velocity->ptr, state->len, state->momentum_scale);
     return check_kernel_launch("FT FP16 moments decode");
 }
 
@@ -10198,17 +10201,35 @@ __global__ void sgd_momentum_update_kernel(float* gradients, float* weights, flo
     gradients[i] = 0.0f;
 }
 
+__global__ void sgd_momentum_update_half_kernel(float* gradients, float* weights, __half* momentum,
+    size_t len, float gradient_factor, float learning_rate, float decay, float beta,
+    float min_weight, float max_weight, float momentum_scale, unsigned long long* clipped) {
+    size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    float m = beta * (__half2float(momentum[i]) / momentum_scale) + gradients[i] * gradient_factor;
+    weights[i] = clip_updated_weight(weights[i] * (1.0f - learning_rate * decay) - learning_rate * m,
+        min_weight, max_weight);
+    momentum[i] = __float2half_rn(ft_half_moment_scaled(m, momentum_scale, clipped));
+    gradients[i] = 0.0f;
+}
+
 extern "C" int bulletou_cuda_cpp_sgd_momentum_update_device(
     BulletOuCudaCppContext* ctx, size_t len, float gradient_factor, float learning_rate,
     float decay, float beta, float min_weight, float max_weight,
     BulletOuCudaCppF32Buffer* gradients, BulletOuCudaCppF32Buffer* weights,
-    BulletOuCudaCppF32Buffer* momentum) {
+    BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppHalfMoments* half_moments) {
     if (validate_buffer(ctx, gradients, len, "SGD gradients") ||
         validate_buffer(ctx, weights, len, "SGD weights") ||
         validate_buffer(ctx, momentum, len, "SGD momentum") || set_context_device(ctx)) return -1;
+    if (half_moments && (half_moments->device != ctx->device || half_moments->len != len ||
+        half_moments->momentum_scale != FT_SGD_MOMENTUM_SCALE))
+        return fail_message("SGD FT FP16 moments require matching device, length and optimizer");
     int blocks = 0;
     if (block_count_1d(len, 256, &blocks, "SGD momentum")) return -1;
-    if (len) sgd_momentum_update_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr, weights->ptr,
+    if (len && half_moments) sgd_momentum_update_half_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr,
+        weights->ptr, half_moments->momentum, len, gradient_factor, learning_rate, decay, beta,
+        min_weight, max_weight, half_moments->momentum_scale, half_moments->clipped);
+    else if (len) sgd_momentum_update_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr, weights->ptr,
         momentum->ptr, len, gradient_factor, learning_rate, decay, beta, min_weight, max_weight);
     return check_kernel_launch("SGD momentum update");
 }
@@ -10245,7 +10266,8 @@ extern "C" int bulletou_cuda_cpp_ranger_update_device(
     if (set_context_device(ctx) != 0) {
         return -1;
     }
-    if (half_moments && (half_moments->device != ctx->device || half_moments->len != len || len % 4 != 0))
+    if (half_moments && (half_moments->device != ctx->device || half_moments->len != len || len % 4 != 0 ||
+        half_moments->momentum_scale != FT_MOMENTUM_SCALE))
         return fail_message("FT FP16 moments require matching device and vector-aligned length");
     if (len == 0) {
         return ok();

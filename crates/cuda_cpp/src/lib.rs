@@ -188,10 +188,10 @@ struct FtHalfMoments {
 }
 
 impl FtHalfMoments {
-    fn new(ctx: &Context, state: &RangerParamState) -> Result<Self> {
+    fn new(ctx: &Context, state: &RangerParamState, sgd: bool) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
         check(unsafe { ffi::bulletou_cuda_cpp_ft_half_moments_create(ctx.as_ptr(), state.momentum.as_ptr(),
-            state.velocity.as_ptr(), state.momentum.len(), &mut raw) })?;
+            state.velocity.as_ptr(), state.momentum.len(), i32::from(sgd), &mut raw) })?;
         Ok(Self { raw: NonNull::new(raw).ok_or_else(|| CudaCppError::message("FT FP16 moment allocation returned null"))? })
     }
     fn decode(&self, ctx: &Context, state: &RangerParamState) -> Result<()> {
@@ -8354,7 +8354,7 @@ impl SfnnTrainStepRunner {
         }
         if self.ft_half_moments_enabled && self.ft_half_moments.is_none() &&
             lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight) > 0.0 {
-            self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w)?);
+            self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w, params.sgd_momentum.is_some())?);
         }
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
@@ -9345,13 +9345,14 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
     params.validate()?;
     let len = state.validate()?;
     if let Some(momentum) = params.sgd_momentum {
-        if half.is_some() || params.norm_loss_strength != 0.0 {
-            return Err(CudaCppError::message("SGD does not support FP16 moments or norm loss"));
+        if params.norm_loss_strength != 0.0 {
+            return Err(CudaCppError::message("SGD does not support norm loss"));
         }
         return check(unsafe { ffi::bulletou_cuda_cpp_sgd_momentum_update_device(ctx.as_ptr(), len,
             params.radam.gradient_factor, params.radam.learning_rate, params.radam.decay, momentum,
             params.radam.min_weight, params.radam.max_weight, state.gradients.as_ptr(),
-            state.weights.as_ptr(), state.momentum.as_ptr()) });
+            state.weights.as_ptr(), state.momentum.as_ptr(),
+            half.map_or(std::ptr::null_mut(), |h| h.raw.as_ptr())) });
     }
     let scale = params.radam.step_scale()?;
     let do_lookahead = params.should_lookahead()?;
@@ -9490,7 +9491,8 @@ mod ffi {
         pub fn bulletou_cuda_cpp_sgd_momentum_update_device(ctx: *mut BulletOuCudaCppContext,
             len: usize, gradient_factor: f32, learning_rate: f32, decay: f32, beta: f32,
             min_weight: f32, max_weight: f32, gradients: *mut BulletOuCudaCppF32Buffer,
-            weights: *mut BulletOuCudaCppF32Buffer, momentum: *mut BulletOuCudaCppF32Buffer) -> i32;
+            weights: *mut BulletOuCudaCppF32Buffer, momentum: *mut BulletOuCudaCppF32Buffer,
+            half_moments: *mut BulletOuCudaCppHalfMoments) -> i32;
         #[cfg(test)]
         #[cfg(test)]
         pub fn bulletou_test_sfnn_half_grad_gather(ctx: *mut BulletOuCudaCppContext,
@@ -10421,7 +10423,7 @@ mod ffi {
         ) -> i32;
         pub fn bulletou_cuda_cpp_ft_half_moments_create(ctx: *mut BulletOuCudaCppContext,
             momentum: *mut BulletOuCudaCppF32Buffer, velocity: *mut BulletOuCudaCppF32Buffer,
-            len: usize, out: *mut *mut BulletOuCudaCppHalfMoments) -> i32;
+            len: usize, sgd: i32, out: *mut *mut BulletOuCudaCppHalfMoments) -> i32;
         pub fn bulletou_cuda_cpp_ft_half_moments_decode(ctx: *mut BulletOuCudaCppContext,
             state: *mut BulletOuCudaCppHalfMoments, momentum: *mut BulletOuCudaCppF32Buffer,
             velocity: *mut BulletOuCudaCppF32Buffer) -> i32;
@@ -10650,7 +10652,7 @@ mod tests {
         let n = 64usize;
         let initial: Vec<f32> = (0..n).map(|i| i as f32 * 0.001).collect();
         let state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
-        let half = FtHalfMoments::new(&ctx, &state).unwrap();
+        let half = FtHalfMoments::new(&ctx, &state, false).unwrap();
         let actual_weights = F32Buffer::from_host(&ctx, &initial).unwrap();
         let reference_weights = F32Buffer::from_host(&ctx, &initial).unwrap();
         let actual_grad = F32Buffer::new(&ctx, n).unwrap();
@@ -10678,13 +10680,74 @@ mod tests {
         let big = vec![1.0; n];
         let state = RangerParamState::from_host_state(&ctx, n, RangerParamHostState {
             momentum: &big, velocity: &big, slow_params: &initial }).unwrap();
-        let clipped = FtHalfMoments::new(&ctx, &state).unwrap();
+        let clipped = FtHalfMoments::new(&ctx, &state, false).unwrap();
         assert_eq!(clipped.take_clipped(&ctx).unwrap(), (2*n) as u64);
         assert_eq!(clipped.take_clipped(&ctx).unwrap(), 0);
         clipped.decode(&ctx, &state).unwrap();
         let data = state.download(&ctx).unwrap();
         assert!(data.momentum.iter().all(|&x| x == 65504.0 / 268435456.0));
         assert!(data.velocity.iter().all(|&x| x == 65504.0 / 1099511627776.0));
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_ft_half_moments_matches_fp32_step_and_checkpoint_roundtrip() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let n = 64;
+        let initial: Vec<f32> = (0..n).map(|i| (i as f32 - 32.0) * 0.001).collect();
+        let state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+        let half = FtHalfMoments::new(&ctx, &state, true).unwrap();
+        let w = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let reference_w = F32Buffer::from_host(&ctx, &initial).unwrap();
+        let g = F32Buffer::new(&ctx, n).unwrap();
+        let reference_g = F32Buffer::new(&ctx, n).unwrap();
+        let reference_state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+        for step in 1..=12 {
+            half.decode(&ctx, &state).unwrap();
+            let decoded = state.download(&ctx).unwrap();
+            reference_state.upload(&ctx, n, RangerParamHostState { momentum: &decoded.momentum,
+                velocity: &decoded.velocity, slow_params: &decoded.slow_params }).unwrap();
+            reference_w.copy_from(&ctx, &w).unwrap();
+            let grad: Vec<f32> = (0..n).map(|i| ((i * 23 % 29) as f32 - 14.0) * 1e-6).collect();
+            g.upload(&ctx, &grad).unwrap();
+            reference_g.upload(&ctx, &grad).unwrap();
+            let params = RangerUpdateParams { sgd_momentum: Some(0.9),
+                radam: RAdamUpdateParams { step, learning_rate: 0.01, gradient_factor: 0.5,
+                    decay: 0.01, min_weight: -1.0, max_weight: 1.0, ..Default::default() },
+                ..Default::default() };
+            ranger_update_device_with_half_moments(&ctx, params, RangerDeviceStateMut { gradients: &g,
+                weights: &w, momentum: &state.momentum, velocity: &state.velocity, slow_params: &state.slow_params }, Some(&half)).unwrap();
+            ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &reference_g,
+                weights: &reference_w, momentum: &reference_state.momentum, velocity: &reference_state.velocity,
+                slow_params: &reference_state.slow_params }).unwrap();
+            for (actual, expected) in w.download(&ctx).unwrap().iter().zip(reference_w.download(&ctx).unwrap()) {
+                assert!((actual - expected).abs() < 1e-7);
+            }
+            assert!(g.download(&ctx).unwrap().iter().all(|&x| x == 0.0));
+        }
+        assert_eq!(half.take_clipped(&ctx).unwrap(), 0);
+        half.decode(&ctx, &state).unwrap();
+        let saved = state.download(&ctx).unwrap();
+        let restored = RangerParamState::from_host_state(&ctx, n, RangerParamHostState {
+            momentum: &saved.momentum, velocity: &saved.velocity, slow_params: &saved.slow_params }).unwrap();
+        let restored_half = FtHalfMoments::new(&ctx, &restored, true).unwrap();
+        restored_half.decode(&ctx, &restored).unwrap();
+        assert_eq!(saved.momentum, restored.download(&ctx).unwrap().momentum);
+        let large = vec![1.0; n];
+        let clipped_state = RangerParamState::from_host_state(&ctx, n, RangerParamHostState {
+            momentum: &large, velocity: &vec![0.0; n], slow_params: &initial }).unwrap();
+        let clipped = FtHalfMoments::new(&ctx, &clipped_state, true).unwrap();
+        assert_eq!(clipped.take_clipped(&ctx).unwrap(), n as u64);
+        clipped.decode(&ctx, &clipped_state).unwrap();
+        assert!(clipped_state.download(&ctx).unwrap().momentum.iter().all(|&x| x == 65504.0 / 1048576.0));
+        let big_gradient = vec![1.0; n];
+        g.upload(&ctx, &big_gradient).unwrap();
+        let params = RangerUpdateParams { sgd_momentum: Some(0.9), ..Default::default() };
+        ranger_update_device_with_half_moments(&ctx, params, RangerDeviceStateMut { gradients: &g,
+            weights: &w, momentum: &state.momentum, velocity: &state.velocity, slow_params: &state.slow_params }, Some(&half)).unwrap();
+        assert_eq!(half.take_clipped(&ctx).unwrap(), n as u64);
+        assert_eq!(half.take_clipped(&ctx).unwrap(), 0);
     }
 
     #[test]
@@ -12867,6 +12930,36 @@ mod tests {
             assert!(trained.l2fw.is_none() && trained.l2axw.is_none());
             assert!(trained.l3fw.is_none() && trained.l3axw.is_none());
         }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_runner_ft_half_moments_toggle_preserves_training_state() {
+        let shape = tiny_sfnn_shape();
+        let weights = tiny_sfnn_weights(shape);
+        let ctx = Context::new(0).unwrap();
+        let mut optimized = SfnnTrainStepRunner::new(&ctx, weights, 4, 3).unwrap();
+        let mut reference = SfnnTrainStepRunner::new(&ctx, weights, 4, 3).unwrap();
+        let batch = || SfnnTrainStepHostBatch {
+            stm_indices: &[0, 1, -1, 2, -1, -1, 1, 3, -1, 3, 2, -1],
+            nstm_indices: &[2, -1, -1, 0, 3, -1, 0, -1, -1, 1, -1, -1],
+            buckets: &[0, 1, 0, 1], targets: &[0.25, 0.75, 0.6, 0.1],
+            entry_weights: &[1.0, 0.5, 0.75, 1.25], batch_size: 4, max_active: 3,
+        };
+        for step in 1..=6 {
+            optimized.set_ft_fp16_moments(&ctx, step <= 3 || step == 6).unwrap();
+            let params = RangerUpdateParams { sgd_momentum: Some(0.9),
+                radam: RAdamUpdateParams { step, learning_rate: 0.01, gradient_factor: 1e-5,
+                    min_weight: -1.98, max_weight: 1.98, ..Default::default() }, ..Default::default() };
+            for runner in [&mut optimized, &mut reference] {
+                let loss = runner.step(&ctx, params, ScalarLossKind::SigmoidPow { pow_exp: 2.0 }, 1.0, batch()).unwrap();
+                assert!(loss.mean.is_finite());
+            }
+        }
+        let actual = optimized.read_weights(&ctx).unwrap();
+        let expected = reference.read_weights(&ctx).unwrap();
+        assert_close_slice("SGD FT half moments toggling", &actual.l0w, &expected.l0w, 1e-6);
+        assert_eq!(optimized.take_ft_fp16_moments_clipped(&ctx).unwrap(), 0);
     }
 
     #[test]

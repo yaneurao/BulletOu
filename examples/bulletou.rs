@@ -4330,10 +4330,9 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     resolved.apply_all_optim();
-    if resolved.optimizer == OptimizerKind::Sgd && (resolved.sfnn_ft_fp16_moments ||
-        resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
+    if resolved.optimizer == OptimizerKind::Sgd && (resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
         resolved.sfnn_l2_l3_center || resolved.sfnn_l1_effective_weight_clip) {
-        return Err(format!("SGD does not support FP16 optimizer moments, norm loss, centering, or effective clipping at epoch {epoch}"));
+        return Err(format!("SGD does not support norm loss, centering, or effective clipping at epoch {epoch}"));
     }
     if schedules.contains_key("ft_factorizer") {
         if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
@@ -6356,11 +6355,11 @@ impl Args {
         validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
         if self.optimizer == OptimizerKind::Sgd {
             if !self.eval_type().uses_layerstack() || self.lr_schedule == LrScheduleKind::Plateau ||
-                self.sfnn_dirty_bucket_update || self.sfnn_norm_loss_strength != 0.0 || self.sfnn_ft_fp16_moments ||
+                self.sfnn_dirty_bucket_update || self.sfnn_norm_loss_strength != 0.0 ||
                 self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 || self.sfnn_l1_center || self.sfnn_l2_l3_center || self.sfnn_l1_effective_weight_clip || self.optimizer_beta1.is_some() ||
                 self.optimizer_beta2.is_some() || self.optimizer_epsilon.is_some() ||
                 !(self.optimizer_momentum.is_finite() && (0.0..1.0).contains(&self.optimizer_momentum)) {
-                return Err("SGD requires SFNN, momentum in [0,1), and disables plateau, BN, dirty bucket updates, norm loss, centering/effective clipping, FP16 optimizer moments, and Ranger beta/epsilon overrides".into());
+                return Err("SGD requires SFNN, momentum in [0,1), and disables plateau, BN, dirty bucket updates, norm loss, centering/effective clipping, and Ranger beta/epsilon overrides".into());
             }
         }
         if self.initial_state.is_some() && self.resume.is_some() {
@@ -18533,15 +18532,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("SFNN layer QAT", format!("FT={} L1={} L2={} L3={} (non-BN; FP32 masters)",
             args.sfnn_qat_ft && args.non_bn_layer_qat(), args.effective_sfnn_qat_l1(),
             args.sfnn_qat_l2 && args.non_bn_layer_qat(), args.sfnn_qat_l3 && args.non_bn_layer_qat()));
-        if args.sfnn_ft_fp16 {
-            print_startup_kv("SFNN FT precision", format!("FP16 forward weights; FP16 activations={}; scaled FP16 temporary gradients={}; scaled FP16 optimizer moments={}; FP32 master and validation (experimental)", args.sfnn_ft_fp16_act, args.sfnn_ft_fp16_grad, args.sfnn_ft_fp16_moments));
-        }
         if args.effective_sfnn_qat_l1() && args.sfnn_qat_l2 && args.sfnn_qat_l3 && args.non_bn_layer_qat() {
             print_startup_kv("SFNN dense QAT", "on: integer L1/L2/L3 forward and continuous STE; FT precision follows sfnn_qat_ft");
         }
         if args.sfnn_gptq {
             print_startup_kv("SFNN GPTQ", format!("on: L2/L3 export after checkpoint; {} calibration positions", args.sfnn_gptq_calibration_positions));
         }
+    }
+    if args.sfnn_ft_fp16 {
+        print_startup_kv("SFNN FT precision", format!("FP16 forward weights; FP16 activations={}; scaled FP16 temporary gradients={}; scaled FP16 optimizer moments={}; FP32 master and validation (experimental)", args.sfnn_ft_fp16_act, args.sfnn_ft_fp16_grad, args.sfnn_ft_fp16_moments));
     }
     print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     let profile_steps = args.cuda_cpp_profile_steps.min(train_steps);
@@ -28989,6 +28988,12 @@ mod tests {
         assert_eq!(args.optimizer, OptimizerKind::Sgd);
         assert_eq!(args.optimizer_momentum, 0.9);
         assert!(args.validate_backend_flags().is_ok());
+        let mut optimized = Args::try_parse_from(["bulletou", "--teacher", "unused", "--backend", "cuda-cpp",
+            "--arch", "SFNN_halfkahm2_2304_15_64_k21k21_progress8", "--batch-size", "65536",
+            "--optimizer", "sgd", "--superbatches", "1", "--max-epochs", "1", "--all-optim"]).unwrap();
+        optimized.apply_all_optim();
+        assert!(optimized.sfnn_ft_fp16_moments);
+        optimized.validate_backend_flags().unwrap();
         for flags in [&["--optimizer-momentum", "1.0"][..], &["--sfnn-bn-ft"][..],
             &["--sfnn-dirty-bucket-update"][..], &["--sfnn-norm-loss-strength", "0.1"][..],
             &["--optimizer-beta1", "0.9"][..]] {
@@ -29004,6 +29009,7 @@ mod tests {
             "lr": {"epoch1": 0.001, "epoch7": 0.0001}
         }).to_string());
         let active = args_at_epoch(&scheduled, 7).unwrap();
+        assert!(args_at_epoch(&scheduled, 1).unwrap().sfnn_ft_fp16_moments);
         let mut historical = active.clone();
         historical.optimizer = OptimizerKind::Ranger;
         args_at_epoch(&historical, 1).expect("historical Ranger settings must resolve");
@@ -29020,17 +29026,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
         std::fs::write(&path, r#"{
-            "teacher":"teacher.bin", "backend":"cuda-cpp", "batch_size":65536,
+            "teacher":"teacher.bin", "backend":"cuda-cpp", "batch_size":65536, "optimizer":"sgd", "superbatches":1, "max_epochs":1,
             "arch":"SFNN_halfkahm2_2304_15_64_k21k21_progress8",
             "all_optim":{"epoch1":true,"epoch5":false,"epoch8":true}
         }"#).unwrap();
         let raw = vec!["bulletou".into(), "--settings-file".into(), path.as_os_str().to_owned()];
         let args = Args::try_parse_from(expand_settings_file_args(raw.clone()).unwrap()).unwrap();
         let start = args_at_epoch(&args, 1).unwrap();
+        start.validate_backend_flags().unwrap();
         let flags = |a: &Args| [a.sfnn_ft_fp16, a.sfnn_ft_fp16_grad, a.sfnn_ft_fp16_act, a.sfnn_ft_fp16_moments];
         assert_eq!(flags(&start), [true; 4]);
         assert_eq!(flags(&args_at_epoch(&start, 4).unwrap()), [true; 4]);
         let fifth = args_at_epoch(&start, 5).unwrap();
+        fifth.validate_backend_flags().unwrap();
         assert_eq!(flags(&fifth), [false; 4]);
         assert_eq!(flags(&args_at_epoch(&fifth, 8).unwrap()), [true; 4]);
         assert!(resume_signature_matches(&resume_signature(&start), &fifth));

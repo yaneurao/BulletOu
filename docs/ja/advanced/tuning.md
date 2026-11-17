@@ -462,4 +462,4 @@ SFNNの通常学習では `"optimizer": "sgd"` と `"optimizer_momentum": 0.9` �
 
 RangerとSGDを切り替えてcheckpointから再開する場合、重みと学習位置は保持し、optimizer状態とoptimizerのstepを初期化します。同じSGDのcheckpointから再開する場合はmomentumを復元します。checkpointにはoptimizer種別を保存します。
 
-SGDは現時点ではSFNNの通常学習・grid_searchのみ対応です。worker、plateau、BN、dirty bucket更新、norm loss、FP16 optimizer moments、centeringとは併用できません。`all_optim` はFP16 optimizer momentsを有効にするため、SGDでは無効にしてください。
+SGDは現時点ではSFNNの通常学習・grid_searchのみ対応です。worker、plateau、BN、dirty bucket更新、norm loss、centeringとは併用できません。`all_optim` も使用できます。SGDのFT momentumはFP16で保存し、更新時はFP32で計算します。FP16の範囲を超えたmomentumはクリップされ、警告に件数が表示されます。
