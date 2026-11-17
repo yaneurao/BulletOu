@@ -10740,7 +10740,7 @@ mod tests {
         let clipped = FtHalfMoments::new(&ctx, &clipped_state, true).unwrap();
         assert_eq!(clipped.take_clipped(&ctx).unwrap(), n as u64);
         clipped.decode(&ctx, &clipped_state).unwrap();
-        assert!(clipped_state.download(&ctx).unwrap().momentum.iter().all(|&x| x == 65504.0 / 1048576.0));
+        assert!(clipped_state.download(&ctx).unwrap().momentum.iter().all(|&x| x == 65504.0 / 262144.0));
         let big_gradient = vec![1.0; n];
         g.upload(&ctx, &big_gradient).unwrap();
         let params = RangerUpdateParams { sgd_momentum: Some(0.9), ..Default::default() };

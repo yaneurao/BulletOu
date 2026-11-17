@@ -534,7 +534,7 @@ __global__ void radam_update_reset_gradients_kernel(
 }
 
 constexpr float FT_MOMENTUM_SCALE = 268435456.0f;       // 2^28
-constexpr float FT_SGD_MOMENTUM_SCALE = 1048576.0f;     // 2^20; SGD momentum is not EMA-normalized
+constexpr float FT_SGD_MOMENTUM_SCALE = 262144.0f;      // 2^18; SGD momentum is not EMA-normalized
 constexpr float FT_VELOCITY_SCALE = 1099511627776.0f;  // 2^40
 
 __device__ __forceinline__ float ft_half_moment_scaled(float x, float scale, unsigned long long* clipped) {
