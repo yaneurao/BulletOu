@@ -72,3 +72,15 @@ CPU のみでの学習はサポートされていない。現在の BulletOu 学
 ### ライセンス
 
 MIT (上流から継承)。元のコピーライト表記は `LICENSE` に保持されている。
+
+
+
+### アプリバナー
+
+アプリバナーです。ご自由にお使いください。
+
+<p align="center">
+  <img src="docs/images/BulletOu-banner-600x200.jpg" alt="BulletOu UltraFast Shogi AI ML" width="480px">
+</p>
+
+<div align="center">

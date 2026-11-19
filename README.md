@@ -72,3 +72,14 @@ CPU-only training is not supported. The maintained BulletOu trainer backend is `
 ### License
 
 MIT (inherited from upstream). Original copyright notices are preserved in `LICENSE`.
+
+
+### App Banner
+
+Here is the app banner. Feel free to use it.
+
+<p align="center">
+  <img src="docs/images/BulletOu-banner-600x200.jpg" alt="BulletOu UltraFast Shogi AI ML" width="480px">
+</p>
+
+<div align="center">
