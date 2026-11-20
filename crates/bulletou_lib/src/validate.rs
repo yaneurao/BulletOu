@@ -261,7 +261,7 @@ pub fn compute_sign_accuracy_with_loss(
     let blend = 1.0 - lambda;
     let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
     let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
-    let mut loss_sum = 0.0f32;
+    let mut loss_sum = 0.0f64;
     for (i, (m, &s)) in model_outputs.iter().zip(teacher_scores.iter()).enumerate() {
         if let Some(cap) = score_drop_abs {
             if s.unsigned_abs() >= cap {
@@ -336,16 +336,16 @@ pub fn compute_sign_accuracy_with_loss(
                 }
             };
             let diff = model_p - target;
-            loss_sum += match loss_kind {
+            loss_sum += f64::from(match loss_kind {
                 ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bce_with_logits(*m * nnue2score / in_scaling, target),
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
-            };
+            });
             report.loss_sampled += 1;
         }
     }
     if have_results && report.loss_sampled > 0 {
-        report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+        report.test_loss = Some((loss_sum / report.loss_sampled as f64) as f32);
     }
     report
 }
@@ -423,7 +423,7 @@ pub fn compute_sign_accuracy_with_loss_masked(
         let blend = 1.0 - lambda;
         let inv_scale = if eval_scale > 0.0 { 1.0 / eval_scale } else { 0.0025 };
         let model_inv_scale = if model_output_scale > 0.0 { 1.0 / model_output_scale } else { 1.0 };
-        let mut loss_sum = 0.0f32;
+        let mut loss_sum = 0.0f64;
         for &i in &mask.loss_indices {
             let s = teacher_scores[i];
             let m = model_outputs[i];
@@ -445,14 +445,14 @@ pub fn compute_sign_accuracy_with_loss_masked(
                 }
             };
             let diff = model_p - target;
-            loss_sum += match loss_kind {
+            loss_sum += f64::from(match loss_kind {
                 ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bce_with_logits(m * nnue2score / in_scaling, target),
                 ValidationLossKind::SigmoidPow { pow_exp } => diff.abs().powf(pow_exp),
                 ValidationLossKind::WinRateModel { pow_exp, .. } => diff.abs().powf(pow_exp),
-            };
+            });
         }
         if report.loss_sampled > 0 {
-            report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+            report.test_loss = Some((loss_sum / report.loss_sampled as f64) as f32);
         }
     }
 
@@ -769,6 +769,22 @@ mod tests {
             let numeric = (bce_with_logits(z + h, 0.3) - bce_with_logits(z - h, 0.3)) / (2.0 * h);
             assert!((numeric - (sigmoid(z) - 0.3)).abs() < 0.0005);
         }
+    }
+
+    #[test]
+    fn bce_validation_large_zero_output_mean_is_log_two() {
+        // A long f32 accumulation used to report about 0.6888 here instead
+        // of ln(2), even though every individual BCE value equals ln(2).
+        let n = 921_060;
+        let outputs = vec![0.0; n];
+        let scores = vec![100; n];
+        let results = vec![1; n];
+        let kind = ValidationLossKind::BceWithLogits {
+            nnue2score: 600.0, in_scaling: 340.0, target: WinRateModelTargetParams::default(),
+        };
+        let report = compute_sign_accuracy_with_loss(&outputs, &scores, &results, None, 1.0, 600.0, 1.0, kind);
+        assert_eq!(report.loss_sampled, n);
+        assert!((report.test_loss.unwrap() - 2.0f32.ln()).abs() < 1e-7);
     }
 
     #[test]
