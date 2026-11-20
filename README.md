@@ -79,7 +79,7 @@ MIT (inherited from upstream). Original copyright notices are preserved in `LICE
 Here is the app banner. Feel free to use it.
 
 <p align="center">
-  <img src="docs/images/BulletOu-banner-600x200.jpg" alt="BulletOu UltraFast Shogi AI ML" width="480px">
+  <img src="docs/images/BulletOu-banner-600x200.jpg" alt="BulletOu UltraFast Shogi AI ML" width="600px">
 </p>
 
 <div align="center">
