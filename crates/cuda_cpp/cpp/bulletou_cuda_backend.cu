@@ -139,6 +139,7 @@ struct BulletOuCudaCppContext {
     const float* dense_qat_l2_bias = nullptr;
     const float* dense_qat_l3_bias = nullptr;
     int* dense_qat_l1_raw = nullptr;
+    bool dense_qat_weights_prepacked = false;
     size_t dense_qat_l1_raw_len = 0;
     int* dense_qat_l2_raw = nullptr;
     size_t dense_qat_l2_raw_len = 0;
@@ -167,6 +168,7 @@ struct BulletOuCudaCppHalfMoments {
     int device = 0;
     size_t len = 0;
     float momentum_scale = 0.0f;
+    bool sgd = false;
     __half* momentum = nullptr;
     __half* velocity = nullptr;
     unsigned long long* clipped = nullptr;
@@ -548,19 +550,19 @@ __device__ __forceinline__ float ft_half_moment_scaled(float x, float scale, uns
 }
 
 __global__ void ft_half_moments_encode(const float* momentum, const float* velocity,
-    __half* hm, __half* hv, size_t len, float momentum_scale, unsigned long long* clipped) {
+    __half* hm, __half* hv, size_t len, float momentum_scale, unsigned long long* clipped, bool sgd) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= len) return;
     hm[i] = __float2half_rn(ft_half_moment_scaled(momentum[i], momentum_scale, clipped));
-    hv[i] = __float2half_rn(ft_half_moment_scaled(velocity[i], FT_VELOCITY_SCALE, clipped));
+    hv[i] = sgd ? __float2half_rn(0.0f) : __float2half_rn(ft_half_moment_scaled(velocity[i], FT_VELOCITY_SCALE, clipped));
 }
 
 __global__ void ft_half_moments_decode(const __half* hm, const __half* hv, float* momentum,
-    float* velocity, size_t len, float momentum_scale) {
+    float* velocity, size_t len, float momentum_scale, bool sgd) {
     const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= len) return;
     momentum[i] = __half2float(hm[i]) / momentum_scale;
-    velocity[i] = __half2float(hv[i]) / FT_VELOCITY_SCALE;
+    if (!sgd) velocity[i] = __half2float(hv[i]) / FT_VELOCITY_SCALE;
 }
 
 __global__ void radam_update_reset_gradients_half_moments_kernel(
@@ -1832,7 +1834,7 @@ __global__ void sfnn_fold_l1_by_bucket_kernel(
     size_t input_dim, size_t output_dim, size_t num_stacks, size_t king_dim, size_t hand_dim,
     int has_shared, int has_axis, int king, int hand, int progress, int kh, int kp, int hp,
     float shared_alpha, float king_alpha, float hand_alpha, float progress_alpha, float pair_alpha,
-    const float* gates, const float* confidences, bool quantize) {
+    const float* gates, const float* confidences, bool quantize, int* packed_out) {
     const size_t stack = blockIdx.y;
     const size_t chunks = (input_dim + blockDim.x - 1) / blockDim.x;
     const size_t out = blockIdx.x / chunks;
@@ -1855,7 +1857,63 @@ __global__ void sfnn_fold_l1_by_bucket_kernel(
     for (size_t i = 0; i < axis_count; ++i) {
         value = __fadd_rn(value, __fmul_rn(axis_alphas[i], axis_weights[axis_ids[i] * input_dim * output_dim + factor_index]));
     }
-    dst[index] = quantize ? sfnn_quantize_dequant_clamped(value, 64.0f, -128.0f, 127.0f, false) : value;
+    const float folded = quantize ? sfnn_quantize_dequant_clamped(value, 64.0f, -128.0f, 127.0f, false) : value;
+    dst[index] = folded;
+    if (packed_out) {
+        const unsigned v = static_cast<unsigned>(__float2int_rn(folded * 64.0f)) & 255u;
+        const unsigned b = __shfl_down_sync(0xffffffffu, v, 1, 4);
+        const unsigned c = __shfl_down_sync(0xffffffffu, v, 2, 4);
+        const unsigned d = __shfl_down_sync(0xffffffffu, v, 3, 4);
+        if ((threadIdx.x & 3u) == 0)
+            packed_out[index / 4] = static_cast<int>(v | (b << 8) | (c << 16) | (d << 24));
+    }
+}
+
+// Transpose tile: coalesce factorizer reads while keeping residual
+// reads and output writes contiguous. Padding avoids shared-memory bank conflicts.
+__global__ void sfnn_fold_l1_tiled_kernel(
+    const float* weights, const float* shared_weights, const float* axis_weights, float* dst,
+    size_t input_dim, size_t output_dim, size_t num_stacks, size_t king_dim, size_t hand_dim,
+    int has_shared, int has_axis, int king, int hand, int progress, int kh, int kp, int hp,
+    float shared_alpha, float king_alpha, float hand_alpha, float progress_alpha, float pair_alpha,
+    const float* gates, const float* confidences, bool quantize, int* packed_out) {
+    __shared__ size_t ids[8], count;
+    __shared__ float alphas[8], gate;
+    __shared__ float tile[9][32 * 9];
+    const size_t stack = blockIdx.y;
+    const size_t input_base = (blockIdx.x % (input_dim / 32)) * 32;
+    const size_t output_base = (blockIdx.x / (input_dim / 32)) * 8;
+    if (threadIdx.x == 0) {
+        gate = sfnn_residual_count_gate(gates, stack, has_shared, has_axis);
+        count = has_axis ? sfnn_factorizer_axis_ids(stack, num_stacks, king_dim, hand_dim,
+            king, hand, progress, kh, kp, hp, ids) : 0;
+        if (count) sfnn_factorizer_axis_alphas(ids, count, num_stacks, king_dim, hand_dim,
+            kh, kp, hp, king_alpha, hand_alpha, progress_alpha, pair_alpha, confidences, alphas);
+    }
+    __syncthreads();
+    const size_t fi = threadIdx.x / 8, fo = threadIdx.x % 8;
+    const size_t factor_index = (input_base + fi) * output_dim + output_base + fo;
+    const size_t t = fi * 9 + fo;
+    if (has_shared) tile[0][t] = __fmul_rn(shared_alpha, shared_weights[factor_index]);
+    for (size_t j = 0; j < count; ++j)
+        tile[j + 1][t] = __fmul_rn(alphas[j], axis_weights[ids[j] * input_dim * output_dim + factor_index]);
+    __syncthreads();
+    const size_t in = input_base + threadIdx.x % 32, out = output_base + threadIdx.x / 32;
+    const size_t index = (stack * output_dim + out) * input_dim + in;
+    const size_t transposed = (threadIdx.x % 32) * 9 + threadIdx.x / 32;
+    float value = gate * weights[index];
+    if (has_shared) value = __fadd_rn(value, tile[0][transposed]);
+    for (size_t j = 0; j < count; ++j) value = __fadd_rn(value, tile[j + 1][transposed]);
+    const float folded = quantize ? sfnn_quantize_dequant_clamped(value, 64.0f, -128.0f, 127.0f, false) : value;
+    dst[index] = folded;
+    if (packed_out) {
+        const unsigned v = static_cast<unsigned>(__float2int_rn(folded * 64.0f)) & 255u;
+        const unsigned b = __shfl_down_sync(0xffffffffu, v, 1, 4);
+        const unsigned c = __shfl_down_sync(0xffffffffu, v, 2, 4);
+        const unsigned d = __shfl_down_sync(0xffffffffu, v, 3, 4);
+        if ((threadIdx.x & 3u) == 0)
+            packed_out[index / 4] = static_cast<int>(v | (b << 8) | (c << 16) | (d << 24));
+    }
 }
 
 __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
@@ -5536,11 +5594,22 @@ int block_count_1d(size_t len, int threads, int* blocks, const char* label) {
     return 0;
 }
 
+__global__ void test_delay_kernel(unsigned long long ticks) {
+    const unsigned long long start = clock64();
+    while (clock64() - start < ticks) {}
+}
+
+extern "C" int bulletou_test_stream_delay(BulletOuCudaCppContext* ctx) {
+    if (!ctx || set_context_device(ctx)) return -1;
+    test_delay_kernel<<<1, 1, 0, ctx->stream>>>(150000000ULL);
+    return check_kernel_launch("test stream delay");
+}
+
 // Test the production-width fold with a smaller number of buckets.
 extern "C" int bulletou_test_l1_bucket_fold(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* shared, BulletOuCudaCppF32Buffer* axis,
     BulletOuCudaCppF32Buffer* gates, BulletOuCudaCppF32Buffer* confidence,
-    BulletOuCudaCppF32Buffer* out, int fast) {
+    BulletOuCudaCppF32Buffer* out, BulletOuCudaCppI32Buffer* packed, int fast) {
     constexpr size_t width = 2304, outputs = 16, stacks = 36, king_dim = 3, axes = 46;
     const size_t cells = width * outputs;
     if (validate_buffer(ctx, w, stacks*cells, "test fold weights") ||
@@ -5548,13 +5617,19 @@ extern "C" int bulletou_test_l1_bucket_fold(BulletOuCudaCppContext* ctx,
         validate_buffer(ctx, axis, axes*cells, "test fold axes") ||
         validate_buffer(ctx, gates, stacks, "test fold gates") ||
         validate_buffer(ctx, confidence, axes, "test fold confidence") ||
-        validate_buffer(ctx, out, stacks*cells, "test fold output") || set_context_device(ctx)) return -1;
+        validate_buffer(ctx, out, stacks*cells, "test fold output") ||
+        (packed && validate_i32_buffer(ctx, packed, stacks*cells/4, "test fold packed")) || set_context_device(ctx)) return -1;
     constexpr int threads = 256;
-    if (fast) {
+    if (fast == 2) {
+        const dim3 grid(static_cast<unsigned>((width / 32) * (outputs / 8)), stacks);
+        sfnn_fold_l1_tiled_kernel<<<grid,threads,0,ctx->stream>>>(w->ptr,shared->ptr,axis->ptr,out->ptr,
+            width,outputs,stacks,king_dim,0,1,1,1,0,1,0,1,0,
+            0.7f,0.6f,0.8f,0.9f,0.4f,gates->ptr,confidence->ptr,true,packed ? packed->ptr : nullptr);
+    } else if (fast) {
         const dim3 grid(static_cast<unsigned>(outputs * ((width + threads - 1) / threads)), stacks);
         sfnn_fold_l1_by_bucket_kernel<<<grid,threads,0,ctx->stream>>>(w->ptr,shared->ptr,axis->ptr,out->ptr,
             width,outputs,stacks,king_dim,0,1,1,1,0,1,0,1,0,
-            0.7f,0.6f,0.8f,0.9f,0.4f,gates->ptr,confidence->ptr,true);
+            0.7f,0.6f,0.8f,0.9f,0.4f,gates->ptr,confidence->ptr,true,packed ? packed->ptr : nullptr);
     } else {
         const size_t len = stacks*cells;
         sfnn_build_quantized_proxy_stacked_weights_kernel<<<static_cast<unsigned>((len+threads-1)/threads),threads,0,ctx->stream>>>(
@@ -6207,9 +6282,22 @@ __global__ void dense_qat_l3_kernel(const float* input,const float* weights,cons
     output[i]=static_cast<float>(static_cast<double>(static_cast<int>(sum))/8128.0);
 }
 
-__global__ void dense_qat_l2_ste_kernel(const int* raw,float* gradient,size_t n) {
+__global__ void dense_qat_l2_ste_kernel(const int* raw, const float* master_bias, const int* buckets,
+    float* gradient, size_t n, size_t l2_size, size_t stacks) {
     const size_t i=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
-    if(i<n && (raw[i]<=0 || raw[i]>=8128)) gradient[i]=0.0f;
+    if(i>=n)return;
+    const int x=raw[i];
+    if(x<0 || x>8128){gradient[i]=0.0f;return;}
+    if(x!=0 && x!=8128)return;
+    const int bucket=buckets[i/l2_size];
+    if(bucket<0 || static_cast<size_t>(bucket)>=stacks){gradient[i]=0.0f;return;}
+    // The integer dot product is exact, but the master bias was rounded for
+    // the forward lattice. For the rounding identity STE, restore its
+    // fractional part before deciding which side of the clamp we are on.
+    const double bias=fmin(2147483647.0,fmax(-2147483648.0,
+        static_cast<double>(master_bias[static_cast<size_t>(bucket)*l2_size+i%l2_size])*8128.0));
+    const double fraction=bias-round(bias);
+    if((x==0 && fraction<=0.0) || (x==8128 && fraction>=0.0))gradient[i]=0.0f;
 }
 
 int launch_sfnn_forward_kernels(
@@ -6467,6 +6555,8 @@ int launch_sfnn_forward_kernels(
         if(!fused) bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
         if(check_kernel_launch("BN FT activation"))return -1;
     }
+    const bool prepacked_l1 = ctx->dense_qat_weights_prepacked;
+    ctx->dense_qat_weights_prepacked = false;
     if (ctx->dense_qat) {
         if(ctx->bn[0].params || ctx->bn[1].params || ctx->bn[2].params || has_l1f || has_l1ax || has_l2f || has_l2ax || has_l3f || has_l3ax)
             return fail_message("dense QAT requires folded L1 and unfactorized L2/L3 without BN");
@@ -6484,7 +6574,8 @@ int launch_sfnn_forward_kernels(
                 if (check_kernel_launch("packed QAT lattice")) return -1;
             }
             if (block_count_1d(weight_words, threads, &blocks, "packed QAT weights")) return -1;
-            dense_qat_weights_pack<<<blocks,threads,0,ctx->stream>>>(l1w, ctx->dense_qat_packed_weights, weight_words);
+            if (!prepacked_l1)
+                dense_qat_weights_pack<<<blocks,threads,0,ctx->stream>>>(l1w, ctx->dense_qat_packed_weights, weight_words);
         } else {
             if (block_count_1d(batch*ft_size,threads,&blocks,"dense QAT FT lattice")) return -1;
             dense_qat_ft_lattice_kernel<<<blocks,threads,0,ctx->stream>>>(combined,batch*ft_size);
@@ -7134,6 +7225,37 @@ extern "C" int bulletou_test_l1_gather2(BulletOuCudaCppContext* ctx,
         offsets->ptr, positions->ptr, dw->ptr, db->ptr, dfw->ptr, dfb->ptr,
         width, outputs, alpha, axis);
     return check_kernel_launch("test L1 gather");
+}
+
+// Diagnostic hook for the king/progress factorizer used by the SGD investigation.
+extern "C" int bulletou_test_l1_gather2_king_progress(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* inputs, BulletOuCudaCppF32Buffer* dy,
+    BulletOuCudaCppI32Buffer* offsets, BulletOuCudaCppI32Buffer* positions,
+    BulletOuCudaCppF32Buffer* dw, BulletOuCudaCppF32Buffer* db,
+    BulletOuCudaCppF32Buffer* dfw, BulletOuCudaCppF32Buffer* dfb,
+    BulletOuCudaCppF32Buffer* daw, BulletOuCudaCppF32Buffer* dab,
+    BulletOuCudaCppF32Buffer* confidence,
+    size_t batch, size_t width, size_t outputs, size_t stacks, size_t king_dim,
+    float shared_alpha, float king_alpha, float progress_alpha, float pair_alpha) {
+    const size_t axis_count=sfnn_factorizer_axis_count(stacks,king_dim,0,1,0,1,0);
+    if (!ctx || width%2 || validate_buffer(ctx,inputs,batch*width,"test axis inputs") ||
+        validate_buffer(ctx,dy,batch*outputs,"test axis dy") ||
+        validate_i32_buffer(ctx,offsets,stacks+1,"test axis offsets") ||
+        validate_i32_buffer(ctx,positions,batch,"test axis positions") ||
+        validate_buffer(ctx,dw,stacks*outputs*width,"test axis dw") ||
+        validate_buffer(ctx,db,stacks*outputs,"test axis db") ||
+        validate_buffer(ctx,dfw,width*outputs,"test axis shared dw") ||
+        validate_buffer(ctx,dfb,outputs,"test axis shared db") ||
+        validate_buffer(ctx,daw,axis_count*width*outputs,"test axis dw") ||
+        validate_buffer(ctx,dab,axis_count*outputs,"test axis db") ||
+        validate_buffer(ctx,confidence,axis_count,"test axis confidence")) return -1;
+    const CompactL1AxisGradient axis={daw->ptr,dab->ptr,stacks,king_dim,0,
+        1,0,1,0,1,0,king_alpha,1.0f,progress_alpha,pair_alpha,confidence->ptr};
+    const dim3 grid(static_cast<unsigned>((width/2+32)/32),static_cast<unsigned>(stacks),
+        static_cast<unsigned>((outputs+7)/8));
+    sfnn_l1_bucket_gather_gradient2<<<grid,256,0,ctx->stream>>>(inputs->ptr,dy->ptr,
+        offsets->ptr,positions->ptr,dw->ptr,db->ptr,dfw->ptr,dfb->ptr,width,outputs,shared_alpha,axis);
+    return check_kernel_launch("test L1 king/progress gather");
 }
 
 // No low-precision GEMM or changed gradients; accumulate across BPU as before.
@@ -8124,7 +8246,8 @@ int launch_sfnn_backward_kernels(
     if(ctx->dense_qat) {
         int qat_blocks=0;
         if(block_count_1d(batch*l2_size,threads,&qat_blocks,"dense QAT L2 STE"))return -1;
-        dense_qat_l2_ste_kernel<<<qat_blocks,threads,0,ctx->stream>>>(ctx->dense_qat_l2_raw,l2_gradients,batch*l2_size);
+        dense_qat_l2_ste_kernel<<<qat_blocks,threads,0,ctx->stream>>>(ctx->dense_qat_l2_raw,
+            ctx->dense_qat_l2_bias,buckets,l2_gradients,batch*l2_size,l2_size,num_stacks);
         if(check_kernel_launch("dense QAT L2 STE"))return -1;
     }
 
@@ -10135,6 +10258,7 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_create(BulletOuCudaCppContext* 
     *out = nullptr;
     auto* state = new BulletOuCudaCppHalfMoments();
     state->device = ctx->device; state->len = len;
+    state->sgd = sgd != 0;
     state->momentum_scale = sgd ? FT_SGD_MOMENTUM_SCALE : FT_MOMENTUM_SCALE;
     if (checked_malloc(&state->momentum, len, "FT FP16 momentum") ||
         checked_malloc(&state->velocity, len, "FT FP16 velocity") ||
@@ -10147,7 +10271,7 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_create(BulletOuCudaCppContext* 
     if (block_count_1d(len, 256, &blocks, "FT FP16 moments encode")) {
         cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
     }
-    ft_half_moments_encode<<<blocks,256,0,ctx->stream>>>(momentum->ptr, velocity->ptr, state->momentum, state->velocity, len, state->momentum_scale, state->clipped);
+    ft_half_moments_encode<<<blocks,256,0,ctx->stream>>>(momentum->ptr, velocity->ptr, state->momentum, state->velocity, len, state->momentum_scale, state->clipped, state->sgd);
     if (check_kernel_launch("FT FP16 moments encode")) {
         cudaFree(state->momentum); cudaFree(state->velocity); cudaFree(state->clipped); delete state; return -1;
     }
@@ -10162,7 +10286,7 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_decode(BulletOuCudaCppContext* 
         validate_buffer(ctx, velocity, state->len, "FT velocity") || set_context_device(ctx)) return -1;
     int blocks = 0;
     if (block_count_1d(state->len, 256, &blocks, "FT FP16 moments decode")) return -1;
-    ft_half_moments_decode<<<blocks,256,0,ctx->stream>>>(state->momentum, state->velocity, momentum->ptr, velocity->ptr, state->len, state->momentum_scale);
+    ft_half_moments_decode<<<blocks,256,0,ctx->stream>>>(state->momentum, state->velocity, momentum->ptr, velocity->ptr, state->len, state->momentum_scale, state->sgd);
     return check_kernel_launch("FT FP16 moments decode");
 }
 
@@ -10188,7 +10312,23 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_destroy(BulletOuCudaCppHalfMome
     return ok();
 }
 
-__global__ void sgd_momentum_update_kernel(float* gradients, float* weights, float* momentum,
+// SGD uses its otherwise-unused FP32 velocity slot as the low part of the
+// master weight. Preserve sub-ULP updates instead of rounding them away on
+// every step. Explicit rounded operations prevent compiler reassociation.
+__device__ __forceinline__ float sgd_compensated_weight(float weight, float& remainder,
+    float momentum, float learning_rate, float decay, float min_weight, float max_weight) {
+    const float decay_rate = learning_rate * decay;
+    const float delta = __fadd_rn(__fadd_rn(-learning_rate * momentum, -decay_rate * weight),
+        remainder * (1.0f - decay_rate));
+    const float updated = __fadd_rn(weight, delta);
+    const float clipped = clip_updated_weight(updated, min_weight, max_weight);
+    remainder = clipped == updated ? __fadd_rn(__fsub_rn(weight, updated), delta) : 0.0f;
+    if ((clipped >= max_weight && remainder > 0.0f) || (clipped <= min_weight && remainder < 0.0f))
+        remainder = 0.0f;
+    return clipped;
+}
+
+__global__ void sgd_momentum_update_kernel(float* gradients, float* weights, float* momentum, float* remainder,
     size_t len, float gradient_factor, float learning_rate, float decay, float beta,
     float min_weight, float max_weight) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -10196,41 +10336,126 @@ __global__ void sgd_momentum_update_kernel(float* gradients, float* weights, flo
     float g = gradients[i] * gradient_factor;
     float m = beta * momentum[i] + g;
     momentum[i] = m;
-    weights[i] = clip_updated_weight(weights[i] * (1.0f - learning_rate * decay) - learning_rate * m,
-        min_weight, max_weight);
+    float r = remainder[i];
+    weights[i] = sgd_compensated_weight(weights[i], r, m, learning_rate, decay, min_weight, max_weight);
+    remainder[i] = r;
     gradients[i] = 0.0f;
 }
 
-__global__ void sgd_momentum_update_half_kernel(float* gradients, float* weights, __half* momentum,
+__global__ void sgd_momentum_update_half_kernel(float* gradients, float* weights, __half* momentum, float* remainder,
     size_t len, float gradient_factor, float learning_rate, float decay, float beta,
     float min_weight, float max_weight, float momentum_scale, unsigned long long* clipped) {
     size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= len) return;
     float m = beta * (__half2float(momentum[i]) / momentum_scale) + gradients[i] * gradient_factor;
-    weights[i] = clip_updated_weight(weights[i] * (1.0f - learning_rate * decay) - learning_rate * m,
-        min_weight, max_weight);
+    float r = remainder[i];
+    weights[i] = sgd_compensated_weight(weights[i], r, m, learning_rate, decay, min_weight, max_weight);
+    remainder[i] = r;
     momentum[i] = __float2half_rn(ft_half_moment_scaled(m, momentum_scale, clipped));
     gradients[i] = 0.0f;
+}
+
+// Factorizer coordinates represent alpha * weight in the folded network.
+// Clip that contribution, not the arbitrary unscaled coordinates.
+__device__ __forceinline__ void axis_clip_bounds(size_t axis, size_t king_end, size_t hand_end,
+    size_t pair_end, float king_alpha, float hand_alpha, float pair_alpha, float progress_alpha,
+    const float* confidence, float min_weight, float max_weight, float& lo, float& hi) {
+    float a = axis < king_end ? king_alpha : axis < hand_end ? hand_alpha :
+        axis < pair_end ? pair_alpha : progress_alpha;
+    if (confidence) a *= confidence[axis];
+    lo = a > 0.0f && min_weight != -FLT_MAX ? fmaxf(-FLT_MAX, min_weight / a) : -FLT_MAX;
+    hi = a > 0.0f && max_weight != FLT_MAX ? fminf(FLT_MAX, max_weight / a) : FLT_MAX;
+}
+
+__global__ void factor_axis_update_kernel(float* gradients, float* weights, float* momentum, float* velocity,
+    size_t len, size_t stride, size_t king_end, size_t hand_end, size_t pair_end,
+    float king_alpha, float hand_alpha, float pair_alpha, float progress_alpha, const float* confidence,
+    float grad_factor, float lr, float decay, float beta1, float beta2, float epsilon, float step_size,
+    int use_denom, int sgd, float min_weight, float max_weight) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    float lo, hi;
+    axis_clip_bounds(i / stride, king_end, hand_end, pair_end, king_alpha, hand_alpha, pair_alpha,
+        progress_alpha, confidence, min_weight, max_weight, lo, hi);
+    float g = gradients[i] * grad_factor;
+    if (sgd) {
+        float m = beta1 * momentum[i] + g;
+        float r = velocity[i];
+        weights[i] = sgd_compensated_weight(weights[i], r, m, lr, decay, lo, hi);
+        momentum[i] = m;
+        velocity[i] = r;
+    } else {
+        float w = weights[i], m = momentum[i], v = velocity[i];
+        radam_update_one(g, lr, step_size, use_denom, decay, beta1, beta2, epsilon, lo, hi, &w, &m, &v);
+        weights[i] = w; momentum[i] = m; velocity[i] = v;
+    }
+    gradients[i] = 0.0f;
+}
+
+__global__ void factor_axis_lookahead_kernel(float* weights, float* slow, size_t len, size_t stride,
+    size_t king_end, size_t hand_end, size_t pair_end, float king_alpha, float hand_alpha,
+    float pair_alpha, float progress_alpha, const float* confidence, float lookahead_alpha,
+    int clip_after, float min_weight, float max_weight) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= len) return;
+    float lo = -FLT_MAX, hi = FLT_MAX;
+    if (clip_after) axis_clip_bounds(i / stride, king_end, hand_end, pair_end, king_alpha, hand_alpha,
+        pair_alpha, progress_alpha, confidence, min_weight, max_weight, lo, hi);
+    const float w = clip_updated_weight(lookahead_alpha * weights[i] + (1.0f-lookahead_alpha)*slow[i], lo, hi);
+    weights[i] = slow[i] = w;
+}
+
+extern "C" int bulletou_factor_axis_update_device(BulletOuCudaCppContext* ctx, size_t len, size_t stride,
+    size_t king_end, size_t hand_end, size_t pair_end, float king_alpha, float hand_alpha, float pair_alpha,
+    float progress_alpha, BulletOuCudaCppF32Buffer* confidence, float gradient_factor, float lr, float decay,
+    float beta1, float beta2, float epsilon, float step_size, int use_denom, int sgd, float min_weight,
+    float max_weight, float norm_rate, int norm_before, int do_lookahead, float lookahead_alpha, int clip_after,
+    BulletOuCudaCppF32Buffer* gradients, BulletOuCudaCppF32Buffer* weights, BulletOuCudaCppF32Buffer* momentum,
+    BulletOuCudaCppF32Buffer* velocity, BulletOuCudaCppF32Buffer* slow) {
+    if (!stride || len % stride || king_end > hand_end || hand_end > pair_end || pair_end > len / stride)
+        return fail_message("invalid factorizer axis clipping layout");
+    if (validate_buffer(ctx, gradients, len, "axis gradients") || validate_buffer(ctx, weights, len, "axis weights") ||
+        validate_buffer(ctx, momentum, len, "axis momentum") || validate_buffer(ctx, velocity, len, "axis velocity") ||
+        validate_buffer(ctx, slow, len, "axis slow") ||
+        (confidence && validate_buffer(ctx, confidence, len / stride, "axis confidence")) || set_context_device(ctx)) return -1;
+    if (!len) return ok();
+    int blocks = 0;
+    if (block_count_1d(len, 256, &blocks, "factorizer axis update")) return -1;
+    if (!sgd && norm_before && apply_norm_loss(ctx, weights, len, norm_rate)) return -1;
+    factor_axis_update_kernel<<<blocks,256,0,ctx->stream>>>(gradients->ptr, weights->ptr, momentum->ptr,
+        velocity->ptr, len, stride, king_end, hand_end, pair_end, king_alpha, hand_alpha, pair_alpha,
+        progress_alpha, confidence ? confidence->ptr : nullptr, gradient_factor, lr, decay, beta1, beta2,
+        epsilon, step_size, use_denom, sgd, min_weight, max_weight);
+    if (check_kernel_launch("factorizer axis update")) return -1;
+    if (!sgd && !norm_before && apply_norm_loss(ctx, weights, len, norm_rate)) return -1;
+    if (!sgd && do_lookahead) {
+        factor_axis_lookahead_kernel<<<blocks,256,0,ctx->stream>>>(weights->ptr, slow->ptr, len, stride,
+            king_end, hand_end, pair_end, king_alpha, hand_alpha, pair_alpha, progress_alpha,
+            confidence ? confidence->ptr : nullptr, lookahead_alpha, clip_after, min_weight, max_weight);
+        if (check_kernel_launch("factorizer axis lookahead")) return -1;
+    }
+    return ok();
 }
 
 extern "C" int bulletou_cuda_cpp_sgd_momentum_update_device(
     BulletOuCudaCppContext* ctx, size_t len, float gradient_factor, float learning_rate,
     float decay, float beta, float min_weight, float max_weight,
     BulletOuCudaCppF32Buffer* gradients, BulletOuCudaCppF32Buffer* weights,
-    BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppHalfMoments* half_moments) {
+    BulletOuCudaCppF32Buffer* momentum, BulletOuCudaCppF32Buffer* remainder, BulletOuCudaCppHalfMoments* half_moments) {
     if (validate_buffer(ctx, gradients, len, "SGD gradients") ||
         validate_buffer(ctx, weights, len, "SGD weights") ||
-        validate_buffer(ctx, momentum, len, "SGD momentum") || set_context_device(ctx)) return -1;
+        validate_buffer(ctx, momentum, len, "SGD momentum") ||
+        validate_buffer(ctx, remainder, len, "SGD update remainder") || set_context_device(ctx)) return -1;
     if (half_moments && (half_moments->device != ctx->device || half_moments->len != len ||
         half_moments->momentum_scale != FT_SGD_MOMENTUM_SCALE))
         return fail_message("SGD FT FP16 moments require matching device, length and optimizer");
     int blocks = 0;
     if (block_count_1d(len, 256, &blocks, "SGD momentum")) return -1;
     if (len && half_moments) sgd_momentum_update_half_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr,
-        weights->ptr, half_moments->momentum, len, gradient_factor, learning_rate, decay, beta,
+        weights->ptr, half_moments->momentum, remainder->ptr, len, gradient_factor, learning_rate, decay, beta,
         min_weight, max_weight, half_moments->momentum_scale, half_moments->clipped);
     else if (len) sgd_momentum_update_kernel<<<blocks, 256, 0, ctx->stream>>>(gradients->ptr, weights->ptr,
-        momentum->ptr, len, gradient_factor, learning_rate, decay, beta, min_weight, max_weight);
+        momentum->ptr, remainder->ptr, len, gradient_factor, learning_rate, decay, beta, min_weight, max_weight);
     return check_kernel_launch("SGD momentum update");
 }
 
@@ -11177,6 +11402,7 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
     if ((qat_l1w == nullptr) != (qat_l1b == nullptr)) {
         return fail_message("L1 QAT requires both weight and bias scratch buffers");
     }
+    ctx->dense_qat_weights_prepacked = false;
     if (qat_l1w != nullptr) {
         if (validate_buffer(ctx, qat_l1w, l1w_len, "QAT L1 weights") != 0 ||
             validate_buffer(ctx, qat_l1b, num_stacks * l1_out, "QAT L1 bias") != 0) return -1;
@@ -11189,16 +11415,37 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
             if (num_stacks == 3528 && l1_out == 16 && l1_group_count == 1 &&
                 l1_common_size == 0 && l1_shard_size == 0 && !bn_use_reference() &&
                 std::getenv("BULLETOU_L1_FOLD_BUCKET_REFERENCE") == nullptr) {
+                int* packed_out = nullptr;
+                if (ctx->dense_qat && ctx->dense_qat_dp4a_available > 0 && quantize_l1 &&
+                    ft_size == 2304 && batch >= 1024 &&
+                    (input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE ||
+                     input_size == SFNN_HALFKA_HM2_BASE_INPUT_SIZE + SFNN_HALFKA2_PIECE_INPUTS) &&
+                    std::getenv("BULLETOU_QAT_PACKED_REFERENCE") == nullptr &&
+                    std::getenv("BULLETOU_FUSED_L1_PACK_REFERENCE") == nullptr) {
+                    if (ensure_i32_scratch(&ctx->dense_qat_packed_weights, &ctx->dense_qat_packed_weights_len,
+                            l1w_len / 4, "fused packed QAT weights")) return -1;
+                    packed_out = ctx->dense_qat_packed_weights;
+                    ctx->dense_qat_weights_prepacked = true;
+                }
                 const dim3 grid(static_cast<unsigned>(l1_out * ((ft_size + threads - 1) / threads)),
                     static_cast<unsigned>(num_stacks));
-                sfnn_fold_l1_by_bucket_kernel<<<grid, threads, 0, ctx->stream>>>(
+                if (ft_size == 2304 && std::getenv("BULLETOU_L1_TILED_FOLD_REFERENCE") == nullptr)
+                sfnn_fold_l1_tiled_kernel<<<grid, threads, 0, ctx->stream>>>(
                     l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
                     qat_l1w->ptr, ft_size, l1_out, num_stacks, factorizer_king_axis_dim, factorizer_hand_axis_dim,
                     has_l1f, has_l1ax, use_king_axis, use_hand_axis, use_progress_axis,
                     use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
                     factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                     factorizer_progress_axis_alpha, factorizer_pair_alpha,
-                    residual_count_gates_ptr, factorizer_axis_confidences_ptr, quantize_l1);
+                    residual_count_gates_ptr, factorizer_axis_confidences_ptr, quantize_l1, packed_out);
+                else sfnn_fold_l1_by_bucket_kernel<<<grid, threads, 0, ctx->stream>>>(
+                    l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
+                    qat_l1w->ptr, ft_size, l1_out, num_stacks, factorizer_king_axis_dim, factorizer_hand_axis_dim,
+                    has_l1f, has_l1ax, use_king_axis, use_hand_axis, use_progress_axis,
+                    use_king_hand_pair, use_king_progress_pair, use_hand_progress_pair,
+                    factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
+                    factorizer_progress_axis_alpha, factorizer_pair_alpha,
+                    residual_count_gates_ptr, factorizer_axis_confidences_ptr, quantize_l1, packed_out);
             } else sfnn_build_quantized_proxy_stacked_weights_kernel<<<blocks, threads, 0, ctx->stream>>>(
                 l1w->ptr, has_l1f ? l1fw->ptr : nullptr, has_l1ax ? l1axw->ptr : nullptr,
                 qat_l1w->ptr, ft_size, l1_out, num_stacks,
@@ -13451,7 +13698,7 @@ extern "C" int bulletou_ft_saturation_guard(BulletOuCudaCppContext* ctx,
     return 0;
 }
 
-__global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,
+__global__ void clip_effective_l1_kernel(float* w,float* slow,const float* shared,const float* shared_slow,float* remainder,
     size_t n,size_t cols,size_t outputs,float alpha) {
     const size_t i=static_cast<size_t>(blockIdx.x)*static_cast<size_t>(blockDim.x)+threadIdx.x;
     if(i>=n) return;
@@ -13460,27 +13707,82 @@ __global__ void clip_effective_l1_kernel(float* w,float* slow,const float* share
     const float s=shared_slow ? alpha*shared_slow[si] : 0.0f;
     // Preserve in-range masters bit-for-bit. Do not fold the correction into bias.
     const float v=w[i]+f, vs=slow[i]+s;
-    if(v < -2.0f) w[i]=-2.0f-f;
-    else if(v > 127.0f/64.0f) w[i]=127.0f/64.0f-f;
+    if(v < -2.0f) { w[i]=-2.0f-f; if(remainder) remainder[i]=0.0f; }
+    else if(v > 127.0f/64.0f) { w[i]=127.0f/64.0f-f; if(remainder) remainder[i]=0.0f; }
     if(vs < -2.0f) slow[i]=-2.0f-s;
     else if(vs > 127.0f/64.0f) slow[i]=127.0f/64.0f-s;
 }
 
 extern "C" int bulletou_clip_effective_l1(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* w,BulletOuCudaCppF32Buffer* slow,
-    BulletOuCudaCppF32Buffer* shared,BulletOuCudaCppF32Buffer* shared_slow,
+    BulletOuCudaCppF32Buffer* shared,BulletOuCudaCppF32Buffer* shared_slow,BulletOuCudaCppF32Buffer* remainder,
     size_t cols,size_t outputs,float alpha) {
     if(!ctx || !w || !cols || !outputs || cols>SIZE_MAX/outputs || !std::isfinite(alpha)
         || w->len%(cols*outputs) || (shared==nullptr)!=(shared_slow==nullptr))
         return fail_message("invalid effective L1 clip shape");
     if(validate_buffer(ctx,w,w->len,"effective L1") || validate_buffer(ctx,slow,w->len,"slow effective L1")) return -1;
+    if(remainder && validate_buffer(ctx,remainder,w->len,"L1 SGD remainder")) return -1;
     if(shared && (validate_buffer(ctx,shared,cols*outputs,"shared L1") ||
         validate_buffer(ctx,shared_slow,cols*outputs,"slow shared L1"))) return -1;
     int blocks=0;
     if(block_count_1d(w->len,256,&blocks,"effective L1 clip")) return -1;
     clip_effective_l1_kernel<<<blocks,256,0,ctx->stream>>>(w->ptr,slow->ptr,shared?shared->ptr:nullptr,
-        shared_slow?shared_slow->ptr:nullptr,w->len,cols,outputs,alpha);
+        shared_slow?shared_slow->ptr:nullptr,remainder?remainder->ptr:nullptr,w->len,cols,outputs,alpha);
     return check_kernel_launch("effective L1 clip");
+}
+
+// Project the folded effective weight by adjusting only its bucket residual.
+// Factorizer coordinates and optimizer moments stay intact.
+__global__ void clip_effective_l1_axis_kernel(float* w, float* slow, const float* shared,
+    const float* shared_slow, const float* axis, const float* axis_slow, float* remainder,
+    size_t cols, size_t outputs, size_t stacks, size_t king_dim, size_t hand_dim,
+    int king, int hand, int progress, int kh, int kp, int hp,
+    float shared_alpha, float king_alpha, float hand_alpha, float progress_alpha, float pair_alpha) {
+    const size_t stack=blockIdx.y, local=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    __shared__ size_t ids[8], count;
+    __shared__ float alphas[8];
+    if (threadIdx.x==0) {
+        count=sfnn_factorizer_axis_ids(stack,stacks,king_dim,hand_dim,king,hand,progress,kh,kp,hp,ids);
+        sfnn_factorizer_axis_alphas(ids,count,stacks,king_dim,hand_dim,kh,kp,hp,
+            king_alpha,hand_alpha,progress_alpha,pair_alpha,nullptr,alphas);
+    }
+    __syncthreads();
+    if (local>=cols*outputs) return;
+    const size_t out=local/cols, in=local%cols, factor=in*outputs+out, index=stack*cols*outputs+local;
+    float fast=w[index], slower=slow[index];
+    if(shared) { fast=__fadd_rn(fast,__fmul_rn(shared_alpha,shared[factor]));
+        slower=__fadd_rn(slower,__fmul_rn(shared_alpha,shared_slow[factor])); }
+    for(size_t j=0;j<count;++j) {
+        const size_t ai=ids[j]*cols*outputs+factor;
+        fast=__fadd_rn(fast,__fmul_rn(alphas[j],axis[ai]));
+        slower=__fadd_rn(slower,__fmul_rn(alphas[j],axis_slow[ai]));
+    }
+    if(fast < -2.0f) { w[index]+=(-2.0f-fast); if(remainder) remainder[index]=0.0f; }
+    else if(fast > 127.0f/64.0f) { w[index]+=(127.0f/64.0f-fast); if(remainder) remainder[index]=0.0f; }
+    if(slower < -2.0f) slow[index]+=(-2.0f-slower);
+    else if(slower > 127.0f/64.0f) slow[index]+=(127.0f/64.0f-slower);
+}
+extern "C" int bulletou_clip_effective_l1_axis(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* slow,
+    BulletOuCudaCppF32Buffer* shared, BulletOuCudaCppF32Buffer* shared_slow,
+    BulletOuCudaCppF32Buffer* axis, BulletOuCudaCppF32Buffer* axis_slow, BulletOuCudaCppF32Buffer* remainder,
+    size_t cols,size_t outputs,size_t stacks,size_t king_dim,size_t hand_dim,
+    int king,int hand,int progress,int kh,int kp,int hp,
+    float shared_alpha,float king_alpha,float hand_alpha,float progress_alpha,float pair_alpha) {
+    if(!ctx || !w || !axis || !axis_slow || !cols || !outputs || !stacks ||
+       cols>SIZE_MAX/outputs || stacks>SIZE_MAX/(cols*outputs) || w->len!=stacks*cols*outputs ||
+       (shared==nullptr)!=(shared_slow==nullptr)) return fail_message("invalid axis effective L1 clip shape");
+    size_t count=sfnn_factorizer_axis_count(stacks,king_dim,hand_dim,progress,kh,kp,hp);
+    if(validate_buffer(ctx,w,w->len,"effective L1") || validate_buffer(ctx,slow,w->len,"slow L1") ||
+       validate_buffer(ctx,axis,count*cols*outputs,"axis L1") || validate_buffer(ctx,axis_slow,count*cols*outputs,"slow axis L1") ||
+       (remainder && validate_buffer(ctx,remainder,w->len,"L1 SGD remainder")) ||
+       (shared && (validate_buffer(ctx,shared,cols*outputs,"shared L1") ||
+                   validate_buffer(ctx,shared_slow,cols*outputs,"slow shared L1"))) || set_context_device(ctx)) return -1;
+    dim3 grid(static_cast<unsigned>((cols*outputs+255)/256),static_cast<unsigned>(stacks));
+    clip_effective_l1_axis_kernel<<<grid,256,0,ctx->stream>>>(w->ptr,slow->ptr,shared?shared->ptr:nullptr,
+        shared_slow?shared_slow->ptr:nullptr,axis->ptr,axis_slow->ptr,remainder?remainder->ptr:nullptr,cols,outputs,stacks,king_dim,hand_dim,
+        king,hand,progress,kh,kp,hp,shared_alpha,king_alpha,hand_alpha,progress_alpha,pair_alpha);
+    return check_kernel_launch("effective L1 axis clip");
 }
 
 __device__ void center_affine_row(float* w,float* b,float* sw,float* sb,float* gw,

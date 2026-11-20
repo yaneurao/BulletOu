@@ -140,6 +140,40 @@ impl SfnnTrainStepRunner {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires CUDA; SGD axis fold at an update boundary"]
+    fn sgd_axis_switch_preserves_output_momentum_and_unrelated_remainders() {
+        let ctx = Context::new(0).unwrap();
+        let mut host = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        host.l2fw = None; host.l2fb = None; host.l3fw = None; host.l3fb = None;
+        let mut r = SfnnTrainStepRunner::new(&ctx, host, 4, 2).unwrap();
+        let mut shape = host.shape; shape.factorizer_progress_axis = true;
+        let active = SfnnFactorizerActive { progress_axis: true, ..SfnnFactorizerActive::SHARED };
+        r.enable_l1_axes_zero(&ctx, shape, active, SfnnFactorizerAlpha::ONE).unwrap();
+        r.weights.l1axw.as_ref().unwrap().fill(&ctx, 0.01).unwrap();
+        r.weights.l1axb.as_ref().unwrap().fill(&ctx, 0.02).unwrap();
+        r.optimizer_states.l1w.momentum.fill(&ctx, 0.125).unwrap();
+        r.optimizer_states.l1w.velocity.fill(&ctx, 1e-8).unwrap();
+        r.optimizer_states.l1axw.as_ref().unwrap().velocity.fill(&ctx, 1e-8).unwrap();
+        r.optimizer_states.l2w.velocity.fill(&ctx, 2e-8).unwrap();
+        let batch = SfnnForwardDeviceBatch::from_host(&ctx, SfnnForwardHostBatch {
+            stm_indices: &[0,1,1,2,2,3,0,3], nstm_indices: &[3,2,2,1,1,0,3,0],
+            buckets: &[0,1,0,1], batch_size: 4, max_active: 2 }).unwrap();
+        let ws = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(shape, 4)).unwrap();
+        r.forward_current_weights(&ctx, &batch, &ws).unwrap();
+        let before = ws.download_output(&ctx).unwrap();
+        r.clear_sgd_factorizer_remainders(&ctx, false, true).unwrap();
+        let target = SfnnForwardShape { factorizer_progress_axis: false, ..shape };
+        r.switch_l1_factorizer(&ctx, target, SfnnFactorizerActive::SHARED, SfnnFactorizerAlpha::ONE,
+            &[vec![(0, 1.0)], vec![(1, 1.0)]]).unwrap();
+        let ws2 = SfnnForwardWorkspace::new(&ctx, SfnnForwardWorkspaceLayout::new(target, 4)).unwrap();
+        r.forward_current_weights(&ctx, &batch, &ws2).unwrap();
+        let after = ws2.download_output(&ctx).unwrap();
+        for (a, b) in before.iter().zip(after) { assert!((a - b).abs() < 1e-6); }
+        assert!(r.optimizer_states.l1w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.0));
+        assert!(r.optimizer_states.l1w.momentum.download(&ctx).unwrap().iter().all(|v| *v == 0.125));
+        assert!(r.optimizer_states.l2w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 2e-8));
+    }
+    #[test]
     #[ignore = "requires CUDA; tiny synthetic model"]
     fn bidirectional_fold_preserves_output_proxy_and_optimizer() {
         let ctx = Context::new(0).unwrap();

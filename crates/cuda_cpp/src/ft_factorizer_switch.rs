@@ -64,6 +64,33 @@ impl SfnnTrainStepRunner {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires CUDA; SGD FT fold at an update boundary"]
+    fn sgd_ft_switch_preserves_model_and_momentum() {
+        const BASE: usize = 73305;
+        const VR: usize = 1629;
+        let ctx = Context::new(0).unwrap();
+        let mut host = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        host.l2fw = None; host.l2fb = None; host.l3fw = None; host.l3fb = None;
+        host.shape.input_size = BASE + VR;
+        let ft = vec![0.01; host.shape.input_size * host.shape.ft_size];
+        host.l0w = &ft;
+        let mut r = SfnnTrainStepRunner::new(&ctx, host, 1, 1).unwrap();
+        r.optimizer_states.l0w.momentum.fill(&ctx, 0.125).unwrap();
+        r.optimizer_states.l0w.velocity.fill(&ctx, 1e-8).unwrap();
+        r.optimizer_states.l1w.velocity.fill(&ctx, 2e-8).unwrap();
+        let target = SfnnForwardShape { input_size: BASE, ..host.shape };
+        let proxy = SfnnForwardDeviceWeights::new_dense(&ctx, target).unwrap();
+        r.build_quantized_proxy(&ctx, BASE, VR, &proxy).unwrap();
+        let before = proxy.l0w.download(&ctx).unwrap();
+        r.clear_sgd_factorizer_remainders(&ctx, true, false).unwrap();
+        r.disable_ft_factorizer(&ctx, BASE, VR).unwrap();
+        r.build_quantized_proxy(&ctx, BASE, VR, &proxy).unwrap();
+        assert_eq!(before, proxy.l0w.download(&ctx).unwrap());
+        assert!(r.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.0));
+        assert!(r.optimizer_states.l0w.momentum.download(&ctx).unwrap().iter().all(|v| *v == 0.125));
+        assert!(r.optimizer_states.l1w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 2e-8));
+    }
+    #[test]
     fn host_fold_keeps_effective_rows() {
         let mut v = vec![1.,2.,3.,4.,5.,6.,7.,8.,10.,20.,30.,40.];
         fold_rows(&mut v,4,2,2,0.5).unwrap();

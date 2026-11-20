@@ -17,6 +17,90 @@ pub(crate) fn enabled(lr: SfnnLayerLrMultipliers) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires CUDA; checks the integer-QAT loss direction"]
+    fn sgd_dense_qat_output_bias_gradient_matches_lattice_loss_difference() {
+        let ctx = Context::new(0).unwrap();
+        let mut w = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        w.l2fw = None; w.l2fb = None; w.l3fw = None; w.l3fb = None;
+        w.l3b = &[0.0, 0.0];
+        let mut r = SfnnTrainStepRunner::new(&ctx, w, 1, 1).unwrap();
+        let lr = SfnnLayerLrMultipliers { qat_l1: true, qat_l2: true, qat_l3: true, ..Default::default() };
+        let batch = || SfnnTrainStepHostBatch { stm_indices: &[0], nstm_indices: &[2], buckets: &[0],
+            targets: &[1.0], entry_weights: &[1.0], batch_size: 1, max_active: 1 };
+        let params = RangerUpdateParams { sgd_momentum: Some(0.0), ..Default::default() };
+        let eval = |r: &mut SfnnTrainStepRunner| {
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx, params,
+                ScalarLossKind::BceWithLogits, 1.0, batch(), true, false, lr).unwrap();
+            let z = r.forward_workspace.download_output(&ctx).unwrap()[0] as f64;
+            (1.0 + (-z).exp()).ln()
+        };
+        let base = eval(&mut r);
+        let grad = r.backward_workspace.l3b_gradients.download(&ctx).unwrap()[0] as f64;
+        let h = 1.0f32 / 8128.0;
+        r.weights.l3b.upload(&ctx, &[h, 0.0]).unwrap();
+        let plus = eval(&mut r);
+        r.weights.l3b.upload(&ctx, &[-h, 0.0]).unwrap();
+        let minus = eval(&mut r);
+        let finite = (plus - minus) / (2.0 * h as f64);
+        assert!((finite - grad).abs() < 0.001, "base={base} grad={grad} finite={finite}");
+    }
+    #[test]
+    #[ignore = "requires CUDA; checks SGD through QAT forward and backward"]
+    fn sgd_dense_qat_decreases_fixed_batch_bce() {
+        let ctx = Context::new(0).unwrap();
+        let mut w = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        w.l2fw = None; w.l2fb = None; w.l3fw = None; w.l3fb = None;
+        let mut r = SfnnTrainStepRunner::new(&ctx, w, 4, 1).unwrap();
+        let lr = SfnnLayerLrMultipliers { qat_l1: true, qat_l2: true, qat_l3: true, ..Default::default() };
+        let batch = || SfnnTrainStepHostBatch { stm_indices: &[0, 1, 2, 3], nstm_indices: &[2, 0, 1, 0],
+            buckets: &[0, 1, 0, 1], targets: &[1.0, 0.0, 1.0, 0.0], entry_weights: &[1.0; 4],
+            batch_size: 4, max_active: 1 };
+        let mut initial = 0.0;
+        let mut last = 0.0;
+        for step in 1..=200 {
+            let params = RangerUpdateParams { sgd_momentum: Some(0.9),
+                radam: RAdamUpdateParams { step, learning_rate: 0.02, ..Default::default() }, ..Default::default() };
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx, params,
+                ScalarLossKind::BceWithLogits, 1.0, batch(), true, true, lr).unwrap();
+            let z = r.forward_workspace.download_output(&ctx).unwrap();
+            let targets = [1.0f64, 0.0, 1.0, 0.0];
+            last = z.iter().zip(targets).map(|(&z, t)| {
+                let z = z as f64; (z.max(0.0) - z * t) + (-z.abs()).exp().ln_1p()
+            }).sum::<f64>() / 4.0;
+            if step == 1 { initial = last; }
+        }
+        assert!(last < initial - 0.05, "initial={initial}, final={last}");
+    }
+    #[test]
+    #[ignore = "requires CUDA; checks the shared skip path against integer-QAT loss"]
+    fn sgd_dense_qat_shared_skip_bias_matches_lattice_loss_difference() {
+        let ctx = Context::new(0).unwrap();
+        let mut w = crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        w.l2fw = None; w.l2fb = None; w.l3fw = None; w.l3fb = None;
+        w.l1fb = Some(&[0.0, 0.0, 0.0]);
+        let mut r = SfnnTrainStepRunner::new(&ctx, w, 1, 1).unwrap();
+        let lr = SfnnLayerLrMultipliers { qat_l1: true, qat_l2: true, qat_l3: true, ..Default::default() };
+        let batch = || SfnnTrainStepHostBatch { stm_indices: &[0], nstm_indices: &[2], buckets: &[0],
+            targets: &[1.0], entry_weights: &[1.0], batch_size: 1, max_active: 1 };
+        let params = RangerUpdateParams { sgd_momentum: Some(0.0), ..Default::default() };
+        let eval = |r: &mut SfnnTrainStepRunner| {
+            r.forward_workspace.invalidate_l1_qat();
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx, params,
+                ScalarLossKind::BceWithLogits, 1.0, batch(), true, false, lr).unwrap();
+            let z = r.forward_workspace.download_output(&ctx).unwrap()[0] as f64;
+            (1.0 + (-z).exp()).ln()
+        };
+        let base = eval(&mut r);
+        let grad = r.backward_workspace.l1fb_gradients.download(&ctx).unwrap()[2] as f64;
+        let h = 1.0f32 / 8128.0;
+        r.weights.l1fb.as_ref().unwrap().upload(&ctx, &[0.0, 0.0, h]).unwrap();
+        let plus = eval(&mut r);
+        r.weights.l1fb.as_ref().unwrap().upload(&ctx, &[0.0, 0.0, -h]).unwrap();
+        let minus = eval(&mut r);
+        let finite = (plus - minus) / (2.0 * h as f64);
+        assert!((finite - grad).abs() < 0.001, "base={base} grad={grad} finite={finite}");
+    }
     pub(crate) fn integer_dense_expected(ctx:&Context, fw:&SfnnForwardWorkspace, proxy:&SfnnForwardDeviceWeights,
         shape:SfnnForwardShape, buckets:&[i32]) -> Vec<f32> {
         let combined=fw.combined.download(ctx).unwrap();
@@ -134,6 +218,35 @@ pub(crate) mod tests {
         assert_eq!(r.forward_workspace.l2.download(&ctx).unwrap()[0],0.0);
         assert!(r.backward_workspace.l2b_gradients.download(&ctx).unwrap()[0].abs()>0.1);
         assert!(r.backward_workspace.l1b_gradients.download(&ctx).unwrap()[0].abs()>0.1);
+    }
+    #[test]
+    #[ignore = "requires CUDA; checks the STE near both quantized L2 clamp boundaries"]
+    fn dense_qat_sub_lattice_l2_bias_passes_gradient() {
+        let ctx=Context::new(0).unwrap();
+        for (bias, expected_output, passes) in [(-0.25/8128.0,0.0,false),(0.25/8128.0,0.0,true),
+            (1.0-0.25/8128.0,1.0,true),(1.0+0.25/8128.0,1.0,false)] {
+        let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        let shape=w.shape; let n=shape.l1_out(); let l2in=shape.l2_in();
+        let l1w=vec![0.0;shape.num_stacks*n*shape.ft_size];
+        let l1b=vec![0.0;shape.num_stacks*n];
+        let l2w=vec![0.0;shape.num_stacks*shape.l2_size*l2in];
+        let mut l2b=vec![0.0;shape.num_stacks*shape.l2_size]; l2b[0]=bias;
+        let mut l3w=vec![0.0;shape.num_stacks*shape.l2_size]; l3w[0]=1.0;
+        let l3b=vec![0.0;shape.num_stacks];
+        w.l1w=&l1w;w.l1b=&l1b;w.l1fw=None;w.l1fb=None;
+        w.l2w=&l2w;w.l2b=&l2b;w.l2fw=None;w.l2fb=None;
+        w.l3w=&l3w;w.l3b=&l3b;w.l3fw=None;w.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+            targets:&[1.0],entry_weights:&[1.0],batch_size:1,max_active:1};
+        let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+        assert_eq!(r.forward_workspace.l2.download(&ctx).unwrap()[0],expected_output);
+        let grad=r.backward_workspace.l2b_gradients.download(&ctx).unwrap()[0];
+        if passes { assert!(grad.abs()>0.1,"bias={bias} grad={grad}"); }
+        else { assert_eq!(grad,0.0,"bias={bias}"); }
+        }
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]

@@ -4098,6 +4098,7 @@ pub struct RangerParamState {
 #[derive(Debug, Clone, Copy)]
 pub struct RangerParamHostState<'a> {
     pub momentum: &'a [f32],
+    /// RAdam second moment; for SGD, the FP32 weight-update remainder.
     pub velocity: &'a [f32],
     pub slow_params: &'a [f32],
 }
@@ -4105,6 +4106,7 @@ pub struct RangerParamHostState<'a> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RangerParamStateReadback {
     pub momentum: Vec<f32>,
+    /// RAdam second moment; for SGD, the FP32 weight-update remainder.
     pub velocity: Vec<f32>,
     pub slow_params: Vec<f32>,
 }
@@ -5556,6 +5558,10 @@ impl NnueTrainStepUploadSlot {
             )));
         }
         if self.in_use {
+            // A stream wait protects the device buffers, but does not stop
+            // the CPU from overwriting pinned staging memory. Wait for the
+            // previous H2D copy before refilling this slot.
+            self.upload_ready.synchronize()?;
             self.compute_done.wait(upload_ctx)?;
         }
         self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
@@ -6133,6 +6139,9 @@ impl SfnnTrainStepUploadSlot {
             )));
         }
         if self.in_use {
+            // The host writes the pinned buffers immediately; the stream
+            // wait below alone protects only the device-side buffers.
+            self.upload_ready.synchronize()?;
             self.compute_done.wait(upload_ctx)?;
         }
         self.pinned_stm_indices.upload_to_device(upload_ctx, &self.device_batch.stm_indices, batch.stm_indices)?;
@@ -6232,6 +6241,12 @@ pub struct SfnnTrainStepRunnerSnapshot {
     pub l2_revival_flags: u8,
     pub revival_rng: revival_rng::RevivalRng,
     pub batch_norm: batch_norm::NetworkState,
+    pub residual_count_decay_by_stack: F32Buffer,
+    pub residual_count_decay_enabled: bool,
+    pub residual_count_gates_by_stack: F32Buffer,
+    pub residual_count_gates_enabled: bool,
+    pub factorizer_axis_confidences: F32Buffer,
+    pub factorizer_axis_confidences_enabled: bool,
     pub weights: SfnnForwardDeviceWeights,
     pub optimizer_states: SfnnRangerOptimizerStates,
     pub factorizer: SfnnFactorizerActive,
@@ -6303,6 +6318,8 @@ pub struct SfnnLayerLrMultipliers {
     pub l0: f32,
     pub l1: f32,
     pub l2: f32,
+    /// Additional multiplier for L2 bias updates, relative to L2 weights.
+    pub l2_bias: f32,
     pub l3: f32,
     pub update_scope: SfnnUpdateScope,
     pub factorizer_residual_decay: f32,
@@ -6333,6 +6350,7 @@ impl Default for SfnnLayerLrMultipliers {
             l0: 1.0,
             l1: 1.0,
             l2: 1.0,
+            l2_bias: 1.0,
             l3: 1.0,
             update_scope: SfnnUpdateScope::All,
             factorizer_residual_decay: 0.0,
@@ -6361,12 +6379,15 @@ impl SfnnLayerLrMultipliers {
         if !self.norm_loss_strength.is_finite() || self.norm_loss_strength < 0.0 {
             return Err(CudaCppError::message("SFNN norm loss strength must be finite and non-negative"));
         }
-        for (name, value) in [("bn_affine", self.bn_affine), ("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l3", self.l3)] {
+        for (name, value) in [("bn_affine", self.bn_affine), ("l0", self.l0), ("l1", self.l1), ("l2", self.l2), ("l2_bias", self.l2_bias), ("l3", self.l3)] {
             if !(value.is_finite() && value >= 0.0) {
                 return Err(CudaCppError::message(format!(
                     "SFNN {name} learning-rate multiplier must be finite and non-negative"
                 )));
             }
+        }
+        if !(self.l2 * self.l2_bias).is_finite() {
+            return Err(CudaCppError::message("SFNN L2 bias learning-rate multiplier overflow"));
         }
         if !(self.factorizer_residual_decay.is_finite() && self.factorizer_residual_decay >= 0.0) {
             return Err(CudaCppError::message("SFNN factorizer residual decay must be finite and non-negative"));
@@ -6393,7 +6414,9 @@ impl SfnnLayerLrMultipliers {
     }
 
     fn param_multiplier(self, layer: SfnnUpdateLayer, kind: SfnnUpdateParamKind) -> f32 {
-        if self.update_scope.allows(layer, kind) { self.layer_multiplier(layer) } else { 0.0 }
+        if !self.update_scope.allows(layer, kind) { return 0.0; }
+        let factor = if matches!((layer, kind), (SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias)) { self.l2_bias } else { 1.0 };
+        self.layer_multiplier(layer) * factor
     }
 
     fn clip_params(
@@ -6960,6 +6983,24 @@ impl SfnnTrainStepRunner {
         Ok(())
     }
 
+    /// Discard SGD's sub-ULP update remainders before changing coordinates.
+    /// Momentum and unrelated layers are left intact. The caller must only
+    /// use this for SGD at an optimizer-update boundary.
+    pub fn clear_sgd_factorizer_remainders(&mut self, ctx: &Context, ft: bool, l1: bool) -> Result<()> {
+        if self.pending_gradient_batches != 0 {
+            return Err(CudaCppError::message("SGD factorizer rebase requires an optimizer-update boundary"));
+        }
+        if ft { self.optimizer_states.l0w.velocity.fill(ctx, 0.0)?; }
+        if l1 {
+            self.optimizer_states.l1w.velocity.fill(ctx, 0.0)?;
+            self.optimizer_states.l1b.velocity.fill(ctx, 0.0)?;
+            for state in [&self.optimizer_states.l1axw, &self.optimizer_states.l1axb].into_iter().flatten() {
+                state.velocity.fill(ctx, 0.0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Preserve FT/L1-shared contributions when their coefficients change.
     /// Positive -> zero folds into base and slow weights, resets mixed moments.
     /// Zero -> positive clears dormant shared weights and optimizer state.
@@ -7192,6 +7233,11 @@ impl SfnnTrainStepRunner {
     }
 
     pub fn snapshot_device(&self, ctx: &Context) -> Result<SfnnTrainStepRunnerSnapshot> {
+        // Snapshots do not contain accumulated gradients or the pending count.
+        // Restoring one mid-update would silently discard those batches.
+        if self.pending_gradient_batches != 0 {
+            return Err(CudaCppError::message("SFNN snapshot requires an optimizer-update boundary; accumulated gradients are pending"));
+        }
         self.sync_ft_half_moments(ctx)?;
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
@@ -7201,6 +7247,12 @@ impl SfnnTrainStepRunner {
             l2_revival_flags: self.l2_revival_flags,
             revival_rng: self.revival_rng,
             batch_norm: self.read_batch_norm_state(ctx)?,
+            residual_count_decay_by_stack: self.residual_count_decay_by_stack.try_clone_device(ctx)?,
+            residual_count_decay_enabled: self.residual_count_decay_enabled,
+            residual_count_gates_by_stack: self.residual_count_gates_by_stack.try_clone_device(ctx)?,
+            residual_count_gates_enabled: self.residual_count_gates_enabled,
+            factorizer_axis_confidences: self.factorizer_axis_confidences.try_clone_device(ctx)?,
+            factorizer_axis_confidences_enabled: self.factorizer_axis_confidences_enabled,
             weights: self.weights.try_clone_device(ctx)?,
             optimizer_states: self.optimizer_states.try_clone_device(ctx, self.shape)?,
             factorizer: self.factorizer,
@@ -7226,6 +7278,12 @@ impl SfnnTrainStepRunner {
         src.factorizer_alpha.validate()?;
         self.weights.copy_from_device(ctx, &src.weights)?;
         self.optimizer_states.copy_from_device(ctx, self.shape, &src.optimizer_states)?;
+        self.residual_count_decay_by_stack.copy_from(ctx, &src.residual_count_decay_by_stack)?;
+        self.residual_count_decay_enabled = src.residual_count_decay_enabled;
+        self.residual_count_gates_by_stack.copy_from(ctx, &src.residual_count_gates_by_stack)?;
+        self.residual_count_gates_enabled = src.residual_count_gates_enabled;
+        self.factorizer_axis_confidences.copy_from(ctx, &src.factorizer_axis_confidences)?;
+        self.factorizer_axis_confidences_enabled = src.factorizer_axis_confidences_enabled;
         self.backward_workspace.zero_parameter_gradients(ctx)?;
         self.factorizer = src.factorizer;
         self.factorizer_alpha = src.factorizer_alpha;
@@ -8411,9 +8469,17 @@ impl SfnnTrainStepRunner {
             &self.optimizer_states.l0b,
             l0b_lr,
         )?;
+        // Effective projection owns the L1 residual constraint. Clipping that
+        // residual independently first would undo cancellation of shared/axis
+        // terms on every optimizer step and change the quantized forward.
+        let mut l1_weight_params = lr_multipliers.clip_params(l1_residual_params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight);
+        if lr_multipliers.l1_effective_weight_clip {
+            l1_weight_params.radam.min_weight = -f32::MAX;
+            l1_weight_params.radam.max_weight = f32::MAX;
+        }
         update_stacked_param_group_with_lr_multiplier(
             ctx,
-            lr_multipliers.clip_params(l1_residual_params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
+            l1_weight_params,
             &self.backward_workspace.l1w_gradients,
             &self.weights.l1w,
             &self.optimizer_states.l1w,
@@ -8435,7 +8501,7 @@ impl SfnnTrainStepRunner {
             (Some(l1fw), Some(l1fb), Some(l1fw_state), Some(l1fb_state)) if self.factorizer.shared => {
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
+                    factor_contribution_clip(lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight), self.factorizer_alpha.shared),
                     &self.backward_workspace.l1fw_gradients,
                     l1fw,
                     l1fw_state,
@@ -8443,7 +8509,7 @@ impl SfnnTrainStepRunner {
                 )?;
                 update_param_group_with_lr_multiplier(
                     ctx,
-                    lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias),
+                    factor_contribution_clip(lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias), self.factorizer_alpha.shared),
                     &self.backward_workspace.l1fb_gradients,
                     l1fb,
                     l1fb_state,
@@ -8456,21 +8522,23 @@ impl SfnnTrainStepRunner {
         }
         match (&self.weights.l1axw, &self.weights.l1axb, &self.optimizer_states.l1axw, &self.optimizer_states.l1axb) {
             (Some(l1axw), Some(l1axb), Some(l1axw_state), Some(l1axb_state)) if self.factorizer.any_axis() => {
-                update_param_group_with_lr_multiplier(
+                update_axis_group_with_lr_multiplier(
                     ctx,
                     lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Weight),
                     &self.backward_workspace.l1axw_gradients,
                     l1axw,
                     l1axw_state,
                     l1w_lr,
+                    self.shape, self.factorizer_alpha, self.factorizer_axis_confidences(),
                 )?;
-                update_param_group_with_lr_multiplier(
+                update_axis_group_with_lr_multiplier(
                     ctx,
                     lr_multipliers.clip_params(params, SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias),
                     &self.backward_workspace.l1axb_gradients,
                     l1axb,
                     l1axb_state,
                     l1b_lr,
+                    self.shape, self.factorizer_alpha, self.factorizer_axis_confidences(),
                 )?;
             }
             (Some(_), Some(_), Some(_), Some(_)) => {}
@@ -8622,7 +8690,7 @@ impl SfnnTrainStepRunner {
         self.output_center_batches = 0;
         self.l1_center_batches = 0;
         if lr_multipliers.l1_effective_weight_clip && lr_multipliers.l1 > 0.0 {
-            l1_center::clip_effective_weights(self, ctx)?;
+            l1_center::clip_effective_weights(self, ctx, params.sgd_momentum.is_some())?;
         }
         if let Some(bn)=&self.batch_norm {bn.update_with_lr_multiplier(ctx,params,lr_multipliers.bn_affine)?;}
         self.pending_gradient_batches = 0;
@@ -8668,6 +8736,64 @@ fn update_param_group(
     state: &RangerParamState,
 ) -> Result<()> {
     update_param_group_with_lr_multiplier(ctx, params, gradients, weights, state, 1.0)
+}
+
+// Bounds refer to the factor's contribution after multiplying by alpha.
+fn factor_contribution_clip(mut params: RangerUpdateParams, alpha: f32) -> RangerUpdateParams {
+    if alpha == 0.0 {
+        params.radam.min_weight = f32::MIN;
+        params.radam.max_weight = f32::MAX;
+        return params;
+    }
+    let scale = |bound: f32| {
+        if bound == f32::MIN || bound == f32::MAX {
+            if bound.is_sign_negative() { f32::MIN } else { f32::MAX }
+        } else {
+            (bound as f64 / alpha as f64).clamp(f32::MIN as f64, f32::MAX as f64) as f32
+        }
+    };
+    params.radam.min_weight = scale(params.radam.min_weight);
+    params.radam.max_weight = scale(params.radam.max_weight);
+    params
+}
+
+fn update_axis_group_with_lr_multiplier(
+    ctx: &Context, params: RangerUpdateParams, gradients: &F32Buffer, weights: &F32Buffer,
+    state: &RangerParamState, lr_multiplier: f32, shape: SfnnForwardShape,
+    alpha: SfnnFactorizerAlpha, confidence: Option<&F32Buffer>,
+) -> Result<()> {
+    let bounded = params.radam.min_weight != f32::MIN || params.radam.max_weight != f32::MAX;
+    let unit = alpha.king_axis == 1.0 && alpha.hand_axis == 1.0 && alpha.pair == 1.0
+        && alpha.progress_axis == 1.0 && confidence.is_none();
+    if !bounded || unit || lr_multiplier == 0.0 {
+        return update_param_group_with_lr_multiplier(ctx, params, gradients, weights, state, lr_multiplier);
+    }
+    if !(lr_multiplier.is_finite() && lr_multiplier >= 0.0) {
+        return Err(CudaCppError::message("SFNN learning-rate multiplier must be finite and non-negative"));
+    }
+    let mut p = params;
+    p.radam.learning_rate *= lr_multiplier;
+    p.validate()?;
+    let len = weights.len();
+    let axis_count = shape.factorizer_axis_count();
+    if axis_count == 0 || len % axis_count != 0 || gradients.len() != len || state.momentum.len() != len
+        || state.velocity.len() != len || state.slow_params.len() != len {
+        return Err(CudaCppError::message("invalid factorizer axis optimizer state"));
+    }
+    let scale = if p.sgd_momentum.is_some() { RAdamStepScale { step_size: 0.0, use_denom: false } }
+        else { p.radam.step_scale()? };
+    let king_end = shape.factorizer_king_axis_dim * 2;
+    let hand_end = king_end + shape.factorizer_hand_axis_dim * 2;
+    let pair_end = axis_count - shape.factorizer_progress_axis_count();
+    check(unsafe { ffi::bulletou_factor_axis_update_device(ctx.as_ptr(), len, len / axis_count,
+        king_end, hand_end, pair_end, alpha.king_axis, alpha.hand_axis, alpha.pair, alpha.progress_axis,
+        confidence.map_or(std::ptr::null_mut(), F32Buffer::as_ptr), p.radam.gradient_factor,
+        p.radam.learning_rate, p.radam.decay, p.sgd_momentum.unwrap_or(p.radam.beta1), p.radam.beta2,
+        p.radam.epsilon, scale.step_size, i32::from(scale.use_denom), i32::from(p.sgd_momentum.is_some()),
+        p.radam.min_weight, p.radam.max_weight, p.norm_loss_rate(), i32::from(p.norm_loss_before),
+        i32::from(p.sgd_momentum.is_none() && p.should_lookahead()?), p.lookahead_alpha,
+        i32::from(p.clip_after_lookahead), gradients.as_ptr(), weights.as_ptr(), state.momentum.as_ptr(),
+        state.velocity.as_ptr(), state.slow_params.as_ptr()) })
 }
 
 fn update_param_group_with_lr_multiplier(
@@ -9221,6 +9347,7 @@ pub struct RangerDeviceStateMut<'a> {
     pub gradients: &'a F32Buffer,
     pub weights: &'a F32Buffer,
     pub momentum: &'a F32Buffer,
+    /// RAdam second moment; for SGD, the FP32 weight-update remainder.
     pub velocity: &'a F32Buffer,
     pub slow_params: &'a F32Buffer,
 }
@@ -9351,7 +9478,7 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
         return check(unsafe { ffi::bulletou_cuda_cpp_sgd_momentum_update_device(ctx.as_ptr(), len,
             params.radam.gradient_factor, params.radam.learning_rate, params.radam.decay, momentum,
             params.radam.min_weight, params.radam.max_weight, state.gradients.as_ptr(),
-            state.weights.as_ptr(), state.momentum.as_ptr(),
+            state.weights.as_ptr(), state.momentum.as_ptr(), state.velocity.as_ptr(),
             half.map_or(std::ptr::null_mut(), |h| h.raw.as_ptr())) });
     }
     let scale = params.radam.step_scale()?;
@@ -9492,6 +9619,7 @@ mod ffi {
             len: usize, gradient_factor: f32, learning_rate: f32, decay: f32, beta: f32,
             min_weight: f32, max_weight: f32, gradients: *mut BulletOuCudaCppF32Buffer,
             weights: *mut BulletOuCudaCppF32Buffer, momentum: *mut BulletOuCudaCppF32Buffer,
+            remainder: *mut BulletOuCudaCppF32Buffer,
             half_moments: *mut BulletOuCudaCppHalfMoments) -> i32;
         #[cfg(test)]
         #[cfg(test)]
@@ -9505,6 +9633,15 @@ mod ffi {
             combined: *mut BulletOuCudaCppF32Buffer, out_stm: *mut BulletOuCudaCppF32Buffer,
             out_nstm: *mut BulletOuCudaCppF32Buffer, bias: *mut BulletOuCudaCppF32Buffer,
             batch: usize, ft: usize, fused: i32) -> i32;
+        pub fn bulletou_factor_axis_update_device(ctx: *mut BulletOuCudaCppContext, len: usize, stride: usize,
+            king_end: usize, hand_end: usize, pair_end: usize, king_alpha: f32, hand_alpha: f32,
+            pair_alpha: f32, progress_alpha: f32, confidence: *mut BulletOuCudaCppF32Buffer,
+            gradient_factor: f32, lr: f32, decay: f32, beta1: f32, beta2: f32, epsilon: f32,
+            step_size: f32, use_denom: i32, sgd: i32, min_weight: f32, max_weight: f32,
+            norm_rate: f32, norm_before: i32, do_lookahead: i32, lookahead_alpha: f32, clip_after: i32,
+            gradients: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
+            momentum: *mut BulletOuCudaCppF32Buffer, velocity: *mut BulletOuCudaCppF32Buffer,
+            slow: *mut BulletOuCudaCppF32Buffer) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_grad(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
         pub fn bulletou_cuda_cpp_context_set_sfnn_ft_fp16_act(ctx: *mut BulletOuCudaCppContext, enabled: i32) -> i32;
@@ -9574,9 +9711,16 @@ mod ffi {
             gw: *mut BulletOuCudaCppF32Buffer, gb: *mut BulletOuCudaCppF32Buffer,
             batch: usize, ft: usize, active: usize, inputs: usize, ft_alpha: f32,
             strength: f32, rate: f32, patience: i32) -> i32;
-        pub fn bulletou_clip_effective_l1(ctx:*mut BulletOuCudaCppContext,
+        pub fn bulletou_clip_effective_l1_axis(ctx:*mut BulletOuCudaCppContext,
             w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,
             shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,
+            axis:*mut BulletOuCudaCppF32Buffer,axis_slow:*mut BulletOuCudaCppF32Buffer,remainder:*mut BulletOuCudaCppF32Buffer,
+            cols:usize,outputs:usize,stacks:usize,king_dim:usize,hand_dim:usize,
+            king:i32,hand:i32,progress:i32,kh:i32,kp:i32,hp:i32,
+            shared_alpha:f32,king_alpha:f32,hand_alpha:f32,progress_alpha:f32,pair_alpha:f32)->i32;
+        pub fn bulletou_clip_effective_l1(ctx:*mut BulletOuCudaCppContext,
+            w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,
+            shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,remainder:*mut BulletOuCudaCppF32Buffer,
             cols:usize,outputs:usize,alpha:f32)->i32;
         #[cfg(test)]
         pub fn bulletou_center_affine_layout(ctx:*mut BulletOuCudaCppContext,
@@ -10463,6 +10607,282 @@ mod ffi {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires CUDA; verifies pure SGD and BCE on a single-bucket network without skip or factorizer"]
+    fn sgd_single_bucket_bce_gradients_and_step_match_finite_difference() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let shape = SfnnForwardShape { input_size: 4, ft_size: 4, l1_hidden: 2, l1_skip: false,
+            l2_size: 2, num_stacks: 1, l1_group_count: 1, l1_common_size: 0, l1_shard_size: 0,
+            factorizer_king_axis_dim: 0, factorizer_hand_axis_dim: 0, factorizer_progress_axis: false,
+            factorizer_king_hand_pair: false, factorizer_king_progress_pair: false, factorizer_hand_progress_pair: false };
+        let w = SfnnForwardHostWeights { shape,
+            l0w: &[0.2,0.3,0.4,0.5, 0.1,0.2,0.3,0.4, 0.3,0.1,0.2,0.4, 0.4,0.2,0.3,0.1],
+            l0b: &[0.1,0.1,0.1,0.1], l1w: &[0.3,0.2,0.4,0.1, 0.2,0.4,0.1,0.3],
+            l1b: &[0.05,0.08], l1fw: None, l1fb: None, l1axw: None, l1axb: None,
+            l2w: &[0.2,0.3,0.4,0.1, 0.3,0.1,0.2,0.4], l2b: &[0.1,0.2],
+            l2fw: None, l2fb: None, l2axw: None, l2axb: None,
+            l3w: &[0.4,-0.2], l3b: &[0.03], l3fw: None, l3fb: None, l3axw: None, l3axb: None };
+        let mut r = SfnnTrainStepRunner::new(&ctx, w, 4, 1).unwrap();
+        let targets = [0.2f32,0.4,0.6,0.9];
+        let batch = SfnnTrainStepHostBatch { stm_indices: &[0,1,2,3], nstm_indices: &[2,3,0,1],
+            buckets: &[0;4], targets: &targets, entry_weights: &[1.0;4], batch_size: 4, max_active: 1 };
+        let p = RangerUpdateParams { sgd_momentum: Some(0.0),
+            radam: RAdamUpdateParams { learning_rate: 0.02, ..Default::default() }, ..Default::default() };
+        let policy = SfnnLayerLrMultipliers::default();
+        let scale = 600.0f32 / 340.0;
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx, p, ScalarLossKind::BceWithLogits,
+            scale, batch, true, false, policy).unwrap();
+        let eval = || {
+            sfnn_forward_device_with_factorizer_and_alpha(&ctx, &r.device_batch, &r.weights,
+                &r.forward_workspace, r.factorizer, r.factorizer_alpha).unwrap();
+            let out = r.forward_workspace.download_output(&ctx).unwrap();
+            out.iter().zip(targets).map(|(&x,t)| {
+                let z = x as f64 * scale as f64;
+                z.max(0.0) - z * t as f64 + (-z.abs()).exp().ln_1p()
+            }).sum::<f64>() / targets.len() as f64
+        };
+        let before = eval();
+        for (name, weights, gradients) in [
+            ("ft", &r.weights.l0w, &r.backward_workspace.l0w_gradients),
+            ("ft_bias", &r.weights.l0b, &r.backward_workspace.l0b_gradients),
+            ("l1", &r.weights.l1w, &r.backward_workspace.l1w_gradients),
+            ("l1_bias", &r.weights.l1b, &r.backward_workspace.l1b_gradients),
+            ("l2", &r.weights.l2w, &r.backward_workspace.l2w_gradients),
+            ("l2_bias", &r.weights.l2b, &r.backward_workspace.l2b_gradients),
+            ("l3", &r.weights.l3w, &r.backward_workspace.l3w_gradients),
+            ("l3_bias", &r.weights.l3b, &r.backward_workspace.l3b_gradients),
+        ] {
+            let mut values = weights.download(&ctx).unwrap();
+            let grad = gradients.download(&ctx).unwrap();
+            let i = (0..grad.len()).max_by(|&a,&b| grad[a].abs().total_cmp(&grad[b].abs())).unwrap();
+            let h = 0.001f32; let original = values[i];
+            values[i] = original+h; weights.upload(&ctx,&values).unwrap(); let plus = eval();
+            values[i] = original-h; weights.upload(&ctx,&values).unwrap(); let minus = eval();
+            values[i] = original; weights.upload(&ctx,&values).unwrap();
+            let finite = (plus-minus)/(2.0*h as f64);
+            eprintln!("{name}[{i}]: analytical={}, finite={finite}",grad[i]);
+            assert!((grad[i] as f64-finite).abs() < 3e-6 + finite.abs()*0.003,
+                "{name}[{i}]: analytical={}, finite={finite}",grad[i]);
+        }
+        r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,policy,None).unwrap();
+        sfnn_forward_device_with_factorizer_and_alpha(&ctx, &r.device_batch, &r.weights,
+            &r.forward_workspace, r.factorizer, r.factorizer_alpha).unwrap();
+        let after = r.forward_workspace.download_output(&ctx).unwrap().iter().zip(targets).map(|(&x,t)| {
+            let z = x as f64 * scale as f64;
+            z.max(0.0) - z * t as f64 + (-z.abs()).exp().ln_1p()
+        }).sum::<f64>() / targets.len() as f64;
+        assert!(after < before, "pure SGD BCE: before={before}, after={after}");
+    }
+
+    #[test]
+    fn factorizer_shared_clip_scales_with_alpha() {
+        use super::*;
+        let mut p = RangerUpdateParams::default();
+        p.radam.min_weight = -1.0;
+        p.radam.max_weight = 1.0;
+        let half = factor_contribution_clip(p, 0.5);
+        assert_eq!((half.radam.min_weight, half.radam.max_weight), (-2.0, 2.0));
+        let zero = factor_contribution_clip(p, 0.0);
+        assert_eq!((zero.radam.min_weight, zero.radam.max_weight), (f32::MIN, f32::MAX));
+        assert_eq!(factor_contribution_clip(RangerUpdateParams::default(), 2.0).radam.max_weight, f32::MAX);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn factorizer_axis_clip_uses_per_axis_alpha_for_sgd_and_ranger() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let mut shape = tiny_sfnn_shape();
+        shape.factorizer_king_axis_dim = 1;
+        shape.factorizer_hand_axis_dim = 0;
+        shape.factorizer_progress_axis = false;
+        shape.factorizer_king_hand_pair = false;
+        shape.factorizer_king_progress_pair = false;
+        shape.factorizer_hand_progress_pair = false;
+        shape.num_stacks = 1;
+        assert_eq!(shape.factorizer_axis_count(), 2);
+        let alpha = SfnnFactorizerAlpha { king_axis: 0.5, ..SfnnFactorizerAlpha::ONE };
+        let confidence = F32Buffer::from_host(&ctx, &[1.0, 0.5]).unwrap();
+        for sgd in [false, true] {
+            let values = [3.0, 5.0, 7.0, -9.0];
+            let weights = F32Buffer::from_host(&ctx, &values).unwrap();
+            let gradients = F32Buffer::from_host(&ctx, &[0.0; 4]).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &values).unwrap();
+            let mut p = RangerUpdateParams { sgd_momentum: sgd.then_some(0.0), ..Default::default() };
+            p.radam.min_weight = -1.0; p.radam.max_weight = 1.0;
+            update_axis_group_with_lr_multiplier(&ctx, p, &gradients, &weights, &state, 1.0,
+                shape, alpha, Some(&confidence)).unwrap();
+            assert_eq!(weights.download(&ctx).unwrap(), vec![2.0, 2.0, 4.0, -4.0]);
+            if sgd { assert_eq!(state.velocity.download(&ctx).unwrap(), vec![0.0; 4]); }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn factorizer_axis_clip_handles_zero_pair_progress_and_lookahead() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let mut shape = tiny_sfnn_shape();
+        shape.factorizer_king_axis_dim = 1;
+        shape.factorizer_hand_axis_dim = 0;
+        shape.factorizer_progress_axis = true;
+        shape.factorizer_king_hand_pair = false;
+        shape.factorizer_king_progress_pair = true;
+        shape.factorizer_hand_progress_pair = false;
+        shape.num_stacks = 2;
+        assert_eq!(shape.factorizer_axis_count(), 6);
+        let alpha = SfnnFactorizerAlpha { king_axis: 0.0, pair: 2.0, progress_axis: 0.5, ..SfnnFactorizerAlpha::ONE };
+        for clip_after in [false, true] {
+            let weights = F32Buffer::from_host(&ctx, &[3.0; 6]).unwrap();
+            let gradients = F32Buffer::from_host(&ctx, &[0.0; 6]).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &[3.0; 6]).unwrap();
+            let mut p = RangerUpdateParams::default();
+            p.radam.min_weight = -1.0; p.radam.max_weight = 1.0;
+            p.radam.step = 6;
+            p.clip_after_lookahead = clip_after;
+            update_axis_group_with_lr_multiplier(&ctx, p, &gradients, &weights, &state, 1.0,
+                shape, alpha, None).unwrap();
+            let expected = if clip_after { vec![3.0, 3.0, 0.5, 0.5, 2.0, 2.0] }
+                else { vec![3.0, 3.0, 1.75, 1.75, 2.5, 2.5] };
+            assert_eq!(weights.download(&ctx).unwrap(), expected);
+            assert_eq!(state.slow_params.download(&ctx).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn factorizer_axis_optimizer_matches_individual_updates() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let mut shape = tiny_sfnn_shape();
+        shape.factorizer_king_axis_dim = 1; shape.factorizer_hand_axis_dim = 0;
+        shape.factorizer_progress_axis = true; shape.factorizer_king_hand_pair = false;
+        shape.factorizer_king_progress_pair = true; shape.factorizer_hand_progress_pair = false;
+        shape.num_stacks = 2;
+        let alpha = SfnnFactorizerAlpha { king_axis: 0.5, pair: 2.0, progress_axis: 0.25, ..SfnnFactorizerAlpha::ONE };
+        let coefficients = [0.5, 0.25, 2.0, 1.0, 0.25, 0.125];
+        let confidence = F32Buffer::from_host(&ctx, &[1.0, 0.5, 1.0, 0.5, 1.0, 0.5]).unwrap();
+        let values = [1.0, -4.0, 0.4, 2.0, 3.0, -9.0];
+        let grads = [0.2, -0.1, 0.3, -0.4, 0.01, 0.5];
+        for sgd in [false, true] {
+            let weights = F32Buffer::from_host(&ctx, &values).unwrap();
+            let gradients = F32Buffer::from_host(&ctx, &grads).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &values).unwrap();
+            state.momentum.fill(&ctx, 0.2).unwrap();
+            if !sgd { state.velocity.fill(&ctx, 0.04).unwrap(); }
+            let mut p = RangerUpdateParams { sgd_momentum: sgd.then_some(0.9), ..Default::default() };
+            p.radam.step = 6; p.radam.min_weight = -1.0; p.radam.max_weight = 1.0;
+            p.radam.learning_rate = 0.01; p.radam.decay = 0.001;
+            update_axis_group_with_lr_multiplier(&ctx, p, &gradients, &weights, &state, 1.0,
+                shape, alpha, Some(&confidence)).unwrap();
+            let actual = weights.download(&ctx).unwrap();
+            for i in 0..values.len() {
+                let w = F32Buffer::from_host(&ctx, &[values[i]]).unwrap();
+                let g = F32Buffer::from_host(&ctx, &[grads[i]]).unwrap();
+                let s = RangerParamState::from_host_weights(&ctx, &[values[i]]).unwrap();
+                s.momentum.fill(&ctx, 0.2).unwrap();
+                if !sgd { s.velocity.fill(&ctx, 0.04).unwrap(); }
+                update_param_group_with_lr_multiplier(&ctx, factor_contribution_clip(p, coefficients[i]),
+                    &g, &w, &s, 1.0).unwrap();
+                let expected = w.download(&ctx).unwrap()[0];
+                assert!((actual[i] - expected).abs() < 1e-6, "sgd={sgd} axis={i}: {} != {expected}", actual[i]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sgd_factorizer_remainder_clear_preserves_momentum_and_other_layers() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let shape = tiny_sfnn_shape();
+        let mut runner = SfnnTrainStepRunner::new(&ctx, tiny_sfnn_weights(shape), 1, 1).unwrap();
+        runner.optimizer_states.l0w.velocity.fill(&ctx, 0.01).unwrap();
+        runner.optimizer_states.l0w.momentum.fill(&ctx, 0.5).unwrap();
+        runner.optimizer_states.l1w.velocity.fill(&ctx, 0.02).unwrap();
+        runner.optimizer_states.l1fw.as_ref().unwrap().velocity.fill(&ctx, 0.03).unwrap();
+        runner.optimizer_states.l2w.velocity.fill(&ctx, 0.04).unwrap();
+        runner.clear_sgd_factorizer_remainders(&ctx, false, true).unwrap();
+        assert!(runner.optimizer_states.l1w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.0));
+        assert!(runner.optimizer_states.l1fw.as_ref().unwrap().velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.03));
+        assert!(runner.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.01));
+        assert!(runner.optimizer_states.l2w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.04));
+        runner.clear_sgd_factorizer_remainders(&ctx, true, false).unwrap();
+        assert!(runner.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|v| *v == 0.0));
+        assert!(runner.optimizer_states.l0w.momentum.download(&ctx).unwrap().iter().all(|v| *v == 0.5));
+        runner.pending_gradient_batches = 1;
+        assert!(runner.clear_sgd_factorizer_remainders(&ctx, true, true).is_err());
+    }
+    #[test]
+    fn l2_bias_lr_multiplier_affects_only_l2_bias() {
+        use super::*;
+        let m = SfnnLayerLrMultipliers { l2: 10_000.0, l2_bias: 0.1, ..Default::default() };
+        m.validate().unwrap();
+        assert_eq!(m.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Weight), 10_000.0);
+        assert_eq!(m.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias), 1_000.0);
+        assert_eq!(m.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias), 1.0);
+        assert!(SfnnLayerLrMultipliers { l2: f32::MAX, l2_bias: 2.0, ..m }.validate().is_err());
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_preserves_sub_ulp_updates_and_remainder_across_half_moment_restore() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        for half_mode in [false, true] {
+            let start = -0.17503738f32;
+            let w = F32Buffer::from_host(&ctx, &[start]).unwrap();
+            let g = F32Buffer::new(&ctx, 1).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &[start]).unwrap();
+            let mut half = half_mode.then(|| FtHalfMoments::new(&ctx, &state, true).unwrap());
+            let params = RangerUpdateParams { sgd_momentum: Some(0.0),
+                radam: RAdamUpdateParams { learning_rate: 0.0022483811, ..Default::default() },
+                ..Default::default() };
+            let grad = 1.0e-8f32;
+            for step in 0..1000 {
+                g.upload(&ctx, &[grad]).unwrap();
+                ranger_update_device_with_half_moments(&ctx, params, RangerDeviceStateMut {
+                    gradients: &g, weights: &w, momentum: &state.momentum,
+                    velocity: &state.velocity, slow_params: &state.slow_params,
+                }, half.as_ref()).unwrap();
+                if step == 499 && half_mode {
+                    half.as_ref().unwrap().decode(&ctx, &state).unwrap();
+                    let saved = state.download(&ctx).unwrap();
+                    assert_ne!(saved.velocity[0], 0.0);
+                    half = Some(FtHalfMoments::new(&ctx, &state, true).unwrap());
+                    half.as_ref().unwrap().decode(&ctx, &state).unwrap();
+                    assert_eq!(state.download(&ctx).unwrap().velocity, saved.velocity);
+                }
+            }
+            let expected = (start as f64 - 1000.0 * params.radam.learning_rate as f64 * grad as f64) as f32;
+            let actual = w.download(&ctx).unwrap()[0];
+            assert_eq!(actual, expected, "half={half_mode}");
+            assert_ne!(actual, start);
+        }
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_preserves_small_weight_decay_and_discards_clipped_remainder() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let w = F32Buffer::from_host(&ctx, &[1.0, 1.0]).unwrap();
+        let g = F32Buffer::new(&ctx, 2).unwrap();
+        let state = RangerParamState::from_host_weights(&ctx, &[1.0, 1.0]).unwrap();
+        let params = RangerUpdateParams { sgd_momentum: Some(0.0),
+            radam: RAdamUpdateParams { learning_rate: 0.001, decay: 0.00001,
+                min_weight: -1.0, max_weight: 1.0, ..Default::default() },
+            ..Default::default() };
+        for _ in 0..1000 {
+            g.upload(&ctx, &[0.0, -0.00002]).unwrap();
+            ranger_update_device(&ctx, params, RangerDeviceStateMut { gradients: &g, weights: &w,
+                momentum: &state.momentum, velocity: &state.velocity, slow_params: &state.slow_params }).unwrap();
+        }
+        let actual = w.download(&ctx).unwrap();
+        let expected = (1.0f64 - 0.001f32 as f64 * 0.00001f32 as f64).powi(1000) as f32;
+        assert!((actual[0] - expected).abs() <= f32::EPSILON);
+        assert_eq!(actual[1], 1.0);
+        assert_eq!(state.velocity.download(&ctx).unwrap()[1], 0.0);
+    }
+    #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn sgd_momentum_matches_reference_over_multiple_updates() {
         use super::*;
@@ -10584,26 +11004,45 @@ mod tests {
                 w: *mut ffi::BulletOuCudaCppF32Buffer, shared: *mut ffi::BulletOuCudaCppF32Buffer,
                 axis: *mut ffi::BulletOuCudaCppF32Buffer, gates: *mut ffi::BulletOuCudaCppF32Buffer,
                 confidence: *mut ffi::BulletOuCudaCppF32Buffer, out: *mut ffi::BulletOuCudaCppF32Buffer,
-                fast: i32) -> i32;
+                packed: *mut ffi::BulletOuCudaCppI32Buffer, fast: i32) -> i32;
         }
         let ctx = Context::new(0).unwrap();
         let cells = 2304 * 16;
         let values = |n: usize, scale: f32| (0..n).map(|i| ((i*97%511) as f32 - 255.0)*scale).collect::<Vec<_>>();
-        let w = F32Buffer::from_host(&ctx, &values(36*cells, 0.0008)).unwrap();
+        let mut raw_weights = values(36*cells, 0.0008);
+        raw_weights[cells] = 100.0;
+        raw_weights[cells + 1] = -100.0;
+        let w = F32Buffer::from_host(&ctx, &raw_weights).unwrap();
         let shared = F32Buffer::from_host(&ctx, &values(cells, 0.0007)).unwrap();
         let axis = F32Buffer::from_host(&ctx, &values(46*cells, 0.0006)).unwrap();
         let gates = F32Buffer::from_host(&ctx, &(0..36).map(|i| (i%7) as f32/6.0).collect::<Vec<_>>()).unwrap();
         let confidence = F32Buffer::from_host(&ctx, &(0..46).map(|i| (i%9) as f32/8.0).collect::<Vec<_>>()).unwrap();
         let a = F32Buffer::new(&ctx, 36*cells).unwrap();
         let b = F32Buffer::new(&ctx, 36*cells).unwrap();
-        for (out, fast) in [(&a, 0), (&b, 1)] {
+        let c = F32Buffer::new(&ctx, 36*cells).unwrap();
+        let packed = I32Buffer::new(&ctx, 36*cells/4).unwrap();
+        let packed_tiled = I32Buffer::new(&ctx, 36*cells/4).unwrap();
+        for (out, fast) in [(&a, 0), (&b, 1), (&c, 2)] {
             check(unsafe { bulletou_test_l1_bucket_fold(ctx.as_ptr(),w.as_ptr(),shared.as_ptr(),axis.as_ptr(),
-                gates.as_ptr(),confidence.as_ptr(),out.as_ptr(),fast) }).unwrap();
+                gates.as_ptr(),confidence.as_ptr(),out.as_ptr(),
+                if fast == 1 { packed.as_ptr() } else if fast == 2 { packed_tiled.as_ptr() } else { std::ptr::null_mut() },fast) }).unwrap();
         }
         let a = a.download(&ctx).unwrap();
         let b = b.download(&ctx).unwrap();
+        let c = c.download(&ctx).unwrap();
+        assert_eq!(packed.download(&ctx).unwrap(), packed_tiled.download(&ctx).unwrap());
+        assert_eq!(a.iter().map(|v|v.to_bits()).collect::<Vec<_>>(), c.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
         assert!(a.iter().any(|&v| v != 0.0));
+        assert!(a.iter().any(|&v| v == 127.0 / 64.0));
+        assert!(a.iter().any(|&v| v == -2.0));
         assert_eq!(a.iter().map(|v|v.to_bits()).collect::<Vec<_>>(), b.iter().map(|v|v.to_bits()).collect::<Vec<_>>());
+        for (i, (&actual, chunk)) in packed.download(&ctx).unwrap().iter().zip(a.chunks_exact(4)).enumerate() {
+            let mut expected = 0u32;
+            for (j, &v) in chunk.iter().enumerate() {
+                expected |= (((v * 64.0).round() as i32 as u32) & 255) << (8 * j);
+            }
+            assert_eq!(actual as u32, expected, "packed word {i}");
+        }
     }
 
     #[test]
@@ -11188,6 +11627,166 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn l1_gather2_king_progress_axes_match_cpu() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_l1_gather2_king_progress(ctx: *mut ffi::BulletOuCudaCppContext,
+                inputs: *mut ffi::BulletOuCudaCppF32Buffer, dy: *mut ffi::BulletOuCudaCppF32Buffer,
+                offsets: *mut ffi::BulletOuCudaCppI32Buffer, positions: *mut ffi::BulletOuCudaCppI32Buffer,
+                dw: *mut ffi::BulletOuCudaCppF32Buffer, db: *mut ffi::BulletOuCudaCppF32Buffer,
+                dfw: *mut ffi::BulletOuCudaCppF32Buffer, dfb: *mut ffi::BulletOuCudaCppF32Buffer,
+                daw: *mut ffi::BulletOuCudaCppF32Buffer, dab: *mut ffi::BulletOuCudaCppF32Buffer,
+                confidence: *mut ffi::BulletOuCudaCppF32Buffer, batch: usize, width: usize,
+                outputs: usize, stacks: usize, king_dim: usize, shared_alpha: f32,
+                king_alpha: f32, progress_alpha: f32, pair_alpha: f32) -> i32;
+        }
+        let ctx = Context::new(0).unwrap();
+        let (batch, width, outputs, stacks, axes) = (97usize, 64usize, 16usize, 21usize * 21 * 8, 42usize + 21 * 21 * 8 + 8);
+        let (shared_alpha, king_alpha, progress_alpha, pair_alpha) = (0.375f32, 0.4f32, 0.6f32, 0.8f32);
+        let inputs: Vec<f32> = (0..batch * width).map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.01).collect();
+        let dy: Vec<f32> = (0..batch * outputs).map(|i| ((i * 3 % 29) as f32 - 14.0) * 0.02).collect();
+        let confidence: Vec<f32> = (0..axes).map(|i| 0.5 + i as f32 * 0.02).collect();
+        let mut positions = Vec::new();
+        let mut offsets = Vec::new();
+        for stack in 0..stacks {
+            offsets.push(positions.len() as i32);
+            positions.extend((0..batch).filter(|row| (row * 281) % stacks == stack).map(|row| row as i32));
+        }
+        offsets.push(positions.len() as i32);
+        let input_gpu = F32Buffer::from_host(&ctx, &inputs).unwrap();
+        let dy_gpu = F32Buffer::from_host(&ctx, &dy).unwrap();
+        let offsets_gpu = I32Buffer::from_host(&ctx, &offsets).unwrap();
+        let positions_gpu = I32Buffer::from_host(&ctx, &positions).unwrap();
+        let confidence_gpu = F32Buffer::from_host(&ctx, &confidence).unwrap();
+        let mut dw = vec![0.125f32; stacks * outputs * width];
+        let mut db = vec![0.125f32; stacks * outputs];
+        let mut dfw = vec![0.125f32; width * outputs];
+        let mut dfb = vec![0.125f32; outputs];
+        let mut daw = vec![0.125f32; axes * width * outputs];
+        let mut dab = vec![0.125f32; axes * outputs];
+        let dw_gpu = F32Buffer::from_host(&ctx, &dw).unwrap();
+        let db_gpu = F32Buffer::from_host(&ctx, &db).unwrap();
+        let dfw_gpu = F32Buffer::from_host(&ctx, &dfw).unwrap();
+        let dfb_gpu = F32Buffer::from_host(&ctx, &dfb).unwrap();
+        let daw_gpu = F32Buffer::from_host(&ctx, &daw).unwrap();
+        let dab_gpu = F32Buffer::from_host(&ctx, &dab).unwrap();
+        for _ in 0..2 {
+            check(unsafe { bulletou_test_l1_gather2_king_progress(ctx.as_ptr(), input_gpu.as_ptr(), dy_gpu.as_ptr(),
+                offsets_gpu.as_ptr(), positions_gpu.as_ptr(), dw_gpu.as_ptr(), db_gpu.as_ptr(), dfw_gpu.as_ptr(),
+                dfb_gpu.as_ptr(), daw_gpu.as_ptr(), dab_gpu.as_ptr(), confidence_gpu.as_ptr(),
+                batch, width, outputs, stacks, 21, shared_alpha, king_alpha, progress_alpha, pair_alpha) }).unwrap();
+            for row in 0..batch {
+                let stack = row * 281 % stacks;
+                let king = stack / 8;
+                let progress = stack % 8;
+                let ids = [king / 21, 21 + king % 21, 42 + progress * 441 + king, 42 + 441 * 8 + progress];
+                let alphas = [king_alpha, king_alpha, pair_alpha, progress_alpha];
+                for out in 0..outputs {
+                    let grad = dy[row * outputs + out];
+                    db[stack * outputs + out] += grad;
+                    dfb[out] += shared_alpha * grad;
+                    for j in 0..4 { dab[ids[j] * outputs + out] += alphas[j] * confidence[ids[j]] * grad; }
+                    for col in 0..width {
+                        let value = grad * inputs[row * width + col];
+                        dw[(stack * outputs + out) * width + col] += value;
+                        dfw[col * outputs + out] += shared_alpha * value;
+                        for j in 0..4 { daw[ids[j] * width * outputs + col * outputs + out] += alphas[j] * confidence[ids[j]] * value; }
+                    }
+                }
+            }
+        }
+        for (name, expected, actual) in [("weight", dw, dw_gpu.download(&ctx).unwrap()),
+            ("bias", db, db_gpu.download(&ctx).unwrap()), ("shared weight", dfw, dfw_gpu.download(&ctx).unwrap()),
+            ("shared bias", dfb, dfb_gpu.download(&ctx).unwrap()), ("axis weight", daw, daw_gpu.download(&ctx).unwrap()),
+            ("axis bias", dab, dab_gpu.download(&ctx).unwrap())] {
+            for (i, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+                assert!((expected - actual).abs() < 1.0e-4, "{name}[{i}]: {expected} != {actual}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn l1_gather2_full_width_with_pair_matches_cpu() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_l1_gather2_king_progress(ctx: *mut ffi::BulletOuCudaCppContext,
+                inputs: *mut ffi::BulletOuCudaCppF32Buffer, dy: *mut ffi::BulletOuCudaCppF32Buffer,
+                offsets: *mut ffi::BulletOuCudaCppI32Buffer, positions: *mut ffi::BulletOuCudaCppI32Buffer,
+                dw: *mut ffi::BulletOuCudaCppF32Buffer, db: *mut ffi::BulletOuCudaCppF32Buffer,
+                dfw: *mut ffi::BulletOuCudaCppF32Buffer, dfb: *mut ffi::BulletOuCudaCppF32Buffer,
+                daw: *mut ffi::BulletOuCudaCppF32Buffer, dab: *mut ffi::BulletOuCudaCppF32Buffer,
+                confidence: *mut ffi::BulletOuCudaCppF32Buffer, batch: usize, width: usize,
+                outputs: usize, stacks: usize, king_dim: usize, shared_alpha: f32,
+                king_alpha: f32, progress_alpha: f32, pair_alpha: f32) -> i32;
+        }
+        let ctx = Context::new(0).unwrap();
+        let (batch, width, outputs, stacks, axes) = (17usize, 2304usize, 16usize, 8usize, 18usize);
+        let (shared_alpha, king_alpha, progress_alpha, pair_alpha) = (0.375f32, 0.4f32, 0.6f32, 0.8f32);
+        let inputs: Vec<f32> = (0..batch * width).map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.01).collect();
+        let dy: Vec<f32> = (0..batch * outputs).map(|i| ((i * 3 % 29) as f32 - 14.0) * 0.02).collect();
+        let confidence: Vec<f32> = (0..axes).map(|i| 0.5 + i as f32 * 0.02).collect();
+        let mut positions = Vec::new();
+        let mut offsets = Vec::new();
+        for stack in 0..stacks {
+            offsets.push(positions.len() as i32);
+            positions.extend((0..batch).filter(|row| (row * 281) % stacks == stack).map(|row| row as i32));
+        }
+        offsets.push(positions.len() as i32);
+        let input_gpu = F32Buffer::from_host(&ctx, &inputs).unwrap();
+        let dy_gpu = F32Buffer::from_host(&ctx, &dy).unwrap();
+        let offsets_gpu = I32Buffer::from_host(&ctx, &offsets).unwrap();
+        let positions_gpu = I32Buffer::from_host(&ctx, &positions).unwrap();
+        let confidence_gpu = F32Buffer::from_host(&ctx, &confidence).unwrap();
+        let mut dw = vec![0.125f32; stacks * outputs * width];
+        let mut db = vec![0.125f32; stacks * outputs];
+        let mut dfw = vec![0.125f32; width * outputs];
+        let mut dfb = vec![0.125f32; outputs];
+        let mut daw = vec![0.125f32; axes * width * outputs];
+        let mut dab = vec![0.125f32; axes * outputs];
+        let dw_gpu = F32Buffer::from_host(&ctx, &dw).unwrap();
+        let db_gpu = F32Buffer::from_host(&ctx, &db).unwrap();
+        let dfw_gpu = F32Buffer::from_host(&ctx, &dfw).unwrap();
+        let dfb_gpu = F32Buffer::from_host(&ctx, &dfb).unwrap();
+        let daw_gpu = F32Buffer::from_host(&ctx, &daw).unwrap();
+        let dab_gpu = F32Buffer::from_host(&ctx, &dab).unwrap();
+        for _ in 0..2 {
+            check(unsafe { bulletou_test_l1_gather2_king_progress(ctx.as_ptr(), input_gpu.as_ptr(), dy_gpu.as_ptr(),
+                offsets_gpu.as_ptr(), positions_gpu.as_ptr(), dw_gpu.as_ptr(), db_gpu.as_ptr(), dfw_gpu.as_ptr(),
+                dfb_gpu.as_ptr(), daw_gpu.as_ptr(), dab_gpu.as_ptr(), confidence_gpu.as_ptr(),
+                batch, width, outputs, stacks, 1, shared_alpha, king_alpha, progress_alpha, pair_alpha) }).unwrap();
+            for row in 0..batch {
+                let stack = row * 281 % stacks;
+                let king = stack / 8;
+                let progress = stack % 8;
+                let ids = [king, 1 + king, 2 + progress + king, 10 + progress];
+                let alphas = [king_alpha, king_alpha, pair_alpha, progress_alpha];
+                for out in 0..outputs {
+                    let grad = dy[row * outputs + out];
+                    db[stack * outputs + out] += grad;
+                    dfb[out] += shared_alpha * grad;
+                    for j in 0..4 { dab[ids[j] * outputs + out] += alphas[j] * confidence[ids[j]] * grad; }
+                    for col in 0..width {
+                        let value = grad * inputs[row * width + col];
+                        dw[(stack * outputs + out) * width + col] += value;
+                        dfw[col * outputs + out] += shared_alpha * value;
+                        for j in 0..4 { daw[ids[j] * width * outputs + col * outputs + out] += alphas[j] * confidence[ids[j]] * value; }
+                    }
+                }
+            }
+        }
+        for (name, expected, actual) in [("weight", dw, dw_gpu.download(&ctx).unwrap()),
+            ("bias", db, db_gpu.download(&ctx).unwrap()), ("shared weight", dfw, dfw_gpu.download(&ctx).unwrap()),
+            ("shared bias", dfb, dfb_gpu.download(&ctx).unwrap()), ("axis weight", daw, daw_gpu.download(&ctx).unwrap()),
+            ("axis bias", dab, dab_gpu.download(&ctx).unwrap())] {
+            for (i, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+                assert!((expected - actual).abs() < 1.0e-4, "{name}[{i}]: {expected} != {actual}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn hm2_half_grad_gather_handles_empty_rows_and_accumulation() {
         use super::*;
         let ctx = Context::new(0).unwrap();
@@ -11212,6 +11811,93 @@ mod tests {
             }
         }
         assert_eq!(out.download(&ctx).unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sfnn_pipelined_upload_does_not_overwrite_inflight_pinned_data() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_stream_delay(ctx: *mut ffi::BulletOuCudaCppContext) -> i32;
+        }
+        let compute = Context::new(0).unwrap();
+        let upload = Context::new(0).unwrap();
+        let mut slot = SfnnTrainStepUploadSlot::new(&compute, 4, 1).unwrap();
+        let first_targets = F32Buffer::new(&compute, 4).unwrap();
+        let first_weights = F32Buffer::new(&compute, 4).unwrap();
+        let first_stm = I32Buffer::new(&compute, 4).unwrap();
+        let first_nstm = I32Buffer::new(&compute, 4).unwrap();
+        let first_buckets = I32Buffer::new(&compute, 4).unwrap();
+        let gate = Event::new(&compute).unwrap();
+        let first = SfnnTrainStepHostBatch {
+            stm_indices: &[1, 2, 3, 4], nstm_indices: &[5, 6, 7, 8],
+            buckets: &[1, 0, 1, 0], targets: &[0.1, 0.2, 0.3, 0.4],
+            entry_weights: &[1.0, 0.9, 0.8, 0.7], batch_size: 4, max_active: 1,
+        };
+        let second = SfnnTrainStepHostBatch {
+            stm_indices: &[11, 12, 13, 14], nstm_indices: &[15, 16, 17, 18],
+            buckets: &[0, 1, 0, 1], targets: &[0.9, 0.8, 0.7, 0.6],
+            entry_weights: &[0.5, 0.4, 0.3, 0.2], batch_size: 4, max_active: 1,
+        };
+        check(unsafe { bulletou_test_stream_delay(compute.as_ptr()) }).unwrap();
+        gate.record(&compute).unwrap();
+        gate.wait(&upload).unwrap();
+        slot.upload(&upload, first).unwrap();
+        slot.wait_upload_on(&compute).unwrap();
+        first_targets.copy_from(&compute, &slot.targets).unwrap();
+        first_weights.copy_from(&compute, &slot.entry_weights).unwrap();
+        first_stm.copy_from(&compute, &slot.device_batch.stm_indices).unwrap();
+        first_nstm.copy_from(&compute, &slot.device_batch.nstm_indices).unwrap();
+        first_buckets.copy_from(&compute, &slot.device_batch.buckets).unwrap();
+        slot.record_compute_done(&compute).unwrap();
+        slot.upload(&upload, second).unwrap();
+        slot.wait_upload_on(&compute).unwrap();
+        compute.synchronize().unwrap();
+        assert_eq!(first_targets.download(&compute).unwrap(), first.targets);
+        assert_eq!(first_weights.download(&compute).unwrap(), first.entry_weights);
+        assert_eq!(first_stm.download(&compute).unwrap(), first.stm_indices);
+        assert_eq!(first_nstm.download(&compute).unwrap(), first.nstm_indices);
+        assert_eq!(first_buckets.download(&compute).unwrap(), first.buckets);
+        assert_eq!(slot.targets.download(&compute).unwrap(), second.targets);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn nnue_pipelined_upload_does_not_overwrite_inflight_pinned_data() {
+        use super::*;
+        unsafe extern "C" {
+            fn bulletou_test_stream_delay(ctx: *mut ffi::BulletOuCudaCppContext) -> i32;
+        }
+        let compute = Context::new(0).unwrap();
+        let upload = Context::new(0).unwrap();
+        let mut slot = NnueTrainStepUploadSlot::new(&compute, 4, 1).unwrap();
+        let first_targets = F32Buffer::new(&compute, 4).unwrap();
+        let first_stm = I32Buffer::new(&compute, 4).unwrap();
+        let gate = Event::new(&compute).unwrap();
+        let first = NnueTrainStepHostBatch {
+            stm_indices: &[1, 2, 3, 4], nstm_indices: &[5, 6, 7, 8],
+            targets: &[0.1, 0.2, 0.3, 0.4], entry_weights: &[1.0, 0.9, 0.8, 0.7],
+            batch_size: 4, max_active: 1,
+        };
+        let second = NnueTrainStepHostBatch {
+            stm_indices: &[11, 12, 13, 14], nstm_indices: &[15, 16, 17, 18],
+            targets: &[0.9, 0.8, 0.7, 0.6], entry_weights: &[0.5, 0.4, 0.3, 0.2],
+            batch_size: 4, max_active: 1,
+        };
+        check(unsafe { bulletou_test_stream_delay(compute.as_ptr()) }).unwrap();
+        gate.record(&compute).unwrap();
+        gate.wait(&upload).unwrap();
+        slot.upload(&upload, first).unwrap();
+        slot.wait_upload_on(&compute).unwrap();
+        first_targets.copy_from(&compute, &slot.targets).unwrap();
+        first_stm.copy_from(&compute, &slot.device_batch.stm_indices).unwrap();
+        slot.record_compute_done(&compute).unwrap();
+        slot.upload(&upload, second).unwrap();
+        slot.wait_upload_on(&compute).unwrap();
+        compute.synchronize().unwrap();
+        assert_eq!(first_targets.download(&compute).unwrap(), first.targets);
+        assert_eq!(first_stm.download(&compute).unwrap(), first.stm_indices);
+        assert_eq!(slot.targets.download(&compute).unwrap(), second.targets);
     }
 
     #[test]
@@ -11497,6 +12183,40 @@ mod tests {
                 &ctx, &device_batch, &device_weights, &forward, &loss, &backward, active, a,
             ).unwrap();
             let direct_gradients = backward.l0w_gradients.download(&ctx).unwrap();
+            // Independently check both physical and virtual FT weights against
+            // numerical differences of the CPU forward/loss, away from QAT.
+            if alpha == 1.0 {
+                let physical_len = BASE * shape.ft_size;
+                for (start, end) in [(0, physical_len), (physical_len, direct_gradients.len())] {
+                    let index = (start..end).max_by(|&i, &j| direct_gradients[i].abs()
+                        .total_cmp(&direct_gradients[j].abs())).unwrap();
+                    let analytic = direct_gradients[index] as f64;
+                    assert!(analytic.abs() > 1e-10, "finite difference needs nonzero FT gradient");
+                    let cpu_loss = |delta: f32| {
+                        let mut perturbed = folded.clone();
+                        if index < physical_len {
+                            perturbed[index] += delta;
+                        } else {
+                            let offset = index - physical_len;
+                            for i in (offset..physical_len).step_by(VIRTUAL * shape.ft_size) {
+                                perturbed[i] += alpha * delta;
+                            }
+                        }
+                        let output = tiny_sfnn_forward_cpu(batch, SfnnForwardHostWeights {
+                            l0w: &perturbed, ..folded_host
+                        });
+                        output.iter().zip([0.25f64, 0.75]).map(|(&x, t)| {
+                            let q = 1.0 / (1.0 + (-(x as f64)).exp());
+                            (q - t).powi(2)
+                        }).sum::<f64>() / 2.0
+                    };
+                    let eps = 0.002f32;
+                    let numerical = (cpu_loss(eps) - cpu_loss(-eps)) / (2.0 * eps as f64);
+                    eprintln!("FT finite difference index={index}: analytic={analytic:.9e}, numerical={numerical:.9e}");
+                    assert!((analytic - numerical).abs() <= 1e-7 + analytic.abs() * 0.001,
+                        "FT gradient index={index}: analytic={analytic}, finite_difference={numerical}");
+                }
+            }
             sfnn_forward_train_device_with_factorizer(
                 &ctx,
                 &device_batch,
@@ -12930,6 +13650,89 @@ mod tests {
             assert!(trained.l2fw.is_none() && trained.l2axw.is_none());
             assert!(trained.l3fw.is_none() && trained.l3axw.is_none());
         }
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; verifies snapshot boundary with accumulated gradients"]
+    fn sfnn_snapshot_rejects_pending_gradient_batches() {
+        let ctx=Context::new(0).unwrap();
+        let mut w=tiny_sfnn_weights(tiny_sfnn_shape());
+        w.l2fw=None; w.l2fb=None; w.l3fw=None; w.l3fb=None;
+        let mut runner=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
+        let batch=|| SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[2,3,0,1],
+            buckets:&[0,1,0,1],targets:&[0.2,0.8,0.3,0.7],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        let params=RangerUpdateParams {sgd_momentum:Some(0.9),..Default::default()};
+        runner.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,params,
+            ScalarLossKind::BceWithLogits,1.0,batch(),true,false,Default::default()).unwrap();
+        assert_eq!(runner.pending_gradient_batches,1);
+        assert!(runner.snapshot_device(&ctx).is_err(), "snapshot must not discard accumulated gradients");
+        runner.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,params,
+            ScalarLossKind::BceWithLogits,1.0,batch(),true,true,Default::default()).unwrap();
+        assert!(runner.snapshot_device(&ctx).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; snapshot preserves model count gates"]
+    fn sfnn_snapshot_restores_residual_count_gates() {
+        let ctx=Context::new(0).unwrap();
+        let mut w=tiny_sfnn_weights(tiny_sfnn_shape());
+        w.shape.factorizer_king_axis_dim=1;
+        w.shape.factorizer_progress_axis=true;
+        let axes=w.shape.factorizer_axis_count();
+        let aw=vec![0.01;axes*w.shape.ft_size*w.shape.l1_out()];
+        let ab=vec![0.02;axes*w.shape.l1_out()];
+        w.l1axw=Some(&aw); w.l1axb=Some(&ab);
+        let mut r=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
+        r.set_residual_count_gates_by_stack(&ctx,Some(&[0.25,0.75])).unwrap();
+        r.set_residual_count_decay_by_stack(&ctx,Some(&[0.4,0.6])).unwrap();
+        r.set_factorizer_axis_confidences(&ctx,Some(&vec![0.5;axes])).unwrap();
+        let saved=r.snapshot_device(&ctx).unwrap();
+        r.set_residual_count_gates_by_stack(&ctx,None).unwrap();
+        r.set_residual_count_decay_by_stack(&ctx,None).unwrap();
+        r.set_factorizer_axis_confidences(&ctx,None).unwrap();
+        r.copy_state_from_device(&ctx,&saved).unwrap();
+        assert!(r.residual_count_gates_enabled);
+        assert_eq!(r.residual_count_gates_by_stack.download(&ctx).unwrap(),vec![0.25,0.75]);
+        assert!(r.residual_count_decay_enabled);
+        assert_eq!(r.residual_count_decay_by_stack.download(&ctx).unwrap(),vec![0.4,0.6]);
+        assert!(r.factorizer_axis_confidences_enabled);
+        assert_eq!(r.factorizer_axis_confidences.download(&ctx).unwrap(),vec![0.5;axes]);
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; SGD/QAT save and restore continuation"]
+    fn sgd_qat_snapshot_continuation_matches_uninterrupted() {
+        let ctx=Context::new(0).unwrap();
+        let mut w=tiny_sfnn_weights(tiny_sfnn_shape());
+        w.l2fw=None; w.l2fb=None; w.l3fw=None; w.l3fb=None;
+        let mut original=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
+        original.set_ft_fp16_moments(&ctx,true).unwrap();
+        let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,
+            l1_effective_weight_clip:true,..Default::default()};
+        let batch=|| SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[2,3,0,1],
+            buckets:&[0,1,0,1],targets:&[0.2,0.8,0.3,0.7],entry_weights:&[1.0;4],batch_size:4,max_active:1};
+        let update=|r:&mut SfnnTrainStepRunner, step| {
+            let p=RangerUpdateParams {sgd_momentum:Some(0.9),radam:RAdamUpdateParams {
+                step,learning_rate:0.002,..Default::default()},..Default::default()};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
+                ScalarLossKind::BceWithLogits,1.0,batch(),true,true,lr).unwrap();
+        };
+        for step in 1..=4 {update(&mut original,step);}
+        let snap=original.snapshot_device(&ctx).unwrap();
+        let mut resumed=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
+        resumed.set_ft_fp16_moments(&ctx,true).unwrap();
+        resumed.copy_state_from_device(&ctx,&snap).unwrap();
+        for step in 5..=8 {update(&mut original,step);update(&mut resumed,step);}
+        let a=original.read_weights(&ctx).unwrap();let b=resumed.read_weights(&ctx).unwrap();
+        for (name,x,y) in [("FT weights",&a.l0w,&b.l0w),("L1 weights",&a.l1w,&b.l1w),
+            ("L1 bias",&a.l1b,&b.l1b),("L2 weights",&a.l2w,&b.l2w),("L3 weights",&a.l3w,&b.l3w)] {
+            assert_close_slice(name,x,y,1e-6);
+        }
+        let a=original.read_optimizer_states(&ctx).unwrap();let b=resumed.read_optimizer_states(&ctx).unwrap();
+        assert_close_slice("FT momentum",&a.l0w.momentum,&b.l0w.momentum,1e-7);
+        assert_close_slice("FT SGD remainder",&a.l0w.velocity,&b.l0w.velocity,1e-7);
+        assert_close_slice("L1 momentum",&a.l1w.momentum,&b.l1w.momentum,1e-7);
+        assert_close_slice("L1 SGD remainder",&a.l1w.velocity,&b.l1w.velocity,1e-7);
     }
 
     #[test]

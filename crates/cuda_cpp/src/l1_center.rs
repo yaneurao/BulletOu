@@ -4,19 +4,30 @@ use super::*;
 use experimental_output_center::{mean_into, scale_into};
 
 pub(super) fn validate_effective_clip(r: &SfnnTrainStepRunner, lr: SfnnLayerLrMultipliers) -> Result<()> {
-    if r.shape.has_compact_l1() || r.factorizer.any_axis() || r.residual_count_gates_enabled
+    if r.shape.has_compact_l1() || r.residual_count_gates_enabled || r.factorizer_axis_confidences_enabled
         || lr.update_scope != SfnnUpdateScope::All {
-        return Err(CudaCppError::message("L1 effective weight clip requires dense L1, none/shared, no count gates, update-scope=all"));
+        return Err(CudaCppError::message("L1 effective weight clip requires dense L1, no count gates or axis confidences, update-scope=all"));
     }
     Ok(())
 }
 
-pub(super) fn clip_effective_weights(r: &SfnnTrainStepRunner, ctx: &Context) -> Result<()> {
+pub(super) fn clip_effective_weights(r: &SfnnTrainStepRunner, ctx: &Context, sgd: bool) -> Result<()> {
     let (shared, slow) = if r.factorizer.shared {
         (r.weights.l1fw.as_ref().unwrap().as_ptr(), r.optimizer_states.l1fw.as_ref().unwrap().slow_params.as_ptr())
     } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
+    let remainder = if sgd { r.optimizer_states.l1w.velocity.as_ptr() } else { std::ptr::null_mut() };
+    if r.factorizer.any_axis() {
+        let f=r.factorizer; let a=r.factorizer_alpha; let shape=r.shape;
+        return check(unsafe { ffi::bulletou_clip_effective_l1_axis(ctx.as_ptr(),r.weights.l1w.as_ptr(),
+            r.optimizer_states.l1w.slow_params.as_ptr(),shared,slow,
+            r.weights.l1axw.as_ref().unwrap().as_ptr(),r.optimizer_states.l1axw.as_ref().unwrap().slow_params.as_ptr(),remainder,
+            shape.ft_size,shape.l1_out(),shape.num_stacks,shape.factorizer_king_axis_dim,shape.factorizer_hand_axis_dim,
+            f.king_axis as i32,f.hand_axis as i32,f.progress_axis as i32,f.king_hand_pair as i32,
+            f.king_progress_pair as i32,f.hand_progress_pair as i32,
+            a.shared,a.king_axis,a.hand_axis,a.progress_axis,a.pair) });
+    }
     check(unsafe { ffi::bulletou_clip_effective_l1(ctx.as_ptr(), r.weights.l1w.as_ptr(),
-        r.optimizer_states.l1w.slow_params.as_ptr(), shared, slow,
+        r.optimizer_states.l1w.slow_params.as_ptr(), shared, slow,remainder,
         r.shape.ft_size, r.shape.l1_out(), r.factorizer_alpha.shared) })
 }
 
@@ -109,6 +120,51 @@ mod tests {
     use super::*;
     #[test]
     #[ignore = "requires CUDA"]
+    fn effective_clip_pair_projects_fast_and_slow_without_changing_factors() {
+        let ctx=Context::new(0).unwrap();
+        let (stacks,cols,outputs)=(36usize,4usize,3usize);
+        let cells=cols*outputs; let axes=46;
+        let initial:Vec<f32>=(0..stacks*cells).map(|i|((i*17%31) as f32-15.0)*0.18).collect();
+        let slow_initial:Vec<f32>=initial.iter().map(|x|-x*0.8).collect();
+        let shared_values:Vec<f32>=(0..cells).map(|i|(i as f32-5.0)*0.13).collect();
+        let axis_values:Vec<f32>=(0..axes*cells).map(|i|((i*7%23) as f32-11.0)*0.07).collect();
+        let slow_shared:Vec<f32>=shared_values.iter().map(|x|x*0.5).collect();
+        let slow_axis:Vec<f32>=axis_values.iter().map(|x|-x*0.6).collect();
+        let w=F32Buffer::from_host(&ctx,&initial).unwrap();
+        let slow=F32Buffer::from_host(&ctx,&slow_initial).unwrap();
+        let sh=F32Buffer::from_host(&ctx,&shared_values).unwrap();
+        let ss=F32Buffer::from_host(&ctx,&slow_shared).unwrap();
+        let ax=F32Buffer::from_host(&ctx,&axis_values).unwrap();
+        let sa=F32Buffer::from_host(&ctx,&slow_axis).unwrap();
+        let remainder=F32Buffer::from_host(&ctx,&vec![0.25;stacks*cells]).unwrap();
+        check(unsafe{ffi::bulletou_clip_effective_l1_axis(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),
+            sh.as_ptr(),ss.as_ptr(),ax.as_ptr(),sa.as_ptr(),remainder.as_ptr(),cols,outputs,stacks,3,0,
+            1,0,1,0,1,0,0.7,0.5,1.0,0.9,0.4)}).unwrap();
+        let remains=remainder.download(&ctx).unwrap();
+        for (result,base,shared,axis) in [(w.download(&ctx).unwrap(),&initial,&shared_values,&axis_values),
+            (slow.download(&ctx).unwrap(),&slow_initial,&slow_shared,&slow_axis)] {
+            for stack in 0..stacks {
+                let k=stack/4; let p=stack%4; let ids=[k/3,3+k%3,6+p*9+k,42+p];
+                let alpha=[0.5,0.5,0.4,0.9];
+                for out in 0..outputs { for input in 0..cols {
+                    let idx=stack*cells+out*cols+input; let f=input*outputs+out;
+                    let effective=|v:f32| {let mut x=v+0.7*shared[f];
+                        for j in 0..4 {x+=alpha[j]*axis[ids[j]*cells+f];} x};
+                    let original=effective(base[idx]); let actual=effective(result[idx]);
+                    assert!((actual-original.clamp(-2.0,127.0/64.0)).abs()<1e-5,
+                        "stack={stack} out={out} input={input} original={original} actual={actual}");
+                    if (-2.0..=127.0/64.0).contains(&original) {assert_eq!(result[idx],base[idx]);}
+                    if std::ptr::eq(base,&initial) {
+                        assert_eq!(remains[idx], if (-2.0..=127.0/64.0).contains(&original) {0.25} else {0.0});
+                    }
+                }}
+            }
+        }
+        assert_eq!(sh.download(&ctx).unwrap(),shared_values);
+        assert_eq!(ax.download(&ctx).unwrap(),axis_values);
+    }
+    #[test]
+    #[ignore = "requires CUDA"]
     fn effective_clip_fast_slow_shared_alpha_and_noop() {
         let ctx=Context::new(0).unwrap();
         for enabled_shared in [false,true] {
@@ -120,7 +176,7 @@ mod tests {
                 let shared=F32Buffer::from_host(&ctx,&shared_values).unwrap();
                 let ss=F32Buffer::from_host(&ctx,&shared_values.iter().map(|x|2.0*x).collect::<Vec<_>>()).unwrap();
                 let ptr=|x:&F32Buffer| if enabled_shared{x.as_ptr()}else{std::ptr::null_mut()};
-                check(unsafe{ffi::bulletou_clip_effective_l1(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),ptr(&shared),ptr(&ss),2,2,alpha)}).unwrap();
+                check(unsafe{ffi::bulletou_clip_effective_l1(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),ptr(&shared),ptr(&ss),std::ptr::null_mut(),2,2,alpha)}).unwrap();
                 for (got,sign,factor) in [(w.download(&ctx).unwrap(),1.0,1.0),(slow.download(&ctx).unwrap(),-1.0,2.0)] {
                     for i in 0..8 {
                         let f=if enabled_shared{alpha*factor*shared_values[(i%2)*2+(i/2)%2]}else{0.0};

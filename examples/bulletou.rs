@@ -1816,6 +1816,11 @@ impl QuantizedTestArgs {
         if !self.engine_score_offset.is_finite() {
             return Err(format!("--engine-score-offset must be finite (got {})", self.engine_score_offset));
         }
+        if self.mode == QuantizedTestMode::Gpu && (self.engine_score_offset != 0.0 || self.sfnn_ft_shift != 7
+            || self.quant_ft_round != QuantizedRoundMode::Floor || self.quant_crelu_round != QuantizedRoundMode::Floor
+            || self.quant_sqrcrelu_round != QuantizedRoundMode::Floor || self.quant_final_div_round != QuantizedRoundMode::Floor) {
+            return Err("GPU proxy does not apply engine score offset, FT shift, or integer rounding options; use --mode cpu-exact".into());
+        }
         Ok(())
     }
 }
@@ -4170,7 +4175,7 @@ const EPOCH_SETTING_KEYS: &[&str] = &[
     "sfnn_l1_revive", "sfnn_l2_revive", "sfnn_ft_revive", "sfnn_ft_revive_contribution_threshold", "sfnn_ft_revive_saturation_threshold", "sfnn_ft_revive_batches",
     "ft_factorizer", "all_optim",
     "sfnn_l1_factorizer",
-    "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l3_lr_mult",
+    "sfnn_ft_lr_mult", "sfnn_l2_lr_mult", "sfnn_l2_bias_lr_mult", "sfnn_l3_lr_mult",
     "sfnn_bn_affine_lr_multiplier",
     "sfnn_bn_qat", "sfnn_bn_qat_freeze_stats",
     "sfnn_ft_saturation_penalty", "sfnn_ft_saturation_rate", "sfnn_ft_saturation_patience",
@@ -4325,14 +4330,14 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
         assign!(superbatches, save_rate, sfnn_l1_revive_lr_suppress_sb, sfnn_l1_revive, sfnn_l2_revive, ft_factorizer, sfnn_bn_affine_lr_multiplier, sfnn_bn_qat, sfnn_bn_qat_freeze_stats, sfnn_ft_saturation_penalty, sfnn_ft_saturation_rate, sfnn_ft_saturation_patience,
             sfnn_l1_revive_contribution_threshold, sfnn_l2_revive_contribution_threshold, sfnn_ft_revive, sfnn_ft_revive_contribution_threshold, sfnn_ft_revive_saturation_threshold, sfnn_ft_revive_batches,
             lr, lr_min, batches_per_update, sfnn_gptq, sfnn_qat_l1, sfnn_qat_ft, sfnn_ft_fp16, sfnn_ft_fp16_grad, sfnn_ft_fp16_act, sfnn_ft_fp16_moments, sfnn_qat_l2, sfnn_qat_l3, sfnn_freeze_l1, sfnn_l2_l3_center, sfnn_l1_center, sfnn_l1_effective_weight_clip,
-            sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l3_lr_mult,
+            sfnn_ft_lr_mult, sfnn_l2_lr_mult, sfnn_l2_bias_lr_mult, sfnn_l3_lr_mult,
             sfnn_l1_lr_mult, sfnn_norm_loss_strength, sfnn_saturation_penalty,
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     resolved.apply_all_optim();
     if resolved.optimizer == OptimizerKind::Sgd && (resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
-        resolved.sfnn_l2_l3_center || resolved.sfnn_l1_effective_weight_clip) {
-        return Err(format!("SGD does not support norm loss, centering, or effective clipping at epoch {epoch}"));
+        resolved.sfnn_l2_l3_center) {
+        return Err(format!("SGD does not support norm loss or centering at epoch {epoch}"));
     }
     if schedules.contains_key("ft_factorizer") {
         if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
@@ -4764,6 +4769,10 @@ struct Args {
     #[arg(long, default_value = "1.0")]
     sfnn_l2_lr_mult: f32,
 
+    /// Additional L2 bias LR multiplier, relative to --sfnn-l2-lr-mult.
+    #[arg(long, default_value = "1.0")]
+    sfnn_l2_bias_lr_mult: f32,
+
     /// SFNN L3 master weights/biases LR multiplier.
     #[arg(long, default_value = "1.0")]
     sfnn_l3_lr_mult: f32,
@@ -5119,6 +5128,7 @@ struct Args {
     /// Override training weight clipping: 0 disables it; N > 0 clips all updated
     /// weights and biases to [-N, +N]. Omitted: tatara per-layer bounds for SFNN
     /// (L1/L2 weights+biases and L3 weights at +/-127/64; FT and L3 bias unbounded).
+    /// L1 shared/axis bounds apply to each coefficient-scaled contribution.
     /// Other architectures default to no clipping. Quantization limits are unchanged.
     #[arg(long)]
     optimizer_weight_clip: Option<f32>,
@@ -5582,7 +5592,7 @@ struct Args {
     #[arg(long, default_value_t = 1e-5)]
     nnue_bn_epsilon: f32,
 
-    /// Clip folded L1 weights (residual + alpha*shared) to [-2,127/64] after updates.
+    /// Clip folded L1 weights (residual + shared + active axes/pairs) to [-2,127/64] after updates.
     /// Default off. Projects fast and Lookahead slow weights; preserves biases/moments.
     #[arg(long)]
     sfnn_l1_effective_weight_clip: bool,
@@ -5845,12 +5855,10 @@ impl Args {
             return Err("L1 initialization options require --backend cuda-cpp and an SFNN arch".into());
         }
         if self.sfnn_l1_effective_weight_clip {
-            let spec = effective_sfnn_factorizer_spec(self);
             if self.backend != BackendKind::CudaCpp || !self.eval_type().uses_layerstack()
                 || self.arch().sfnn_l1_group_count() != 1 || self.arch().sfnn_l1_common_size.is_some()
-                || (spec != SfnnFactorizerSpec::NONE && spec != SfnnFactorizerSpec::SHARED)
                 || self.sfnn_bucket_counts.is_some() || self.sfnn_update_scope != SfnnUpdateScopeArg::All {
-                return Err("--sfnn-l1-effective-weight-clip requires cuda-cpp dense SFNN L1, none/shared, no bucket counts and update-scope=all".into());
+                return Err("--sfnn-l1-effective-weight-clip requires cuda-cpp dense SFNN L1, no bucket counts and update-scope=all".into());
             }
         }
         if self.sfnn_l2_l3_center || self.sfnn_l1_center {
@@ -6138,6 +6146,15 @@ impl Args {
                 return Err(format!("--{name} applies to SFNN / LayerStack eval types only"));
             }
         }
+        if !self.sfnn_l2_bias_lr_mult.is_finite() || self.sfnn_l2_bias_lr_mult < 0.0 {
+            return Err("--sfnn-l2-bias-lr-mult must be finite and non-negative".to_string());
+        }
+        if !(self.sfnn_l2_lr_mult * self.sfnn_l2_bias_lr_mult).is_finite() {
+            return Err("combined L2 and L2 bias learning-rate multipliers overflow".to_string());
+        }
+        if self.sfnn_l2_bias_lr_mult != 1.0 && !eval_type.uses_layerstack() {
+            return Err("--sfnn-l2-bias-lr-mult applies to SFNN / LayerStack eval types only".to_string());
+        }
         if (self.sfnn_l1_lr_mult != 1.0 || self.sfnn_freeze_l1) && !eval_type.uses_layerstack() {
             return Err("--sfnn-l1-lr-mult / --sfnn-freeze-l1 apply to SFNN / LayerStack eval types only".to_string());
         }
@@ -6356,10 +6373,10 @@ impl Args {
         if self.optimizer == OptimizerKind::Sgd {
             if !self.eval_type().uses_layerstack() || self.lr_schedule == LrScheduleKind::Plateau ||
                 self.sfnn_dirty_bucket_update || self.sfnn_norm_loss_strength != 0.0 ||
-                self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 || self.sfnn_l1_center || self.sfnn_l2_l3_center || self.sfnn_l1_effective_weight_clip || self.optimizer_beta1.is_some() ||
+                self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 || self.sfnn_l1_center || self.sfnn_l2_l3_center || self.optimizer_beta1.is_some() ||
                 self.optimizer_beta2.is_some() || self.optimizer_epsilon.is_some() ||
                 !(self.optimizer_momentum.is_finite() && (0.0..1.0).contains(&self.optimizer_momentum)) {
-                return Err("SGD requires SFNN, momentum in [0,1), and disables plateau, BN, dirty bucket updates, norm loss, centering/effective clipping, and Ranger beta/epsilon overrides".into());
+                return Err("SGD requires SFNN, momentum in [0,1), and disables plateau, BN, dirty bucket updates, norm loss, centering, and Ranger beta/epsilon overrides".into());
             }
         }
         if self.initial_state.is_some() && self.resume.is_some() {
@@ -7990,8 +8007,10 @@ fn quantized_shift_right_nonnegative(value: i64, shift: u32, round: QuantizedRou
 
 #[cfg(feature = "cuda-cpp-backend")]
 fn quantized_sfnn_ft_pair_value(sum0: i32, sum1: i32, ft_shift: u32, round: QuantizedRoundMode) -> u8 {
-    let sum0 = sum0.clamp(0, i32::from(SFNN_QA) * 2);
-    let sum1 = sum1.clamp(0, i32::from(SFNN_QA) * 2);
+    // Engine FT weights/biases are doubled into i16 and accumulated with
+    // wrapping i16 SIMD addition. Apply the same modulo before CReLU.
+    let sum0 = i32::from(sum0 as i16).clamp(0, i32::from(SFNN_QA) * 2);
+    let sum1 = i32::from(sum1 as i16).clamp(0, i32::from(SFNN_QA) * 2);
     let product = ((sum0 as i64) << ft_shift) * sum1 as i64;
     (quantized_shift_right_nonnegative(product, 16, round).clamp(0, 255)) as u8
 }
@@ -9303,14 +9322,21 @@ fn run_quantized_test_impl(args: &QuantizedTestArgs, verbose: bool) -> Result<Qu
             format_count(weights.num_stacks)
         );
         eprintln!("  fv_scale          = {}", args.fv_scale);
+        if args.mode == QuantizedTestMode::Gpu {
+            eprintln!("  GPU proxy reports train-scale metrics; exact engine-scale scores require --mode cpu-exact");
+        }
         eprintln!("  sfnn_ft_shift     = {}", args.sfnn_ft_shift);
-        eprintln!(
-            "  quant_rounding    = ft:{}, crelu:{}, sqrcrelu:{}, final_div:{}",
-            args.quant_ft_round.cli_name(),
-            args.quant_crelu_round.cli_name(),
-            args.quant_sqrcrelu_round.cli_name(),
-            args.quant_final_div_round.cli_name(),
-        );
+        if args.mode == QuantizedTestMode::CpuExact {
+            eprintln!(
+                "  quant_rounding    = ft:{}, crelu:{}, sqrcrelu:{}, final_div:{}",
+                args.quant_ft_round.cli_name(),
+                args.quant_crelu_round.cli_name(),
+                args.quant_sqrcrelu_round.cli_name(),
+                args.quant_final_div_round.cli_name(),
+            );
+        } else {
+            eprintln!("  quant_rounding    = unavailable (GPU proxy uses floating-point activations)");
+        }
         eprintln!("  loss              = {}", quantized_loss_label(args));
         eprintln!(
             "  loss scales       = train raw/(QA*QB) raw/{:.0}, engine Value raw/FV_SCALE",
@@ -10418,7 +10444,7 @@ fn quantized_calibration_engine_report_from_outputs(
     }
 
     if !prepared.loss_targets.is_empty() {
-        let mut loss_sum = 0.0f32;
+        let mut loss_sum = 0.0f64;
         let model_inv_scale = if args.scale > 0 { 1.0 / (args.scale as f32) } else { 1.0 };
         let loss_kind = quantized_engine_scale_loss_kind(args);
         for &(i, target) in &prepared.loss_targets {
@@ -10438,12 +10464,12 @@ fn quantized_calibration_engine_report_from_outputs(
                 }
             };
             let diff = model_p - target;
-            loss_sum += match loss_kind {
+            loss_sum += f64::from(match loss_kind {
                 ValidationLossKind::BceWithLogits { nnue2score, in_scaling, .. } => bulletou_lib::validate::bce_with_logits(model_score * nnue2score / in_scaling, target),
                 _ => diff.abs().powf(args.loss_pow_exp),
-            };
+            });
         }
-        report.test_loss = Some(loss_sum / report.loss_sampled as f32);
+        report.test_loss = Some((loss_sum / report.loss_sampled as f64) as f32);
     }
 
     Ok(report)
@@ -12818,11 +12844,15 @@ fn main() {
                         report.engine_scale.drawn_games,
                         report.engine_scale.filtered_by_score_cap
                     );
-                    println!(
-                        "  loss_engine_scale = {:.8} (n={})",
-                        report.engine_scale.test_loss.unwrap_or(f32::NAN),
-                        format_count(report.engine_scale.loss_sampled)
-                    );
+                    if args.mode == QuantizedTestMode::CpuExact {
+                        println!(
+                            "  loss_engine_scale = {:.8} (n={})",
+                            report.engine_scale.test_loss.unwrap_or(f32::NAN),
+                            format_count(report.engine_scale.loss_sampled)
+                        );
+                    } else {
+                        println!("  loss_engine_scale = unavailable (GPU proxy uses train-scale floating-point outputs)");
+                    }
                     println!(
                         "  accuracy_train_scale = {:.9} ({}/{} decisive; sign of raw output)",
                         report.train_scale.sign_matches as f64 / report.train_scale.compared.max(1) as f64,
@@ -18503,7 +18533,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             ),
         );
     }
-    if args.sfnn_ft_lr_mult != 1.0 || args.sfnn_l2_lr_mult != 1.0 || args.sfnn_l3_lr_mult != 1.0
+    if args.sfnn_ft_lr_mult != 1.0 || args.sfnn_l2_lr_mult != 1.0 || args.sfnn_l2_bias_lr_mult != 1.0 || args.sfnn_l3_lr_mult != 1.0
         || args.sfnn_l1_lr_mult != 1.0
         || args.sfnn_freeze_l1
         || progress_enabled
@@ -18522,8 +18552,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv(
             "SFNN layer LR",
             format!(
-                "FT={} L2={} L3={} L1 multiplier={} freeze={freeze}, progress={}, update_scope={}",
-                args.sfnn_ft_lr_mult, args.sfnn_l2_lr_mult, args.sfnn_l3_lr_mult,
+                "FT={} L2={} L2 bias relative={} L3={} L1 multiplier={} freeze={freeze}, progress={}, update_scope={}",
+                args.sfnn_ft_lr_mult, args.sfnn_l2_lr_mult, args.sfnn_l2_bias_lr_mult, args.sfnn_l3_lr_mult,
                 paint(format!("{:.6}", args.sfnn_l1_lr_mult), ConsoleColor::BoldYellow),
                 progress_freeze,
                 paint(args.sfnn_update_scope.cli_name(), ConsoleColor::BoldYellow)
@@ -18607,6 +18637,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         print_startup_kv("BN affine LR", format!("current LR x {}; gamma/beta only, 0 freezes affine optimizer; independent of running-stat freeze", args.sfnn_bn_affine_lr_multiplier));
     }
     runner.configure_bn_qat_mode(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows(),args.sfnn_bn_qat_freeze_stats).map_err(|e|e.to_string())?;
+    let sgd_trace_layers = if std::env::var_os("BULLETOU_SGD_TRACE_LAYERS").is_some() {
+        Some((runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?,
+            runner.weights.l2b.download(&ctx).map_err(|e| e.to_string())?,
+            runner.weights.l3w.download(&ctx).map_err(|e| e.to_string())?,
+            runner.weights.l3b.download(&ctx).map_err(|e| e.to_string())?))
+    } else { None };
+    let sgd_trace_l1 = if std::env::var_os("BULLETOU_SGD_TRACE_LAYERS").is_some() {
+        Some((runner.weights.l1fw.as_ref().map(|v| v.download(&ctx)).transpose().map_err(|e| e.to_string())?,
+            runner.weights.l1fb.as_ref().map(|v| v.download(&ctx)).transpose().map_err(|e| e.to_string())?,
+            runner.weights.l1axw.as_ref().map(|v| v.download(&ctx)).transpose().map_err(|e| e.to_string())?,
+            runner.weights.l1axb.as_ref().map(|v| v.download(&ctx)).transpose().map_err(|e| e.to_string())?))
+    } else { None };
     runner.configure_bn_l2_effective_weight_clip(&ctx,args.sfnn_bn_l2_effective_weight_clip).map_err(|e|e.to_string())?;
     if args.sfnn_bn_l2_effective_weight_clip {
         print_startup_kv("BN L2 effective weight clip", "on: folded range [-2, 127/64]; master + Lookahead slow projected on load/after each update; moments retained");
@@ -19157,6 +19199,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 }
                 if effective_sfnn_factorizer_spec(&next_args) != effective_sfnn_factorizer_spec(&epoch_args) {
                     upload_ctx.synchronize().map_err(|e|e.to_string())?;
+                    if epoch_args.optimizer == OptimizerKind::Sgd && effective_sfnn_factorizer_spec(&epoch_args).any_axis() {
+                        runner.clear_sgd_factorizer_remainders(&ctx, false, true).map_err(|e| e.to_string())?;
+                    }
                     let next_active = cuda_cpp_sfnn_factorizer_active(&next_args);
                     let counts=WorkerSfnnSession::compute_count_settings(&epoch_args,runner.shape)?;
                     let coefficients=scheduled_l1_axis_fold_coefficients(&epoch_args,runner.shape,&counts)?;
@@ -19178,6 +19223,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         return Err("FT factorizer OFF -> ON is not supported during training".into());
                     }
                     upload_ctx.synchronize().map_err(|e|e.to_string())?;
+                    if epoch_args.optimizer == OptimizerKind::Sgd {
+                        runner.clear_sgd_factorizer_remainders(&ctx, true, false).map_err(|e| e.to_string())?;
+                    }
                     runner.disable_ft_factorizer(&ctx, feature_kind.base_input_size(), feature_kind.virtual_rows())
                         .map_err(|e|e.to_string())?;
                     cuda_shape = runner.shape;
@@ -19775,6 +19823,44 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     let completed_steps = completed_step_offset + seen_steps;
     let optimizer_steps = optimizer_step_offset + optimizer_updates;
+    if let Some((l2w, l2b, l3w, l3b)) = sgd_trace_layers {
+        for (name, before, after, scale) in [
+            ("l2w", l2w, runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
+            ("l2b", l2b, runner.weights.l2b.download(&ctx).map_err(|e| e.to_string())?, 8128.0f32),
+            ("l3w", l3w, runner.weights.l3w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
+            ("l3b", l3b, runner.weights.l3b.download(&ctx).map_err(|e| e.to_string())?, 8128.0f32),
+        ] {
+            let mut changed = 0usize;
+            let mut quant_changed = 0usize;
+            let mut abs_delta = 0.0f64;
+            for (&a, &b) in before.iter().zip(&after) {
+                changed += usize::from(a.to_bits() != b.to_bits());
+                quant_changed += usize::from((a * scale).round() != (b * scale).round());
+                abs_delta += (f64::from(a) - f64::from(b)).abs();
+            }
+            eprintln!("  SGD layer trace {name}: n={} changed={} quant_changed={} mean_abs_delta={:.9e}",
+                before.len(), changed, quant_changed, abs_delta / before.len().max(1) as f64);
+        }
+    }
+    if let Some((fw, fb, axw, axb)) = sgd_trace_l1 {
+        for (name, before, buffer) in [
+            ("l1fw", fw, runner.weights.l1fw.as_ref()), ("l1fb", fb, runner.weights.l1fb.as_ref()),
+            ("l1axw", axw, runner.weights.l1axw.as_ref()), ("l1axb", axb, runner.weights.l1axb.as_ref()),
+        ] {
+            if let (Some(before), Some(buffer)) = (before, buffer)
+                && runner.shape.l1_skip && runner.shape.l1_out() > 1 {
+                let after = buffer.download(&ctx).map_err(|e| e.to_string())?;
+                let out = runner.shape.l1_out();
+                let mut sums = vec![0.0f64; out];
+                for (i, (&a, &b)) in before.iter().zip(&after).enumerate() {
+                    sums[i % out] += (f64::from(a) - f64::from(b)).abs();
+                }
+                let rows = (before.len() / out).max(1) as f64;
+                let main = sums[..out - 1].iter().sum::<f64>() / ((out - 1).max(1) as f64 * rows);
+                eprintln!("  SGD layer trace {name}: main_mean_abs_delta={main:.9e} skip_mean_abs_delta={:.9e}", sums[out - 1] / rows);
+            }
+        }
+    }
     if args.cuda_cpp_skip_final_output {
         if let Some((chunk, _)) = deferred_direct_checkpoint {
             if let Some((metrics, validation_elapsed)) = {
@@ -19805,6 +19891,22 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     Some(validation_elapsed),
                 );
                 last_checkpoint_metrics = Some(metrics);
+            }
+            let current_progress_params =
+                cuda_cpp_sfnn_progress_params_for_state(sfnn_progress_train_state.as_ref())?;
+            if let Some(test_args) = quantized_test_args_from_training_args(args, PathBuf::from("<live-quantized-sfnn>"))? {
+                if sfnn_quantized_validation_cache.is_none() {
+                    sfnn_quantized_validation_cache = CudaCppSfnnQuantizedValidationCache::try_new(
+                        args, feature_kind, &ctx, cuda_shape, current_progress_params.as_ref(),
+                    )?;
+                }
+                if let Some(cache) = sfnn_quantized_validation_cache.as_mut() {
+                    let started = std::time::Instant::now();
+                    let metrics = cache.run_runner(args, feature_kind, &ctx, cuda_shape, &runner,
+                        current_progress_params.as_ref(), &test_args)?;
+                    print_cuda_cpp_quantized_validation_summary(chunk.epoch, chunk.superbatch,
+                        metrics.accuracy, metrics.loss, started.elapsed(), quantized_validation_mode_label(args));
+                }
             }
         }
         if checkpoint_chunk_idx != schedule.chunks.len() {
@@ -22611,6 +22713,18 @@ fn rebase_loaded_sfnn_shared(
     if gates.as_ref().is_some_and(|g| g.iter().any(|x| *x <= 0.0)) {
         return Err("cannot rebase L1 shared to zero with a zero residual gate; keep shared alpha positive".to_string());
     }
+    if args.optimizer == OptimizerKind::Sgd {
+        if let Some(opt) = optimizer.as_mut() {
+            if old[1] != new[1] && weights.l1fw.is_some() {
+                if old[1] > 0.0 && new[1] == 0.0 {
+                    opt.l1w.velocity.fill(0.0);
+                    opt.l1b.velocity.fill(0.0);
+                }
+                if let Some(group) = opt.l1fw.as_mut() { group.velocity.fill(0.0); }
+                if let Some(group) = opt.l1fb.as_mut() { group.velocity.fill(0.0); }
+            }
+        }
+    }
     if old[0] != new[0] {
         let base = match args.resolved_eval_type() {
             Some(EvalType::SfnnHalfka2) => ShogiHalfKa2.num_inputs(),
@@ -22620,6 +22734,12 @@ fn rebase_loaded_sfnn_shared(
         let split = base * weights.shape.ft_size;
         if weights.shape.input_size != base + bulletou_lib::game::inputs::PIECE_INPUTS {
             return Err("FT alpha rebase requires shared piece rows".to_string());
+        }
+        if args.optimizer == OptimizerKind::Sgd {
+            if let Some(opt) = optimizer.as_mut() {
+                if old[0] > 0.0 && new[0] == 0.0 { opt.l0w.velocity[..split].fill(0.0); }
+                opt.l0w.velocity[split..].fill(0.0);
+            }
         }
         let (base, common) = weights.l0w.split_at_mut(split);
         let (bs, cs) = if let Some(opt) = optimizer.as_mut() {
@@ -22689,6 +22809,7 @@ fn rebase_loaded_sfnn_axes(
     active: SfnnFactorizerSpec,
     old: &[f32],
     new: &[f32],
+    sgd: bool,
 ) -> Result<(), String> {
     let shape = weights.shape;
     let count = shape.factorizer_axis_count();
@@ -22721,7 +22842,7 @@ fn rebase_loaded_sfnn_axes(
                         group.momentum[i] = 0.0; group.velocity[i] = 0.0; group.slow_params[i] = 0.0;
                     } else {
                         group.momentum[i] /= ratio;
-                        group.velocity[i] /= ratio * ratio;
+                        if sgd { group.velocity[i] = 0.0; } else { group.velocity[i] /= ratio * ratio; }
                         group.slow_params[i] *= ratio;
                         if !group.momentum[i].is_finite() || !group.velocity[i].is_finite() || !group.slow_params[i].is_finite() {
                             return Err(format!("L1 axis {axis} optimizer rebase overflow"));
@@ -22738,7 +22859,7 @@ fn rebase_loaded_sfnn_axes(
 fn rebase_loaded_sfnn_residual_gates(
     weights: &mut CudaCppSfnnInitialWeights,
     optimizer: &mut Option<CudaCppSfnnOptimizerState>,
-    old: Option<&[f32]>, new: Option<&[f32]>,
+    old: Option<&[f32]>, new: Option<&[f32]>, sgd: bool,
 ) -> Result<(), String> {
     let stacks = weights.shape.num_stacks;
     for gates in [old, new].into_iter().flatten() {
@@ -22767,7 +22888,9 @@ fn rebase_loaded_sfnn_residual_gates(
                 for i in range {
                     if ratio == 0.0 { group.momentum[i]=0.0; group.velocity[i]=0.0; group.slow_params[i]=0.0; }
                     else {
-                        group.momentum[i]/=ratio; group.velocity[i]/=ratio*ratio; group.slow_params[i]*=ratio;
+                        group.momentum[i]/=ratio;
+                        if sgd { group.velocity[i]=0.0; } else { group.velocity[i]/=ratio*ratio; }
+                        group.slow_params[i]*=ratio;
                         if !group.momentum[i].is_finite() || !group.velocity[i].is_finite() || !group.slow_params[i].is_finite() {
                             return Err("residual gate optimizer rebase overflow".into());
                         }
@@ -22832,6 +22955,12 @@ fn switch_loaded_l1_factorizer(state: &mut CudaCppSfnnInitialState, old: &Args, 
     let shape = state.weights.shape;
     let w = &mut state.weights;
     if effective_sfnn_factorizer_spec(old).any_axis() {
+        if old.optimizer == OptimizerKind::Sgd {
+            if let Some(o) = state.optimizer_states.as_mut() {
+                o.l1w.velocity.fill(0.0);
+                o.l1b.velocity.fill(0.0);
+            }
+        }
         let counts = WorkerSfnnSession::compute_count_settings(old, shape)?;
         let coefficients = scheduled_l1_axis_fold_coefficients(old, shape, &counts)?;
         fold_axes(shape, &mut w.l1w, &mut w.l1b, w.l1axw.as_deref().ok_or("missing L1 axis/pair weights")?,
@@ -22965,6 +23094,7 @@ fn load_cuda_cpp_sfnn_initial_state(
                 .map_err(|e|e.to_string())?;
             opt.l0w.momentum.truncate(base*width);
             opt.l0w.velocity.truncate(base*width);
+            if args.optimizer == OptimizerKind::Sgd { opt.l0w.velocity.fill(0.0); }
         }
         state.weights.shape.input_size = base;
         eprintln!("{}", paint("  [FT FACTORIZER] restore ON -> OFF: folded master + Lookahead slow weights; base moments/steps retained, shared moments discarded", ConsoleColor::BoldYellow));
@@ -23024,22 +23154,45 @@ fn load_cuda_cpp_sfnn_initial_state(
         }
     }
     let keep_optimizer_state_on_factorizer_change = args.sfnn_keep_optimizer_state_on_factorizer_change;
+    let train = initial_sections.remove("train").unwrap_or_default();
+    let checkpoint_optimizer = sfnn_checkpoint_optimizer(&train)?;
+    let optimizer_changed = checkpoint_optimizer != args.optimizer;
     // New factorizer coordinates reset the optimizer during migration; do not
-    // load an incomplete shared optimizer state just to discard it afterwards.
-    let mut pre_migration_optimizer_states = if created_factorizers.any() || progress_axis_appended {
+    // load incompatible or incomplete optimizer state just to discard it afterwards.
+    let mut pre_migration_optimizer_states = if optimizer_changed || created_factorizers.any() || progress_axis_appended {
         None
     } else {
         load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
     };
-    let train = initial_sections.remove("train").unwrap_or_default();
     let target_counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
     let old_gates = if source_has_factorizer { train.get("residual_count_gates").map(Vec::as_slice) } else { None };
     let new_gates = if effective_sfnn_factorizer_spec(args).any() { target_counts.residual_count_gates.as_deref() } else { None };
-    rebase_loaded_sfnn_residual_gates(&mut weights, &mut pre_migration_optimizer_states, old_gates, new_gates)?;
+    rebase_loaded_sfnn_residual_gates(&mut weights, &mut pre_migration_optimizer_states, old_gates, new_gates,
+        args.optimizer == OptimizerKind::Sgd)?;
     let new_shared_coefficients = shared_coefficients_for_args(args);
     let old_shared_coefficients = match load_sfnn_shared_coefficients(&train)? {
         Some(values) => values,
         None => {
+            if args.optimizer == OptimizerKind::Sgd {
+                // With no saved coefficients a changed alpha cannot be rebased
+                // safely. Prefer the per-checkpoint signature, never the mutable
+                // top-level settings, when deciding whether it changed.
+                let signature = path.parent().and_then(|dir| std::fs::read_to_string(dir.join(RESUME_CONFIG_NAME)).ok());
+                let changed = if let Some(signature) = signature {
+                    let saved = resume_signature_normalize_defaults(&signature);
+                    let requested = resume_signature_normalize_defaults(&resume_signature(args));
+                    let differs = |prefix: &str| saved.lines().find(|line| line.starts_with(prefix))
+                        != requested.lines().find(|line| line.starts_with(prefix));
+                    (args.ft_factorizer && feature_kind.virtual_rows() > 0 && differs("ft_factorizer_alpha="))
+                        || (weights.l1fw.is_some() && !created_factorizers.shared_l1 && differs("sfnn_factorizer_alpha="))
+                } else {
+                    (args.ft_factorizer && feature_kind.virtual_rows() > 0 && new_shared_coefficients[0] != 1.0)
+                        || (weights.l1fw.is_some() && !created_factorizers.shared_l1 && new_shared_coefficients[1] != 1.0)
+                };
+                if changed {
+                    return Err(format!("{} does not record the original shared/FT factorizer coefficients; cannot safely change them on SGD resume", path.display()));
+                }
+            }
             if weights.l1fw.is_some() && !created_factorizers.shared_l1 {
                 eprintln!(
                     "  WARN: {} does not record L1 shared alpha; retaining its shared tensors without L1 alpha rebase. Use the same L1 alpha as when this state was saved.",
@@ -23098,7 +23251,8 @@ fn load_cuda_cpp_sfnn_initial_state(
             Some(old) => old,
             None => return Err(format!("{} lacks saved L1 axis coefficients and its original settings cannot be reconstructed; cannot safely load active axis weights", path.display())),
         };
-        rebase_loaded_sfnn_axes(&mut weights, &mut pre_migration_optimizer_states, active, old, &new)?;
+        rebase_loaded_sfnn_axes(&mut weights, &mut pre_migration_optimizer_states, active, old, &new,
+            args.optimizer == OptimizerKind::Sgd)?;
     }
     if inactive_nonzero {
         let coefficients = source_axis_coefficients.ok_or_else(|| format!(
@@ -23134,8 +23288,6 @@ fn load_cuda_cpp_sfnn_initial_state(
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_sections(&train, &step_ranger, &weights)?;
-    let checkpoint_optimizer = sfnn_checkpoint_optimizer(&train)?;
-    let optimizer_changed = checkpoint_optimizer != args.optimizer;
     let optimizer_states = if optimizer_changed {
         eprintln!("  initial optimizer state = reset when switching {} -> {}", checkpoint_optimizer.cli_name(), args.optimizer.cli_name());
         None
@@ -23151,6 +23303,14 @@ fn load_cuda_cpp_sfnn_initial_state(
             None
         } else if keep_optimizer_state_on_factorizer_change && !extracted_new_factorizers {
             if let Some(mut optimizer_states) = pre_migration_optimizer_states.take() {
+                if args.optimizer == OptimizerKind::Sgd {
+                    optimizer_states.l1w.velocity.fill(0.0);
+                    optimizer_states.l1b.velocity.fill(0.0);
+                    for group in [&mut optimizer_states.l1fw, &mut optimizer_states.l1fb,
+                        &mut optimizer_states.l1axw, &mut optimizer_states.l1axb].into_iter().flatten() {
+                        group.velocity.fill(0.0);
+                    }
+                }
                 fold_cuda_cpp_sfnn_inactive_factorizers_into_optimizer_state(
                     &mut optimizer_states,
                     weights.shape,
@@ -26404,7 +26564,7 @@ fn print_sfnn_qat_mode(args: &Args) {
     print_startup_kv("FT saturation guard", &format!("strength={}, rate={}, patience={} training batches; mean over batch x 2 views x FT units; history resets on restore",
         args.sfnn_ft_saturation_penalty, args.sfnn_ft_saturation_rate, args.sfnn_ft_saturation_patience));
     print_startup_kv("L1 effective weight clip", if args.sfnn_l1_effective_weight_clip {
-        "on: folded residual+alpha*shared in [-2, 1.984375]; fast/slow post-update; bias/moments unchanged"
+        "on: folded residual+shared+axes in [-2, 1.984375]; fast/slow post-update; bias/moments unchanged"
     } else { "off" });
     print_startup_kv("L1 centering", if args.sfnn_l1_center {
         "on: GPU accumulated-batch global input mean; residual/shared optimizer coordinates; folded forward/export"
@@ -26487,6 +26647,7 @@ fn cuda_cpp_sfnn_layer_lr_multipliers(
     let mut multipliers = bulletou_cuda_cpp::SfnnLayerLrMultipliers {
         l0: args.sfnn_ft_lr_mult,
         l2: args.sfnn_l2_lr_mult,
+        l2_bias: args.sfnn_l2_bias_lr_mult,
         l3: args.sfnn_l3_lr_mult,
         bn_affine: args.sfnn_bn_affine_lr_multiplier,
         l2_l3_center: args.sfnn_l2_l3_center,
@@ -27207,6 +27368,7 @@ fn resume_signature_values(args: &Args) -> String {
         format!("sfnn_bn_affine_lr_multiplier={}", args.sfnn_bn_affine_lr_multiplier),
         format!("sfnn_ft_lr_mult={}", args.sfnn_ft_lr_mult),
         format!("sfnn_l2_lr_mult={}", args.sfnn_l2_lr_mult),
+        format!("sfnn_l2_bias_lr_mult={}", args.sfnn_l2_bias_lr_mult),
         format!("sfnn_l3_lr_mult={}", args.sfnn_l3_lr_mult),
         format!("sfnn_bn_qat_freeze_stats={}", args.sfnn_bn_qat_freeze_stats),
         format!("sfnn_bn_l2_effective_weight_clip={}", args.sfnn_bn_l2_effective_weight_clip),
@@ -27248,7 +27410,7 @@ fn write_resume_config(output_dir: &std::path::Path, args: &Args) -> std::io::Re
 
 fn resume_config_matches(output_dir: &std::path::Path, args: &Args) -> Result<bool, std::io::Error> {
     let stored = std::fs::read_to_string(output_dir.join(RESUME_CONFIG_NAME))?;
-    Ok(resume_signature_matches(&stored, args))
+    Ok(resume_signature_matches_impl(&stored, args, true))
 }
 
 #[cfg(test)]
@@ -27509,6 +27671,7 @@ fn resume_signature_for_match(signature: &str) -> String {
     let signature = resume_signature_without_line(&signature, "sfnn_bn_affine_lr_multiplier=");
     let signature = resume_signature_without_line(&signature, "sfnn_ft_lr_mult=");
     let signature = resume_signature_without_line(&signature, "sfnn_l2_lr_mult=");
+    let signature = resume_signature_without_line(&signature, "sfnn_l2_bias_lr_mult=");
     let signature = resume_signature_without_line(&signature, "sfnn_l3_lr_mult=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_qat_freeze_stats=");
     let signature = resume_signature_without_line(&signature, "sfnn_bn_l2_effective_weight_clip=");
@@ -27531,8 +27694,21 @@ fn resume_signature_for_match(signature: &str) -> String {
 }
 
 fn resume_signature_matches(stored: &str, args: &Args) -> bool {
+    resume_signature_matches_impl(stored, args, false)
+}
+
+fn resume_signature_matches_impl(stored: &str, args: &Args, allow_sgd_factorizer_rebase: bool) -> bool {
     let mut current = resume_signature_for_match(&resume_signature(args));
     let mut stored = resume_signature_for_match(stored);
+    if allow_sgd_factorizer_rebase && args.optimizer == OptimizerKind::Sgd && args.backend == BackendKind::CudaCpp
+        && args.eval_type().uses_layerstack() && !args.sfnn_bn_ft && !args.sfnn_bn_l1 && !args.sfnn_bn_l2 {
+        // The checkpoint loader rebases saved coefficients and handles SGD's
+        // rounding remainders. All network layout checks remain in force.
+        for key in ["ft_factorizer_alpha=", "sfnn_factorizer_alpha="] {
+            current = resume_signature_without_line(&current, key);
+            stored = resume_signature_without_line(&stored, key);
+        }
+    }
     if matches!(args.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm)) {
         // The actual state layout is checked by the loader. ON -> OFF folds;
         // OFF -> ON still errors there. Epoch1's scalar need not match a later checkpoint.
@@ -28964,6 +29140,20 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 mod tests {
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
+    fn l2_bias_lr_setting_parses_and_resolves_per_epoch() {
+        use super::*;
+        let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "teacher.bin",
+            "--arch", "SFNN_halfkahm2_2304_15_64_k21k21_progress8", "--optimizer", "sgd",
+            "--superbatches", "1", "--max-epochs", "2", "--sfnn-l2-lr-mult", "10000",
+            "--sfnn-l2-bias-lr-mult", "0.1"]).unwrap();
+        assert_eq!(cuda_cpp_sfnn_layer_lr_multipliers(&args, None).l2_bias, 0.1);
+        args.epoch_settings_json = Some(serde_json::json!({"sfnn_l2_bias_lr_mult": {"epoch1": 0.1, "epoch2": 0.0}}).to_string());
+        assert_eq!(args_at_epoch(&args, 1).unwrap().sfnn_l2_bias_lr_mult, 0.1);
+        assert_eq!(args_at_epoch(&args, 2).unwrap().sfnn_l2_bias_lr_mult, 0.0);
+        assert!(!resume_signature_for_match(&resume_signature(&args)).contains("sfnn_l2_bias_lr_mult="));
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
     fn checkpoint_optimizer_marker_handles_legacy_and_rejects_invalid() {
         use super::*;
         let mut records = BTreeMap::new();
@@ -29149,16 +29339,118 @@ mod tests {
     }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
+    fn sgd_checkpoint_preserves_remainders_without_rebase_and_clears_affected_on_rebase() {
+        let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "teacher.bin",
+            "--arch", "SFNN_ka2_32_8_32_k3k3", "--sfnn-l1-factorizer", "shared", "--optimizer", "sgd"]).unwrap();
+        let kind = CudaCppSfnnFeatureKind::Ka2;
+        let w = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        let fields = [("l0w", w.l0w.as_slice()), ("l0b", w.l0b.as_slice()), ("l1w", w.l1w.as_slice()),
+            ("l1b", w.l1b.as_slice()), ("l1fw", w.l1fw.as_deref().unwrap()), ("l1fb", w.l1fb.as_deref().unwrap()),
+            ("l2w", w.l2w.as_slice()), ("l2b", w.l2b.as_slice()), ("l3w", w.l3w.as_slice()), ("l3b", w.l3b.as_slice())];
+        let mut records = vec![("nnue/train/optimizer_kind".to_string(), vec![1.0]),
+            ("nnue/train/shared_coefficients".to_string(), vec![1.0, 1.0])];
+        for (name, weights) in fields {
+            records.push((format!("nnue/weights/{name}"), weights.to_vec()));
+            records.push((format!("nnue/momentum/{name}"), vec![0.25; weights.len()]));
+            records.push((format!("nnue/velocity/{name}"), vec![1.0e-8; weights.len()]));
+            records.push((format!("nnue/slow/{name}"), weights.to_vec()));
+        }
+        let path = std::env::temp_dir().join(format!("bulletou-sgd-rebase-checkpoint-{}.bin", std::process::id()));
+        write_cuda_cpp_state_records_atomic(&path, records.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect()).unwrap();
+        let unchanged = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap().optimizer_states.unwrap();
+        assert!(unchanged.l1w.velocity.iter().all(|v| *v == 1.0e-8));
+        let signature = resume_signature(&args);
+        args.sfnn_factorizer_alpha = Some("shared=0.5".parse().unwrap());
+        assert!(resume_signature_matches_impl(&signature, &args, true));
+        assert!(!resume_signature_matches(&signature, &args));
+        let changed = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap().optimizer_states.unwrap();
+        args.optimizer = OptimizerKind::Ranger;
+        let changed_optimizer = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap();
+        assert!(changed_optimizer.optimizer_states.is_none());
+        args.optimizer = OptimizerKind::Sgd;
+        let legacy_dir = std::env::temp_dir().join(format!("bulletou-sgd-rebase-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy = legacy_dir.join("state.bin");
+        std::fs::write(legacy_dir.join(RESUME_CONFIG_NAME), &signature).unwrap();
+        let old_records: Vec<_> = records.iter().filter(|(key, _)| key != "nnue/train/shared_coefficients")
+            .map(|(key, value)| (key.as_str(), value.as_slice())).collect();
+        write_cuda_cpp_state_records_atomic(&legacy, old_records).unwrap();
+        let err = load_cuda_cpp_sfnn_initial_state(&legacy, &args, kind).unwrap_err();
+        assert!(err.contains("does not record the original shared/FT factorizer coefficients"));
+        args.sfnn_factorizer_alpha = None;
+        let legacy_unchanged = load_cuda_cpp_sfnn_initial_state(&legacy, &args, kind).unwrap().optimizer_states.unwrap();
+        assert!(legacy_unchanged.l1fw.unwrap().velocity.iter().all(|v| *v == 1.0e-8));
+        std::fs::remove_file(legacy).unwrap();
+        std::fs::remove_file(legacy_dir.join(RESUME_CONFIG_NAME)).unwrap();
+        std::fs::remove_dir(legacy_dir).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(changed.l1w.velocity.iter().all(|v| *v == 1.0e-8));
+        assert!(changed.l1fw.as_ref().unwrap().velocity.iter().all(|v| *v == 0.0));
+        assert!(changed.l2w.velocity.iter().all(|v| *v == 1.0e-8));
+        assert!(changed.l1w.momentum.iter().all(|v| *v == 0.25));
+        assert!(changed.l1fw.unwrap().momentum.iter().all(|v| *v == 0.125));
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn sgd_factorizer_rebase_discards_only_changed_remainders() {
+        let args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "teacher.bin",
+            "--arch", "SFNN_ka2_32_8_32_k3k3", "--sfnn-l1-factorizer", "axis", "--optimizer", "sgd"]).unwrap();
+        let mut w = build_sfnn_initial_weights_for_cuda_cpp(&args, CudaCppSfnnFeatureKind::Ka2).unwrap();
+        let group = |weights: &[f32]| {
+            let mut state = CudaCppRangerGroupState::zero_from_weights(weights);
+            state.momentum.fill(0.25); state.velocity.fill(1.0e-8); state
+        };
+        let mut opt = Some(CudaCppSfnnOptimizerState {
+            l0w: group(&w.l0w), l0b: group(&w.l0b), l1w: group(&w.l1w), l1b: group(&w.l1b),
+            l1fw: w.l1fw.as_deref().map(group), l1fb: w.l1fb.as_deref().map(group),
+            l1axw: w.l1axw.as_deref().map(group), l1axb: w.l1axb.as_deref().map(group),
+            l2w: group(&w.l2w), l2b: group(&w.l2b), l2fw: None, l2fb: None, l2axw: None, l2axb: None,
+            l3w: group(&w.l3w), l3b: group(&w.l3b), l3fw: None, l3fb: None, l3axw: None, l3axb: None,
+        });
+        rebase_loaded_sfnn_shared(&mut w, &mut opt, &args, [1.0, 1.0], [1.0, 1.0]).unwrap();
+        assert!(opt.as_ref().unwrap().l1w.velocity.iter().all(|v| *v == 1.0e-8));
+        rebase_loaded_sfnn_shared(&mut w, &mut opt, &args, [1.0, 1.0], [1.0, 0.5]).unwrap();
+        let o = opt.as_ref().unwrap();
+        assert!(o.l1w.velocity.iter().all(|v| *v == 1.0e-8));
+        assert!(o.l1fw.as_ref().unwrap().velocity.iter().all(|v| *v == 0.0));
+        assert!(o.l0w.velocity.iter().all(|v| *v == 1.0e-8));
+        assert!(o.l2w.velocity.iter().all(|v| *v == 1.0e-8));
+        assert!(o.l1w.momentum.iter().all(|v| *v == 0.25));
+        let active = effective_sfnn_factorizer_spec(&args);
+        let ids = cuda_cpp_sfnn_factorizer_axis_indices(w.shape, active);
+        let old = vec![1.0; w.shape.factorizer_axis_count()];
+        let mut new = old.clone(); new[ids[0]] = 0.5;
+        rebase_loaded_sfnn_axes(&mut w, &mut opt, active, &old, &new, true).unwrap();
+        let axis = opt.as_ref().unwrap().l1axb.as_ref().unwrap();
+        let width = w.shape.l1_out();
+        assert!(axis.velocity[ids[0]*width..(ids[0]+1)*width].iter().all(|v| *v == 0.0));
+        assert_eq!(axis.momentum[ids[0]*width], 0.125);
+        let mut gates = vec![1.0; w.shape.num_stacks]; gates[0] = 0.5;
+        opt.as_mut().unwrap().l1b.velocity.fill(1.0e-8);
+        let mut ranger_w = w.clone();
+        let mut ranger_opt = opt.clone();
+        rebase_loaded_sfnn_residual_gates(&mut ranger_w, &mut ranger_opt, Some(&gates), None, false).unwrap();
+        assert_eq!(ranger_opt.as_ref().unwrap().l1b.velocity[0], 4.0e-8);
+        rebase_loaded_sfnn_residual_gates(&mut w, &mut opt, Some(&gates), None, true).unwrap();
+        let bias = &opt.as_ref().unwrap().l1b.velocity;
+        assert!(bias[..width].iter().all(|v| *v == 0.0));
+        assert!(bias[width..].iter().all(|v| *v == 1.0e-8));
+        opt.as_mut().unwrap().l1w.velocity.fill(1.0e-8);
+        rebase_loaded_sfnn_shared(&mut w, &mut opt, &args, [1.0, 0.5], [1.0, 0.0]).unwrap();
+        assert!(opt.as_ref().unwrap().l1w.velocity.iter().all(|v| *v == 0.0));
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
     fn loaded_residual_gate_rebase_preserves_master_and_rejects_singular() {
         let args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
             "--arch","SFNN_ka2_32_8_32_k3k3","--sfnn-factorizer","axis"]).unwrap();
         let mut w=build_sfnn_initial_weights_for_cuda_cpp(&args,CudaCppSfnnFeatureKind::Ka2).unwrap();
         w.l1b[0]=2.0;
         let old=vec![0.5;w.shape.num_stacks];
-        rebase_loaded_sfnn_residual_gates(&mut w,&mut None,Some(&old),None).unwrap();
+        rebase_loaded_sfnn_residual_gates(&mut w,&mut None,Some(&old),None,false).unwrap();
         assert_eq!(w.l1b[0],1.0);
         let zero=vec![0.0;w.shape.num_stacks];
-        assert!(rebase_loaded_sfnn_residual_gates(&mut w,&mut None,None,Some(&zero)).is_err());
+        assert!(rebase_loaded_sfnn_residual_gates(&mut w,&mut None,None,Some(&zero),false).is_err());
     }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
@@ -29228,10 +29520,10 @@ mod tests {
         let mut old = vec![1.0; weights.shape.factorizer_axis_count()];
         let new = old.clone();
         old[axis] = 0.5;
-        rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &old, &new).unwrap();
+        rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &old, &new, false).unwrap();
         assert_eq!(weights.l1axb.as_ref().unwrap()[axis * width], 1.0);
         let mut zero = new.clone(); zero[axis] = 0.0;
-        assert!(rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &new, &zero).is_err());
+        assert!(rebase_loaded_sfnn_axes(&mut weights, &mut None, active, &new, &zero, false).is_err());
     }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
@@ -37209,6 +37501,29 @@ mod tests {
         assert_eq!(resume_signature(&base),resume_signature(&enabled));
     }
 
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_gpu_proxy_rejects_engine_only_options() {
+        let base = QuantizedTestArgs::try_parse_from(["quantized-test", "--arch", "SFNN_halfka2_1024_7_64_k3k3",
+            "--nn-bin", "nn.bin", "--test-teacher", "test.psv", "--mode", "gpu"]).unwrap();
+        assert!(base.validate_arch_flags().is_ok());
+        let mut a=base.clone(); a.engine_score_offset=1.0; assert!(a.validate_arch_flags().is_err());
+        let mut a=base.clone(); a.sfnn_ft_shift=6; assert!(a.validate_arch_flags().is_err());
+        let mut a=base.clone(); a.quant_ft_round=QuantizedRoundMode::Nearest; assert!(a.validate_arch_flags().is_err());
+        let mut a=base.clone(); a.quant_crelu_round=QuantizedRoundMode::Nearest; assert!(a.validate_arch_flags().is_err());
+        let mut a=base.clone(); a.quant_sqrcrelu_round=QuantizedRoundMode::Nearest; assert!(a.validate_arch_flags().is_err());
+        let mut a=base.clone(); a.quant_final_div_round=QuantizedRoundMode::Nearest; assert!(a.validate_arch_flags().is_err());
+        a.mode=QuantizedTestMode::CpuExact; assert!(a.validate_arch_flags().is_ok());
+    }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_ft_accumulator_matches_engine_i16_wrapping() {
+        // YaneuraOu doubles serialized i16 FT weights and accumulates in i16.
+        // Wrapping is observable after the subsequent CReLU clamp.
+        assert_eq!(quantized_sfnn_ft_pair_value(40_000,254,7,QuantizedRoundMode::Floor),0);
+        assert_eq!(quantized_sfnn_ft_pair_value(-65_500,254,7,QuantizedRoundMode::Floor),17);
+        assert_eq!(quantized_sfnn_ft_pair_value(254,254,7,QuantizedRoundMode::Floor),126);
+    }
     #[test]
     fn l1_effective_weight_clip_cli_json_epoch() {
         let mut argv: Vec<std::ffi::OsString> = ["bulletou", "--backend", "cuda-cpp", "--teacher", "/dev/null",
@@ -37227,6 +37542,11 @@ mod tests {
         base.epoch_settings_json=Some(serde_json::json!({"sfnn_l1_effective_weight_clip":{"epoch1":false,"epoch2":true}}).to_string());
         assert!(!args_at_epoch(&base,1).unwrap().sfnn_l1_effective_weight_clip);
         assert!(args_at_epoch(&base,2).unwrap().sfnn_l1_effective_weight_clip);
+        let pair=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","/dev/null",
+            "--arch","SFNN_halfkahm2_2304_15_64_k21k21_progress8","--sfnn-l1-factorizer","pair",
+            "--optimizer","sgd","--sfnn-l1-effective-weight-clip","--superbatches","1","--max-epochs","1"]).unwrap();
+        assert!(pair.validate_arch_flags().is_ok());
+        assert!(pair.validate_backend_flags().is_ok());
     }
 
     #[test]
