@@ -145,6 +145,8 @@ struct BulletOuCudaCppContext {
     size_t dense_qat_l2_raw_len = 0;
     int* dense_qat_l1_bias = nullptr;
     size_t dense_qat_l1_bias_len = 0;
+    float* dense_qat_l1_master_bias = nullptr;
+    size_t dense_qat_l1_master_bias_len = 0;
     int* dense_qat_packed_input = nullptr;
     size_t dense_qat_packed_input_len = 0;
     float* sfnn_fp16_folded_ft = nullptr;
@@ -1940,7 +1942,8 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     float pair_alpha,
     const float* residual_count_gates,
     const float* factorizer_axis_confidences,
-    float scale, BnConfig bn={}, bool precise=false, int* integer_bias=nullptr, bool quantize=true) {
+    float scale, BnConfig bn={}, bool precise=false, int* integer_bias=nullptr, bool quantize=true,
+    float* master_bias_out=nullptr) {
     const size_t total = num_stacks * output_dim;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (tid >= total) {
@@ -1991,6 +1994,7 @@ __global__ void sfnn_build_quantized_proxy_stacked_bias_kernel(
     }
 
     const float folded = bn_fold_bias(value,bn,stack,out_col);
+    if (master_bias_out) master_bias_out[tid] = folded;
     if (integer_bias) {
         const double q=fmin(2147483647.0,fmax(-2147483648.0,round(static_cast<double>(folded)*static_cast<double>(scale))));
         integer_bias[tid]=static_cast<int>(q);
@@ -3709,7 +3713,8 @@ __global__ void sfnn_l2_input_backward_kernel(
     float* l1_gradients,
     size_t batch,
     size_t l1_hidden,
-    int l1_skip) {
+    int l1_skip, const int* buckets = nullptr, const int* qat_raw = nullptr,
+    const float* qat_master_bias = nullptr, const int* qat_integer_bias = nullptr, size_t stacks = 0) {
     size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t l1_out = sfnn_l1_out_for_shape(l1_hidden, l1_skip);
     size_t total = batch * l1_out;
@@ -3731,10 +3736,42 @@ __global__ void sfnn_l2_input_backward_kernel(
     // The activation buffers may be rounded to the integer lattice by dense
     // QAT.  Rounding is an identity STE: the clamp derivative must therefore
     // be evaluated from the pre-rounding L1 value, not the rounded output.
-    const float continuous_square = fabsf(value) * fabsf(value) * SFNN_PAIRWISE_SCALE;
-    const float square_grad = crelu_pre_gradient_from_value(continuous_square, l2_input_gradients[square_idx]) *
-        (2.0f * value * SFNN_PAIRWISE_SCALE);
-    const float linear_grad = crelu_pre_gradient_from_value(value, l2_input_gradients[linear_idx]);
+    float ste_value = value;
+    float bias_fraction = 0.0f;
+    if (qat_raw && qat_master_bias && qat_integer_bias) {
+        const int bucket = buckets[sample];
+        if (bucket >= 0 && static_cast<size_t>(bucket) < stacks) {
+            const size_t index=static_cast<size_t>(bucket)*l1_out+col;
+            const float master=qat_master_bias[index];
+            const int quantized=qat_integer_bias[index];
+            if (quantized >= -16777216 && quantized <= 16777216) {
+                // Exact product residual even when an FP32 multiply would
+                // round to an integer; integer bias is exactly representable.
+                bias_fraction=__fmaf_rn(master,8128.0f,-static_cast<float>(quantized));
+            } else {
+                const double scaled=fmin(2147483647.0,fmax(-2147483648.0,static_cast<double>(master)*8128.0));
+                bias_fraction=static_cast<float>(scaled-static_cast<double>(quantized));
+            }
+            ste_value = __fmaf_rn(bias_fraction, 1.0f/8128.0f, value);
+        }
+    }
+    const float continuous_square = fabsf(ste_value) * fabsf(ste_value) * SFNN_PAIRWISE_SCALE;
+    bool square_active=continuous_square > 0.0f && continuous_square < 1.0f;
+    bool linear_active=ste_value > 0.0f && ste_value < 1.0f;
+    if (qat_raw && qat_master_bias && qat_integer_bias) {
+        const int raw=qat_raw[tid];
+        // Avoid FP32 rounding at the two linear boundaries. The square
+        // boundary is +/-8159.937..., so only +/-8160 needs FP64 here.
+        if (raw==0) linear_active=bias_fraction>0.0f;
+        else if(raw==8128) linear_active=bias_fraction<0.0f;
+        if(raw==8160 || raw==-8160) {
+            const double x=static_cast<double>(raw)+static_cast<double>(bias_fraction);
+            square_active=x*x*127.0 < 128.0*8128.0*8128.0;
+        }
+    }
+    const float square_grad = square_active ? l2_input_gradients[square_idx] *
+        (2.0f * ste_value * SFNN_PAIRWISE_SCALE) : 0.0f;
+    const float linear_grad = linear_active ? l2_input_gradients[linear_idx] : 0.0f;
     l1_gradients[tid] += square_grad + linear_grad;
 }
 
@@ -8356,7 +8393,10 @@ int launch_sfnn_backward_kernels(
         return -1;
     }
     sfnn_l2_input_backward_kernel<<<blocks, threads, 0, ctx->stream>>>(
-        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip);
+        l1, l2_input, l2_input_gradients, l1_gradients, batch, l1_hidden, l1_skip,
+        buckets, ctx->dense_qat ? ctx->dense_qat_l1_raw : nullptr,
+        ctx->dense_qat ? ctx->dense_qat_l1_master_bias : nullptr,
+        ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr, num_stacks);
     if (check_kernel_launch("sfnn_l2_input_backward_kernel launch") != 0) {
         return -1;
     }
@@ -9253,7 +9293,8 @@ extern "C" int bulletou_dense_qat_begin(BulletOuCudaCppContext* ctx,
         validate_buffer(ctx,l3_bias,stacks,"dense QAT master L3 bias") || set_context_device(ctx)) return -1;
     if (ensure_i32_scratch(&ctx->dense_qat_l1_raw,&ctx->dense_qat_l1_raw_len,batch*l1_out,"dense QAT L1 raw") ||
         ensure_i32_scratch(&ctx->dense_qat_l2_raw,&ctx->dense_qat_l2_raw_len,batch*l2_size,"dense QAT L2 raw") ||
-        ensure_i32_scratch(&ctx->dense_qat_l1_bias,&ctx->dense_qat_l1_bias_len,stacks*l1_out,"dense QAT L1 bias")) return -1;
+        ensure_i32_scratch(&ctx->dense_qat_l1_bias,&ctx->dense_qat_l1_bias_len,stacks*l1_out,"dense QAT L1 bias") ||
+        ensure_f32_scratch(&ctx->dense_qat_l1_master_bias,&ctx->dense_qat_l1_master_bias_len,stacks*l1_out,"dense QAT L1 master bias")) return -1;
     ctx->dense_qat_l2_bias=l2_bias->ptr;
     ctx->dense_qat_l3_bias=l3_bias->ptr;
     ctx->dense_qat=true;
@@ -9448,7 +9489,8 @@ extern "C" int bulletou_cuda_cpp_context_destroy(BulletOuCudaCppContext* ctx) {
         free_i32_scratch(ctx->sfnn_ft_sort_positions, ctx->sfnn_ft_sort_positions_len, "cudaFree FT sort positions") != 0 ||
         free_i32_scratch(ctx->dense_qat_l1_raw, ctx->dense_qat_l1_raw_len, "cudaFree dense QAT L1") != 0 ||
         free_i32_scratch(ctx->dense_qat_l2_raw, ctx->dense_qat_l2_raw_len, "cudaFree dense QAT L2") != 0 ||
-        free_i32_scratch(ctx->dense_qat_l1_bias, ctx->dense_qat_l1_bias_len, "cudaFree dense QAT bias") != 0) {
+        free_i32_scratch(ctx->dense_qat_l1_bias, ctx->dense_qat_l1_bias_len, "cudaFree dense QAT bias") != 0 ||
+        free_f32_scratch(ctx->dense_qat_l1_master_bias, ctx->dense_qat_l1_master_bias_len, "cudaFree dense QAT master bias") != 0) {
         delete ctx;
         return -1;
     }
@@ -11475,7 +11517,8 @@ extern "C" int bulletou_cuda_cpp_sfnn_forward_device(
                 factorizer_shared_alpha, factorizer_king_axis_alpha, factorizer_hand_axis_alpha,
                 factorizer_progress_axis_alpha, factorizer_pair_alpha,
                 residual_count_gates_ptr, factorizer_axis_confidences_ptr, 127.0f * 64.0f, {}, false,
-                ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr, quantize_l1);
+                ctx->dense_qat ? ctx->dense_qat_l1_bias : nullptr, quantize_l1,
+                ctx->dense_qat ? ctx->dense_qat_l1_master_bias : nullptr);
             if (check_kernel_launch("QAT L1 bias launch") != 0) return -1;
         }
     }

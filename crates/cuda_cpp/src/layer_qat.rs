@@ -249,6 +249,128 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    #[ignore = "requires CUDA; checks the STE near both quantized L1 clamp boundaries"]
+    fn dense_qat_sub_lattice_l1_bias_passes_gradient() {
+        let ctx = Context::new(0).unwrap();
+        for (bias, passes) in [(-0.25/8128.0,false),(0.25/8128.0,true),
+            (1.0-0.25/8128.0,true),(1.0+0.25/8128.0,false)] {
+            let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+            let shape=w.shape; let n=shape.l1_out(); let l2in=shape.l2_in();
+            let l1w=vec![0.0;shape.num_stacks*n*shape.ft_size];
+            let mut l1b=vec![0.0;shape.num_stacks*n]; l1b[0]=bias;
+            let mut l2w=vec![0.0;shape.num_stacks*shape.l2_size*l2in];
+            l2w[shape.l1_hidden]=0.5;
+            let mut l2b=vec![0.0;shape.num_stacks*shape.l2_size]; l2b[0]=0.25;
+            let mut l3w=vec![0.0;shape.num_stacks*shape.l2_size]; l3w[0]=1.0;
+            let l3b=vec![0.0;shape.num_stacks];
+            w.l1w=&l1w; w.l1b=&l1b; w.l1fw=None; w.l1fb=None;
+            w.l2w=&l2w; w.l2b=&l2b; w.l2fw=None; w.l2fb=None;
+            w.l3w=&l3w; w.l3b=&l3b; w.l3fw=None; w.l3fb=None;
+            let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+                targets:&[1.0],entry_weights:&[1.0],batch_size:1,max_active:1};
+            let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+            let grad=r.backward_workspace.l1b_gradients.download(&ctx).unwrap()[0];
+            if passes { assert!(grad.abs()>0.1,"bias={bias} grad={grad}"); }
+            else { assert_eq!(grad,0.0,"bias={bias}"); }
+        }
+    }
+    #[test]
+    #[ignore = "requires CUDA; verifies the L1 STE uses the fully folded pair bias"]
+    fn dense_qat_sub_lattice_pair_bias_passes_gradient() {
+        let ctx=Context::new(0).unwrap();
+        for (offset,passes) in [(0.25/8128.0,true),(-0.25/8128.0,false)] {
+            let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+            w.shape.num_stacks=72;
+            w.shape.factorizer_king_axis_dim=3;
+            w.shape.factorizer_progress_axis=true;
+            w.shape.factorizer_king_progress_pair=true;
+            let shape=w.shape; let n=shape.l1_out(); let l2in=shape.l2_in();
+            let l1w=vec![0.0;shape.num_stacks*n*shape.ft_size];
+            let mut l1b=vec![0.0;shape.num_stacks*n]; l1b[0]=0.125;
+            let l1fw=vec![0.0;shape.ft_size*n];
+            let mut l1fb=vec![0.0;n]; l1fb[0]=-0.25;
+            let l1axw=vec![0.0;shape.factorizer_axis_count()*shape.ft_size*n];
+            let mut l1axb=vec![0.0;shape.factorizer_axis_count()*n]; l1axb[6*n]=0.125+offset;
+            let mut l2w=vec![0.0;shape.num_stacks*shape.l2_size*l2in]; l2w[shape.l1_hidden]=0.5;
+            let mut l2b=vec![0.0;shape.num_stacks*shape.l2_size]; l2b[0]=0.25;
+            let mut l3w=vec![0.0;shape.num_stacks*shape.l2_size]; l3w[0]=1.0;
+            let l3b=vec![0.0;shape.num_stacks];
+            w.l1w=&l1w;w.l1b=&l1b;w.l1fw=Some(&l1fw);w.l1fb=Some(&l1fb);
+            w.l1axw=Some(&l1axw);w.l1axb=Some(&l1axb);
+            w.l2w=&l2w;w.l2b=&l2b;w.l2fw=None;w.l2fb=None;
+            w.l3w=&l3w;w.l3b=&l3b;w.l3fw=None;w.l3fb=None;
+            let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+                targets:&[1.0],entry_weights:&[1.0],batch_size:1,max_active:1};
+            let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+            let grad=r.backward_workspace.l1b_gradients.download(&ctx).unwrap()[0];
+            if passes { assert!(grad.abs()>0.1,"offset={offset} grad={grad}"); }
+            else { assert_eq!(grad,0.0,"offset={offset}"); }
+        }
+    }
+    #[test]
+    #[ignore = "requires CUDA; checks the square STE at rounded L1 bias boundaries"]
+    fn dense_qat_sub_lattice_l1_square_gradient() {
+        let ctx=Context::new(0).unwrap();
+        for (bias,passes) in [(0.25/8128.0,true),((8160.0-0.25)/8128.0,true),
+            ((8160.0+0.25)/8128.0,false),((-8160.0+0.25)/8128.0,true),
+            ((-8160.0-0.25)/8128.0,false)] {
+            let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+            let shape=w.shape; let n=shape.l1_out();let l2in=shape.l2_in();
+            let l1w=vec![0.0;shape.num_stacks*n*shape.ft_size];
+            let mut l1b=vec![0.0;shape.num_stacks*n];l1b[0]=bias;
+            let mut l2w=vec![0.0;shape.num_stacks*shape.l2_size*l2in];l2w[0]=0.25;
+            let mut l2b=vec![0.0;shape.num_stacks*shape.l2_size];l2b[0]=0.25;
+            let mut l3w=vec![0.0;shape.num_stacks*shape.l2_size];l3w[0]=1.0;
+            let l3b=vec![0.0;shape.num_stacks];
+            w.l1w=&l1w;w.l1b=&l1b;w.l1fw=None;w.l1fb=None;
+            w.l2w=&l2w;w.l2b=&l2b;w.l2fw=None;w.l2fb=None;
+            w.l3w=&l3w;w.l3b=&l3b;w.l3fw=None;w.l3fb=None;
+            let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+                targets:&[1.0],entry_weights:&[1.0],batch_size:1,max_active:1};
+            let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+            let grad=r.backward_workspace.l1b_gradients.download(&ctx).unwrap()[0];
+            if passes {assert!(grad.abs()>1e-7,"bias={bias} grad={grad}");}
+            else {assert_eq!(grad,0.0,"bias={bias}");}
+        }
+    }
+    #[test]
+    #[ignore = "requires CUDA; square identity STE must use the unrounded L1 bias"]
+    fn dense_qat_l1_square_uses_bias_fraction_away_from_boundary() {
+        let ctx=Context::new(0).unwrap();
+        for bias in [1.25/8128.0,-1.25/8128.0,1000.25/8128.0] {
+            let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+            let shape=w.shape; let n=shape.l1_out();let l2in=shape.l2_in();
+            let l1w=vec![0.0;shape.num_stacks*n*shape.ft_size];
+            let mut l1b=vec![0.0;shape.num_stacks*n];l1b[0]=bias;
+            let mut l2w=vec![0.0;shape.num_stacks*shape.l2_size*l2in];l2w[0]=0.25;
+            let mut l2b=vec![0.0;shape.num_stacks*shape.l2_size];l2b[0]=0.25;
+            let mut l3w=vec![0.0;shape.num_stacks*shape.l2_size];l3w[0]=1.0;
+            let l3b=vec![0.0;shape.num_stacks];
+            w.l1w=&l1w;w.l1b=&l1b;w.l1fw=None;w.l1fb=None;
+            w.l2w=&l2w;w.l2b=&l2b;w.l2fw=None;w.l2fb=None;
+            w.l3w=&l3w;w.l3b=&l3b;w.l3fw=None;w.l3fb=None;
+            let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+            let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+                targets:&[1.0],entry_weights:&[1.0],batch_size:1,max_active:1};
+            let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+            r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+                ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+            let output=r.forward_workspace.download_output(&ctx).unwrap()[0];
+            let grad=r.backward_workspace.l1b_gradients.download(&ctx).unwrap()[0];
+            let expected=(1.0/(1.0+(-output).exp())-1.0)*0.25*2.0*bias*(127.0/128.0);
+            assert!((grad-expected).abs()<1e-8,"bias={bias} grad={grad} expected={expected}");
+        }
+    }
+    #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn rejects_only_all_zero_quantized_ft() {
         let ctx = Context::new(0).unwrap();
