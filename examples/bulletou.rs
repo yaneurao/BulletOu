@@ -19181,6 +19181,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     let mut epoch_args = args.clone();
     let mut l1_suppress_cache: Option<(usize, usize, bool)> = None;
     let mut active_epoch = None;
+    let trace_batch_stride = std::env::var("BULLETOU_SGD_TRACE_BATCH_HASH").ok().map(|s| {
+        s.parse::<usize>().ok().filter(|&n| n>0)
+            .ok_or_else(|| "BULLETOU_SGD_TRACE_BATCH_HASH must be a positive batch interval".to_string())
+    }).transpose()?;
+    let mut trace_batch_rolling_hash=std::collections::hash_map::DefaultHasher::new();
+    let reference_upload=std::env::var_os("BULLETOU_SGD_REFERENCE_UPLOAD").is_some();
+    if reference_upload { eprintln!("  SGD diagnostic: synchronous reference upload enabled"); }
     for_each_cuda_cpp_sfnn_teacher_batch(feature_kind, &config, train_steps, |teacher_batch| {
         seen_steps += 1;
         let revival_resume_pos = last_dataloader_pos.or(config.dataloader_resume_pos);
@@ -19334,6 +19341,27 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         } else {
             fast.buckets.as_slice()
         };
+        if let Some(interval)=trace_batch_stride {
+            use std::hash::{Hash, Hasher};
+            seen_steps.hash(&mut trace_batch_rolling_hash);
+            let stride=(fast.layout.batch_size/128).max(1);
+            for i in (0..fast.layout.batch_size).step_by(stride) {
+                let range=i*fast.layout.max_active..(i+1)*fast.layout.max_active;
+                fast.stm[range.clone()].hash(&mut trace_batch_rolling_hash);
+                fast.nstm[range].hash(&mut trace_batch_rolling_hash);
+                buckets[i].hash(&mut trace_batch_rolling_hash);
+                fast.targets[i].to_bits().hash(&mut trace_batch_rolling_hash);
+                fast.weights[i].to_bits().hash(&mut trace_batch_rolling_hash);
+            }
+            if seen_steps==1 || seen_steps%interval==0 || seen_steps==train_steps {
+                let mut hash=std::collections::hash_map::DefaultHasher::new();
+                fast.stm.hash(&mut hash);fast.nstm.hash(&mut hash);buckets.hash(&mut hash);
+                for &v in &fast.targets {v.to_bits().hash(&mut hash);}
+                for &v in &fast.weights {v.to_bits().hash(&mut hash);}
+                eprintln!("  SGD batch fingerprint step={seen_steps} full={:016x} sampled_cumulative={:016x}",
+                    hash.finish(),trace_batch_rolling_hash.finish());
+            }
+        }
         let batch = SfnnTrainStepHostBatch {
             stm_indices: &fast.stm,
             nstm_indices: &fast.nstm,
@@ -19403,6 +19431,13 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     profile.backward_stages.total_ms
                 );
             }
+        } else if reference_upload {
+            runner.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                &ctx,params,loss_kind,output_inv_scale,batch,should_report,is_optimizer_step,
+                lr_multipliers,dirty_update_buckets).map_err(|e|e.to_string())?;
+            // Keep the pageable host batch alive until all copies and kernels
+            // complete, making this a fully synchronized diagnostic path.
+            ctx.synchronize().map_err(|e|e.to_string())?;
         } else {
             runner
                 .step_pipelined_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
@@ -19823,7 +19858,46 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     let completed_steps = completed_step_offset + seen_steps;
     let optimizer_steps = optimizer_step_offset + optimizer_updates;
+    if std::env::var_os("BULLETOU_SGD_TRACE_WEIGHTS_HASH").is_some() {
+        use std::hash::{Hash,Hasher};
+        let sample_dir=std::env::var_os("BULLETOU_SGD_TRACE_WEIGHT_SAMPLES_DIR").map(PathBuf::from);
+        if let Some(dir)=&sample_dir {
+            std::fs::create_dir_all(dir).map_err(|e|format!("failed to create {}: {e}",dir.display()))?;
+        }
+        let record=|name:&str,data:Vec<f32>| -> Result<(),String> {
+            let mut hash=std::collections::hash_map::DefaultHasher::new();
+            for &value in &data {value.to_bits().hash(&mut hash);}
+            eprintln!("  SGD weights fingerprint {name}={:016x}",hash.finish());
+            if let Some(dir)=&sample_dir {
+                let mut bytes=Vec::with_capacity(data.len().div_ceil(64)*4);
+                for value in data.iter().step_by(64) {bytes.extend_from_slice(&value.to_le_bytes());}
+                let path=dir.join(format!("{name}.f32"));
+                std::fs::write(&path,bytes).map_err(|e|format!("failed to write {}: {e}",path.display()))?;
+            }
+            Ok(())
+        };
+        for (name,buffer) in [
+            ("l0w",&runner.weights.l0w),("l0b",&runner.weights.l0b),
+            ("l1w",&runner.weights.l1w),("l1b",&runner.weights.l1b),
+            ("l2w",&runner.weights.l2w),("l2b",&runner.weights.l2b),
+            ("l3w",&runner.weights.l3w),("l3b",&runner.weights.l3b),
+        ] {
+            let data=buffer.download(&ctx).map_err(|e|e.to_string())?;
+            record(name,data)?;
+        }
+        for (name,buffer) in [("l1fw",&runner.weights.l1fw),("l1fb",&runner.weights.l1fb),
+            ("l1axw",&runner.weights.l1axw),("l1axb",&runner.weights.l1axb)] {
+            if let Some(buffer)=buffer {
+                let data=buffer.download(&ctx).map_err(|e|e.to_string())?;
+                record(name,data)?;
+            }
+        }
+    }
     if let Some((l2w, l2b, l3w, l3b)) = sgd_trace_layers {
+        let bucket_trace_path = std::env::var_os("BULLETOU_SGD_TRACE_BUCKETS_CSV").map(PathBuf::from);
+        let mut bucket_csv = bucket_trace_path.as_ref().map(|_| {
+            String::from("layer,bucket,weights,fp_changed,quant_changed,mean_abs_delta\n")
+        });
         for (name, before, after, scale) in [
             ("l2w", l2w, runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
             ("l2b", l2b, runner.weights.l2b.download(&ctx).map_err(|e| e.to_string())?, 8128.0f32),
@@ -19840,6 +19914,34 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             }
             eprintln!("  SGD layer trace {name}: n={} changed={} quant_changed={} mean_abs_delta={:.9e}",
                 before.len(), changed, quant_changed, abs_delta / before.len().max(1) as f64);
+            if let Some(csv) = bucket_csv.as_mut() {
+                use std::fmt::Write as _;
+                let stacks=runner.shape.num_stacks;
+                if stacks == 0 || before.len()%stacks != 0 {
+                    return Err(format!("SGD bucket trace: invalid {name} length {} for {stacks} buckets",before.len()));
+                }
+                let stride=before.len()/stacks;
+                let quantize=|v:f32| {
+                    let q=(f64::from(v)*f64::from(scale)).round();
+                    if scale==64.0 {q.clamp(-128.0,127.0)}
+                    else {q.clamp(i32::MIN as f64,i32::MAX as f64)}
+                };
+                for bucket in 0..stacks {
+                    let range=bucket*stride..(bucket+1)*stride;
+                    let mut fp=0usize;let mut quant=0usize;let mut total=0.0f64;
+                    for (&a,&b) in before[range.clone()].iter().zip(&after[range]) {
+                        fp+=usize::from(a.to_bits()!=b.to_bits());
+                        quant+=usize::from(quantize(a)!=quantize(b));
+                        total+=(f64::from(a)-f64::from(b)).abs();
+                    }
+                    writeln!(csv,"{name},{bucket},{stride},{fp},{quant},{:.12e}",total/stride.max(1) as f64)
+                        .expect("writing to String cannot fail");
+                }
+            }
+        }
+        if let (Some(path),Some(csv))=(bucket_trace_path,bucket_csv) {
+            std::fs::write(&path,csv).map_err(|e|format!("failed to write SGD bucket trace {}: {e}",path.display()))?;
+            eprintln!("  SGD bucket trace = {}",path.display());
         }
     }
     if let Some((fw, fb, axw, axb)) = sgd_trace_l1 {
@@ -19906,6 +20008,43 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         current_progress_params.as_ref(), &test_args)?;
                     print_cuda_cpp_quantized_validation_summary(chunk.epoch, chunk.superbatch,
                         metrics.accuracy, metrics.loss, started.elapsed(), quantized_validation_mode_label(args));
+                }
+            }
+            if std::env::var_os("BULLETOU_SGD_EXACT_FINAL").is_some() && !args.quantized_validation_exact {
+                let mut exact_args=args.clone();
+                exact_args.quantized_validation_exact=true;
+                let test_args=quantized_test_args_from_training_args(&exact_args,PathBuf::from("<live-exact-sfnn>"))?
+                    .ok_or_else(|| "exact final diagnostic requires an SFNN validation teacher".to_string())?;
+                let exact=CudaCppSfnnQuantizedValidationCache::try_new(
+                    &exact_args,feature_kind,&ctx,cuda_shape,current_progress_params.as_ref())?
+                    .ok_or_else(|| "exact final diagnostic could not load validation positions".to_string())?;
+                let start=std::time::Instant::now();
+                let CudaCppSfnnQuantizedValidationCache::Exact {cache,batch,..}=exact else {
+                    return Err("exact final diagnostic unexpectedly created a proxy cache".to_string());
+                };
+                let weights=runner.read_weights(&ctx).map_err(|e|e.to_string())?;
+                let quantized=quantized_sfnn_weights_from_cuda_cpp_readback(
+                    &exact_args,feature_kind,cuda_shape,&weights,current_progress_params.as_ref())?;
+                let outputs=quantized_sfnn_forward_outputs(&quantized,&batch,&test_args)?;
+                let report=quantized_test_report_from_outputs(&cache.positions,&outputs,&test_args,0)?;
+                eprintln!("  [qvalid-exact] accuracy={:.9} loss_engine_scale={:.9} accuracy_raw={:.9} loss_train_scale={:.9} elapsed={}",
+                    report.engine_scale.accuracy(),report.engine_scale.test_loss.unwrap_or(f32::NAN),
+                    report.train_scale.accuracy(),report.train_scale.test_loss.unwrap_or(f32::NAN),
+                    format_duration_secs(start.elapsed()));
+                if let Some(CudaCppSfnnQuantizedValidationCache::Proxy {inner,..})=&sfnn_quantized_validation_cache {
+                    if !Arc::ptr_eq(&cache,&inner.cache) || inner.outputs.len()!=outputs.len() {
+                        return Err("exact/proxy diagnostic validation positions differ".to_string());
+                    }
+                    let mut flips=0usize;let mut proxy_only=0usize;let mut exact_only=0usize;
+                    for &i in &cache.sample_mask.accuracy_indices {
+                        let proxy=inner.outputs[i]>=0.0;
+                        let value=quantized_final_division(outputs[i].raw,test_args.fv_scale,test_args.quant_final_div_round) as f32
+                            +test_args.engine_score_offset;
+                        let exact=value>=0.0;let truth=cache.teacher_results[i]>0;
+                        if proxy!=exact {flips+=1;proxy_only+=usize::from(proxy==truth);exact_only+=usize::from(exact==truth);}
+                    }
+                    eprintln!("  [qvalid-disagreement] compared={} sign_flips={flips} proxy_only_correct={proxy_only} exact_only_correct={exact_only}",
+                        cache.sample_mask.compared());
                 }
             }
         }

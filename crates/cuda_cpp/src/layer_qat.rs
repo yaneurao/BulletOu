@@ -18,6 +18,117 @@ pub(crate) fn enabled(lr: SfnnLayerLrMultipliers) -> bool {
 pub(crate) mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires CUDA; compares 3528-bucket pair QAT gradients with scalar STE"]
+    fn sgd_dense_qat_3528_bucket_gradients_match_scalar_ste() {
+        let ctx=Context::new(0).unwrap();
+        for (batch_size,l1_hidden,l2_size) in [(8usize,2usize,2usize),(1024,15,64)] {
+        for qat_ft in [false,true] {
+        let mut w=crate::tests::tiny_sfnn_weights(crate::tests::tiny_sfnn_shape());
+        // HalfKA_hm2 base + FT factorizer rows, with the production bucket layout.
+        w.shape.input_size=73305+1629;w.shape.num_stacks=3528;w.shape.factorizer_king_axis_dim=21;
+        w.shape.factorizer_progress_axis=true;w.shape.factorizer_king_progress_pair=true;
+        w.shape.l1_hidden=l1_hidden;w.shape.l2_size=l2_size;
+        let s=w.shape;let n=s.l1_out();let d=s.ft_size;let m=s.l2_size;let h=s.l1_hidden;
+        let mut l0w=vec![0.0;s.input_size*d];l0w[..w.l0w.len()].copy_from_slice(w.l0w);
+        for f in 0..4 {for j in 0..d {l0w[(73305+f)*d+j]=0.02;}}
+        let l1w=vec![0.125;s.num_stacks*n*d];let l1b=vec![0.25;s.num_stacks*n];
+        let l1fw=vec![0.03125;d*n];let l1fb=vec![0.0;n];
+        let l1axw=vec![0.015625;s.factorizer_axis_count()*d*n];
+        let l1axb=vec![0.0;s.factorizer_axis_count()*n];
+        let l2_weight=0.015625f32;
+        let l2w=vec![l2_weight;s.num_stacks*m*2*h];let mut l2b=vec![0.25;s.num_stacks*m];
+        for b in 0..s.num_stacks {for u in 0..m {
+            l2b[b*m+u]=match u%3 {0=>0.25,1=>-0.25,_=>1.25};
+        }}
+        let mut l3w=vec![0.0;s.num_stacks*m];
+        for b in 0..s.num_stacks {for u in 0..m {l3w[b*m+u]=if u%2==0 {0.5}else{-0.25};}}
+        let l3b=vec![0.03125;s.num_stacks];
+        w.l0w=&l0w;w.l1w=&l1w;w.l1b=&l1b;w.l1fw=Some(&l1fw);w.l1fb=Some(&l1fb);
+        w.l1axw=Some(&l1axw);w.l1axb=Some(&l1axb);
+        w.l2w=&l2w;w.l2b=&l2b;w.l2fw=None;w.l2fb=None;
+        w.l3w=&l3w;w.l3b=&l3b;w.l3fw=None;w.l3fb=None;
+        let bucket_pattern=[0,1,7,8,120,120,3527,3527];
+        let stm_pattern=[0,1,2,3,1,2,0,3];let nstm_pattern=[2,0,1,0,3,1,2,1];
+        let target_pattern=[0.1,0.2,0.3,0.4,0.6,0.7,0.8,0.9];
+        let buckets:Vec<i32>=(0..batch_size).map(|i|bucket_pattern[i%8]).collect();
+        let stm:Vec<i32>=(0..batch_size).map(|i|stm_pattern[i%8]).collect();
+        let nstm:Vec<i32>=(0..batch_size).map(|i|nstm_pattern[i%8]).collect();
+        let targets:Vec<f32>=(0..batch_size).map(|i|target_pattern[i%8]).collect();
+        let entry_weights=vec![1.0;batch_size];
+        let batch=SfnnTrainStepHostBatch {stm_indices:&stm,nstm_indices:&nstm,buckets:&buckets,
+            targets:&targets,entry_weights:&entry_weights,batch_size,max_active:1};
+        let mut r=SfnnTrainStepRunner::new(&ctx,w,batch_size,1).unwrap();
+        let lr=SfnnLayerLrMultipliers {qat_ft,qat_ft_virtual_rows:1629,qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+        let x=r.forward_workspace.combined.download(&ctx).unwrap();
+        let l1=r.forward_workspace.l1.download(&ctx).unwrap();
+        let x2=r.forward_workspace.l2_input.download(&ctx).unwrap();
+        let x3=r.forward_workspace.l2.download(&ctx).unwrap();
+        let out=r.forward_workspace.download_output(&ctx).unwrap();
+        let stm_ft=r.forward_workspace.stm_l0.download(&ctx).unwrap();
+        let nstm_ft=r.forward_workspace.nstm_l0.download(&ctx).unwrap();
+        let mut e0w=vec![0.0f64;w.l0w.len()];let mut e0b=vec![0.0f64;w.l0b.len()];
+        let mut e1w=vec![0.0f64;l1w.len()];let mut e1b=vec![0.0f64;l1b.len()];
+        let mut efw=vec![0.0f64;l1fw.len()];let mut efb=vec![0.0f64;l1fb.len()];
+        let mut eaw=vec![0.0f64;l1axw.len()];let mut eab=vec![0.0f64;l1axb.len()];
+        let mut e2w=vec![0.0f64;l2w.len()];let mut e2b=vec![0.0f64;l2b.len()];
+        let mut e3w=vec![0.0f64;l3w.len()];let mut e3b=vec![0.0f64;l3b.len()];
+        for i in 0..batch_size {
+            let b=buckets[i] as usize;let k=b/8;let p=b%8;
+            let axes=[k/21,21+k%21,42+p*441+k,3570+p];
+            let delta=(1.0/(1.0+(-f64::from(out[i])).exp())-f64::from(targets[i]))/batch_size as f64;
+            e3b[b]+=delta;let mut dx2=vec![0.0f64;2*h];
+            for u in 0..m {
+                e3w[b*m+u]+=delta*f64::from(x3[i*m+u]);
+                let pre=f64::from(l2b[b*m+u])+(0..2*h).map(|j|f64::from(x2[i*2*h+j])*f64::from(l2_weight)).sum::<f64>();
+                let g=if pre>0.0 && pre<1.0 {delta*f64::from(l3w[b*m+u])}else{0.0};
+                e2b[b*m+u]+=g;
+                for j in 0..2*h {e2w[(b*m+u)*2*h+j]+=g*f64::from(x2[i*2*h+j]);dx2[j]+=g*f64::from(l2_weight);}
+            }
+            let mut sum_l1_gradient=0.0;
+            for u in 0..n {
+                let v=f64::from(l1[i*n+u]);
+                let g=if u==h {delta}else{let sq=v*v*127.0/128.0;
+                    (if sq>0.0 && sq<1.0 {dx2[u]*2.0*v*127.0/128.0}else{0.0})+
+                    (if v>0.0 && v<1.0 {dx2[h+u]}else{0.0})};
+                sum_l1_gradient+=g;
+                e1b[b*n+u]+=g;efb[u]+=g;for &a in &axes {eab[a*n+u]+=g;}
+                for j in 0..d {let dw=g*f64::from(x[i*d+j]);
+                    e1w[(b*n+u)*d+j]+=dw;efw[j*n+u]+=dw;for &a in &axes {eaw[a*d*n+j*n+u]+=dw;}}
+            }
+            // Every folded L1 weight equals 0.125 + 0.03125 + 4*0.015625.
+            for (features,acts) in [(&stm,&stm_ft),(&nstm,&nstm_ft)] {
+                for j in 0..d/2 {
+                    let a=f64::from(acts[i*d+j]);let bval=f64::from(acts[i*d+d/2+j]);
+                    let g=sum_l1_gradient*0.21875*127.0/128.0;
+                    let ga=if a>0.0 && a<1.0 {g*bval}else{0.0};
+                    let gb=if bval>0.0 && bval<1.0 {g*a}else{0.0};
+                    let feature=features[i] as usize;
+                    e0w[feature*d+j]+=ga;e0w[feature*d+d/2+j]+=gb;
+                    let virtual_feature=73305+feature%1629;
+                    e0w[virtual_feature*d+j]+=ga;e0w[virtual_feature*d+d/2+j]+=gb;
+                    e0b[j]+=ga;e0b[d/2+j]+=gb;
+                }
+            }
+        }
+        let compare=|name:&str,buffer:&F32Buffer,expected:&[f64]| {
+            let got=buffer.download(&ctx).unwrap();
+            for (i,(&a,&b)) in got.iter().zip(expected).enumerate() {
+                assert!((f64::from(a)-b).abs()<2e-7+1e-5*b.abs(),"{name}[{i}] got={a} expected={b}");
+            }
+            assert!(expected.iter().any(|v|v.abs()>1e-6),"{name} did not exercise gradients");
+        };
+        compare("l0w",&r.backward_workspace.l0w_gradients,&e0w);compare("l0b",&r.backward_workspace.l0b_gradients,&e0b);
+        compare("l1w",&r.backward_workspace.l1w_gradients,&e1w);compare("l1b",&r.backward_workspace.l1b_gradients,&e1b);
+        compare("l1fw",&r.backward_workspace.l1fw_gradients,&efw);compare("l1fb",&r.backward_workspace.l1fb_gradients,&efb);
+        compare("l1axw",&r.backward_workspace.l1axw_gradients,&eaw);compare("l1axb",&r.backward_workspace.l1axb_gradients,&eab);
+        compare("l2w",&r.backward_workspace.l2w_gradients,&e2w);compare("l2b",&r.backward_workspace.l2b_gradients,&e2b);
+        compare("l3w",&r.backward_workspace.l3w_gradients,&e3w);compare("l3b",&r.backward_workspace.l3b_gradients,&e3b);
+        }
+        }
+    }
+    #[test]
     #[ignore = "requires CUDA; checks the integer-QAT loss direction"]
     fn sgd_dense_qat_output_bias_gradient_matches_lattice_loss_difference() {
         let ctx = Context::new(0).unwrap();
