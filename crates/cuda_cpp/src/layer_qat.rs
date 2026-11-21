@@ -36,6 +36,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[ignore = "requires CUDA; FT integer wrap must also determine backward activations"]
+    fn dense_qat_ft_backward_uses_wrapped_integer_activation() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut w=crate::tests::tiny_sfnn_weights(shape);
+        let mut ft=vec![0.0;w.l0w.len()];
+        ft[0]=32767.0/127.0;
+        let bias=vec![65.0/127.0;shape.ft_size];
+        w.l0w=&ft; w.l0b=&bias; w.l2fw=None; w.l2fb=None; w.l3fw=None; w.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+        let lr=SfnnLayerLrMultipliers {qat_ft:true,qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[1],buckets:&[0],
+            targets:&[0.5],entry_weights:&[1.0],batch_size:1,max_active:1};
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+        let stm=r.forward_workspace.stm_l0.download(&ctx).unwrap();
+        let nstm=r.forward_workspace.nstm_l0.download(&ctx).unwrap();
+        assert!((stm[0]-64.0/127.0).abs()<1e-6,"wrapped stm={}",stm[0]);
+        assert!((nstm[0]-65.0/127.0).abs()<1e-6,"nstm={}",nstm[0]);
+    }
+
+    #[test]
     #[ignore = "requires CUDA; compares 3528-bucket pair QAT gradients with scalar STE"]
     fn sgd_dense_qat_3528_bucket_gradients_match_scalar_ste() {
         let ctx=Context::new(0).unwrap();

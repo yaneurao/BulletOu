@@ -6339,10 +6339,11 @@ __global__ void dense_qat_l2_ste_kernel(const int* raw, const float* master_bias
 
 // FT QAT weights and biases are already folded and quantized to q/127.
 // Reconstruct their integer values and reproduce the engine's doubled i16
-// wrapping accumulator and pair product. The float FT pass is retained for
-// the straight-through backward activations.
+// wrapping accumulator and pair product. Backward uses these same clamped
+// activations, with the integer conversion and pair product treated as STEs.
 __global__ void dense_qat_exact_ft_kernel(const int* stm,const int* nstm,const float* w,const float* bias,
-    float* combined,int* packed,size_t batch,size_t active,size_t inputs,size_t width) {
+    float* combined,int* packed,size_t batch,size_t active,size_t inputs,size_t width,
+    float* stm_activation,float* nstm_activation,__half* half_activation) {
     const size_t half=width/2;
     const size_t tid=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
     if(tid>=batch*half)return;
@@ -6367,6 +6368,18 @@ __global__ void dense_qat_exact_ft_kernel(const int* stm,const int* nstm,const f
     s1=max(0,min(254,static_cast<int>(static_cast<short>(s1))));
     n0=max(0,min(254,static_cast<int>(static_cast<short>(n0))));
     n1=max(0,min(254,static_cast<int>(static_cast<short>(n1))));
+    if (stm_activation && nstm_activation) {
+        const size_t i=sample*width+unit;
+        const float fs0=static_cast<float>(s0)/254.0f, fs1=static_cast<float>(s1)/254.0f;
+        const float fn0=static_cast<float>(n0)/254.0f, fn1=static_cast<float>(n1)/254.0f;
+        stm_activation[i]=fs0; stm_activation[i+half]=fs1;
+        nstm_activation[i]=fn0; nstm_activation[i+half]=fn1;
+        if (half_activation) {
+            half_activation[i]=__float2half_rn(fs0); half_activation[i+half]=__float2half_rn(fs1);
+            half_activation[batch*width+i]=__float2half_rn(fn0);
+            half_activation[batch*width+i+half]=__float2half_rn(fn1);
+        }
+    }
     const unsigned a=static_cast<unsigned>((s0*s1)>>9), b=static_cast<unsigned>((n0*n1)>>9);
     const size_t base=sample*width;
     combined[base+unit]=static_cast<float>(a)/127.0f;
@@ -6392,7 +6405,7 @@ extern "C" int bulletou_test_dense_qat_exact_ft(BulletOuCudaCppContext* ctx,
        (packed && (width%8 || batch*width%128 || validate_i32_buffer(ctx,packed,batch*width/4,"exact FT packed")))) return -1;
     const size_t n=batch*width/2;
     dense_qat_exact_ft_kernel<<<static_cast<unsigned>((n+255)/256),256,0,ctx->stream>>>(
-        stm->ptr,nstm->ptr,w->ptr,bias->ptr,output->ptr,packed?packed->ptr:nullptr,batch,active,inputs,width);
+        stm->ptr,nstm->ptr,w->ptr,bias->ptr,output->ptr,packed?packed->ptr:nullptr,batch,active,inputs,width,nullptr,nullptr,nullptr);
     return check_kernel_launch("test exact FT");
 }
 
@@ -6658,7 +6671,9 @@ int launch_sfnn_forward_kernels(
         if (block_count_1d(batch*pairwise,threads,&blocks,"exact QAT FT")) return -1;
         dense_qat_exact_ft_kernel<<<blocks,threads,0,ctx->stream>>>(stm_indices,nstm_indices,l0w,l0b,
             combined,pack_exact ? ctx->dense_qat_packed_input : nullptr,batch,max_active,
-            factorized_ft_base ? factorized_ft_base : input_size,ft_size);
+            factorized_ft_base ? factorized_ft_base : input_size,ft_size,stm_l0,nstm_l0,
+            ctx->sfnn_ft_half_activation_stm_owner == stm_l0 && ctx->sfnn_ft_half_activation_nstm_owner == nstm_l0
+                ? ctx->sfnn_ft_half_activations : nullptr);
         if (check_kernel_launch("exact QAT FT")) return -1;
     }
     const bool prepacked_l1 = ctx->dense_qat_weights_prepacked;
