@@ -8022,7 +8022,7 @@ fn quantized_sfnn_clipped_relu(value: i32, round: QuantizedRoundMode) -> u8 {
         // After the final clamp, negative values become zero anyway. Restrict
         // rounding to the positive side so this models "round-to-nearest
         // activation" without turning small negative sums into positive output.
-        QuantizedRoundMode::Nearest if value > 0 => (value + 32) >> 6,
+        QuantizedRoundMode::Nearest if value > 0 => ((i64::from(value) + 32) >> 6).min(i64::from(i32::MAX)) as i32,
         QuantizedRoundMode::Nearest => value >> 6,
     };
     shifted.clamp(0, i32::from(SFNN_QA)) as u8
@@ -8046,8 +8046,9 @@ fn quantized_final_division(output: i32, fv_scale: i32, round: QuantizedRoundMod
     match round {
         QuantizedRoundMode::Floor => output / fv_scale,
         QuantizedRoundMode::Nearest => {
-            let half = fv_scale / 2;
-            if output >= 0 { (output + half) / fv_scale } else { (output - half) / fv_scale }
+            let half = i64::from(fv_scale) / 2;
+            let value = i64::from(output);
+            (if value >= 0 { (value + half) / i64::from(fv_scale) } else { (value - half) / i64::from(fv_scale) }) as i32
         }
     }
 }
@@ -9461,6 +9462,41 @@ fn log_line_with_quantized_metrics(line: &str, index: usize, accuracy: f32, loss
     fields.join(",")
 }
 
+// Write a complete replacement next to the destination so interruption never
+// truncates the previous log. On Windows rename cannot replace an existing file.
+fn atomic_replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing filename"))?;
+    let mut temp_name = name.to_os_string();
+    temp_name.push(format!(".tmp-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let temp = parent.join(temp_name);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)] {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name = "kernel32")]
+            unsafe extern "system" { fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32; }
+            let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH; both paths are on the same volume.
+            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&temp); }
+    result
+}
+
 #[cfg(feature = "cuda-cpp-backend")]
 fn update_checkpoint_learn_log_quantized_metrics(
     checkpoint_dir: &std::path::Path,
@@ -9489,7 +9525,7 @@ fn update_checkpoint_learn_log_quantized_metrics(
     }
     let mut out = lines.join("\n");
     out.push('\n');
-    std::fs::write(&path, out).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    atomic_replace_file(&path, out.as_bytes()).map_err(|err| format!("failed to write {}: {err}", path.display()))
 }
 
 #[cfg(all(feature = "cuda-cpp-backend", test))]
@@ -9548,7 +9584,7 @@ fn update_summary_log_quantized_metrics_and_diagnostics(
     }
     let mut out = lines.join("\n");
     out.push('\n');
-    std::fs::write(&top, out).map_err(|err| format!("failed to write {}: {err}", top.display()))?;
+    atomic_replace_file(&top, out.as_bytes()).map_err(|err| format!("failed to write {}: {err}", top.display()))?;
     Ok(())
 }
 
@@ -10355,6 +10391,11 @@ fn maybe_run_live_sfnn_quantized_validation(
         &args.output_dir(), epoch, superbatch, metrics, cache.diagnostics(),
     )?;
     Ok(Some(CudaCppQuantizedValidationOutcome { metrics, run_elapsed, total_elapsed }))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn run_if_quantized_validation<T, E>(enabled: bool, run: impl FnOnce() -> Result<Option<T>, E>) -> Result<Option<T>, E> {
+    if enabled { run() } else { Ok(None) }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -19125,7 +19166,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             checkpoint_elapsed,
                         )),
                     );
-                    if let Some(qvalid) = maybe_run_live_sfnn_quantized_validation(
+                    if let Some(qvalid) = run_if_quantized_validation(chunk.run_quantized_validation, || maybe_run_live_sfnn_quantized_validation(
                         args,
                         feature_kind,
                         &ctx,
@@ -19136,7 +19177,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         chunk.superbatch,
                         Some(&checkpoint_dir),
                         &mut sfnn_quantized_validation_cache,
-                    )? {
+                    ))? {
                         excluded_elapsed = excluded_elapsed.saturating_add(qvalid.total_elapsed);
                         print_cuda_cpp_quantized_validation_summary(
                             chunk.epoch,
@@ -19767,7 +19808,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             Some(validation_elapsed),
                         );
                     }
-                    if let Some(qvalid) = maybe_run_live_sfnn_quantized_validation(
+                    if let Some(qvalid) = run_if_quantized_validation(chunk.run_quantized_validation, || maybe_run_live_sfnn_quantized_validation(
                         args,
                         feature_kind,
                         &ctx,
@@ -19778,7 +19819,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                         chunk.superbatch,
                         Some(&checkpoint_dir),
                         &mut sfnn_quantized_validation_cache,
-                    )? {
+                    ))? {
                         excluded_elapsed = excluded_elapsed.saturating_add(qvalid.total_elapsed);
                         print_cuda_cpp_quantized_validation_summary(
                             chunk.epoch,
@@ -27519,6 +27560,7 @@ fn write_cuda_cpp_state_records_atomic<'a>(
         writer.write_all(&write_state_backend_marker("cuda-cpp"))?;
         write_model_weights_bin_writer(&mut writer, records)?;
         writer.flush()?;
+        writer.get_ref().sync_all()?;
         Ok(())
     })();
 
@@ -27526,10 +27568,20 @@ fn write_cuda_cpp_state_records_atomic<'a>(
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("failed to write {}: {err}", path.display()));
     }
-    if path.exists() {
-        std::fs::remove_file(path).map_err(|err| format!("failed to replace {}: {err}", path.display()))?;
-    }
-    if let Err(err) = std::fs::rename(&tmp, path) {
+    #[cfg(windows)]
+    let replace_result = {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32; }
+        let from: Vec<u16> = tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else { Ok(()) }
+    };
+    #[cfg(not(windows))]
+    let replace_result = std::fs::rename(&tmp, path);
+    if let Err(err) = replace_result {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("failed to rename {} to {}: {err}", tmp.display(), path.display()));
     }
@@ -28127,7 +28179,14 @@ fn numbered_checkpoint_dirs_desc(output_dir: &std::path::Path) -> Vec<(usize, st
 }
 
 fn is_complete_checkpoint_dir(dir: &std::path::Path) -> bool {
-    dir.join("state.bin").is_file() && dir.join("learn.log").is_file() && dir.join("dataloader_pos.txt").is_file()
+    if !dir.join("state.bin").is_file() || !dir.join("dataloader_pos.txt").is_file() { return false; }
+    let Ok(log) = std::fs::read_to_string(dir.join("learn.log")) else { return false };
+    let mut lines = log.lines();
+    if lines.next() != Some(LEARN_LOG_HEADER) { return false; }
+    lines.any(|line| {
+        let fields = split_log_csv_row(line);
+        fields.len() == 13 && fields[1].parse::<usize>().is_ok() && fields[2].parse::<usize>().is_ok()
+    })
 }
 
 /// Find the latest complete numbered checkpoint under `output_dir`.
@@ -28204,7 +28263,11 @@ fn truncate_summary_log_after_checkpoint(
     checkpoint_epoch_superbatch: (usize, usize),
 ) -> std::io::Result<usize> {
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
-    let Ok(content) = std::fs::read_to_string(&top) else { return Ok(0) };
+    let content = match std::fs::read_to_string(&top) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
     let mut kept = Vec::new();
     let mut removed = 0usize;
     for line in content.lines() {
@@ -28231,7 +28294,7 @@ fn truncate_summary_log_after_checkpoint(
     if removed > 0 {
         let mut output = kept.join("\n");
         output.push('\n');
-        std::fs::write(top, output)?;
+        atomic_replace_file(&top, output.as_bytes())?;
     }
     Ok(removed)
 }
@@ -29048,7 +29111,7 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
         );
         output.push('\n');
     }
-    std::fs::write(top, output)?;
+    atomic_replace_file(top, output.as_bytes())?;
     Ok(true)
 }
 
@@ -29496,6 +29559,40 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn atomic_log_replacement_and_checkpoint_validation() {
+        use super::*;
+        let dir=std::env::temp_dir().join(format!("bulletou-atomic-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log=dir.join("learn.log");
+        std::fs::write(&log,b"old").unwrap();
+        atomic_replace_file(&log,b"new").unwrap();
+        assert_eq!(std::fs::read(&log).unwrap(),b"new");
+        std::fs::write(dir.join("state.bin"),b"state").unwrap();
+        std::fs::write(dir.join("dataloader_pos.txt"),b"0,0").unwrap();
+        assert!(!is_complete_checkpoint_dir(&dir));
+        atomic_replace_file(&log,format!("{LEARN_LOG_HEADER}\nSFNN,1,2,1,-,-,-,-,0.1,0.1,1,64,teacher\n").as_bytes()).unwrap();
+        assert!(is_complete_checkpoint_dir(&dir));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(),3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn checkpoint_exact_sgd_lr_roundtrip_and_invalid() {
+        use super::*;
+        let dir=std::env::temp_dir().join(format!("bulletou-sgd-lr-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_checkpoint_sgd_last_lr(&dir).unwrap(),None);
+        let lr=0.0012345678f32;
+        std::fs::write(dir.join("sgd-last-lr.bin"),lr.to_le_bytes()).unwrap();
+        assert_eq!(read_checkpoint_sgd_last_lr(&dir).unwrap(),Some(lr));
+        std::fs::write(dir.join("sgd-last-lr.bin"),f32::NAN.to_le_bytes()).unwrap();
+        assert!(read_checkpoint_sgd_last_lr(&dir).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn sgd_epoch_restart_uses_previous_last_update_and_next_first_lr() {
@@ -31609,6 +31706,42 @@ mod tests {
             schedule.chunks.iter().map(|chunk| chunk.run_quantized_validation).collect::<Vec<_>>(),
             vec![false, true]
         );
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn checkpoint_quantized_validation_runs_only_when_scheduled() {
+        let mut calls=0;
+        let skipped=run_if_quantized_validation(false, || { calls+=1; Ok::<_, ()>(Some(1)) }).unwrap();
+        assert_eq!(skipped,None);
+        assert_eq!(calls,0);
+        let measured=run_if_quantized_validation(true, || { calls+=1; Ok::<_, ()>(Some(42)) }).unwrap();
+        assert_eq!(measured,Some(42));
+        assert_eq!(calls,1);
+        assert!(run_if_quantized_validation(true, || Err::<Option<()>, _>("validation error")).is_err());
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn streamed_state_replaces_existing_file() {
+        let dir=std::env::temp_dir().join(format!("bulletou-stream-replace-{}-{}",std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path=dir.join("state.bin");
+        write_cuda_cpp_state_records_atomic(&path,vec![("test",&[1.0])]).unwrap();
+        write_cuda_cpp_state_records_atomic(&path,vec![("test",&[2.0])]).unwrap();
+        let records=bulletou_lib::value::yaneuraou_kppt::parse_model_weights_bin(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(records["test"],vec![2.0]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn quantized_nearest_rounding_handles_i32_extremes() {
+        assert_eq!(quantized_sfnn_clipped_relu(i32::MAX,QuantizedRoundMode::Nearest),127);
+        assert_eq!(quantized_sfnn_clipped_relu(i32::MIN,QuantizedRoundMode::Nearest),0);
+        assert_eq!(quantized_final_division(i32::MAX,24,QuantizedRoundMode::Nearest),89_478_485);
+        assert_eq!(quantized_final_division(i32::MIN,24,QuantizedRoundMode::Nearest),-89_478_485);
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
