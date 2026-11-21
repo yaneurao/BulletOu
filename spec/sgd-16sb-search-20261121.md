@@ -4,6 +4,8 @@
 
 基準はSGD momentum=0.95、lr=lr_min=0.0005、FT FP32、FT/L1/L2/L3 QATオン、L1 pair factorizer・FT factorizerおよびL1実効clip有効。入力batchの先頭・610更新ごとの全体指紋と、各batchの標本の累積指紋を保存する。全batch全要素の同一性を保証するものではない。実行間に揺れがあるため、各結果は独立した16 sb学習終了時の1回の検証であり、sb平均や単独試行による確定的な優劣ではない。
 
+**現在の本学習設定への適用上の注意:** 上記のL1倍率比較はFT FP32・FT QATオンであり、2026-11-21に実行中だった本学習のepoch 3（all_optimオンによるFT FP16・FT QATオフ）とは異なる。後者でのL1倍率0.5対1.0の16 sb比較は実施しておらず、本学習でも同様の優位があるとは結論できない。
+
 | 条件 | GPU proxy qacc | CPU整数qacc | GPU proxy qloss | CPU整数 train loss | 備考 |
 |---|---:|---:|---:|---:|---|
 | 基準 lr=0.0005 | 59.73927% | 59.69709% | 0.72454196 | 0.72493601 | `full_ft_qat-9760-16sb-exact-baseline.log` |
@@ -29,3 +31,11 @@ L1活性化については、丸め前のbias端数を省いた近似で、clamp
 L1学習率倍率0.5の2回は整数qacc 59.70890%・59.70259%（平均59.70575%）。基準2回は59.69709%・59.62843%（平均59.66276%）。それぞれ2試行のみの同一データ・checkpointであり、平均差0.04298ポイントが一般的な優位性を示すとは限らない。L1倍率0.5のFT unit上限最大は67.7582%・64.9803%、L1 unit上限最大7.3111%・7.3924%、L2 unit上限最大はいずれも0.5686%。入力の全体指紋を各sb末尾と初回batchで、標本の累積指紋を全batchで比較した結果、この4実行は一致した。前記のとおり未標本の入力完全一致は証明していない。
 
 診断の再現は実験用設定で `cuda_cpp_train_steps=1`、`cuda_cpp_skip_final_output=true`、L1/L2/L3 QAT有効、環境変数 `BULLETOU_SGD_REAL_GRADIENT_DIAGNOSTIC=1` を指定する。1バッチの勾配を計算して比較し、optimizer更新は意図的に省略する。CPU比較は所定の許容誤差を超えるとエラーとなる。release版の診断をFT FP32 QATオンと `all_optim=true` で再実行し、いずれも `CPU comparisons = ok` を確認。ログは `full_ft_qat-1-real-gradient-checked.log` と `half-1-real-gradient-checked-alloptim.log`。SGD関連の明示GPUテスト15件も成功した。
+
+## 2026-11-21 稼働中設定の静的確認
+
+読み取り時の本学習はepoch 3、`all_optim`はepoch 1〜5で有効。設定ファイル上のFT個別フラグがfalseでも `all_optim` のscheduleとのORで4つすべてtrueとなる。FT QATはfalse、L1/L2/L3 QATはtrue、L1倍率は0.5。epoch 6からFT半精度4項目はfalseになる設定で、FT QATは自動的にオンにはならない。読み取り確認時点のsummary最新行はepoch 3 sb 467、lr_start/end=0.0005、lambda=1.0。動作中のプロセスは変更していない。
+
+step LRはepochごとに再始動する。設定が変わらない場合、epoch 4冒頭の基本lrは0.0044であり、この時点でL1倍率0.5によりL1のlrは0.0022となる。epoch 3 sb 467時点のL1 lr 0.00025の8.8倍。LR上昇自体は実装上の仕様であり、不具合や学習への影響はこの静的確認だけでは判断できない。
+
+現在のbucketは `(king_pair, progress)` の441×8通り。pair factorizerのking-progress成分も同じ組を添字に取るため、bucket残差との対応は一対一。係数1・残差ゲートなしのとき、lossから来る同じ座標のbucket残差とking-progress pairの勾配は、浮動小数点の集計順序を除き同じになる。両者のmomentum・重み制約・projectionの履歴は異なりうるため、実際の更新量が常に2倍になるとは限らない。shared、両玉axis、progress axisもfolded L1を同時に変える。L1倍率0.5はこれら全てのL1座標に適用される。設計上の重複であり、それだけを実装バグや今回の停滞原因と断定できない。
