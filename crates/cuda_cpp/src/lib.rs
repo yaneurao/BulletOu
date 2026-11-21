@@ -6186,6 +6186,8 @@ impl SfnnTrainStepUploadSlot {
 #[derive(Debug)]
 pub struct SfnnTrainStepRunner {
     ft_half_moments_enabled: bool,
+    // Keep the rebased momentum in FP32 through the first subsequent update.
+    ft_half_moments_defer_once: bool,
     ft_half_moments: Option<FtHalfMoments>,
     ft_half_moments_clipped_pending: u64,
     pub l1_revival_flags: u8,
@@ -6234,6 +6236,7 @@ pub struct SfnnTrainStepRunner {
 
 #[derive(Debug)]
 pub struct SfnnTrainStepRunnerSnapshot {
+    ft_half_moments_defer_once: bool,
     pub l1_revival_flags: u8,
     /// Encoded last actual L1 reset epoch (0 = none, None = legacy unknown).
     pub l1_last_reset_epoch: Option<usize>,
@@ -6461,6 +6464,9 @@ impl SfnnTrainStepRunner {
         // Decode and discard the optional FT half cache before changing the
         // authoritative FP32 buffers; it will be recreated on the next step.
         self.invalidate_ft_half_moments(ctx)?;
+        // The next epoch may enable FP16 moments after this rebase, including
+        // when resuming into a freshly constructed runner.
+        self.ft_half_moments_defer_once = true;
         let scale = F32Buffer::from_host(ctx, &[ratio])?;
         let states = &self.optimizer_states;
         for state in [&states.l0w, &states.l0b, &states.l1w, &states.l1b,
@@ -6656,6 +6662,7 @@ impl SfnnTrainStepRunner {
             batch_size,
             max_active,
             ft_half_moments_enabled: false,
+            ft_half_moments_defer_once: false,
             ft_half_moments: None,
             ft_half_moments_clipped_pending: 0,
             device_batch: SfnnForwardDeviceBatch {
@@ -7271,6 +7278,7 @@ impl SfnnTrainStepRunner {
         self.sync_ft_half_moments(ctx)?;
         self.validate()?;
         Ok(SfnnTrainStepRunnerSnapshot {
+            ft_half_moments_defer_once: self.ft_half_moments_defer_once,
             l1_revival_flags: self.l1_revival_flags,
             l1_last_reset_epoch: self.l1_last_reset_epoch,
             l1_suppress_until: self.l1_suppress_until,
@@ -7292,6 +7300,7 @@ impl SfnnTrainStepRunner {
 
     pub fn copy_state_from_device(&mut self, ctx: &Context, src: &SfnnTrainStepRunnerSnapshot) -> Result<()> {
         self.invalidate_ft_half_moments(ctx)?;
+        self.ft_half_moments_defer_once = src.ft_half_moments_defer_once;
         self.layer_qat.invalidate();
         self.l1_revival_flags = src.l1_revival_flags;
         self.l1_last_reset_epoch = src.l1_last_reset_epoch;
@@ -7332,6 +7341,7 @@ impl SfnnTrainStepRunner {
         if self.batch_norm.is_some() {
             return Err(CudaCppError::message("host-only runner restore cannot restore BN state; use the complete device snapshot restore"));
         }
+        self.ft_half_moments_defer_once = false;
         self.layer_qat.invalidate();
         self.ft_saturation_guard = None;
         self.l1_center_batches = 0;
@@ -8440,7 +8450,7 @@ impl SfnnTrainStepRunner {
         if lr_multipliers.l1_effective_weight_clip {
             l1_center::validate_effective_clip(self, lr_multipliers)?;
         }
-        if self.ft_half_moments_enabled && self.ft_half_moments.is_none() &&
+        if self.ft_half_moments_enabled && !self.ft_half_moments_defer_once && self.ft_half_moments.is_none() &&
             lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight) > 0.0 {
             self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w, params.sgd_momentum.is_some())?);
         }
@@ -8723,6 +8733,7 @@ impl SfnnTrainStepRunner {
             l1_center::clip_effective_weights(self, ctx, params.sgd_momentum.is_some())?;
         }
         if let Some(bn)=&self.batch_norm {bn.update_with_lr_multiplier(ctx,params,lr_multipliers.bn_affine)?;}
+        if l0w_lr > 0.0 { self.ft_half_moments_defer_once = false; }
         self.pending_gradient_batches = 0;
         Ok(())
     }
@@ -10848,8 +10859,38 @@ mod tests {
         }
         assert!(r.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|v|*v==0.01));
         assert!(r.ft_half_moments.is_none());
+        assert!(r.ft_half_moments_defer_once);
+        let mut p=RangerUpdateParams::default(); p.sgd_momentum=Some(0.9);
+        r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,Default::default(),None).unwrap();
+        assert!(r.ft_half_moments.is_none());
+        assert!(!r.ft_half_moments_defer_once);
+        assert!(r.optimizer_states.l0w.momentum.download(&ctx).unwrap().iter().all(|v|(*v-0.03125*0.9).abs()<1e-7));
+        r.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,Default::default(),None).unwrap();
+        assert!(r.ft_half_moments.is_some());
         r.pending_gradient_batches=1;
         assert!(r.rescale_sgd_momentum(&ctx,0.5).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA; resumed runner enables FP16 after momentum rebase"]
+    fn sgd_rebase_defers_newly_enabled_half_moments_and_restores_snapshot() {
+        let ctx=Context::new(0).unwrap();
+        let shape=tiny_sfnn_shape();
+        let mut runner=SfnnTrainStepRunner::new(&ctx,tiny_sfnn_weights(shape),1,1).unwrap();
+        runner.optimizer_states.l0w.momentum.fill(&ctx,0.000000000002).unwrap();
+        runner.rescale_sgd_momentum(&ctx,0.25).unwrap();
+        assert!(runner.ft_half_moments_defer_once);
+        let snapshot=runner.snapshot_device(&ctx).unwrap();
+        let mut restored=SfnnTrainStepRunner::new(&ctx,tiny_sfnn_weights(shape),1,1).unwrap();
+        restored.copy_state_from_device(&ctx,&snapshot).unwrap();
+        assert!(restored.ft_half_moments_defer_once);
+        restored.set_ft_fp16_moments(&ctx,true).unwrap();
+        let mut p=RangerUpdateParams::default(); p.sgd_momentum=Some(0.9);
+        restored.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,Default::default(),None).unwrap();
+        assert!(restored.ft_half_moments.is_none());
+        assert!(!restored.ft_half_moments_defer_once);
+        restored.update_weights_with_lr_multipliers_and_dirty_buckets(&ctx,p,Default::default(),None).unwrap();
+        assert!(restored.ft_half_moments.is_some());
     }
 
     #[test]
