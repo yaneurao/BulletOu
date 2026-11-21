@@ -18137,6 +18137,124 @@ fn run_sfnn_l2_revival(args:&Args, feature_kind:CudaCppSfnnFeatureKind, ctx:&bul
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn diagnostic_sfnn_gradients(
+    ctx: &bulletou_cuda_cpp::Context,
+    runner: &bulletou_cuda_cpp::SfnnTrainStepRunner,
+    buckets: &[i32], targets: &[f32], weights: &[f32], output_inv_scale: f32,
+) -> Result<(), String> {
+    let s = runner.shape;
+    let n = s.l1_out();
+    let h = s.l1_hidden;
+    let m = s.l2_size;
+    let batch = buckets.len();
+    if s.factorizer_king_axis_dim != 21 || !s.factorizer_king_progress_pair || s.num_stacks != 3528 {
+        return Err("gradient diagnostic currently requires k21k21_progress8 pair".into());
+    }
+    let dl1 = runner.backward_workspace.l1_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let dl2 = runner.backward_workspace.l2_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let dx2 = runner.backward_workspace.l2_input_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let l2in = runner.forward_workspace.l2_input.download(ctx).map_err(|e| e.to_string())?;
+    let l1 = runner.forward_workspace.l1.download(ctx).map_err(|e| e.to_string())?;
+    let l2 = runner.forward_workspace.l2.download(ctx).map_err(|e| e.to_string())?;
+    let out = runner.forward_workspace.output.download(ctx).map_err(|e| e.to_string())?;
+    let dout = runner.loss_workspace.mean_output_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let l2w = runner.weights.l2w.download(ctx).map_err(|e| e.to_string())?;
+    let l3w = runner.weights.l3w.download(ctx).map_err(|e| e.to_string())?;
+    let gl1b = runner.backward_workspace.l1b_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let gl1w = runner.backward_workspace.l1w_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let gl1fw = runner.backward_workspace.l1fw_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let ft = runner.forward_workspace.combined.download(ctx).map_err(|e| e.to_string())?;
+    let gl1fb = runner.backward_workspace.l1fb_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let gl1axb = runner.backward_workspace.l1axb_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let gl2b = runner.backward_workspace.l2b_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let gl2w = runner.backward_workspace.l2w_gradients.download(ctx).map_err(|e| e.to_string())?;
+    let mut freq=vec![0usize;s.num_stacks];
+    for &b in buckets { if b<0 || b as usize>=s.num_stacks { return Err("invalid bucket in gradient diagnostic".into()); } freq[b as usize]+=1; }
+    let bucket=freq.iter().enumerate().max_by_key(|x|x.1).map(|(i,_)|i).ok_or("empty batch")?;
+    let alpha=runner.factorizer_alpha;
+    let mut eb1=vec![0.0f64;s.num_stacks*n]; let mut es1=vec![0.0f64;n];
+    let mut ea1=vec![0.0f64;gl1axb.len()]; let mut eb2=vec![0.0f64;s.num_stacks*m];
+    let mut ew2=vec![0.0f64;m*2*h];
+    let features=[0usize,s.ft_size/3,s.ft_size/2,s.ft_size-1];
+    let mut ew1=vec![0.0f64;n*features.len()]; let mut esw1=vec![0.0f64;n*features.len()];
+    let mut loss_error=0.0f64; let mut chain2_error=0.0f64; let mut chain2_count=0usize;
+    let mut input_error=0.0f64; let mut l1_nonzero=0usize; let mut l2_nonzero=0usize;
+    let mut l1_chain_count=0usize; let mut l1_chain_error=0.0f64; let mut l1_chain_scale=0.0f64;
+    let quant=|v:f32| ((f64::from(v)*64.0).round().clamp(-128.0,127.0))/64.0;
+    for i in 0..batch {
+        let b=buckets[i] as usize; let k=b/8; let p=b%8;
+        let axes=[(k/21,alpha.king_axis),(21+k%21,alpha.king_axis),(42+p*441+k,alpha.pair),(3570+p,alpha.progress_axis)];
+        let z=f64::from(out[i])*f64::from(output_inv_scale);
+        let d=(1.0/(1.0+(-z).exp())-f64::from(targets[i]))*f64::from(weights[i])*f64::from(output_inv_scale)/batch as f64;
+        loss_error=loss_error.max((d-f64::from(dout[i])).abs());
+        for u in 0..n {
+            let g=f64::from(dl1[i*n+u]); l1_nonzero+=usize::from(g!=0.0);
+            if u<h {
+                let v=f64::from(l1[i*n+u]);
+                // Away from clamp boundaries, omit the sub-quantum master-bias
+                // fraction; its contribution bounds this approximation error.
+                if v.abs()>0.01 && v.abs()<0.95 {
+                    let ds=f64::from(dx2[i*2*h+u]); let dt=f64::from(dx2[i*2*h+h+u]);
+                    let e=ds*(2.0*v*127.0/128.0)+if v>0.0 {dt}else{0.0};
+                    l1_chain_count+=1; l1_chain_error=l1_chain_error.max((g-e).abs()); l1_chain_scale=l1_chain_scale.max(e.abs());
+                }
+            }
+            eb1[b*n+u]+=g; es1[u]+=g*f64::from(alpha.shared);
+            for &(axis,a) in &axes { ea1[axis*n+u]+=g*f64::from(a); }
+            for (j,&f) in features.iter().enumerate() {
+                let v=g*f64::from(ft[i*s.ft_size+f]);
+                esw1[u*features.len()+j]+=v*f64::from(alpha.shared);
+                if b==bucket { ew1[u*features.len()+j]+=v; }
+            }
+        }
+        for u in 0..m {
+            let g=f64::from(dl2[i*m+u]); l2_nonzero+=usize::from(g!=0.0); eb2[b*m+u]+=g;
+            if l2[i*m+u]>0.0 && l2[i*m+u]<1.0 {
+                chain2_count+=1; chain2_error=chain2_error.max((g-d*quant(l3w[b*m+u])).abs());
+            }
+            if b==bucket { for j in 0..2*h { ew2[u*2*h+j]+=g*f64::from(l2in[i*2*h+j]); } }
+        }
+        if i<512 {
+            for j in 0..2*h {
+                let mut expected=0.0f64;
+                for u in 0..m { expected+=f64::from(dl2[i*m+u])*quant(l2w[(b*m+u)*2*h+j]); }
+                input_error=input_error.max((expected-f64::from(dx2[i*2*h+j])).abs());
+            }
+        }
+    }
+    let compare=|name:&str,actual:&[f32],expected:&[f64]| -> Result<(),String> {
+        if actual.len()!=expected.len() { return Err(format!("gradient diagnostic {name}: length mismatch")); }
+        let mut max_abs=0.0f64; let mut max_expected=0.0f64; let mut nonzero=0usize;
+        for (&a,&e) in actual.iter().zip(expected) {
+            if !a.is_finite() || !e.is_finite() { return Err(format!("gradient diagnostic {name}: non-finite value")); }
+            max_abs=max_abs.max((f64::from(a)-e).abs()); max_expected=max_expected.max(e.abs()); nonzero+=usize::from(a!=0.0);
+        }
+        eprintln!("  SGD real-gradient {name}: n={} nonzero={nonzero} max_abs_error={max_abs:.9e} expected_max_abs={max_expected:.9e}",expected.len());
+        if nonzero==0 || max_abs>1e-10+max_expected*1e-4 { return Err(format!("gradient diagnostic {name}: CPU comparison failed")); }
+        Ok(())
+    };
+    eprintln!("  SGD real-gradient batch={batch} most_common_bucket={bucket} count={} l1_sample_nonzero={l1_nonzero}/{} l2_sample_nonzero={l2_nonzero}/{}",freq[bucket],dl1.len(),dl2.len());
+    eprintln!("  SGD real-gradient loss_max_abs_error={loss_error:.9e} l3_to_l2_interior_count={chain2_count} max_abs_error={chain2_error:.9e} l2_to_l1_input_first512_max_abs_error={input_error:.9e}");
+    eprintln!("  SGD real-gradient l1_activation_approx_count={l1_chain_count} max_abs_error={l1_chain_error:.9e} expected_max_abs={l1_chain_scale:.9e} (master bias fraction omitted)");
+    compare("l1_bucket_bias",&gl1b,&eb1)?; compare("l1_shared_bias",&gl1fb,&es1)?;
+    compare("l1_axis_bias",&gl1axb,&ea1)?; compare("l2_bucket_bias",&gl2b,&eb2)?;
+    compare("l2_bucket_weights",&gl2w[bucket*m*2*h..(bucket+1)*m*2*h],&ew2)?;
+    let mut observed_bucket=Vec::with_capacity(n*features.len()); let mut observed_shared=Vec::with_capacity(n*features.len());
+    for u in 0..n { for &f in &features {
+        observed_bucket.push(gl1w[(bucket*n+u)*s.ft_size+f]);
+        observed_shared.push(gl1fw[f*n+u]);
+    }}
+    compare("l1_bucket_weights_selected_features",&observed_bucket,&ew1)?;
+    compare("l1_shared_weights_selected_features",&observed_shared,&esw1)?;
+    if loss_error>1e-9 || chain2_count==0 || chain2_error>1e-9 || input_error>1e-9 ||
+        l1_chain_count==0 || l1_chain_error>1e-8+l1_chain_scale*0.001 {
+        return Err("gradient diagnostic propagation comparison failed".into());
+    }
+    eprintln!("  SGD real-gradient CPU comparisons = ok");
+    Ok(())
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureKind) -> Result<(), String> {
     if let Err(e) = revival_audit::ensure_summary_header(&args.output_dir()) {
         eprintln!("warning: failed to initialize revive-summary.csv: {e}");
@@ -19431,6 +19549,15 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     profile.backward_stages.total_ms
                 );
             }
+        } else if std::env::var_os("BULLETOU_SGD_REAL_GRADIENT_DIAGNOSTIC").is_some() {
+            if train_steps != 1 || !args.cuda_cpp_skip_final_output || !lr_multipliers.qat_l1 || !lr_multipliers.qat_l2 || !lr_multipliers.qat_l3 {
+                return Err("real gradient diagnostic requires one direct step, skip-final-output and L1/L2/L3 QAT".into());
+            }
+            runner.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
+                &ctx,params,loss_kind,output_inv_scale,batch,should_report,false,
+                lr_multipliers,dirty_update_buckets).map_err(|e|e.to_string())?;
+            diagnostic_sfnn_gradients(&ctx,&runner,buckets,&fast.targets,&fast.weights,output_inv_scale)?;
+            eprintln!("  SGD real-gradient diagnostic: optimizer update intentionally skipped");
         } else if reference_upload {
             runner.step_no_readback_with_loss_finalize_update_lr_multipliers_and_dirty_buckets(
                 &ctx,params,loss_kind,output_inv_scale,batch,should_report,is_optimizer_step,
