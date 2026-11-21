@@ -19311,6 +19311,32 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         let revival_resume_pos = last_dataloader_pos.or(config.dataloader_resume_pos);
         last_dataloader_pos = teacher_batch.dataloader_pos;
         let mut progress_for_step = schedule.progress_for_step(seen_steps);
+        if let Some(progress) = progress_for_step.as_ref() {
+            if base_args.optimizer == OptimizerKind::Sgd && progress.epoch > 1
+                && progress.superbatch == 1 && progress.batch_in_superbatch == 1 {
+                let (mut old_lr,new_lr) = sgd_epoch_restart_lrs(base_args, progress.epoch, batch_size)?;
+                if seen_steps == 1 && resume_enabled(base_args, &base_args.output_dir()) {
+                    if let Some(dir)=latest_complete_checkpoint_dir_raw(&base_args.output_dir()) {
+                        let path=dir.join("bulletou-settings.json");
+                        if path.is_file() {
+                            let saved_progress=latest_checkpoint_epoch_superbatch(&base_args.output_dir());
+                            let loaded=sgd_previous_lr_from_checkpoint_settings(&path,progress.epoch,saved_progress);
+                            match loaded {
+                                Ok(lr) => old_lr=lr,
+                                Err(e) => eprintln!("  WARN: cannot recover prior checkpoint LR from {}: {}; using current schedule",path.display(),e),
+                            }
+                        } else {
+                            eprintln!("  WARN: checkpoint settings unavailable for SGD momentum rebase; using current schedule");
+                        }
+                    }
+                }
+                if old_lr >= 0.0 && new_lr > 0.0 && old_lr != new_lr {
+                    runner.rescale_sgd_momentum(&ctx, old_lr / new_lr).map_err(|e|e.to_string())?;
+                    eprintln!("  [SGD momentum] epoch={} LR restart {:.9} -> {:.9}; previous momentum scaled by {:.9}",
+                        progress.epoch, old_lr, new_lr, old_lr / new_lr);
+                }
+            }
+        }
         if let Some(progress) = progress_for_step.as_mut() {
             if active_epoch != Some(progress.epoch) && base_args.epoch_settings_json.is_some() {
                 ctx.synchronize().map_err(|e| e.to_string())?;
@@ -27297,6 +27323,43 @@ fn cuda_cpp_epoch_lr(
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
+fn sgd_epoch_restart_lrs(args: &Args, epoch: usize, batch_size: usize) -> Result<(f32,f32),String> {
+    if epoch <= 1 { return Err("SGD epoch restart requires epoch >= 2".into()); }
+    let old = args_at_epoch(args,epoch-1)?; let new = args_at_epoch(args,epoch)?;
+    let old_batches=effective_batches_per_superbatch(&old)?;
+    let old_steps=configured_epoch_superbatches(args,epoch-1).checked_mul(old_batches).ok_or("previous epoch step overflow")?;
+    let old_period=(old_steps as u64).checked_mul(batch_size as u64).ok_or("previous epoch LR period overflow")?;
+    let old_lr=cuda_cpp_epoch_lr(&old,epoch-1,old_steps.saturating_sub(old.batches_per_update.max(1)),batch_size,
+        old_period,effective_lr_step_gamma(&old,old_batches)?.0,effective_lr_step_positions(&old,old_batches),old_batches);
+    let new_batches=effective_batches_per_superbatch(&new)?;
+    let new_period=(configured_epoch_superbatches(args,epoch) as u64).checked_mul(new_batches as u64)
+        .and_then(|x|x.checked_mul(batch_size as u64)).ok_or("next epoch LR period overflow")?;
+    let new_lr=cuda_cpp_epoch_lr(&new,epoch,0,batch_size,new_period,effective_lr_step_gamma(&new,new_batches)?.0,
+        effective_lr_step_positions(&new,new_batches),new_batches);
+    Ok((old_lr,new_lr))
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn sgd_previous_lr_from_checkpoint_settings(path: &Path, epoch: usize, saved_progress: Option<(usize,usize)>) -> Result<f32,String> {
+    let mut argv=vec![std::ffi::OsString::from("bulletou")];
+    argv.extend(bulletou_settings_json_args(path)?);
+    let saved=Args::try_parse_from(argv).map_err(|e|e.to_string())?;
+    let previous_epoch=epoch.checked_sub(1).ok_or("invalid restart epoch")?;
+    if let Some((saved_epoch,saved_sb))=saved_progress {
+        if saved_epoch!=previous_epoch || saved_sb==0 {return Err("checkpoint progress does not match prior epoch".into());}
+        let old=args_at_epoch(&saved,previous_epoch)?;
+        let batch=effective_batch_size(&old); let batches=effective_batches_per_superbatch(&old)?;
+        let epoch_sbs=configured_epoch_superbatches(&saved,previous_epoch);
+        let epoch_steps=epoch_sbs.checked_mul(batches).ok_or("previous epoch step overflow")?;
+        let saved_steps=saved_sb.checked_mul(batches).ok_or("checkpoint step overflow")?;
+        let period=(epoch_steps as u64).checked_mul(batch as u64).ok_or("previous epoch LR period overflow")?;
+        return Ok(cuda_cpp_epoch_lr(&old,previous_epoch,saved_steps.saturating_sub(old.batches_per_update.max(1)),
+            batch,period,effective_lr_step_gamma(&old,batches)?.0,effective_lr_step_positions(&old,batches),batches));
+    }
+    Ok(sgd_epoch_restart_lrs(&saved,epoch,effective_batch_size(&saved))?.0)
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
 fn cuda_cpp_lr_at_step(
     args: &Args,
     step_index: usize,
@@ -29404,6 +29467,33 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn sgd_epoch_restart_uses_previous_last_update_and_next_first_lr() {
+        use super::*;
+        let mut args=Args::try_parse_from(["bulletou","--backend","cuda-cpp","--teacher","teacher.bin",
+            "--arch","SFNN_halfkahm2_2304_15_64_k21k21_progress8","--optimizer","sgd",
+            "--superbatches","1296","--max-epochs","3","--batch-size","65536",
+            "--positions-per-superbatch","40000000","--lr","0.0044","--lr-min","0.0005",
+            "--lr-schedule","step","--lr-step-gamma","0.8","--lr-step-positions","40000000"]).unwrap();
+        let (old,new)=sgd_epoch_restart_lrs(&args,2,65536).unwrap();
+        assert!((old-0.0005).abs()<1e-9 && (new-0.0044).abs()<1e-9);
+        args.epoch_settings_json=Some(serde_json::json!({"lr":{"epoch1":0.0044,"epoch2":0.002}}).to_string());
+        let (old,new)=sgd_epoch_restart_lrs(&args,2,65536).unwrap();
+        assert!((old-0.0005).abs()<1e-9 && (new-0.002).abs()<1e-9);
+        let path=std::env::temp_dir().join(format!("bulletou-sgd-restart-{}.json",std::process::id()));
+        std::fs::write(&path,serde_json::json!({"backend":"cuda-cpp","teacher":"teacher.bin",
+            "arch":"SFNN_halfkahm2_2304_15_64_k21k21_progress8","optimizer":"sgd","superbatches":1296,
+            "max_epochs":3,"batch_size":65536,"positions_per_superbatch":40000000,
+            "lr":0.003,"lr_min":0.0003,"lr_schedule":"step","lr_step_gamma":0.8,
+            "lr_step_positions":40000000}).to_string()).unwrap();
+        let saved=sgd_previous_lr_from_checkpoint_settings(&path,2,Some((1,1296))).unwrap();
+        let earlier=sgd_previous_lr_from_checkpoint_settings(&path,2,Some((1,1))).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!((saved-0.0003).abs()<1e-9,"must use the saved schedule, not the new one");
+        assert!((earlier-0.003).abs()<1e-9,"must use the actual saved superbatch");
+    }
+
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn l2_bias_lr_setting_parses_and_resolves_per_epoch() {

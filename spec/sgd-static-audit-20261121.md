@@ -16,7 +16,7 @@ FTの半精度勾配経路は、局面・view・unitごとの勾配を `16384 * 
 
 ## epoch境界のSGD momentum
 
-step LRのepoch再始動で過去のmomentum全体に新しいlrが掛かる点は、ユーザーが学習停止後の修正を指示済み。実際の修正方式と検証は未着手。
+step LRのepoch再始動で過去のmomentum全体に新しいlrが掛かる点は、ユーザーの指示により修正した。方式と検証範囲は末尾の修正作業を参照。稼働中の旧プロセスには未反映。
 
 ## qlossの評価mode間の尺度
 
@@ -41,3 +41,18 @@ integer QATはFT pairwise出力をまず浮動小数点で計算し、`dense_qat
 ## 学習ログの範囲確認
 
 読み取り時点の `summary-learn.csv` でepoch 3 sb 325〜629の305行を確認し、test accuracy/loss、quantized accuracy/loss、および記録された各全体上限飽和率に欠損・非有限値はなかった。これは読み取り時に完了していた行だけの確認で、各unitの飽和率・FT境界勾配や半精度clipの発生有無を証明しない。
+
+## 2026-11-21 修正作業
+
+FT半精度activationは、順伝播の積にはFP16に丸めた値を使い、CReLUの逆伝播判定にはFP16丸め前のactivationを使う。fusedと非fusedの両経路を対象とし、0.9999と1.0の両視点の境界テストを追加した。
+
+L1/L2/L3とFTのQATがすべてオンのとき、FTの量子化済み重み・biasからi16折り返しを含む整数累積とpairwise積を計算し、整数推論と同じ格子値を生成する。FT QATオフ時は従来どおり。境界、負値、折り返し、packed出力、小さいdense QAT全体のテストを実施した。追加のFT計算を行うため、実モデルでの速度影響は学習停止後に測定が必要。
+
+epoch 2以降のSGD最初の更新前に、過去のmomentumを `前epoch最後のlr / 新epoch最初のlr` で変換する。これにより前epochからの更新寄与を保ちつつ、新しい勾配には新lrを適用する。通常のepoch内step LR減衰は変更しない。epoch境界checkpointからの再開時は、保存されたbulletou-settings.jsonから前epochのlrを復元し、読めない場合は警告して現在設定のscheduleから推定する。層別倍率がepoch境界で同時に変更される場合、その倍率変更自体は補正しない。これは新たな学習器が適用された後の境界から有効で、稼働中の旧プロセスには反映されない。
+
+修正中は本学習を継続し、別ビルド先で小規模GPUテストを実行。実checkpointでの長時間学習、実モデルでの速度、epoch境界をまたぐ実checkpointの再開試験は未実施。
+
+検証追記: FTの0近傍（正の値がFP16で0になる場合）と1近傍を両視点・3経路で検証し成功。QAT関連GPUテスト18件、SGD関連GPUテスト16件、以前の設定をcheckpointから読むepoch LR計算テストが成功した。別ビルド先は `C:\shogi\codex-bulletou-build`。epoch boundary時の層別倍率変更自体を補正しないほか、checkpointに前epoch設定がなく現在設定も変わっている場合、旧lrの推定は不確実で警告する。
+追加検証: 整数FTは複数特徴・異なる先後視点のpacked出力をCPU整数計算と照合し成功。小さいQATモデルでepoch境界相当のlr変更を挟み、保存・復元した場合と継続した場合のmomentumと重みが一致した。いずれも小規模であり、実checkpointの再開や本番幅での速度を保証しない。
+epoch境界で再開する際、前回checkpointがepoch途中で保存されていた場合も、そのcheckpointのsb位置までの最後のlrを保存設定から算出する。現在設定を変更して再開した場合の旧lrと新lrを混同しないためである。設定や進捗が読めない場合は警告し、現在scheduleから推定する。
+別出力先のCUDA版releaseビルドと起動確認は成功。参考としてCUDA featureを付けないexampleのビルドも試したが、今回変更していない既存箇所の条件付きコンパイルで失敗した。対象のCUDA版は成功している。

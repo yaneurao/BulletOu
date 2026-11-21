@@ -18,6 +18,24 @@ pub(crate) fn enabled(lr: SfnnLayerLrMultipliers) -> bool {
 pub(crate) mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires CUDA; exact integer FT must be used by dense QAT"]
+    fn dense_qat_ft_forward_uses_integer_pair_product() {
+        let ctx=Context::new(0).unwrap();
+        let shape=crate::tests::tiny_sfnn_shape();
+        let mut w=crate::tests::tiny_sfnn_weights(shape);
+        let zeros=vec![0.0;w.l0w.len()]; let bias=vec![64.0/127.0;shape.ft_size];
+        w.l0w=&zeros; w.l0b=&bias; w.l2fw=None;w.l2fb=None;w.l3fw=None;w.l3fb=None;
+        let mut r=SfnnTrainStepRunner::new(&ctx,w,1,1).unwrap();
+        let lr=SfnnLayerLrMultipliers {qat_ft:true,qat_l1:true,qat_l2:true,qat_l3:true,..Default::default()};
+        let batch=SfnnTrainStepHostBatch {stm_indices:&[0],nstm_indices:&[0],buckets:&[0],
+            targets:&[0.5],entry_weights:&[1.0],batch_size:1,max_active:1};
+        r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,RangerUpdateParams::default(),
+            ScalarLossKind::BceWithLogits,1.0,batch,true,false,lr).unwrap();
+        let got=r.forward_workspace.combined.download(&ctx).unwrap();
+        assert!(got.iter().all(|v|(*v-32.0/127.0).abs()<1e-7),"dense QAT FT: {got:?}");
+    }
+
+    #[test]
     #[ignore = "requires CUDA; compares 3528-bucket pair QAT gradients with scalar STE"]
     fn sgd_dense_qat_3528_bucket_gradients_match_scalar_ste() {
         let ctx=Context::new(0).unwrap();
@@ -792,7 +810,7 @@ pub(crate) mod tests {
 unsafe extern "C" {
     fn bulletou_dense_qat_begin(ctx: *mut ffi::BulletOuCudaCppContext,
         l2_bias: *mut ffi::BulletOuCudaCppF32Buffer, l3_bias: *mut ffi::BulletOuCudaCppF32Buffer,
-        batch: usize, l1_out: usize, l2_size: usize, stacks: usize) -> i32;
+        batch: usize, l1_out: usize, l2_size: usize, stacks: usize, integer_ft: i32) -> i32;
     fn bulletou_dense_qat_end(ctx: *mut ffi::BulletOuCudaCppContext);
     fn bulletou_layer_qat_nonzero(ctx: *mut ffi::BulletOuCudaCppContext,
         w: *mut ffi::BulletOuCudaCppF32Buffer, b: *mut ffi::BulletOuCudaCppF32Buffer,
@@ -963,7 +981,7 @@ pub(crate) fn step<T>(
             }
             // SAFETY: master bias buffers live through the nested training step.
             check(unsafe { bulletou_dense_qat_begin(ctx.as_ptr(), r.weights.l2b.as_ptr(), r.weights.l3b.as_ptr(),
-                r.batch_size, r.shape.l1_out(), r.shape.l2_size, r.shape.num_stacks) })?;
+                r.batch_size, r.shape.l1_out(), r.shape.l2_size, r.shape.num_stacks, i32::from(lr.qat_ft)) })?;
         }
         q.swap(&mut r.weights);
         let inner = SfnnLayerLrMultipliers { qat_ft: false, qat_l2: false, qat_l3: false, ..lr };

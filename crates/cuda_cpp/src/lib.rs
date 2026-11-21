@@ -6447,6 +6447,36 @@ impl SfnnLayerLrMultipliers {
 }
 
 impl SfnnTrainStepRunner {
+    /// Rebase gradient-buffer SGD momentum when the learning rate is restarted.
+    /// Keep the previous velocity contribution invariant: lr_new * m_new =
+    /// lr_old * m_old. Weight remainders and master weights are untouched.
+    pub fn rescale_sgd_momentum(&mut self, ctx: &Context, ratio: f32) -> Result<()> {
+        if self.pending_gradient_batches != 0 {
+            return Err(CudaCppError::message("SGD momentum rebase requires an optimizer-update boundary"));
+        }
+        if !ratio.is_finite() || ratio < 0.0 {
+            return Err(CudaCppError::message("invalid SGD momentum rebase ratio"));
+        }
+        if ratio == 1.0 { return Ok(()); }
+        // Decode and discard the optional FT half cache before changing the
+        // authoritative FP32 buffers; it will be recreated on the next step.
+        self.invalidate_ft_half_moments(ctx)?;
+        let scale = F32Buffer::from_host(ctx, &[ratio])?;
+        let states = &self.optimizer_states;
+        for state in [&states.l0w, &states.l0b, &states.l1w, &states.l1b,
+            &states.l2w, &states.l2b, &states.l3w, &states.l3b] {
+            scale_axis_rows_f32_device(ctx, &state.momentum, &scale, 1, state.momentum.len())?;
+        }
+        for state in [&states.l1fw, &states.l1fb, &states.l1axw, &states.l1axb,
+            &states.l2fw, &states.l2fb, &states.l2axw, &states.l2axb,
+            &states.l3fw, &states.l3fb, &states.l3axw, &states.l3axb].into_iter().flatten() {
+            scale_axis_rows_f32_device(ctx, &state.momentum, &scale, 1, state.momentum.len())?;
+        }
+        // The temporary scale buffer must remain alive until every kernel has
+        // consumed it, including when training uses asynchronous uploads.
+        ctx.synchronize()
+    }
+
     /// Synchronize the public FP32 FT optimizer buffers with the optional
     /// FP16 state. `read_optimizer_states` and snapshots do this automatically.
     pub fn synchronize_ft_optimizer_moments(&self, ctx: &Context) -> Result<()> {
@@ -9652,6 +9682,12 @@ mod ffi {
         pub fn bulletou_test_qat_ft_lattice(ctx: *mut BulletOuCudaCppContext,
             values: *mut BulletOuCudaCppF32Buffer, n: usize, fast: i32) -> i32;
         #[cfg(test)]
+        pub fn bulletou_test_dense_qat_exact_ft(ctx: *mut BulletOuCudaCppContext,
+            stm: *mut BulletOuCudaCppI32Buffer, nstm: *mut BulletOuCudaCppI32Buffer,
+            weights: *mut BulletOuCudaCppF32Buffer, bias: *mut BulletOuCudaCppF32Buffer,
+            output: *mut BulletOuCudaCppF32Buffer, packed: *mut BulletOuCudaCppI32Buffer,
+            batch: usize, active: usize, inputs: usize, width: usize) -> i32;
+        #[cfg(test)]
         pub fn bulletou_test_qat_packed_l1(ctx: *mut BulletOuCudaCppContext,
             input: *mut BulletOuCudaCppF32Buffer, weights: *mut BulletOuCudaCppF32Buffer,
             bias: *mut BulletOuCudaCppI32Buffer, buckets: *mut BulletOuCudaCppI32Buffer,
@@ -10792,6 +10828,32 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA"]
+    fn sgd_restart_rescales_all_momenta_preserving_remainders_and_half_state() {
+        let ctx=Context::new(0).unwrap();
+        let shape=tiny_sfnn_shape();
+        let mut r=SfnnTrainStepRunner::new(&ctx,tiny_sfnn_weights(shape),1,1).unwrap();
+        r.optimizer_states.l0w.momentum.fill(&ctx,0.125).unwrap();
+        r.optimizer_states.l0w.velocity.fill(&ctx,0.01).unwrap();
+        r.optimizer_states.l1w.momentum.fill(&ctx,0.4).unwrap();
+        r.optimizer_states.l1fw.as_ref().unwrap().momentum.fill(&ctx,0.3).unwrap();
+        r.optimizer_states.l2b.momentum.fill(&ctx,0.2).unwrap();
+        r.optimizer_states.l3w.momentum.fill(&ctx,0.1).unwrap();
+        // Force the FT cache to exist, then rebase it as at an epoch restart.
+        r.ft_half_moments_enabled=true;
+        r.ft_half_moments=Some(FtHalfMoments::new(&ctx,&r.optimizer_states.l0w,true).unwrap());
+        r.rescale_sgd_momentum(&ctx,0.25).unwrap();
+        for (state,expected) in [(&r.optimizer_states.l0w,0.03125),(&r.optimizer_states.l1w,0.1),
+            (r.optimizer_states.l1fw.as_ref().unwrap(),0.075),(&r.optimizer_states.l2b,0.05),(&r.optimizer_states.l3w,0.025)] {
+            assert!(state.momentum.download(&ctx).unwrap().iter().all(|v|(*v-expected).abs()<1e-6));
+        }
+        assert!(r.optimizer_states.l0w.velocity.download(&ctx).unwrap().iter().all(|v|*v==0.01));
+        assert!(r.ft_half_moments.is_none());
+        r.pending_gradient_batches=1;
+        assert!(r.rescale_sgd_momentum(&ctx,0.5).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
     fn sgd_factorizer_remainder_clear_preserves_momentum_and_other_layers() {
         use super::*;
         let ctx = Context::new(0).unwrap();
@@ -11191,6 +11253,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn half_ft_crelu_ste_uses_pre_round_boundary() {
+        let ctx=Context::new(0).unwrap();
+        let (batch,width,stacks)=(4usize,2usize,1usize);
+        let mut dy_values=vec![0.0;batch*16];
+        for i in 0..batch {dy_values[i*16]=1e-5;}
+        let mut weight_values=vec![0.0;stacks*16*width]; weight_values[0]=1.0; weight_values[1]=1.0;
+        let dy=F32Buffer::from_host(&ctx,&dy_values).unwrap();
+        let weights=F32Buffer::from_host(&ctx,&weight_values).unwrap();
+        // First sample rounds 0.9999 to half 1 but is inside CReLU; second
+        // sample is genuinely saturated. Each perspective uses the same data.
+        let activations=F32Buffer::from_host(&ctx,&[0.9999,0.5,1.0,0.5,1e-8,0.5,0.0,0.5,
+            0.9999,0.5,1.0,0.5,1e-8,0.5,0.0,0.5]).unwrap();
+        let buckets=I32Buffer::from_host(&ctx,&[0,0,0,0]).unwrap();
+        for fused in [0,1,2] {
+            let out=F32Buffer::new(&ctx,2*batch*width).unwrap();
+            let bias=F32Buffer::new(&ctx,width).unwrap(); bias.fill(&ctx,0.0).unwrap();
+            check(unsafe {ffi::bulletou_test_l1_to_ft_half_gradient(ctx.as_ptr(),dy.as_ptr(),weights.as_ptr(),
+                buckets.as_ptr(),activations.as_ptr(),out.as_ptr(),bias.as_ptr(),batch,width,stacks,fused)}).unwrap();
+            let actual=out.download(&ctx).unwrap();
+            assert!(actual[0]>0.0 && actual[8]>0.0,"inside CReLU lost its gradient: {actual:?}");
+            assert_eq!(actual[2],0.0,"saturated activation must have zero gradient");
+            assert!(actual[4]>0.0 && actual[12]>0.0,"positive value rounded to zero lost its gradient: {actual:?}");
+            assert_eq!(actual[6],0.0,"zero activation must have zero gradient");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn fused_l1_ft_half_gradient_matches_separate_kernels() {
         use super::*;
         let ctx = Context::new(0).unwrap();
@@ -11341,6 +11431,69 @@ mod tests {
         assert_eq!(raw_a.download(&ctx).unwrap(), raw_b.download(&ctx).unwrap());
         assert_eq!(out_a.download(&ctx).unwrap(), out_b.download(&ctx).unwrap());
     }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn qat_ft_integer_product_boundary_matches_engine() {
+        let ctx=Context::new(0).unwrap();
+        let (batch,ft,input,active)=(1usize,8usize,1usize,1usize);
+        let stm=I32Buffer::from_host(&ctx,&[0]).unwrap();
+        let nstm=I32Buffer::from_host(&ctx,&[0]).unwrap();
+        let weights=F32Buffer::from_host(&ctx,&vec![0.0;input*ft]).unwrap();
+        let bias=F32Buffer::from_host(&ctx,&vec![64.0/127.0;ft]).unwrap();
+        let combined=F32Buffer::new(&ctx,batch*ft).unwrap();
+        check(unsafe {ffi::bulletou_test_dense_qat_exact_ft(ctx.as_ptr(),stm.as_ptr(),nstm.as_ptr(),weights.as_ptr(),
+            bias.as_ptr(),combined.as_ptr(),std::ptr::null_mut(),batch,active,input,ft)}).unwrap();
+        let got=combined.download(&ctx).unwrap();
+        assert!(got.iter().all(|x|(*x-32.0/127.0).abs()<1e-7),"engine lattice mismatch: {got:?}");
+        // Exercise signed FT values, sparse features and i16 wrapping.
+        let wq=[32767i32, -32000, 64, -80, 200, 64, 32767, 200];
+        weights.upload(&ctx,&wq.map(|x|x as f32/127.0)).unwrap();
+        bias.upload(&ctx,&[64.0/127.0;8]).unwrap();
+        check(unsafe {ffi::bulletou_test_dense_qat_exact_ft(ctx.as_ptr(),stm.as_ptr(),nstm.as_ptr(),weights.as_ptr(),
+            bias.as_ptr(),combined.as_ptr(),std::ptr::null_mut(),batch,active,input,ft)}).unwrap();
+        let got=combined.download(&ctx).unwrap();
+        for j in 0..ft/2 {
+            let x=((2*(64+wq[j])) as i16 as i32).clamp(0,254);
+            let y=((2*(64+wq[ft/2+j])) as i16 as i32).clamp(0,254);
+            let expected=((x*y)>>9) as f32/127.0;
+            assert!((got[j]-expected).abs()<1e-7 && (got[ft/2+j]-expected).abs()<1e-7,
+                "unit {j}: {} / {} != {expected}",got[j],got[ft/2+j]);
+        }
+        let batch=16usize;
+        let stm=I32Buffer::from_host(&ctx,&vec![0;batch]).unwrap();
+        let nstm=I32Buffer::from_host(&ctx,&vec![0;batch]).unwrap();
+        let out=F32Buffer::new(&ctx,batch*ft).unwrap(); let packed=I32Buffer::new(&ctx,batch*ft/4).unwrap();
+        check(unsafe {ffi::bulletou_test_dense_qat_exact_ft(ctx.as_ptr(),stm.as_ptr(),nstm.as_ptr(),weights.as_ptr(),
+            bias.as_ptr(),out.as_ptr(),packed.as_ptr(),batch,active,input,ft)}).unwrap();
+        let values=out.download(&ctx).unwrap(); let words=packed.download(&ctx).unwrap();
+        for (chunk,&word) in values.chunks_exact(4).zip(&words) {
+            for (j,&v) in chunk.iter().enumerate() {
+                assert_eq!(((word as u32 >> (8*j))&255) as i32,(v*127.0).round() as i32);
+            }
+        }
+        let inputs=4usize; let active=3usize;
+        let indices:Vec<i32>=(0..batch*active).map(|i| if i%7==0 {-1} else {(i%inputs) as i32}).collect();
+        let reverse:Vec<i32>=indices.iter().map(|&x|if x<0 {-1}else{3-x}).collect();
+        let wq:Vec<i32>=(0..inputs*ft).map(|i|((i*773)%801) as i32-400).collect();
+        let bq:Vec<i32>=(0..ft).map(|i|i as i32*19-40).collect();
+        let stm=I32Buffer::from_host(&ctx,&indices).unwrap(); let nstm=I32Buffer::from_host(&ctx,&reverse).unwrap();
+        let weights=F32Buffer::from_host(&ctx,&wq.iter().map(|&x|x as f32/127.0).collect::<Vec<_>>()).unwrap();
+        let bias=F32Buffer::from_host(&ctx,&bq.iter().map(|&x|x as f32/127.0).collect::<Vec<_>>()).unwrap();
+        check(unsafe {ffi::bulletou_test_dense_qat_exact_ft(ctx.as_ptr(),stm.as_ptr(),nstm.as_ptr(),weights.as_ptr(),
+            bias.as_ptr(),out.as_ptr(),packed.as_ptr(),batch,active,inputs,ft)}).unwrap();
+        let values=out.download(&ctx).unwrap(); let words=packed.download(&ctx).unwrap();
+        for sample in 0..batch {for (view,features) in [&indices,&reverse].into_iter().enumerate() {for j in 0..ft/2 {
+            let mut x=2*bq[j];let mut y=2*bq[ft/2+j];
+            for &f in &features[sample*active..(sample+1)*active] {if f>=0 {
+                x+=2*wq[f as usize*ft+j];y+=2*wq[f as usize*ft+ft/2+j];
+            }}
+            let expected=(((x as i16 as i32).clamp(0,254)*(y as i16 as i32).clamp(0,254))>>9) as u32;
+            let pos=sample*ft+view*ft/2+j;
+            assert_eq!((values[pos]*127.0).round() as u32,expected);
+            assert_eq!((words[pos/4] as u32 >> (8*(pos%4)))&255,expected);
+        }}}
+    }
+
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
     fn qat_ft_lattice_fast_matches_double_precision_at_boundaries() {
@@ -13703,17 +13856,18 @@ mod tests {
     #[ignore = "requires CUDA; SGD/QAT save and restore continuation"]
     fn sgd_qat_snapshot_continuation_matches_uninterrupted() {
         let ctx=Context::new(0).unwrap();
+        for qat_ft in [false,true] {
         let mut w=tiny_sfnn_weights(tiny_sfnn_shape());
         w.l2fw=None; w.l2fb=None; w.l3fw=None; w.l3fb=None;
         let mut original=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
         original.set_ft_fp16_moments(&ctx,true).unwrap();
-        let lr=SfnnLayerLrMultipliers {qat_l1:true,qat_l2:true,qat_l3:true,
+        let lr=SfnnLayerLrMultipliers {qat_ft,qat_l1:true,qat_l2:true,qat_l3:true,
             l1_effective_weight_clip:true,..Default::default()};
         let batch=|| SfnnTrainStepHostBatch {stm_indices:&[0,1,2,3],nstm_indices:&[2,3,0,1],
             buckets:&[0,1,0,1],targets:&[0.2,0.8,0.3,0.7],entry_weights:&[1.0;4],batch_size:4,max_active:1};
         let update=|r:&mut SfnnTrainStepRunner, step| {
             let p=RangerUpdateParams {sgd_momentum:Some(0.9),radam:RAdamUpdateParams {
-                step,learning_rate:0.002,..Default::default()},..Default::default()};
+                step,learning_rate:if step<5 {0.002}else{0.0176},..Default::default()},..Default::default()};
             r.step_no_readback_with_loss_finalize_update_and_lr_multipliers(&ctx,p,
                 ScalarLossKind::BceWithLogits,1.0,batch(),true,true,lr).unwrap();
         };
@@ -13722,6 +13876,10 @@ mod tests {
         let mut resumed=SfnnTrainStepRunner::new(&ctx,w,4,1).unwrap();
         resumed.set_ft_fp16_moments(&ctx,true).unwrap();
         resumed.copy_state_from_device(&ctx,&snap).unwrap();
+        // Simulate epoch LR restart after saving: both the continuous runner
+        // and the restored runner must rebase the same momentum exactly once.
+        original.rescale_sgd_momentum(&ctx,0.002/0.0176).unwrap();
+        resumed.rescale_sgd_momentum(&ctx,0.002/0.0176).unwrap();
         for step in 5..=8 {update(&mut original,step);update(&mut resumed,step);}
         let a=original.read_weights(&ctx).unwrap();let b=resumed.read_weights(&ctx).unwrap();
         for (name,x,y) in [("FT weights",&a.l0w,&b.l0w),("L1 weights",&a.l1w,&b.l1w),
@@ -13733,6 +13891,7 @@ mod tests {
         assert_close_slice("FT SGD remainder",&a.l0w.velocity,&b.l0w.velocity,1e-7);
         assert_close_slice("L1 momentum",&a.l1w.momentum,&b.l1w.momentum,1e-7);
         assert_close_slice("L1 SGD remainder",&a.l1w.velocity,&b.l1w.velocity,1e-7);
+        }
     }
 
     #[test]

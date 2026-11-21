@@ -40,6 +40,6 @@ step LRはepochごとに再始動する。設定が変わらない場合、epoch
 
 現在のbucketは `(king_pair, progress)` の441×8通り。pair factorizerのking-progress成分も同じ組を添字に取るため、bucket残差との対応は一対一。係数1・残差ゲートなしのとき、lossから来る同じ座標のbucket残差とking-progress pairの勾配は、浮動小数点の集計順序を除き同じになる。両者のmomentum・重み制約・projectionの履歴は異なりうるため、実際の更新量が常に2倍になるとは限らない。shared、両玉axis、progress axisもfolded L1を同時に変える。L1倍率0.5はこれら全てのL1座標に適用される。設計上の重複であり、それだけを実装バグや今回の停滞原因と断定できない。
 
-## 保留: epoch境界のSGD momentum
+## epoch境界のSGD momentum
 
-ユーザーは、step LRがepoch冒頭で戻る動作自体は意図しているが、前epochからのmomentum全体に上昇後のlrが掛かる点を問題と判断し、後で修正するよう指示した。学習稼働中は変更・再起動しない。停止後に、期待する更新式と保存・再開やlr schedule変更時の挙動を含めて修正し検証する。修正方式は未決定。
+ユーザーは、step LRがepoch冒頭で戻る動作自体は意図しているが、前epochからのmomentum全体に上昇後のlrが掛かる点を問題と判断した。その後の指示で修正を実装した。方式、テストと未検証項目は `sgd-static-audit-20261121.md` の修正作業を参照。稼働中の学習は再起動しておらず、旧プロセスには未反映。

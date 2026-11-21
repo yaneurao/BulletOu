@@ -136,6 +136,7 @@ struct BulletOuCudaCppContext {
     bool sfnn_ft_fp16_grad = false;
     bool sfnn_ft_fp16_act = false;
     bool dense_qat = false;
+    bool dense_qat_integer_ft = false;
     const float* dense_qat_l2_bias = nullptr;
     const float* dense_qat_l3_bias = nullptr;
     int* dense_qat_l1_raw = nullptr;
@@ -1419,17 +1420,16 @@ __global__ void sfnn_hm2_one_view_half2_kernel(const int* indices, const __half*
     float2 x0 = make_float2(crelu(sum0.x), crelu(sum0.y));
     float2 x1 = make_float2(crelu(sum1.x), crelu(sum1.y));
     const size_t base = sample * ft_size + pair;
+    // Preserve the pre-FP16 activation for the CReLU derivative.  The
+    // FP16-rounded copy is still used by the forward product and its STE.
+    *reinterpret_cast<float2*>(l0 + base) = x0;
+    *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
     if (half_l0) {
         const __half2 h0 = __floats2half2_rn(x0.x, x0.y), h1 = __floats2half2_rn(x1.x, x1.y);
         *reinterpret_cast<__half2*>(half_l0 + base) = h0;
         *reinterpret_cast<__half2*>(half_l0 + base + pairwise) = h1;
         x0 = __half22float2(h0); x1 = __half22float2(h1);
     }
-    // Workspaces expose these values to the non-training backward API and
-    // diagnostics. They must correspond to this forward even when cached in
-    // FP16 for the fast training path.
-    *reinterpret_cast<float2*>(l0 + base) = x0;
-    *reinterpret_cast<float2*>(l0 + base + pairwise) = x1;
     const size_t output_index = base + view * pairwise;
     const float2 activation = make_float2(x0.x * x1.x * SFNN_PAIRWISE_SCALE, x0.y * x1.y * SFNN_PAIRWISE_SCALE);
     if (qat_packed) {
@@ -4403,10 +4403,10 @@ __global__ void sfnn_pairwise_l0_pregrad_kernel(
     float nstm1 = nstm_act_half ? __half2float(nstm_act_half[l0_base + row1]) : nstm_activations[l0_base + row1];
     float stm_pair_grad = combined_gradients[l0_base + pair] * SFNN_PAIRWISE_SCALE;
     float nstm_pair_grad = combined_gradients[l0_base + pairwise + pair] * SFNN_PAIRWISE_SCALE;
-    float stm_grad0 = crelu_pre_gradient_from_value(stm0, stm_pair_grad * stm1);
-    float stm_grad1 = crelu_pre_gradient_from_value(stm1, stm_pair_grad * stm0);
-    float nstm_grad0 = crelu_pre_gradient_from_value(nstm0, nstm_pair_grad * nstm1);
-    float nstm_grad1 = crelu_pre_gradient_from_value(nstm1, nstm_pair_grad * nstm0);
+    float stm_grad0 = crelu_pre_gradient_from_value(stm_activations[l0_base + row0], stm_pair_grad * stm1);
+    float stm_grad1 = crelu_pre_gradient_from_value(stm_activations[l0_base + row1], stm_pair_grad * stm0);
+    float nstm_grad0 = crelu_pre_gradient_from_value(nstm_activations[l0_base + row0], nstm_pair_grad * nstm1);
+    float nstm_grad1 = crelu_pre_gradient_from_value(nstm_activations[l0_base + row1], nstm_pair_grad * nstm0);
 
     // Hinge bypasses clamp backward, but is still included in the ONE ordinary
     // sparse weight-gradient gather. Bias penalty was reduced separately to
@@ -6337,6 +6337,65 @@ __global__ void dense_qat_l2_ste_kernel(const int* raw, const float* master_bias
     if((x==0 && fraction<=0.0) || (x==8128 && fraction>=0.0))gradient[i]=0.0f;
 }
 
+// FT QAT weights and biases are already folded and quantized to q/127.
+// Reconstruct their integer values and reproduce the engine's doubled i16
+// wrapping accumulator and pair product. The float FT pass is retained for
+// the straight-through backward activations.
+__global__ void dense_qat_exact_ft_kernel(const int* stm,const int* nstm,const float* w,const float* bias,
+    float* combined,int* packed,size_t batch,size_t active,size_t inputs,size_t width) {
+    const size_t half=width/2;
+    const size_t tid=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(tid>=batch*half)return;
+    const size_t sample=tid/half, unit=tid%half;
+    int s0=2*__float2int_rn(__fmul_rn(bias[unit],127.0f));
+    int s1=2*__float2int_rn(__fmul_rn(bias[half+unit],127.0f));
+    int n0=s0,n1=s1;
+    for(size_t j=0;j<active;++j) {
+        const int a=stm[sample*active+j],b=nstm[sample*active+j];
+        if(a>=0 && static_cast<size_t>(a)<inputs) {
+            const size_t base=static_cast<size_t>(a)*width;
+            s0+=2*__float2int_rn(__fmul_rn(w[base+unit],127.0f));
+            s1+=2*__float2int_rn(__fmul_rn(w[base+half+unit],127.0f));
+        }
+        if(b>=0 && static_cast<size_t>(b)<inputs) {
+            const size_t base=static_cast<size_t>(b)*width;
+            n0+=2*__float2int_rn(__fmul_rn(w[base+unit],127.0f));
+            n1+=2*__float2int_rn(__fmul_rn(w[base+half+unit],127.0f));
+        }
+    }
+    s0=max(0,min(254,static_cast<int>(static_cast<short>(s0))));
+    s1=max(0,min(254,static_cast<int>(static_cast<short>(s1))));
+    n0=max(0,min(254,static_cast<int>(static_cast<short>(n0))));
+    n1=max(0,min(254,static_cast<int>(static_cast<short>(n1))));
+    const unsigned a=static_cast<unsigned>((s0*s1)>>9), b=static_cast<unsigned>((n0*n1)>>9);
+    const size_t base=sample*width;
+    combined[base+unit]=static_cast<float>(a)/127.0f;
+    combined[base+half+unit]=static_cast<float>(b)/127.0f;
+    if(packed) {
+        const unsigned a1=__shfl_down_sync(0xffffffffu,a,1,4),a2=__shfl_down_sync(0xffffffffu,a,2,4),a3=__shfl_down_sync(0xffffffffu,a,3,4);
+        const unsigned b1=__shfl_down_sync(0xffffffffu,b,1,4),b2=__shfl_down_sync(0xffffffffu,b,2,4),b3=__shfl_down_sync(0xffffffffu,b,3,4);
+        if((unit&3)==0) {
+            packed[(base+unit)/4]=static_cast<int>(a|(a1<<8)|(a2<<16)|(a3<<24));
+            packed[(base+half+unit)/4]=static_cast<int>(b|(b1<<8)|(b2<<16)|(b3<<24));
+        }
+    }
+}
+
+extern "C" int bulletou_test_dense_qat_exact_ft(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppI32Buffer* stm,BulletOuCudaCppI32Buffer* nstm,BulletOuCudaCppF32Buffer* w,
+    BulletOuCudaCppF32Buffer* bias,BulletOuCudaCppF32Buffer* output,BulletOuCudaCppI32Buffer* packed,
+    size_t batch,size_t active,size_t inputs,size_t width) {
+    if(!ctx || !batch || !inputs || !width || width%2 ||
+       validate_i32_buffer(ctx,stm,batch*active,"exact FT stm") || validate_i32_buffer(ctx,nstm,batch*active,"exact FT nstm") ||
+       validate_buffer(ctx,w,inputs*width,"exact FT weights") || validate_buffer(ctx,bias,width,"exact FT bias") ||
+       validate_buffer(ctx,output,batch*width,"exact FT output") ||
+       (packed && (width%8 || batch*width%128 || validate_i32_buffer(ctx,packed,batch*width/4,"exact FT packed")))) return -1;
+    const size_t n=batch*width/2;
+    dense_qat_exact_ft_kernel<<<static_cast<unsigned>((n+255)/256),256,0,ctx->stream>>>(
+        stm->ptr,nstm->ptr,w->ptr,bias->ptr,output->ptr,packed?packed->ptr:nullptr,batch,active,inputs,width);
+    return check_kernel_launch("test exact FT");
+}
+
 int launch_sfnn_forward_kernels(
     BulletOuCudaCppContext* ctx,
     size_t input_size,
@@ -6592,6 +6651,16 @@ int launch_sfnn_forward_kernels(
         if(!fused) bn_ft_activate<<<static_cast<unsigned>((batch*pairwise+255)/256),256,0,ctx->stream>>>(stm_l0,nstm_l0,combined,batch,ft_size);
         if(check_kernel_launch("BN FT activation"))return -1;
     }
+    if (ctx->dense_qat && ctx->dense_qat_integer_ft) {
+        const bool pack_exact = qat_packed_candidate && ctx->dense_qat_dp4a_available != 0;
+        if (pack_exact && ensure_i32_scratch(&ctx->dense_qat_packed_input,&ctx->dense_qat_packed_input_len,
+                batch*ft_size/4,"exact FT packed input")) return -1;
+        if (block_count_1d(batch*pairwise,threads,&blocks,"exact QAT FT")) return -1;
+        dense_qat_exact_ft_kernel<<<blocks,threads,0,ctx->stream>>>(stm_indices,nstm_indices,l0w,l0b,
+            combined,pack_exact ? ctx->dense_qat_packed_input : nullptr,batch,max_active,
+            factorized_ft_base ? factorized_ft_base : input_size,ft_size);
+        if (check_kernel_launch("exact QAT FT")) return -1;
+    }
     const bool prepacked_l1 = ctx->dense_qat_weights_prepacked;
     ctx->dense_qat_weights_prepacked = false;
     if (ctx->dense_qat) {
@@ -6605,7 +6674,7 @@ int launch_sfnn_forward_kernels(
             const size_t weight_words = num_stacks * l1_out * ft_size / 4;
             if (ensure_i32_scratch(&ctx->dense_qat_packed_input, &ctx->dense_qat_packed_input_len, input_words, "packed QAT input") ||
                 ensure_i32_scratch(&ctx->dense_qat_packed_weights, &ctx->dense_qat_packed_weights_len, weight_words, "packed QAT weights")) return -1;
-            if (!fused_qat_ft_pack) {
+            if (!fused_qat_ft_pack && !ctx->dense_qat_integer_ft) {
                 if (block_count_1d(input_words, threads, &blocks, "packed QAT lattice")) return -1;
                 dense_qat_lattice_pack<<<blocks,threads,0,ctx->stream>>>(combined, ctx->dense_qat_packed_input, input_words);
                 if (check_kernel_launch("packed QAT lattice")) return -1;
@@ -6613,7 +6682,7 @@ int launch_sfnn_forward_kernels(
             if (block_count_1d(weight_words, threads, &blocks, "packed QAT weights")) return -1;
             if (!prepacked_l1)
                 dense_qat_weights_pack<<<blocks,threads,0,ctx->stream>>>(l1w, ctx->dense_qat_packed_weights, weight_words);
-        } else {
+        } else if (!ctx->dense_qat_integer_ft) {
             if (block_count_1d(batch*ft_size,threads,&blocks,"dense QAT FT lattice")) return -1;
             dense_qat_ft_lattice_kernel<<<blocks,threads,0,ctx->stream>>>(combined,batch*ft_size);
         }
@@ -6977,7 +7046,8 @@ __global__ void bn_l1_input_gradient(const float* dy,const float* w,const float*
 // Combine the two perspectives' L1 input gradients with pairwise/CReLU
 // backward. This avoids writing and rereading batch * FT-width floats.
 __global__ void sfnn_l1_to_ft_half_gradient(const float* dy, const float* w, const int* buckets,
-    const __half* activations, __half* gradients, float* bias, unsigned long long* clipped,
+    const __half* activations, const float* stm_pre_round, const float* nstm_pre_round,
+    __half* gradients, float* bias, unsigned long long* clipped,
     size_t batch, size_t width, size_t stacks) {
     const size_t pairwise = width / 2;
     const size_t tid = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -7001,10 +7071,10 @@ __global__ void sfnn_l1_to_ft_half_gradient(const float* dy, const float* w, con
     const float n0 = __half2float(activations[view_size + i]), n1 = __half2float(activations[view_size + i + pairwise]);
     stm_gradient *= SFNN_PAIRWISE_SCALE;
     nstm_gradient *= SFNN_PAIRWISE_SCALE;
-    const float sg0 = crelu_pre_gradient_from_value(s0, stm_gradient * s1);
-    const float sg1 = crelu_pre_gradient_from_value(s1, stm_gradient * s0);
-    const float ng0 = crelu_pre_gradient_from_value(n0, nstm_gradient * n1);
-    const float ng1 = crelu_pre_gradient_from_value(n1, nstm_gradient * n0);
+    const float sg0 = crelu_pre_gradient_from_value(stm_pre_round[i], stm_gradient * s1);
+    const float sg1 = crelu_pre_gradient_from_value(stm_pre_round[i + pairwise], stm_gradient * s0);
+    const float ng0 = crelu_pre_gradient_from_value(nstm_pre_round[i], nstm_gradient * n1);
+    const float ng1 = crelu_pre_gradient_from_value(nstm_pre_round[i + pairwise], nstm_gradient * n0);
     const float scale = 16384.0f * static_cast<float>(batch);
     gradients[i] = sfnn_scaled_half_gradient(sg0, scale, clipped);
     gradients[i + pairwise] = sfnn_scaled_half_gradient(sg1, scale, clipped);
@@ -7104,7 +7174,7 @@ extern "C" int bulletou_test_l1_to_ft_half_gradient(BulletOuCudaCppContext* ctx,
     sfnn_test_half_grad_convert<<<blocks,threads,0,ctx->stream>>>(activations->ptr + n, act + n, n, 1.0f);
     if (fused == 1) {
         sfnn_l1_to_ft_half_gradient<<<pairs,threads,0,ctx->stream>>>(dy->ptr, weights->ptr, buckets->ptr,
-            act, out, bias->ptr, nullptr, batch, width, stacks);
+            act, activations->ptr, activations->ptr+n, out, bias->ptr, nullptr, batch, width, stacks);
     } else {
         if (fused == 2) {
             sfnn_stacked_affine_backward_kernel<<<blocks,threads,0,ctx->stream>>>(nullptr, dy->ptr, weights->ptr,
@@ -8447,7 +8517,7 @@ int launch_sfnn_backward_kernels(
             if (prepare_sfnn_ft_half_gradients(ctx, batch * ft_size)) return -1;
             sfnn_l1_to_ft_half_gradient<<<fused_blocks, threads, 0, ctx->stream>>>(
             l1_gradients, effective_weights, buckets, ctx->sfnn_ft_half_activations,
-            ctx->sfnn_ft_half_grads, l0b_gradients, ctx->sfnn_ft_half_grad_clipped, batch, ft_size, num_stacks);
+            stm_l0, nstm_l0, ctx->sfnn_ft_half_grads, l0b_gradients, ctx->sfnn_ft_half_grad_clipped, batch, ft_size, num_stacks);
         } else {
             sfnn_l1_to_ft_f32_gradient<<<fused_blocks, threads, 0, ctx->stream>>>(
                 l1_gradients, effective_weights, buckets, stm_l0, nstm_l0,
@@ -9285,7 +9355,7 @@ extern "C" int bulletou_dense_qat_integer_reference(
 
 extern "C" int bulletou_dense_qat_begin(BulletOuCudaCppContext* ctx,
     BulletOuCudaCppF32Buffer* l2_bias, BulletOuCudaCppF32Buffer* l3_bias,
-    size_t batch, size_t l1_out, size_t l2_size, size_t stacks) {
+    size_t batch, size_t l1_out, size_t l2_size, size_t stacks, int integer_ft) {
     if (!ctx || !batch || !l1_out || !l2_size || !stacks ||
         batch>SIZE_MAX/l1_out || batch>SIZE_MAX/l2_size || stacks>SIZE_MAX/l1_out || stacks>SIZE_MAX/l2_size)
         return fail_message("invalid dense QAT dimensions");
@@ -9298,12 +9368,14 @@ extern "C" int bulletou_dense_qat_begin(BulletOuCudaCppContext* ctx,
     ctx->dense_qat_l2_bias=l2_bias->ptr;
     ctx->dense_qat_l3_bias=l3_bias->ptr;
     ctx->dense_qat=true;
+    ctx->dense_qat_integer_ft=integer_ft!=0;
     return 0;
 }
 
 extern "C" void bulletou_dense_qat_end(BulletOuCudaCppContext* ctx) {
     if (!ctx) return;
     ctx->dense_qat=false;
+    ctx->dense_qat_integer_ft=false;
     ctx->dense_qat_l2_bias=nullptr;
     ctx->dense_qat_l3_bias=nullptr;
 }
