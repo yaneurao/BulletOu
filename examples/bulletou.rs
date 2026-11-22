@@ -28269,14 +28269,53 @@ fn numbered_checkpoint_dirs_desc(output_dir: &std::path::Path) -> Vec<(usize, st
 }
 
 fn is_complete_checkpoint_dir(dir: &std::path::Path) -> bool {
-    if !dir.join("state.bin").is_file() || !dir.join("dataloader_pos.txt").is_file() { return false; }
+    if !std::fs::metadata(dir.join("state.bin")).is_ok_and(|m| m.is_file() && m.len() > 0) { return false; }
+    let Ok(pos) = std::fs::read_to_string(dir.join("dataloader_pos.txt")) else { return false };
+    if parse_dataloader_pos_text(&pos).is_err() { return false; }
     let Ok(log) = std::fs::read_to_string(dir.join("learn.log")) else { return false };
     let mut lines = log.lines();
-    if lines.next() != Some(LEARN_LOG_HEADER) { return false; }
-    lines.any(|line| {
+    let Some(header) = lines.next() else { return false };
+    let columns = match header.trim_end_matches('\r') {
+        LEARN_LOG_HEADER => 13,
+        "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher" => 12,
+        "eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,quantized_value_accuracy,quantized_value_loss,teacher" => 14,
+        _ => return false,
+    };
+    let mut position: Option<(usize, usize)> = None;
+    for line in lines {
+        if line.trim().is_empty() { continue; }
         let fields = split_log_csv_row(line);
-        fields.len() == 13 && fields[1].parse::<usize>().is_ok() && fields[2].parse::<usize>().is_ok()
-    })
+        if fields.len() != columns { return false; }
+        let (Ok(epoch), Ok(sb)) = (fields[1].parse::<usize>(), fields[2].parse::<usize>()) else { return false };
+        position = Some(position.map_or((epoch, sb), |p| p.max((epoch, sb))));
+    }
+    let Some(position) = position else { return false };
+    match dir.file_name().and_then(|name| name.to_str()).and_then(parse_checkpoint_dir_name) {
+        Some(named_position) => position == named_position,
+        None => true,
+    }
+}
+
+// Never silently fall back to an older checkpoint when a save was started but
+// cannot be validated: that could also truncate or delete summary logs.
+fn ensure_no_unusable_checkpoint_payloads(output_dir: &std::path::Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(output_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
+        let started = ["state.bin", "dataloader_pos.txt", "learn.log", "nn.bin"]
+            .iter().any(|name| path.join(name).exists());
+        if (parse_checkpoint_dir_name(name).is_some() || name.parse::<usize>().is_ok())
+            && started && !is_complete_checkpoint_dir(&path) {
+            return Err(std::io::Error::other(format!(
+                "checkpoint {} is incomplete or has invalid or mismatched metadata; refusing automatic resume or log changes", path.display())));
+        }
+    }
+    Ok(())
 }
 
 /// Find the latest complete numbered checkpoint under `output_dir`.
@@ -28333,7 +28372,7 @@ fn read_checkpoint_epoch_superbatch(dir: &std::path::Path) -> Option<(usize, usi
         if line.is_empty() || line.starts_with('#') || line.starts_with("eval,") {
             continue;
         }
-        let parts: Vec<&str> = line.splitn(4, ',').collect();
+        let parts = split_log_csv_row(line);
         if parts.len() < 3 {
             continue;
         }
@@ -28352,6 +28391,7 @@ fn truncate_summary_log_after_checkpoint(
     output_dir: &std::path::Path,
     checkpoint_epoch_superbatch: (usize, usize),
 ) -> std::io::Result<usize> {
+    use std::io::Write as _;
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let content = match std::fs::read_to_string(&top) {
         Ok(content) => content,
@@ -28382,6 +28422,14 @@ fn truncate_summary_log_after_checkpoint(
         }
     }
     if removed > 0 {
+        // Keep the original even when later state decoding or GPU setup fails.
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos();
+        let backup = output_dir.join(format!("summary-learn.before-rollback-{stamp}-{}.csv", std::process::id()));
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&backup)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        eprintln!("  summary before rollback saved to {}", backup.display());
         let mut output = kept.join("\n");
         output.push('\n');
         atomic_replace_file(&top, output.as_bytes())?;
@@ -28434,9 +28482,25 @@ fn find_latest_state_bin(args: &Args, output_dir: &std::path::Path) -> Option<st
     if resume_enabled(args, output_dir) { find_latest_state_bin_raw(output_dir) } else { None }
 }
 
+fn validate_initial_state_output(args: &Args, output_dir: &std::path::Path) -> Result<(), String> {
+    if args.initial_state.is_some() && find_latest_state_bin_raw(output_dir).is_some() {
+        return Err(format!("--initial-state requires an output without existing checkpoints: {}", output_dir.display()));
+    }
+    Ok(())
+}
+
 fn prepare_resume_config_or_exit(args: &Args) {
     let output_dir = args.output_dir();
+    if let Err(err) = ensure_no_unusable_checkpoint_payloads(&output_dir) {
+        eprintln!("error: {err}");
+        std::process::exit(2);
+    }
     let latest_state = find_latest_state_bin_raw(&output_dir);
+
+    if let Err(err) = validate_initial_state_output(args, &output_dir) {
+        eprintln!("error: {err}");
+        std::process::exit(2);
+    }
 
     if latest_state.is_some() && args.resume == Some(false) {
         eprintln!(
@@ -28490,10 +28554,11 @@ fn prepare_resume_config_or_exit(args: &Args) {
                     "  WARN: removed {removed} non-resumable summary row(s) after latest checkpoint epoch={} sb={}",
                     anchor.0, anchor.1
                 ),
-                Err(e) => eprintln!(
-                    "  WARN: failed to trim {} after latest checkpoint: {e}",
-                    output_dir.join(SUMMARY_LEARN_LOG_NAME).display()
-                ),
+                Err(e) => {
+                    eprintln!("error: failed to protect or trim {} after latest checkpoint: {e}",
+                        output_dir.join(SUMMARY_LEARN_LOG_NAME).display());
+                    std::process::exit(2);
+                }
             }
         }
     } else {
@@ -29650,6 +29715,69 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkpoint_legacy_headers_and_bad_metadata_do_not_cause_silent_rollback() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("bulletou-checkpoint-audit-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+        let formats = [
+            ("eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,teacher", "E,1,1,1,-,-,-,0,0,1,1,t"),
+            ("eval,epoch,superbatch,curr_batch,test_value_accuracy,test_value_loss,train_value_loss,lr_start,lr_end,lambda,positions,quantized_value_accuracy,quantized_value_loss,teacher", "E,1,1,1,-,-,-,0,0,1,1,-,-,t"),
+            (LEARN_LOG_HEADER, "E,1,1,1,-,-,-,-,0,0,1,1,t"),
+        ];
+        let checkpoint = root.join("0001-0001sb");
+        std::fs::create_dir_all(&checkpoint).unwrap();
+        std::fs::write(checkpoint.join("state.bin"), b"state").unwrap();
+        std::fs::write(checkpoint.join("dataloader_pos.txt"), b"0,0").unwrap();
+        for (header, row) in formats {
+            std::fs::write(checkpoint.join("learn.log"), format!("{header}\n{row}\n")).unwrap();
+            assert!(is_complete_checkpoint_dir(&checkpoint));
+            assert!(ensure_no_unusable_checkpoint_payloads(&root).is_ok());
+        }
+        std::fs::write(checkpoint.join("dataloader_pos.txt"), b"broken").unwrap();
+        assert!(!is_complete_checkpoint_dir(&checkpoint));
+        assert!(ensure_no_unusable_checkpoint_payloads(&root).is_err());
+        std::fs::write(checkpoint.join("dataloader_pos.txt"), b"0,0").unwrap();
+        std::fs::write(checkpoint.join("learn.log"), format!("{LEARN_LOG_HEADER}\nE,1,1,1,-,-,-,-,0,0,1,1,t\nE,9,9\n")).unwrap();
+        assert!(!is_complete_checkpoint_dir(&checkpoint));
+        assert!(ensure_no_unusable_checkpoint_payloads(&root).is_err());
+        std::fs::write(checkpoint.join("learn.log"), format!("{LEARN_LOG_HEADER}\nE,1,1,1,-,-,-,-,0,0,1,1,t\n")).unwrap();
+        let later = root.join("0001-0002sb");
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(later.join("state.bin"), b"state").unwrap();
+        std::fs::write(later.join("dataloader_pos.txt"), b"0,0").unwrap();
+        std::fs::write(later.join("learn.log"), format!("{LEARN_LOG_HEADER}\nE,1,1,1,-,-,-,-,0,0,1,1,t\n")).unwrap();
+        assert!(!is_complete_checkpoint_dir(&later));
+        assert!(ensure_no_unusable_checkpoint_payloads(&root).is_err());
+        std::fs::write(later.join("learn.log"), b"corrupt").unwrap();
+        assert!(ensure_no_unusable_checkpoint_payloads(&root).is_err());
+        std::fs::remove_file(later.join("state.bin")).unwrap();
+        assert!(ensure_no_unusable_checkpoint_payloads(&root).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn resume_backup_preserves_rows_and_initial_state_cannot_mix_with_checkpoint() {
+        use super::*;
+        let root = std::env::temp_dir().join(format!("bulletou-resume-protect-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let cp = root.join("0001-0001sb");
+        std::fs::create_dir_all(&cp).unwrap();
+        std::fs::write(cp.join("state.bin"), b"state").unwrap();
+        std::fs::write(cp.join("dataloader_pos.txt"), b"0,0").unwrap();
+        std::fs::write(cp.join("learn.log"), format!("{LEARN_LOG_HEADER}\nE,1,1,1,-,-,-,-,0,0,1,1,t\n")).unwrap();
+        let args = Args::try_parse_from(["bulletou", "--teacher", "teacher.bin", "--initial-state", "another.bin"]).unwrap();
+        assert!(validate_initial_state_output(&args, &root).is_err());
+        assert!(validate_initial_state_output(&args, &root.join("new-output")).is_ok());
+        let original = format!("{SUMMARY_LEARN_LOG_HEADER}\nE,1,1,a\nE,1,2,b\n");
+        std::fs::write(root.join(SUMMARY_LEARN_LOG_NAME), &original).unwrap();
+        assert_eq!(truncate_summary_log_after_checkpoint(&root, (1,1)).unwrap(), 1);
+        let backup = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("summary-learn.before-rollback-")).unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), original);
+        assert!(!std::fs::read_to_string(root.join(SUMMARY_LEARN_LOG_NAME)).unwrap().contains("E,1,2,b"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     #[cfg(windows)]
     fn windows_summary_lock_coordinates_with_python_reader() {
