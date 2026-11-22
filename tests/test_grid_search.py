@@ -579,7 +579,10 @@ class GridSearchTests(unittest.TestCase):
                     self.assertEqual(row[metric], "")
             self.summary(directory, [self.metrics(epoch=e) for e in range(1, 11)])
             return 0, 1.0
-        code, _ = self.run_grid(["--epochs", *map(str, range(1, 11))], child)
+        original_updates = grid.live_summary_updates
+        with patch.object(grid, "live_summary_updates",
+                          side_effect=lambda *a, **kw: original_updates(*a, **kw, interval=0.01)):
+            code, _ = self.run_grid(["--epochs", *map(str, range(1, 11))], child)
         self.assertEqual(code, 0)
 
     def test_live_summary_retries_partial_rows_and_locked_output(self):

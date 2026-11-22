@@ -504,7 +504,10 @@ def log_rows(directory: Path, *, live=False) -> list[dict]:
         return []
     # Live readers must not accept a partially appended final record, even if
     # that prefix happens to be syntactically valid CSV.
-    with summary_read_lock(directory):
+    if live:
+        with summary_read_lock(directory):
+            text = path.read_text(encoding="utf-8-sig")
+    else:
         text = path.read_text(encoding="utf-8-sig")
     if live and text and not text.endswith("\n"):
         raise ValueError(f"{path}: waiting for a complete CSV record")
