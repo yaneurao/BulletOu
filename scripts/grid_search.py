@@ -481,13 +481,31 @@ def validate_summary_path(root: Path, plan: dict, path: Path) -> None:
         raise ValueError("--summary-csv must be outside trials' directories (source logs are never overwritten)")
 
 
+@contextmanager
+def summary_read_lock(directory: Path):
+    """Coordinate live reads with BulletOu's summary updates on Windows."""
+    if os.name != "nt":
+        yield
+        return
+    import msvcrt
+    with (directory / "summary-learn.lock").open("a+b") as lock:
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
 def log_rows(directory: Path, *, live=False) -> list[dict]:
     path = directory / SUMMARY_CSV_NAME
     if not path.is_file():
         return []
     # Live readers must not accept a partially appended final record, even if
     # that prefix happens to be syntactically valid CSV.
-    text = path.read_text(encoding="utf-8-sig")
+    with summary_read_lock(directory):
+        text = path.read_text(encoding="utf-8-sig")
     if live and text and not text.endswith("\n"):
         raise ValueError(f"{path}: waiting for a complete CSV record")
     with io.StringIO(text, newline="") as f:
@@ -938,7 +956,7 @@ def try_write_training_summary(root: Path, plan: dict, path: Path) -> list[dict]
 
 
 @contextmanager
-def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, interval=1.0):
+def live_summary_updates(root: Path, plan: dict, path: Path, trial: dict, *, interval=30.0):
     """Publish completed epochs while the child is alive, even if stdout is quiet.
 
     Stop/join before the main thread updates state or writes its final summary.

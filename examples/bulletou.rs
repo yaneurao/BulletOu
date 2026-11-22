@@ -9464,6 +9464,27 @@ fn log_line_with_quantized_metrics(line: &str, index: usize, accuracy: f32, loss
 
 // Write a complete replacement next to the destination so interruption never
 // truncates the previous log. On Windows rename cannot replace an existing file.
+#[cfg(windows)]
+fn lock_summary_for_update(output_dir: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped { internal: usize, internal_high: usize, offset: u32, offset_high: u32, event: *mut std::ffi::c_void }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFileEx(handle: *mut std::ffi::c_void, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32;
+    }
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true)
+        .open(output_dir.join("summary-learn.lock"))?;
+    let mut overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+    if unsafe { LockFileEx(file.as_raw_handle(), 2, 0, 1, 0, &mut overlapped) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(Some(file)) // Closing the handle releases the lock.
+}
+
+#[cfg(not(windows))]
+fn lock_summary_for_update(_output_dir: &Path) -> std::io::Result<Option<std::fs::File>> { Ok(None) }
+
 fn atomic_replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -9485,8 +9506,17 @@ fn atomic_replace_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
             let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
             // MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH; both paths are on the same volume.
-            if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } == 0 {
-                return Err(std::io::Error::last_os_error());
+            let mut attempt = 0;
+            loop {
+                if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 0x1 | 0x8) } != 0 { break; }
+                let err = std::io::Error::last_os_error();
+                // Readers or other processes may temporarily prevent replacement.
+                if attempt >= 10 {
+                    return Err(err);
+                }
+                attempt += 1;
+                eprintln!("  WARN: failed to replace {}: {err}; retry {attempt}/10 in 5 seconds", path.display());
+                std::thread::sleep(std::time::Duration::from_secs(5));
             }
         }
         #[cfg(not(windows))]
@@ -9546,6 +9576,7 @@ fn update_summary_log_quantized_metrics_and_diagnostics(
     metrics: TestMetrics,
     diagnostics: Option<[f64; 5]>,
 ) -> Result<(), String> {
+    let _lock = lock_summary_for_update(output_dir).map_err(|err| format!("failed to lock summary: {err}"))?;
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
     let content = std::fs::read_to_string(&top).map_err(|err| format!("failed to read {}: {err}", top.display()))?;
@@ -12308,6 +12339,7 @@ impl WorkerSfnnSession {
                 self.factorizer_axis_confidences.as_deref(),
                 None,
                 log,
+            true,
             )?
         };
         if exact_dir.is_some() && save_args.sfnn_gptq {
@@ -19142,6 +19174,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             lr_end: plateau_state.current_lr,
                             dataloader_pos: accepted_dataloader_pos,
                         },
+                    true,
                     )?;
                     let save_elapsed = save_started.elapsed();
                     let checkpoint_elapsed = checkpoint_started.elapsed();
@@ -19701,6 +19734,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             )?;
             excluded_elapsed = excluded_elapsed.saturating_add(log_started.elapsed());
         }
+        let boundary_result = (|| -> Result<(), String> {
         if is_checkpoint_step {
             let chunk = schedule.chunks[checkpoint_chunk_idx].clone();
             let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
@@ -19765,6 +19799,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                             lr_end: chunk.lr_end,
                             dataloader_pos,
                         },
+                    true,
                     )?;
                     let save_elapsed = save_started.elapsed();
                     let checkpoint_elapsed = checkpoint_started.elapsed();
@@ -20011,6 +20046,56 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 append_cuda_cpp_sfnn_diagnostics_log(args, progress, positions, progress_stats, &sfnn_diagnostics)?;
                 sfnn_diagnostics.reset();
             }
+        }
+            Ok(())
+        })();
+        if let Err(original_error) = boundary_result {
+            if schedule.production {
+                if let Some(progress) = schedule.progress_for_step(seen_steps)
+                    .filter(|p| p.batch_in_superbatch == p.batches_per_superbatch)
+                {
+                    let checkpoint_dir = args.output_dir().join(checkpoint_dir_name(progress.epoch, progress.superbatch));
+                    if is_complete_checkpoint_dir(&checkpoint_dir) {
+                        eprintln!("  ERROR: {original_error}; checkpoint already saved at {}", checkpoint_dir.display());
+                    } else if !is_optimizer_step {
+                        eprintln!("  ERROR: emergency checkpoint unavailable: optimizer accumulation is incomplete");
+                    } else {
+                        eprintln!("  ERROR: {original_error}; saving emergency checkpoint before stopping");
+                        let emergency = (|| -> Result<std::path::PathBuf, String> {
+                            ctx.synchronize().map_err(|e| e.to_string())?;
+                            let dataloader_pos = cuda_cpp_direct_dataloader_pos_from_base(
+                                args, seen_steps, batch_size, last_dataloader_pos, dataloader_resume_pos,
+                            )?;
+                            let weights = runner.read_weights(&ctx).map_err(|e| e.to_string())?;
+                            let optimizer_states = runner.read_optimizer_states(&ctx).map_err(|e| e.to_string())?;
+                            let progress_params = cuda_cpp_sfnn_progress_params_for_state(sfnn_progress_train_state.as_ref())?;
+                            let sb_start = seen_steps.saturating_sub(progress.batches_per_superbatch);
+                            write_cuda_cpp_sfnn_numbered_checkpoint(
+                                args, feature_kind, cuda_shape, &weights, &optimizer_states,
+                                completed_step_offset + seen_steps, optimizer_step_offset + optimizer_updates,
+                                sfnn_progress_train_state.as_ref(), progress_params.as_ref(),
+                                sfnn_residual_count_gates.as_deref(), sfnn_factorizer_axis_confidences.as_deref(),
+                                (args.optimizer == OptimizerKind::Sgd).then_some(params.radam.learning_rate),
+                                CudaCppCheckpointLog {
+                                    epoch: progress.epoch, superbatch: progress.superbatch,
+                                    curr_batch: progress.batches_per_superbatch,
+                                    prior_positions: schedule.prior_positions, train_steps: seen_steps,
+                                    test_metrics: None,
+                                    lr_start: schedule.lr_for_step(args, sb_start, batch_size),
+                                    lr_end: schedule.lr_for_step(args, seen_steps.saturating_sub(1), batch_size),
+                                    dataloader_pos,
+                                },
+                                false,
+                            )
+                        })();
+                        match emergency {
+                            Ok(dir) => eprintln!("  emergency checkpoint saved: {}", dir.display()),
+                            Err(err) => eprintln!("  ERROR: emergency checkpoint failed: {err}"),
+                        }
+                    }
+                }
+            }
+            return Err(original_error);
         }
         Ok::<(), String>(())
     })
@@ -20307,6 +20392,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 lr_end: chunk.lr_end,
                 dataloader_pos,
             },
+        true,
         )?;
         let save_elapsed = save_started.elapsed();
         let checkpoint_elapsed = final_readback_elapsed.saturating_add(checkpoint_started.elapsed());
@@ -21014,6 +21100,7 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
     factorizer_axis_confidences: Option<&[f32]>,
     last_sgd_lr: Option<f32>,
     log: CudaCppCheckpointLog,
+    publish_summary: bool,
 ) -> Result<std::path::PathBuf, String> {
     let (output_dir, name, dir, tmp_dir) = prepare_cuda_cpp_numbered_checkpoint_dir(args, log.epoch, log.superbatch)?;
     let write_result = (|| -> Result<(), String> {
@@ -21053,8 +21140,10 @@ fn write_cuda_cpp_sfnn_numbered_checkpoint(
         return Err(err);
     }
     commit_cuda_cpp_numbered_checkpoint_dir(&tmp_dir, &dir)?;
-    append_cuda_cpp_direct_checkpoint_summary(&output_dir, &name, args)?;
-    if args.sfnn_gptq {
+    if publish_summary {
+        append_cuda_cpp_direct_checkpoint_summary(&output_dir, &name, args)?;
+    }
+    if publish_summary && args.sfnn_gptq {
         if let Err(err) = gptq::run_automatic(args, &dir, log.epoch, log.superbatch) {
             eprintln!("  WARNING: GPTQ export failed for {}: {err}; the normal checkpoint was saved", dir.display());
         }
@@ -21239,6 +21328,7 @@ fn append_cuda_cpp_direct_summary_log_row(
     use std::io::Write as _;
 
     std::fs::create_dir_all(output_dir).map_err(|err| format!("failed to create {}: {err}", output_dir.display()))?;
+    let _lock = lock_summary_for_update(output_dir).map_err(|err| format!("failed to lock summary: {err}"))?;
     let top = output_dir.join(SUMMARY_LEARN_LOG_NAME);
     let top_existed =
         ensure_summary_log_schema(&top).map_err(|err| format!("failed to inspect {}: {err}", top.display()))?;
@@ -29117,6 +29207,7 @@ fn ensure_summary_log_schema(top: &std::path::Path) -> std::io::Result<bool> {
 
 fn append_to_top_level_log(output_dir: &std::path::Path, checkpoint: impl std::fmt::Display, args: Option<&Args>) -> std::io::Result<()> {
     use std::io::Write;
+    let _lock = lock_summary_for_update(output_dir)?;
     let checkpoint_name = checkpoint.to_string();
     let checkpoint_name = checkpoint_name.parse::<usize>().map(|n| format!("{n:04}")).unwrap_or(checkpoint_name);
     let latest_log = output_dir.join(&checkpoint_name).join("learn.log");
@@ -29559,6 +29650,24 @@ fn run_one_test_pass(cache: &TestPositionsCache, args: &Args, trainer_outputs: &
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(windows)]
+    fn windows_summary_lock_coordinates_with_python_reader() {
+        let dir = std::env::temp_dir().join(format!("bulletou-summary-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let guard = super::lock_summary_for_update(&dir).unwrap();
+        let marker = dir.join("acquired");
+        let script = "import msvcrt,sys; f=open(sys.argv[1], 'a+b'); f.seek(0); msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1); open(sys.argv[2], 'w').close()";
+        let mut child = std::process::Command::new("python").arg("-c").arg(script)
+            .arg(dir.join("summary-learn.lock")).arg(&marker).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!marker.exists(), "Python reader acquired the writer lock too early");
+        drop(guard);
+        assert!(child.wait().unwrap().success());
+        assert!(marker.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn atomic_log_replacement_and_checkpoint_validation() {
         use super::*;
