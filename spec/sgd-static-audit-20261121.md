@@ -263,3 +263,135 @@ SFNN production scheduleは `quantized_validation_rate=0` をepoch末のみ、�
 - CPU整数検証のnearest丸めでi32端付近の加算がoverflowする問題をi64演算で修正し、両端のCPUテストを追加。
 
 これらの修正は稼働中の実行プロセスには反映されない。epoch長変更時のL1 revival抑制期間、FT QAT境界STE、NaN診断、CPU整数検証のエンジン評価値clip、FP16 momentumの量子化に関する問題は未修正。L1抑制は過去の実行履歴を復元できる保存形式と旧checkpointの扱いを設計する必要がある。
+
+## 追加静的検査: 私が追加したcheckpoint完了判定と旧learn.log
+
+commit `06db6cc` で私が変更した `is_complete_checkpoint_dir` は、`learn.log` のヘッダーを現行 `LEARN_LOG_HEADER` と完全一致させ、行数も13列に限定する。Git履歴の `d2b474f` より前には、`train_value_loss` を含む12列形式と、量子化列を末尾側に置いた14列形式の正式な `learn.log` が存在した。これらを持つcheckpointは、state.binとdataloader_pos.txtが存在しても現行の完了判定では除外される。以前の完了判定は3ファイルの存在で判定していた。
+
+この判定は `latest_complete_checkpoint_dir_raw`、`find_latest_state_bin_raw` と再開位置の検出に共通して使われる。正常な旧checkpointより古い現行形式checkpointがあればそちらを最新として扱い得る。旧形式しかなければresume対象なしと扱われ、`prepare_resume_config_or_exit` のnon-resume側がsummary等を削除する経路へ進む。さらに同名のcheckpoint保存時は不完全と判定してarchiveする経路がある。これは私のcheckpoint安全化修正による回帰であり、旧ヘッダーが実際に出力されていたことはGit履歴で確認したが、この調査では再開・削除・訓練を実行していない。
+
+現在学習中のtrialの直近checkpoint `0003-0972sb/learn.log` は現行形式で、この条件には該当しない。修正時には履歴の正式なヘッダーを列名で検証しつつ、破損・不明形式がある場合に勝手に新規学習やsummary削除へ進まないよう失敗させる必要がある。旧形式のcheckpoint選択、最新と旧形式の混在、破損時のデータ保全をテストする。今回は調査のみでソース修正していない。
+
+この問題は旧形式だけに限らない。新しいcheckpointの `learn.log` が壊れ、より古いcheckpointだけが完了判定を通る場合、再開は古いものを選び、`truncate_summary_log_after_checkpoint` がそれより後のsummary行を削除する。checkpointを誤って新しいものとして使わないという判断と、より古いcheckpointへの巻き戻しをユーザーに明示せずsummaryを変更することは別問題である。現行の `0003-0972sb` のlogは以前の読み取りでは正常であり、実際に破損が生じたと主張するものではない。
+
+## 追加静的検査: checkpointフォルダ名とlearn.logの位置不一致
+
+`latest_complete_checkpoint_dir_raw` は `0003-0972sb` 形式のディレクトリを選ぶとき、名前から抽出したepoch/sbを順位に使う。一方、選択後の `latest_checkpoint_epoch_superbatch` と再開scheduleは同じディレクトリの `learn.log` 内のepoch/sbを使う。`is_complete_checkpoint_dir` はlogのepoch/sbを数値として読めることだけを確認し、フォルダ名の数値との一致を検査しない。
+
+例えば `0003-1296sb` という名前のディレクトリのlogがepoch 2 sb 1296を示していると、名前で `0003-0972sb` より新しいものとして選ばれ、その後はlogに基づきepoch 2末として再開・summary巻き戻しが行われる。この不一致はフォルダを手動で移動・改名した場合やメタデータ不整合時の条件付き問題であり、通常の正常な保存処理が生成するという証拠はない。選択前に名前とlogの位置、epoch長、必要なstate内容を整合確認し、不一致は安全に報告する必要がある。
+
+現在のtrialでは、epoch/sb付きcheckpointディレクトリ11個の `learn.log` を読み取り専用で確認し、フォルダ名とlogの最新位置が一致することを確認した。state.bin中のstepや局面数との完全な整合性を証明したものではない。学習の停止・再開は行っていない。
+
+## 追加静的検査: SGDの重み更新補償で残差を失う条件
+
+`sgd_compensated_weight` は更新 `updated = round_f32(weight + delta)` のあと、丸め残差を `round_f32(round_f32(weight - updated) + delta)` として保存する。これはFastTwoSum型の式であり、加算する最初の値の絶対値が2つ目以上である条件を満たさないと、一般には正確な残差を返さない。元の重みより更新量 `delta` の絶対値が大きい場合に条件が破れうる。
+
+CPUのbinary32算術例（decay=0、以前のremainder=0、clip範囲内）では、`weight=1.790015744518314e-6`、`delta=0.0015099904267117381` とすると、更新後は `0.001511780428700149`。2つのFP32入力を正確に加えた値から更新後のFP32値を引いた残差は約 `1.375610736431554e-11` だが、現行式で保存されるremainderは0になる。これは更新が無効になるという意味ではなく、更新時に失われた低位ビットを次回に繰り越せないという数値上の不具合。通常のSGDでも各stepでFP32丸めは生じるが、この実装が目的とする補償はこの例で成立しない。
+
+現在のcheckpointで当該条件が何回発生するか、学習品質やqaccへの影響は未測定。上の値は構成例で、実学習で同じ値が出たという意味ではない。`all_optim` true/falseともこの重み補償関数を使う。修正時は大小関係に依存しないTwoSum等と、clip境界・weight decay・FP16 momentum・速度の両立を検証する必要がある。今回はソースを修正していない。
+
+### 現在のcheckpoint標本でのゼロ勾配仮定
+
+`0003-0972sb/state.bin` のFT weight、momentum、SGD補償値から、固定seed 20261121で同じ32連続領域×16,384要素を読み出した。現在の設定 `beta=0.95`、`lr=0.0005`、weight decay=0とし、次の勾配を仮に0としてFP32の `delta = -lr*(beta*momentum) + remainder` を計算した。524,288要素中、`abs(delta)>abs(weight)` は0件だった。remainderが非ゼロなのは477,704要素。
+
+この結果はゼロ勾配とした条件下の標本に限る。実際の次batchの勾配、bucket/featureの出現頻度、更新時刻による学習率、L1以降のparameterについては計算していないため、実学習でFastTwoSumの前提が破れる頻度を示さない。GPUや本学習のプロセスは使用していない。
+
+### 以前のremainderがdelta生成時に消える別の条件
+
+FastTwoSumの大小条件とは別に、現在の関数は新しい更新量と以前のremainderを最初にFP32加算してからweightに加える。この最初の加算でもremainderが丸め落ち得る。CPUのbinary32例で、`weight=1.0`、新しい更新量 `0.25`、以前の有効な `remainder=2^-27`、decay=0、clip範囲外ではない場合、FP32の `0.25 + 2^-27` は `0.25` となる。その後の `weight + delta` は正確に1.25となり、現行コードは新しいremainderを0として、以前の `2^-27` を失う。この例では `abs(weight) >= abs(delta)` なので、最後の加算だけを大小関係に依存しないTwoSumへ変えても失われた値は復元できない。
+
+これは構成例であり、現在の学習での発生頻度・影響は未測定。補償の設計・修正時には `update + previous remainder` と `weight + delta` の両方の丸め、およびclip時に外向きの残差を捨てる仕様を一緒に検証する必要がある。
+
+同じcheckpointのFT 524,288要素標本を、勾配0・lr 0.0005・beta 0.95・decay 0という仮定で調べたところ、以前のremainderが非ゼロだった477,704要素のうち、`update + remainder` がupdateと完全に同じFP32値となってremainder全体が落ちるものは0件だった。この検査は残差の一部だけが失われる例や実際の次batchの勾配を除外しておらず、実学習で問題が起きないことを証明しない。
+
+## 追加静的検査: L1実効clip境界とSGD補償値
+
+単体重みの `sgd_compensated_weight` は、重みが上限と等しく、補償値が正なら、その外向き補償を0にする。L1実効clipは一方、FP32のfolded値が上限を厳密に超えた時のみbucket residualを補正してその補償値を消す。folded値がちょうど境界なら外向き補償値を維持する。例えばfactor成分0、residual重み1.984375、補償値2^-25の場合、見えるfolded値は上限1.984375と等しく、L1実効clipは補償を消さない。重みと補償の数学的な和は上限を約2.98e-8超える。この挙動は単体重みのclipと異なる。
+
+この例はCPUのbinary32値を用いた構成例で、実際のcheckpointでの件数や次の更新、qaccへの影響は未測定。補償値は順伝播に直接使われず次更新に持ち越される。shared/axisの補償値も同じ実効重みに寄与するため、residualだけの符号判定を追加すれば正しいと結論することはできない。実効clipにおける補償値の意味と境界条件を設計し、個別clipとの整合性をテストする必要がある。ソースコードや稼働中の学習には手を加えていない。
+
+## 追加静的検査: SGDで層を凍結中のepoch境界momentum再スケール
+
+SGDのepoch初回batchでは、基準学習率の旧値/新値を `rescale_sgd_momentum` に渡し、FT・L1・L2・L3と存在するfactorizerのmomentumを一律に変更する。この関数は各層の学習率倍率や更新対象を参照しない。一方、通常の非dirty更新では倍率0のparameter groupは勾配を消去するだけでweight・momentum・補償値を変更しない。したがって学習率倍率0で層を複数epoch凍結している場合も、epoch境界だけその層のmomentumが変化する。
+
+算術例: 毎epoch末の基準lrが0.0005、次epoch頭が0.0044なら、境界1回ごとに凍結層のmomentumが約0.113636倍、2回なら約0.0129132倍になる。凍結を解除した際に残るmomentumは凍結前と同じではない。これはepoch境界で他層の更新寄与を保持する設計と、倍率0の通常stepにおける状態凍結が一致していない条件付き不具合。倍率を0にする前の実効lr、複数epochにまたがる凍結、解除時のlrを追跡して意味を定義し、単純に境界で再スケールをスキップするだけでは解除時のlr変更との整合を保証しない。
+
+確認した稼働中trialのresume-configではFT/L2/L3の倍率1、L1倍率0.5で、epoch設定にも倍率0への切替は記録されていない。したがってこの条件が現在の学習に発生している証拠はない。さらに稼働中の旧バイナリには今回調査したepoch境界再スケール修正自体がまだ反映されていない。GPU実行試験はしていない。
+
+## 追加静的検査: SGD optimizer状態とfactorizer再基底API
+
+`rebase_shared_factorizer_terms`、`rebase_axis_factorizer_terms`、`rebase_residual_count_gate_terms` はoptimizer種別を受け取らず、velocityをRAdamの二次momentとして倍率の逆数の二乗で変換する。SGDでは同じvelocity bufferはweightの丸め補償を保持するため、同じ変換をSGDに使うことは座標変換後の補償値に合わない。例えばweightを2倍する座標変換では、補償値も2倍するのが重みと補償の和を保つ変換だが、現APIは0.25倍にする。
+
+ただしアプリ側のこれらの呼出元はworker modeであり、worker openとtrialはSGDを明示的に拒否する。現在のstandalone SGDがこの経路に入ると確認したわけではない。公開runner APIをSGDで直接使う場合、または将来workerのSGD拒否を外す場合の条件付き不整合であり、現学習の原因とは言えない。修正時はoptimizer別の状態の意味を区別し、FT FP16 momentumのcacheと、係数0への畳込みも含めて検証する。
+
+## 2026-11-21 checkpoint判定の修正
+
+旧12列・14列の正式learn.logと現行13列を判定対象に含め、epoch/sb付きフォルダは中のログ位置と一致する場合に完了と判定する。番号付きフォルダで保存が始まった形跡がありながらメタデータ不足・形式不正・位置不一致のときは、再開先を古いcheckpointに無言で変更したりsummaryを消したりする前にエラーにする。確認した現trialの11 checkpointは13列でフォルダ位置とログ位置が一致した。これはstate.binのデータ値やchecksumを検証したものではない。
+
+SGD丸め補償とL1実効clip境界、層凍結とepoch momentum再スケール、SGDのfactorizer再基底APIは未修正。保存状態・境界の意味を定め、GPUで更新結果を比較する必要があり、稼働中の学習にGPU実験を重ねていない。
+
+## 2026-11-22 追加静的検査: 再開前のsummary変更とstate.bin実読込の順序
+
+`prepare_resume_config_or_exit` は、checkpointのファイル存在・learn.log形式と位置を確認した後、summaryを選択したcheckpoint以降で巻き戻す。その後で `run_cuda_cpp_backend` が起動し、SFNNの場合 `build_sfnn_initial_state_for_cuda_cpp` / `load_cuda_cpp_sfnn_initial_state` でstate.binのレコードとshapeを実際に読む。したがって、存在するstate.binが途中で破損していたり必要なrecordが不足していたりすると、学習開始はエラーで失敗しても、その前にsummaryのcheckpointより後の行はすでに削除され得る。前回の私のmetadata保護はstate.binの中身を検証しておらず、この順序の問題を解決していない。grid_search経由では該当行がある場合に事前backupを作るが、直接起動では同じbackup処理はない。
+
+現trialの既存11 checkpointでstate.binのファイルサイズはいずれも7,073,787,207 bytes、各dataloader_pos.txtは数値として読めた。これはサイズと位置文字列の検査であり、全stateの中身やchecksumの検証ではなく、破損があるという証拠でもない。直近に読んだsummaryはepoch 3 sb 1270まで、直近の完成checkpointはsb 972で、保存前のsummary行が存在することは確認した。学習中のため、再開操作・巻き戻し・故障注入はしていない。修正にはsummary変更をstate検証・復元成功後まで遅らせるか、直接起動も含め失敗時に元のsummaryを保持できる方法が必要。
+
+## 2026-11-22 追加静的検査: initial-stateと既存出力の暗黙resumeの競合
+
+`--initial-state` は明示的な `--resume true/false` と組み合わせることを拒否するが、既存出力のcheckpointを使う暗黙auto-resumeまでは拒否しない。`resume_enabled` はinitial_stateを見ず、checkpointとresume-configが一致すればtrueを返す。一方SFNNの `build_sfnn_initial_state_for_cuda_cpp` は明示的initial_stateを自動resumeのstateより優先し、dataloader自動再開側はinitial_state指定時に既存checkpointの位置を使わない。
+
+そのため、既存trialと同じ出力先・一致するresume-configで別の `--initial-state` を指定した場合、scheduleやsummaryは出力先checkpointのepoch/sbを使う一方、重みとoptimizerは指定した別stateから読み込む、という食い違いが起き得る。initial-dataloader-pos指定がなければ、その読込位置も既存checkpointとは別になる。これはコード上の条件付き問題で、現在の実行中コマンドはinitial-stateを指定しておらず該当しない。実際に混在起動はしていない。修正時には既存checkpointのある出力先にinitial-stateを指定した場合の拒否と、意図的な新規出力でのinitial-stateを区別し、summary変更より前に検査する必要がある。
+
+## 2026-11-22 追加静的検査: dataloader位置ファイルの内容検証漏れ
+
+前回追加したcheckpoint完了判定はdataloader_pos.txtがファイルとして存在することだけを確認し、内容のparseはしない。`read_latest_dataloader_pos` は読込・parse失敗を `None` に変える。固定長教師ではlearn.logの累計位置から導ける場合はそちらを使い、そうでない経路では保存位置なしとして進み得る。これは位置ファイル破損時の条件付き問題で、教師データ自体の問題ではない。現trialの11 checkpointについては位置文字列が非負整数形式であることを読み取り確認したが、全ての実際の読込経路・データ内容は検証していない。
+
+## 2026-11-22 再開保護とSGD補償の修正・検証
+
+checkpoint判定でdataloader_pos.txtの数値形式とstate.binの非空を確認する。initial-state指定時に既存checkpointのある出力先を拒否する。summary巻き戻し前には元の内容をcreate_newの別ファイルに保存して同期し、失敗した場合は巻き戻し・再開を中止する。これによりstate.binの読込や後続処理が失敗しても巻き戻し前summaryを復元可能にする。state.bin全体のchecksum検証を実装したわけではない。
+
+SGD重み補償は `step + old remainder` と `weight + delta` の両加算に大小関係を仮定しないTwoSumを使う。構成した2種類の丸め落ち例についてFP32およびFT半精度momentumの両GPU経路でFP64参照と一致。GPUテスト `sgd_preserves_` 3件、`sgd_momentum_matches_reference_over_multiple_updates`、`sgd_qat_snapshot_continuation_matches_uninterrupted`、`sgd_dense_qat_3528_bucket_gradients_match_scalar_ste` が成功。これらは小規模モデル等のテストであり、実モデルの長時間学習や速度を測定していない。
+
+CPUでは旧形式/現行checkpoint、破損ログ・dataloader位置、initial-stateと既存出力の競合、rollback前backup、既存summary切詰めテストが成功。実際の学習は起動していない。epoch 3末 `0003-1296sb` のstate.binは既存の他checkpointと同じ7,073,787,207 bytes、位置ファイルは `265834211640,0` だったが、全内容やchecksumの検査ではない。
+
+層を倍率0で凍結中のepoch境界momentum再スケール、L1実効clip境界の補償、SGDでfactorizer再基底APIを直接使う場合のoptimizer種別の扱いは未修正。FT QAT境界STE等、以前記録した未解決項目も残る。
+`0003-1296sb/state.bin` のrecord IDと長さをseekで追加検査し、77 recordがファイル末尾に一致し、重複IDがなく、FTとL1の代表的なweights/momentum/velocity recordが存在することを確認した。値とchecksumは検査していない。
+
+## 2026-11-22 3件の追加検証
+
+層凍結の算術例を追加: 凍結前momentum=1、beta=0.95、直前のlr=0.0005、毎epoch最初のlr=0.0044とする。現在の一括rebaseを凍結中に2回、更に解除epochに1回適用すると、解除直後の旧momentumからの更新寄与は約0.00000613378。凍結前のlrに基づく寄与を保持する場合は0.000475で、約1.29%になる。勾配0、毎epoch旧lr=0.0005という構成した例であり、実学習の観測値ではない。既存GPUテスト `sgd_restart_rescales_all_momenta_preserving_remainders_and_half_state` は全層に共通の倍率が適用される現動作を確認して成功したが、凍結・解除やcheckpoint再開を検証するテストではない。
+
+実効clipの補償に関して、上限1.984375でsharedの補償+2^-25、residualの補償-2^-25なら両者は相殺される。residualだけを0にすると、補償込みの和は逆に上限を2^-25超える。従ってresidualの符号だけでは正しく判定できず、係数を掛けたshared・該当する全axis・residualの補償を合算して制約を考える必要がある。これはCPU算術の構成例であり、GPUコードの修正・実測ではない。sharedやaxisは複数bucketで使うため、あるbucketの境界を守る目的でその共通補償を消すと他bucketの未反映更新も失う。
+
+factorizer再基底について既存GPUテスト `sfnn_shared_rebase_preserves_forward_and_optimizer` を実行して成功。これはRAdam式として、重み2倍のときmomentum1/2、velocity1/4を確認するテストであり、velocityをSGDの重み補償として使う場合の正しさは検証していない。SGDでは重み2倍とともに補償も2倍しなければ和を同じ比率で保てない。GPUテスト成功をもってSGD対応済みとは言えない。
+
+今回の検証では本来の学習を開始していない。3件のソース修正と、凍結を挟む連続学習・checkpoint再開のGPU実証はまだ完了していない。
+
+## 2026-11-22 追加実験: 3件の修正方針の比較
+
+本来の学習・対局・lambda変更は実施していない。CPU人工勾配でlr 0.0005から0.0044へのepoch再始動、複数epoch凍結、解除、さらにlr変動を含む7更新機会を計算した。群ごとに最終有効基準lrと凍結状態を保持し、epoch再始動または凍結解除時にその比でmomentumを再基準化する案では、JSON経由でFP32値と凍結状態を復元する6か所の中断位置すべてで連続実行と一致した。これは算術モデルの検証であり、BulletOuのcheckpoint/GPU実装の実証ではない。層別倍率0.5→1の場合、基準lrだけを補正すると過去寄与の実効量は2倍になり、意図した倍率変更が反映される。一方倍率変更自体も含め過去寄与を保ちたいなら別の仕様が必要。
+
+L1実効clipについて、CUDAの一時テストで上限ちょうど、residual補償±2^-25、shared master 0のとき、現kernelが両方の補償を維持することを確認した。テストコードは調査後に削除。CPUの厳密有理数参照では、上限ちょうどのmasterに対して (residual,shared補償) が (+e,0),(-e,+e),(0,+e),(-e,0) の場合、sharedを維持し超過量だけresidual補償を引く案の結果は、それぞれ (0,0),(-e,+e),(-e,+e),(-e,0) と、相殺・内向きの情報を保てる。ただしこれは数値例であり、FP32 masterのfolded演算順・量子化境界・補償の正規化・多数bucketでの全条件をGPUで実証したものではない。FP64全面使用の速度影響も未測定。
+
+factorizer再基底のCUDA一時テストでは、shared alphaを1→0.5（weight座標を2倍）に変えると現実装がvelocityを1/4、momentumを1/2にすることを確認。SGDにおけるvelocityを重みの低位補償と解釈するなら2倍が必要であり、現行のoptimizer無指定APIはSGDの低位補償を保持しない。テストは調査後に削除し、本学習ではこのworker由来のAPIを使用していない。
+
+重要な補正: SGD momentumを単に勾配の座標変換として1/2にする方針と、係数変更直前の実効更新量を保つため2倍する方針は違う。alpha 1→0.5、同じlr、beta=0.9、旧momentum 0.2なら、旧実効momentum寄与は-0.0018（lr=0.01）で、勾配座標変換なら-0.00045、更新寄与の連続性を保つ変換なら-0.0018。新しい勾配による実効更新も、同じlrではalpha二乗に比例し、係数変更によって変わる。前回の回答はこの設計上の選択を明示しておらず不十分だった。単純な二次損失16 stepのCPU例では、勾配座標変換・更新寄与を保存・momentumリセットの優劣はstepによって変わり、この例だけではどれが学習品質上最良か断定できない。候補: 実効更新寄与の連続性を優先し、正の係数変更ではSGD momentumをweightの変換率と同率に、重み補償も同率に変換する。0へのfoldではbaseとsharedの実効momentumおよび補償をbaseに畳み込み、別bucketとの共有に起因する更新力学の変化も別途テストする。計算精度・overflow、RAdamとの分岐、各層lr倍率の変更を検証する。
+
+3件とも修正パッチはまだ作成していない。CUDA実験は現行kernelの動作確認であり、候補アルゴリズムのGPU実装や学習品質・速度の比較は未実施。
+追加で独立な人工二次損失100,000例（seed 20261122、係数変更先一様0.25〜2、momentumと重みは独立正規分布、lr=0.05、beta=0.9）のCPU比較を行った。係数変更直後の旧momentumによる実効更新誤差の平均絶対値は、勾配座標変換0.0143521、実効更新継続案約1.19e-18、momentumリセット0.0143352。1/8/16 step後の平均lossはそれぞれ、勾配座標変換0.861297/0.294729/0.119230、実効更新継続案0.860895/0.295426/0.119842、リセット0.860849/0.294061/0.118800だった。これは独立に生成した人工momentumと単純な二次損失での観察であり、現実の将棋教師に対する優劣や最適値は示さない。実効更新継続を選ぶ根拠はこの実験でのloss最小化ではなく、係数変更時の更新量不連続を減らすという明示的な設計目的である。
+
+## 2026-11-22 ゼロ初期化16 sbの基準実験
+
+目的は後続比較の基準・再現性確認。現行release（直近のSGD丸め補償修正を含む）、`SFNN_halfkahm2_2304_15_64_k21k21_progress8`、SGD momentum 0.95、初期lr 0.0044・step gamma 0.8・下限0.0005、L1倍率0.5、L1実効clip on、FT factorizer on、L1 pair、FT QAT off・L1/L2/L3 QAT on、all_optim on。lambda=1.0、batch=65536、1 sb=610 batch=39,976,960局面。初期化はscratch、検証は921,060局面。epoch 1を16 sbに変更、save_rate=0・save_epoch_end=false、validation/qvalidationは各sb。0初期化とはscratch開始を意味し、全重み0ではない。
+
+| sb | acc | qacc | loss | qloss |
+|---:|---:|---:|---:|---:|
+| 1 | 52.02793% | 52.04065% | 0.69953704 | 0.69956177 |
+| 6 | 56.21286% | 56.17286% | 0.69192117 | 0.69252974 |
+| 8 | 56.51811% | 56.54642% | 0.69214004 | 0.69232368 |
+| 12 | 56.79126% | 56.85052% | 0.69339901 | 0.69344074 |
+| 16 | 56.89052% | 56.88731% | 0.69490075 | 0.69589800 |
+
+各値はそのsb終了時の単回検証で平均ではない。学習時間694.032秒、639,631,360局面。FT unit上限最大はsb 6で92.0814%、詳細はstdout.log。教師batch全要素の指紋を610 stepごとに、各batchの標本の累積指紋を記録。設定・ログは `C:\shogi\codex-16sb-20261122\baseline`。最終direct出力はnn.bin約308MBとweights.bin約7.07GB。checkpointは保存していないがdirect最終出力が生成された。過去の本学習epoch 1はall_optim、L1 clip、L1 lrなどが異なり、同条件比較ではない。3つの修正候補は未実装であり、この実験だけではそれらの優劣を判断できない。
+
+同条件の再現実験もゼロ初期化から16 sbを完走した。16 sbのacc/qacc/loss/qlossは56.88777% / 56.88639% / 0.69489831 / 0.69589108。基準との差はそれぞれ -0.00275ポイント / -0.00092ポイント / -0.00000244 / -0.00000692。FP32 masterの通常lossはstdoutの8桁表記で比較した。各sb最終batchの全要素指紋と全batchからの標本累積指紋、開始を含む17組は一致。全batch全要素の一致は保証しない。FT unit上限飽和率最大は16 sbで基準93.2952%、再現93.2866%。再現実験のtrain_elapsed=555.690秒だが、実験間で外部環境が異なり、速度の優劣や再現性は判定できない。再現の設定・ログ・direct出力は `C:\shogi\codex-16sb-20261122\baseline-repeat`。2つのdirect出力は各7,382,352,221 bytesで、C:に保存。どちらも未修正の3候補と比較する実験ではなく、条件間優劣は未判定。

@@ -10444,14 +10444,20 @@ extern "C" int bulletou_cuda_cpp_ft_half_moments_destroy(BulletOuCudaCppHalfMome
 // SGD uses its otherwise-unused FP32 velocity slot as the low part of the
 // master weight. Preserve sub-ULP updates instead of rounding them away on
 // every step. Explicit rounded operations prevent compiler reassociation.
+__device__ __forceinline__ float sgd_two_sum_error(float a, float b, float sum) {
+    const float b_virtual = __fsub_rn(sum, a);
+    return __fadd_rn(__fsub_rn(a, __fsub_rn(sum, b_virtual)), __fsub_rn(b, b_virtual));
+}
 __device__ __forceinline__ float sgd_compensated_weight(float weight, float& remainder,
     float momentum, float learning_rate, float decay, float min_weight, float max_weight) {
     const float decay_rate = learning_rate * decay;
-    const float delta = __fadd_rn(__fadd_rn(-learning_rate * momentum, -decay_rate * weight),
-        remainder * (1.0f - decay_rate));
+    const float step = __fadd_rn(-learning_rate * momentum, -decay_rate * weight);
+    const float carry = remainder * (1.0f - decay_rate);
+    const float delta = __fadd_rn(step, carry);
+    const float delta_error = sgd_two_sum_error(step, carry, delta);
     const float updated = __fadd_rn(weight, delta);
     const float clipped = clip_updated_weight(updated, min_weight, max_weight);
-    remainder = clipped == updated ? __fadd_rn(__fsub_rn(weight, updated), delta) : 0.0f;
+    remainder = clipped == updated ? __fadd_rn(sgd_two_sum_error(weight, delta, updated), delta_error) : 0.0f;
     if ((clipped >= max_weight && remainder > 0.0f) || (clipped <= min_weight && remainder < 0.0f))
         remainder = 0.0f;
     return clipped;
@@ -13913,6 +13919,92 @@ extern "C" int bulletou_clip_effective_l1_axis(BulletOuCudaCppContext* ctx,
         shared_slow?shared_slow->ptr:nullptr,axis->ptr,axis_slow->ptr,remainder?remainder->ptr:nullptr,cols,outputs,stacks,king_dim,hand_dim,
         king,hand,progress,kh,kp,hp,shared_alpha,king_alpha,hand_alpha,progress_alpha,pair_alpha);
     return check_kernel_launch("effective L1 axis clip");
+}
+
+// Experimental SGD projection: keep the shared/axis low parts and project the
+// complete latent folded value by changing only this bucket's residual pair.
+__global__ void clip_effective_l1_axis_sgd_kernel(float* w, float* slow, float* rem,
+    const float* shared, const float* shared_slow, const float* shared_rem,
+    const float* axis, const float* axis_slow, const float* axis_rem,
+    size_t cols, size_t outputs, size_t stacks, size_t king_dim, size_t hand_dim,
+    int king, int hand, int progress, int kh, int kp, int hp,
+    float shared_alpha, float king_alpha, float hand_alpha, float progress_alpha, float pair_alpha) {
+    const size_t stack=blockIdx.y, local=static_cast<size_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+    __shared__ size_t ids[8], count;
+    __shared__ float alphas[8];
+    if(threadIdx.x==0) {
+        count=sfnn_factorizer_axis_ids(stack,stacks,king_dim,hand_dim,king,hand,progress,kh,kp,hp,ids);
+        sfnn_factorizer_axis_alphas(ids,count,stacks,king_dim,hand_dim,kh,kp,hp,
+            king_alpha,hand_alpha,progress_alpha,pair_alpha,nullptr,alphas);
+    }
+    __syncthreads();
+    if(local>=cols*outputs) return;
+    const size_t factor=(local%cols)*outputs+local/cols, index=stack*cols*outputs+local;
+    float fast=w[index], slower=slow[index];
+    double factors=0.0;
+    if(shared) {
+        fast=__fadd_rn(fast,__fmul_rn(shared_alpha,shared[factor]));
+        slower=__fadd_rn(slower,__fmul_rn(shared_alpha,shared_slow[factor]));
+        factors=static_cast<double>(shared_alpha)*(static_cast<double>(shared[factor])+shared_rem[factor]);
+    }
+    for(size_t j=0;j<count;++j) {
+        const size_t ai=ids[j]*cols*outputs+factor;
+        fast=__fadd_rn(fast,__fmul_rn(alphas[j],axis[ai]));
+        slower=__fadd_rn(slower,__fmul_rn(alphas[j],axis_slow[ai]));
+        factors+=static_cast<double>(alphas[j])*(static_cast<double>(axis[ai])+axis_rem[ai]);
+    }
+    const double folded=static_cast<double>(w[index])+rem[index]+factors;
+    const double upper=127.0/64.0;
+    if(folded < -2.0 || folded > upper || fast < -2.0f || fast > 127.0f/64.0f) {
+        const double target=fmin(fmax(folded,-2.0),upper)-factors;
+        float hi=static_cast<float>(target);
+        // Also check the actual sequential FP32 fold used by forward. Move
+        // the high part inward where rounding leaves it outside, while keeping
+        // the exact latent residual in the low part.
+        for(int attempt=0;attempt<32;++attempt) {
+            float visible=hi;
+            if(shared) visible=__fadd_rn(visible,__fmul_rn(shared_alpha,shared[factor]));
+            for(size_t j=0;j<count;++j) {
+                const size_t ai=ids[j]*cols*outputs+factor;
+                visible=__fadd_rn(visible,__fmul_rn(alphas[j],axis[ai]));
+            }
+            if(visible >= -2.0f && visible <= 127.0f/64.0f) break;
+            const float correction=__fsub_rn(visible < -2.0f ? -2.0f : 127.0f/64.0f, visible);
+            float next=__fadd_rn(hi,correction);
+            if(next==hi) next=nextafterf(hi,visible < -2.0f ? INFINITY : -INFINITY);
+            if(next==hi) break;
+            hi=next;
+        }
+        w[index]=hi;
+        rem[index]=static_cast<float>(target-static_cast<double>(hi));
+    }
+    if(slower < -2.0f) slow[index]+=(-2.0f-slower);
+    else if(slower > 127.0f/64.0f) slow[index]+=(127.0f/64.0f-slower);
+}
+
+extern "C" int bulletou_clip_effective_l1_axis_sgd(BulletOuCudaCppContext* ctx,
+    BulletOuCudaCppF32Buffer* w, BulletOuCudaCppF32Buffer* slow, BulletOuCudaCppF32Buffer* rem,
+    BulletOuCudaCppF32Buffer* shared, BulletOuCudaCppF32Buffer* shared_slow, BulletOuCudaCppF32Buffer* shared_rem,
+    BulletOuCudaCppF32Buffer* axis, BulletOuCudaCppF32Buffer* axis_slow, BulletOuCudaCppF32Buffer* axis_rem,
+    size_t cols,size_t outputs,size_t stacks,size_t king_dim,size_t hand_dim,
+    int king,int hand,int progress,int kh,int kp,int hp,
+    float shared_alpha,float king_alpha,float hand_alpha,float progress_alpha,float pair_alpha) {
+    if(!ctx || !w || !slow || !rem || !axis || !axis_slow || !axis_rem || !cols || !outputs || !stacks ||
+       cols>SIZE_MAX/outputs || stacks>SIZE_MAX/(cols*outputs) || w->len!=stacks*cols*outputs ||
+       ((shared!=nullptr)!=(shared_slow!=nullptr)) || ((shared!=nullptr)!=(shared_rem!=nullptr)))
+       return fail_message("invalid SGD axis effective L1 clip shape");
+    const size_t count=sfnn_factorizer_axis_count(stacks,king_dim,hand_dim,progress,kh,kp,hp);
+    if(validate_buffer(ctx,w,w->len,"SGD effective L1") || validate_buffer(ctx,slow,w->len,"slow L1") ||
+       validate_buffer(ctx,rem,w->len,"L1 remainder") || validate_buffer(ctx,axis,count*cols*outputs,"axis L1") ||
+       validate_buffer(ctx,axis_slow,count*cols*outputs,"slow axis L1") || validate_buffer(ctx,axis_rem,count*cols*outputs,"axis remainder") ||
+       (shared && (validate_buffer(ctx,shared,cols*outputs,"shared L1") || validate_buffer(ctx,shared_slow,cols*outputs,"slow shared") ||
+                   validate_buffer(ctx,shared_rem,cols*outputs,"shared remainder"))) || set_context_device(ctx)) return -1;
+    dim3 grid(static_cast<unsigned>((cols*outputs+255)/256),static_cast<unsigned>(stacks));
+    clip_effective_l1_axis_sgd_kernel<<<grid,256,0,ctx->stream>>>(w->ptr,slow->ptr,rem->ptr,
+        shared?shared->ptr:nullptr,shared_slow?shared_slow->ptr:nullptr,shared_rem?shared_rem->ptr:nullptr,
+        axis->ptr,axis_slow->ptr,axis_rem->ptr,cols,outputs,stacks,king_dim,hand_dim,
+        king,hand,progress,kh,kp,hp,shared_alpha,king_alpha,hand_alpha,progress_alpha,pair_alpha);
+    return check_kernel_launch("SGD effective L1 axis clip");
 }
 
 __device__ void center_affine_row(float* w,float* b,float* sw,float* sb,float* gw,

@@ -9765,6 +9765,13 @@ mod ffi {
             cols:usize,outputs:usize,stacks:usize,king_dim:usize,hand_dim:usize,
             king:i32,hand:i32,progress:i32,kh:i32,kp:i32,hp:i32,
             shared_alpha:f32,king_alpha:f32,hand_alpha:f32,progress_alpha:f32,pair_alpha:f32)->i32;
+        pub fn bulletou_clip_effective_l1_axis_sgd(ctx:*mut BulletOuCudaCppContext,
+            w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,rem:*mut BulletOuCudaCppF32Buffer,
+            shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,shared_rem:*mut BulletOuCudaCppF32Buffer,
+            axis:*mut BulletOuCudaCppF32Buffer,axis_slow:*mut BulletOuCudaCppF32Buffer,axis_rem:*mut BulletOuCudaCppF32Buffer,
+            cols:usize,outputs:usize,stacks:usize,king_dim:usize,hand_dim:usize,
+            king:i32,hand:i32,progress:i32,kh:i32,kp:i32,hp:i32,
+            shared_alpha:f32,king_alpha:f32,hand_alpha:f32,progress_alpha:f32,pair_alpha:f32)->i32;
         pub fn bulletou_clip_effective_l1(ctx:*mut BulletOuCudaCppContext,
             w:*mut BulletOuCudaCppF32Buffer,slow:*mut BulletOuCudaCppF32Buffer,
             shared:*mut BulletOuCudaCppF32Buffer,shared_slow:*mut BulletOuCudaCppF32Buffer,remainder:*mut BulletOuCudaCppF32Buffer,
@@ -10925,6 +10932,34 @@ mod tests {
         assert_eq!(m.param_multiplier(SfnnUpdateLayer::L2, SfnnUpdateParamKind::Bias), 1_000.0);
         assert_eq!(m.param_multiplier(SfnnUpdateLayer::L1, SfnnUpdateParamKind::Bias), 1.0);
         assert!(SfnnLayerLrMultipliers { l2: f32::MAX, l2_bias: 2.0, ..m }.validate().is_err());
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn sgd_preserves_two_sum_remainders_for_large_steps_and_prior_carry() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        let initial = [1.790015744518314e-6f32, 1.0];
+        let changes = [0.0015099904267117381f32, 0.25];
+        let carry = [0.0f32, 2.0f32.powi(-27)];
+        for half_mode in [false, true] {
+            let w = F32Buffer::from_host(&ctx, &initial).unwrap();
+            let g = F32Buffer::from_host(&ctx, &changes.map(|x| -x)).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+            state.velocity.upload(&ctx, &carry).unwrap();
+            let half = half_mode.then(|| FtHalfMoments::new(&ctx, &state, true).unwrap());
+            let params = RangerUpdateParams { sgd_momentum: Some(0.0),
+                radam: RAdamUpdateParams { learning_rate: 1.0, ..Default::default() }, ..Default::default() };
+            ranger_update_device_with_half_moments(&ctx, params, RangerDeviceStateMut {
+                gradients: &g, weights: &w, momentum: &state.momentum,
+                velocity: &state.velocity, slow_params: &state.slow_params,
+            }, half.as_ref()).unwrap();
+            let weights = w.download(&ctx).unwrap();
+            let remainder = state.velocity.download(&ctx).unwrap();
+            for i in 0..2 {
+                let expected = initial[i] as f64 + changes[i] as f64 + carry[i] as f64;
+                assert_eq!(weights[i] as f64 + remainder[i] as f64, expected, "half={half_mode} i={i}");
+            }
+        }
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]

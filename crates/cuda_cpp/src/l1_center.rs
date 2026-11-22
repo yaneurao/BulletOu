@@ -18,6 +18,19 @@ pub(super) fn clip_effective_weights(r: &SfnnTrainStepRunner, ctx: &Context, sgd
     let remainder = if sgd { r.optimizer_states.l1w.velocity.as_ptr() } else { std::ptr::null_mut() };
     if r.factorizer.any_axis() {
         let f=r.factorizer; let a=r.factorizer_alpha; let shape=r.shape;
+        // The exact latent projection is experimental: it has not yet been
+        // validated for all shapes and currently costs extra runtime.
+        if sgd && std::env::var_os("BULLETOU_SGD_L1_EXACT_CLIP").is_some() {
+            let shared_rem = if f.shared { r.optimizer_states.l1fw.as_ref().unwrap().velocity.as_ptr() }
+                else { std::ptr::null_mut() };
+            return check(unsafe { ffi::bulletou_clip_effective_l1_axis_sgd(ctx.as_ptr(),r.weights.l1w.as_ptr(),
+                r.optimizer_states.l1w.slow_params.as_ptr(),remainder,shared,slow,shared_rem,
+                r.weights.l1axw.as_ref().unwrap().as_ptr(),r.optimizer_states.l1axw.as_ref().unwrap().slow_params.as_ptr(),
+                r.optimizer_states.l1axw.as_ref().unwrap().velocity.as_ptr(),shape.ft_size,shape.l1_out(),shape.num_stacks,
+                shape.factorizer_king_axis_dim,shape.factorizer_hand_axis_dim,
+                f.king_axis as i32,f.hand_axis as i32,f.progress_axis as i32,f.king_hand_pair as i32,
+                f.king_progress_pair as i32,f.hand_progress_pair as i32,a.shared,a.king_axis,a.hand_axis,a.progress_axis,a.pair) });
+        }
         return check(unsafe { ffi::bulletou_clip_effective_l1_axis(ctx.as_ptr(),r.weights.l1w.as_ptr(),
             r.optimizer_states.l1w.slow_params.as_ptr(),shared,slow,
             r.weights.l1axw.as_ref().unwrap().as_ptr(),r.optimizer_states.l1axw.as_ref().unwrap().slow_params.as_ptr(),remainder,
@@ -118,6 +131,90 @@ pub(super) fn transform(r: &SfnnTrainStepRunner, ctx: &Context, before: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sgd_effective_axis_clip_keeps_shared_carry_and_projects_residual() {
+        let ctx=Context::new(0).unwrap();
+        let (stacks,axes)=(36usize,46usize);
+        let bound=127.0f32/64.0; let e=2.0f32.powi(-25);
+        let w=F32Buffer::from_host(&ctx,&vec![bound;stacks]).unwrap();
+        let slow=F32Buffer::from_host(&ctx,&vec![0.0;stacks]).unwrap();
+        let mut carry=vec![0.0;stacks]; carry[0]=-e;carry[1]=0.0;carry[2]=-2.0*e;carry[3]=e;
+        let rem=F32Buffer::from_host(&ctx,&carry).unwrap();
+        let sh=F32Buffer::from_host(&ctx,&[0.0]).unwrap();
+        let shslow=F32Buffer::from_host(&ctx,&[0.0]).unwrap();
+        let shr=F32Buffer::from_host(&ctx,&[e]).unwrap();
+        let ax=F32Buffer::from_host(&ctx,&vec![0.0;axes]).unwrap();
+        let axs=F32Buffer::from_host(&ctx,&vec![0.0;axes]).unwrap();
+        let axr=F32Buffer::from_host(&ctx,&vec![0.0;axes]).unwrap();
+        check(unsafe{ffi::bulletou_clip_effective_l1_axis_sgd(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),rem.as_ptr(),
+            sh.as_ptr(),shslow.as_ptr(),shr.as_ptr(),ax.as_ptr(),axs.as_ptr(),axr.as_ptr(),1,1,stacks,3,0,
+            1,0,1,0,1,0,1.0,1.0,1.0,1.0,1.0)}).unwrap();
+        let actual=rem.download(&ctx).unwrap();
+        assert_eq!(&actual[..4],&[-e,-e,-2.0*e,-e]);
+        assert_eq!(shr.download(&ctx).unwrap(),vec![e]);
+        assert!(w.download(&ctx).unwrap().iter().all(|x|*x==bound));
+    }
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sgd_effective_axis_clip_moves_tiny_residual_enough_for_forward() {
+        let ctx=Context::new(0).unwrap();let (stacks,axes)=(36usize,46usize);
+        let w=F32Buffer::from_host(&ctx,&vec![0.0;stacks]).unwrap();
+        let slow=F32Buffer::from_host(&ctx,&vec![0.0;stacks]).unwrap();
+        let rem=F32Buffer::from_host(&ctx,&vec![0.0;stacks]).unwrap();
+        let sh0=0.5830484628677368f32;
+        let sh=F32Buffer::from_host(&ctx,&[sh0]).unwrap();let ss=F32Buffer::from_host(&ctx,&[0.0]).unwrap();
+        let shr=F32Buffer::from_host(&ctx,&[0.0]).unwrap();
+        let mut ax0=vec![0.0f32;axes];
+        for (i,x) in [(0,1.392811894416809f32),(3,0.6967154741287231),
+            (6,-0.7267242670059204),(42,0.03852343559265137)] {ax0[i]=x;}
+        let ax=F32Buffer::from_host(&ctx,&ax0).unwrap();let axs=F32Buffer::from_host(&ctx,&vec![0.0;axes]).unwrap();
+        let axr=F32Buffer::from_host(&ctx,&vec![0.0;axes]).unwrap();
+        check(unsafe{ffi::bulletou_clip_effective_l1_axis_sgd(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),rem.as_ptr(),
+            sh.as_ptr(),ss.as_ptr(),shr.as_ptr(),ax.as_ptr(),axs.as_ptr(),axr.as_ptr(),1,1,stacks,3,0,
+            1,0,1,0,1,0,1.0,1.0,1.0,1.0,1.0)}).unwrap();
+        let high=w.download(&ctx).unwrap()[0];let low=rem.download(&ctx).unwrap()[0];
+        let mut visible=high+sh0;for i in [0,3,6,42] {visible+=ax0[i];}
+        assert!(visible<=127.0/64.0,"visible={visible}");
+        let exact=high as f64+low as f64+sh0 as f64+[0,3,6,42].into_iter().map(|i|ax0[i] as f64).sum::<f64>();
+        assert!((exact-127.0/64.0).abs()<1e-12,"exact={exact}");
+    }
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn sgd_effective_axis_clip_matches_double_reference() {
+        let ctx=Context::new(0).unwrap();
+        let (stacks,cols,outputs,axes)=(36usize,4usize,3usize,46usize); let cells=cols*outputs;
+        let w0:Vec<f32>=(0..stacks*cells).map(|i|((i*17%31) as f32-15.0)*0.18).collect();
+        let r0:Vec<f32>=(0..stacks*cells).map(|i|((i%7) as f32-3.0)*1e-8).collect();
+        let sh0:Vec<f32>=(0..cells).map(|i|(i as f32-5.0)*0.13).collect();
+        let shr0:Vec<f32>=(0..cells).map(|i|((i%5) as f32-2.0)*1e-8).collect();
+        let ax0:Vec<f32>=(0..axes*cells).map(|i|((i*7%23) as f32-11.0)*0.07).collect();
+        let axr0:Vec<f32>=(0..axes*cells).map(|i|((i%9) as f32-4.0)*1e-8).collect();
+        let w=F32Buffer::from_host(&ctx,&w0).unwrap(); let slow=F32Buffer::from_host(&ctx,&w0).unwrap();
+        let rem=F32Buffer::from_host(&ctx,&r0).unwrap(); let sh=F32Buffer::from_host(&ctx,&sh0).unwrap();
+        let ss=F32Buffer::from_host(&ctx,&sh0).unwrap(); let shr=F32Buffer::from_host(&ctx,&shr0).unwrap();
+        let ax=F32Buffer::from_host(&ctx,&ax0).unwrap(); let axs=F32Buffer::from_host(&ctx,&ax0).unwrap();
+        let axr=F32Buffer::from_host(&ctx,&axr0).unwrap();
+        check(unsafe{ffi::bulletou_clip_effective_l1_axis_sgd(ctx.as_ptr(),w.as_ptr(),slow.as_ptr(),rem.as_ptr(),
+            sh.as_ptr(),ss.as_ptr(),shr.as_ptr(),ax.as_ptr(),axs.as_ptr(),axr.as_ptr(),cols,outputs,stacks,3,0,
+            1,0,1,0,1,0,0.7,0.5,1.0,0.9,0.4)}).unwrap();
+        let got=w.download(&ctx).unwrap(); let gr=rem.download(&ctx).unwrap();
+        for stack in 0..stacks {
+            let k=stack/4;let p=stack%4;let ids=[k/3,3+k%3,6+p*9+k,42+p];let alphas=[0.5f32,0.5,0.4,0.9];
+            for out in 0..outputs {for input in 0..cols {
+                let i=stack*cells+out*cols+input;let f=input*outputs+out;
+                let mut factors=0.7f32 as f64*(sh0[f] as f64+shr0[f] as f64);
+                for j in 0..4 {let a=ids[j]*cells+f;factors+=alphas[j] as f64*(ax0[a] as f64+axr0[a] as f64);}
+                let expected=(w0[i] as f64+r0[i] as f64+factors).clamp(-2.0,127.0/64.0);
+                let actual=got[i] as f64+gr[i] as f64+factors;
+                assert!((actual-expected).abs()<1e-12,"stack={stack} input={input} out={out} actual={actual} expected={expected}");
+                let mut visible=got[i]+0.7f32*sh0[f];
+                for j in 0..4 {visible+=alphas[j]*ax0[ids[j]*cells+f];}
+                assert!((-2.0..=127.0/64.0).contains(&visible),"stack={stack} input={input} out={out} visible={visible}");
+            }}
+        }
+        assert_eq!(shr.download(&ctx).unwrap(),shr0);assert_eq!(axr.download(&ctx).unwrap(),axr0);
+    }
     #[test]
     #[ignore = "requires CUDA"]
     fn effective_clip_pair_projects_fast_and_slow_without_changing_factors() {
