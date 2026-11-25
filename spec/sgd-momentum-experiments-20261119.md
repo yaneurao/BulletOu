@@ -179,3 +179,21 @@ tatara `origin/main` 3eda6c1（SGD導入 d0c9711）の更新方式をBulletOuに
 従来SGD基準はmomentum 0.95、16 sb設定の8 sb時点。optimizer方式・momentum・総sb数が異なり、差を方式だけの効果と断定しない。FP16 momentではsb 1〜8のクリップ回数が順に26,943、766,545、2,390,483、2,151,067、1,587,191、1,348,813、1,267,569、1,195,072。重複する同一要素を含む更新時の発生回数で、重みの個数ではない。FP32 momentではこのクリップはない。両条件の初回・各sb末batch全要素と各batchの約128局面の累積指紋の9組は一致。全入力の完全一致を保証しない。単回比較のため再現性は未確認。
 
 同じ実行ファイルの小型モデルでRAdam checkpoint→tatara SGDへの一次moment移行→SGD checkpoint再開を確認。GPUでFP32・FP16 momentの更新をEMA参照と照合し、factorizer軸経路も個別更新と照合。2304幅k21k21 progress8でall_optim=true/falseを各3更新し正常終了。8 sbの精度は上記のとおりで、tatara互換化による学習改善は確認できていない。実験データは `C:\shogi\codex-tatara-sgd-8sb-20261126` にあり、最終direct出力は各約7.38 GB。本来の学習、対局、E:使用、lambda変更は行っていない。
+## 2026-11-26 tatara本体との8 sb比較
+
+tatara `3eda6c1` を別ディレクトリに展開して実行した。WindowsでのCUDAリンクに必要な `cuda` の静的リンク指定だけをコピーに加え、学習コードは変更していない。元のtatara作業ツリーは変更していない。
+
+tataraは `k21k21_progress8`、L1 pair factorizer、BCEをそのまま実行できないため、両者で近い条件を選択した。FT 2304、L1 16（skipを含む）、L2 64、8 progress buckets、shared L1 factorizer、バッチ65536、610 batch/sb、8 sb、lr 0.0044、superbatchごとに0.8倍、momentum 0.9、教師評価値のみ、WRM二乗誤差、dense QAT、検証917,504局面。初期化範囲は合わせたが、乱数列、入力特徴やfactorizerの細部、量子化、学習データの順序の完全一致は保証していない。tataraの `--wdl 0` は勝敗を使わず教師評価値だけを用いる指定であり、BulletOuのlambdaは1.0のまま。
+
+| 8 sb | tatara本体 SGD、FP16 moment | tatara本体 SGD、FP32 moment | BulletOu従来SGD | BulletOu tatara SGD |
+|---|---:|---:|---:|---:|
+| 検証acc | 50.142636% | 50.142636% | 54.10192% | 53.85152% |
+| qacc | — | — | 54.05693% | 53.86878% |
+| 検証loss | 0.13945022 | 0.13945022 | 0.14181533 | 0.14134888 |
+| qloss | — | — | 0.14197925 | 0.14147429 |
+
+tatara本体の1 sbはacc 50.141715%、loss 0.13943323。8 sbまでaccはほぼ変わらずlossは微増した。FP32 momentでも結果はほぼ同じであり、この条件の停滞をFP16 momentだけでは説明できない。FP32 momentの最終更新時にFT重みを標本抽出すると、base 64,130要素中32,556要素に非ゼロ勾配があり、4,437要素でmaster重みの変化を確認した。単一ステップの標本であり、全層の勾配が正常である証明ではない。
+
+BulletOuの2試行はいずれもall_optim=true、momentum 0.9で、8 sbでは従来SGDのacc/qaccが上だが、tatara SGDのloss/qlossが低い。両者とも1 sbから8 sbにかけてlossが上昇している。異なる実装間ではモデル・初期値等が完全一致していないので、tatara本体が一般に従来SGD以下だとは結論できない。今回のtatara設定自体も有効な学習条件と確認できていない。各試行は1回であり統計的な再現性も未検証。
+
+実験データ、コマンド、ログは `C:\shogi\codex-tatara-compare-20261126`。本来の学習や対局は実行していない。
