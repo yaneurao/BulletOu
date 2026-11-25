@@ -18861,7 +18861,9 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
     }
     runner.configure_bn_qat_mode(&ctx,args.sfnn_bn_qat,feature_kind.base_input_size(),feature_kind.virtual_rows(),args.sfnn_bn_qat_freeze_stats).map_err(|e|e.to_string())?;
     let sgd_trace_layers = if std::env::var_os("BULLETOU_SGD_TRACE_LAYERS").is_some() {
-        Some((runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?,
+        Some((runner.weights.l1w.download(&ctx).map_err(|e| e.to_string())?,
+            runner.weights.l1b.download(&ctx).map_err(|e| e.to_string())?,
+            runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?,
             runner.weights.l2b.download(&ctx).map_err(|e| e.to_string())?,
             runner.weights.l3w.download(&ctx).map_err(|e| e.to_string())?,
             runner.weights.l3b.download(&ctx).map_err(|e| e.to_string())?))
@@ -20215,12 +20217,50 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             }
         }
     }
-    if let Some((l2w, l2b, l3w, l3b)) = sgd_trace_layers {
+    if let (Some((l1w, l1b, ..)), Some((fw, fb, axw, axb))) = (&sgd_trace_layers, &sgd_trace_l1) {
+        if sfnn_residual_count_gates.is_none() && !runner.shape.has_compact_l1() {
+            let mut before_w = l1w.clone();
+            let mut before_b = l1b.clone();
+            let mut after_w = runner.weights.l1w.download(&ctx).map_err(|e| e.to_string())?;
+            let mut after_b = runner.weights.l1b.download(&ctx).map_err(|e| e.to_string())?;
+            let download = |b: &Option<bulletou_cuda_cpp::F32Buffer>| b.as_ref().map(|v| v.download(&ctx)).transpose().map_err(|e| e.to_string());
+            let after_fw = download(&runner.weights.l1fw)?;
+            let after_fb = download(&runner.weights.l1fb)?;
+            let after_axw = download(&runner.weights.l1axw)?;
+            let after_axb = download(&runner.weights.l1axb)?;
+            for (w, b, sw, sb, aw, ab) in [
+                (&mut before_w, &mut before_b, fw.as_deref(), fb.as_deref(), axw.as_deref(), axb.as_deref()),
+                (&mut after_w, &mut after_b, after_fw.as_deref(), after_fb.as_deref(), after_axw.as_deref(), after_axb.as_deref()),
+            ] {
+                fold_cuda_cpp_sfnn_l1f_into_stacked_l1(runner.shape, w, b, sw, sb, factorizer_alpha.shared)?;
+                fold_cuda_cpp_sfnn_l1_axis_into_stacked_l1(runner.shape, w, b, aw, ab, factorizer_spec, effective_sfnn_factorizer_alpha(args), sfnn_factorizer_axis_confidences.as_deref())?;
+            }
+            for (name, before, after, scale, min, max) in [
+                ("l1w", &before_w, &after_w, 64.0f32, -128.0f32, 127.0f32),
+                ("l1b", &before_b, &after_b, 8128.0f32, i32::MIN as f32, i32::MAX as f32),
+            ] {
+                let mut fp = 0usize;
+                let mut quant = 0usize;
+                let mut delta = 0.0f64;
+                for (&a, &b) in before.iter().zip(after) {
+                    fp += usize::from(a.to_bits() != b.to_bits());
+                    quant += usize::from((a * scale).round().clamp(min, max) != (b * scale).round().clamp(min, max));
+                    delta += (f64::from(a) - f64::from(b)).abs();
+                }
+                eprintln!("  SGD effective layer trace {name}: n={} changed={fp} quant_changed={quant} mean_abs_delta={:.9e}", before.len(), delta / before.len().max(1) as f64);
+            }
+        } else {
+            eprintln!("  SGD effective L1 trace unavailable with residual gates or compact L1");
+        }
+    }
+    if let Some((l1w, l1b, l2w, l2b, l3w, l3b)) = sgd_trace_layers {
         let bucket_trace_path = std::env::var_os("BULLETOU_SGD_TRACE_BUCKETS_CSV").map(PathBuf::from);
         let mut bucket_csv = bucket_trace_path.as_ref().map(|_| {
             String::from("layer,bucket,weights,fp_changed,quant_changed,mean_abs_delta\n")
         });
         for (name, before, after, scale) in [
+            ("l1w_component", l1w, runner.weights.l1w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
+            ("l1b_component", l1b, runner.weights.l1b.download(&ctx).map_err(|e| e.to_string())?, 8128.0f32),
             ("l2w", l2w, runner.weights.l2w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
             ("l2b", l2b, runner.weights.l2b.download(&ctx).map_err(|e| e.to_string())?, 8128.0f32),
             ("l3w", l3w, runner.weights.l3w.download(&ctx).map_err(|e| e.to_string())?, 64.0f32),
@@ -20276,12 +20316,18 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                 let after = buffer.download(&ctx).map_err(|e| e.to_string())?;
                 let out = runner.shape.l1_out();
                 let mut sums = vec![0.0f64; out];
+                let mut changed = 0usize;
+                let mut quant_changed = 0usize;
+                let scale = if name.ends_with('w') { 64.0 } else { 8128.0 };
                 for (i, (&a, &b)) in before.iter().zip(&after).enumerate() {
                     sums[i % out] += (f64::from(a) - f64::from(b)).abs();
+                    changed += usize::from(a.to_bits() != b.to_bits());
+                    quant_changed += usize::from((a * scale).round() != (b * scale).round());
                 }
                 let rows = (before.len() / out).max(1) as f64;
                 let main = sums[..out - 1].iter().sum::<f64>() / ((out - 1).max(1) as f64 * rows);
                 eprintln!("  SGD layer trace {name}: main_mean_abs_delta={main:.9e} skip_mean_abs_delta={:.9e}", sums[out - 1] / rows);
+                eprintln!("  SGD component trace {name}: n={} changed={changed} quant_changed={quant_changed}; quantization is per component, not folded L1", before.len());
             }
         }
     }
