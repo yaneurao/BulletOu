@@ -458,6 +458,12 @@ epoch末保存はデフォルトで有効です。epoch末だけ保存したい�
 GPUが空いているのに `pos/s` が低い場合は、教師局面の読み込み、decode、shuffle が詰まっている可能性があります。`cuda-cpp-diagnostics.log` の teacher queue wait を見てください。
 # SGD＋momentum
 
+tatara互換の更新は `"optimizer": "tatara-sgd"` で選択します。既定momentumは0.9です。平均勾配を `g`、保存する一次momentを `m` とすると、`m = beta * m + (1-beta) * g`、`w = clip(w * (1-lr*decay) - lr*m/(1-beta))` です。Lookaheadと重み更新の低位補償は使いません。FT optimizer状態をFP16にしたときはEMAを2^28倍して保存します。既存の `"sgd"` は従来の低位補償付き実装として残ります。
+
+`"optimizer": "radam"` はbeta1=0.9のRAdamで、Lookaheadを使いません。このモードのcheckpointからtatara互換SGDで新規学習を開始するときは、`initial_state` に `state.bin` を指定し、`"transfer_radam_momentum": true` を指定します。重みと一次momentを引き継ぎ、二次moment・slow状態・optimizer stepを初期化し、新しい学習・教師入力スケジュールを開始します。momentumは0.9、factorizer構成・係数・count gateは同一でなければなりません。旧Rangerや既存SGDのcheckpointはRAdamとして移行できません。tatara-sgdと異なるoptimizerのcheckpointは、明示的なRAdam移行以外では拒否します。
+
+RAdam・tatara-sgdともSFNN standalone/grid_search向けです。worker、plateau、BN、dirty bucket更新、norm loss、centeringは未対応です。RAdamからのmomentum移行は新規出力先で行います。
+
 SFNNの通常学習では `"optimizer": "sgd"` と `"optimizer_momentum": 0.9` を指定できます。momentumの既定値は0.9、範囲は0以上1未満です。更新式は `m = momentum * m + g`、`w = w * (1 - lr * weight_decay) - lr * m` で、勾配の蓄積時は平均勾配を使います。既存の学習率スケジュールと重みのクリップ設定も適用されます。
 
 RangerとSGDを切り替えてcheckpointから再開する場合、重みと学習位置は保持し、optimizer状態とoptimizerのstepを初期化します。同じSGDのcheckpointから再開する場合はmomentumを復元します。checkpointにはoptimizer種別を保存します。

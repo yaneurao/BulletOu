@@ -3515,6 +3515,9 @@ impl LrScheduleKind {
 enum OptimizerKind {
     Ranger,
     Sgd,
+    RAdam,
+    #[value(name = "tatara-sgd")]
+    TataraSgd,
 }
 
 impl OptimizerKind {
@@ -3522,6 +3525,8 @@ impl OptimizerKind {
         match self {
             OptimizerKind::Ranger => "ranger",
             OptimizerKind::Sgd => "sgd",
+            OptimizerKind::RAdam => "radam",
+            OptimizerKind::TataraSgd => "tatara-sgd",
         }
     }
 }
@@ -4335,9 +4340,13 @@ fn args_at_epoch(args: &Args, epoch: usize) -> Result<Args, String> {
             sfnn_saturation_threshold, optimizer_weight_clip, optimizer_weight_decay, bce_error_weight_k);
     }
     resolved.apply_all_optim();
-    if resolved.optimizer == OptimizerKind::Sgd && (resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
+    if matches!(resolved.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd) && (resolved.sfnn_norm_loss_strength != 0.0 || resolved.sfnn_l1_center ||
         resolved.sfnn_l2_l3_center) {
         return Err(format!("SGD does not support norm loss or centering at epoch {epoch}"));
+    }
+    if resolved.optimizer == OptimizerKind::RAdam && (resolved.sfnn_norm_loss_strength != 0.0
+        || resolved.sfnn_l1_center || resolved.sfnn_l2_l3_center) {
+        return Err(format!("RAdam does not support norm loss or centering at epoch {epoch}"));
     }
     if schedules.contains_key("ft_factorizer") {
         if !matches!(resolved.resolved_eval_type(), Some(EvalType::SfnnHalfka2 | EvalType::SfnnHalfka2hm))
@@ -4712,6 +4721,10 @@ struct Args {
     #[arg(long)]
     initial_state: Option<PathBuf>,
 
+    /// Transfer the gradient EMA from a BulletOu RAdam checkpoint to tatara SGD.
+    #[arg(long, requires = "initial_state")]
+    transfer_radam_momentum: bool,
+
     /// Explicit teacher dataloader position file used when branching a new
     /// experiment from `--initial-state`. Format is the same as checkpoint
     /// `dataloader_pos.txt`: `<byte_offset>,<plies>`.
@@ -4953,7 +4966,7 @@ struct Args {
     #[arg(long, default_value = "0.000875")]
     lr: f32,
 
-    /// Optimizer used for training: Ranger (RAdam+Lookahead) or SGD with momentum.
+    /// Optimizer: Ranger, compensated SGD, or tatara-compatible SGD.
     #[arg(long, value_enum, default_value = "ranger")]
     optimizer: OptimizerKind,
 
@@ -6370,7 +6383,16 @@ impl Args {
             effective_batches_per_superbatch(self)?
         };
         validate_teacher_shuffle_buffer(self, shuffle_boundary_batches)?;
-        if self.optimizer == OptimizerKind::Sgd {
+        if self.transfer_radam_momentum && self.optimizer != OptimizerKind::TataraSgd {
+            return Err("--transfer-radam-momentum requires --optimizer tatara-sgd".into());
+        }
+        if self.optimizer == OptimizerKind::RAdam && (!self.eval_type().uses_layerstack()
+            || self.lr_schedule == LrScheduleKind::Plateau || self.optimizer_beta1.is_some()
+            || self.sfnn_norm_loss_strength != 0.0 || self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2
+            || self.sfnn_dirty_bucket_update || self.sfnn_l1_center || self.sfnn_l2_l3_center) {
+            return Err("RAdam requires SFNN without plateau, beta1 override, BN, dirty updates, norm loss or centering".into());
+        }
+        if matches!(self.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd) {
             if !self.eval_type().uses_layerstack() || self.lr_schedule == LrScheduleKind::Plateau ||
                 self.sfnn_dirty_bucket_update || self.sfnn_norm_loss_strength != 0.0 ||
                 self.sfnn_bn_ft || self.sfnn_bn_l1 || self.sfnn_bn_l2 || self.sfnn_l1_center || self.sfnn_l2_l3_center || self.optimizer_beta1.is_some() ||
@@ -6604,7 +6626,7 @@ fn resolve_value_loss_runtime_params(args: &Args) -> Result<(), String> {
     if args.loss_bce_with_logits {
         print_startup_kv_colored("loss", value_loss_label(args), ConsoleColor::Magenta);
     }
-    if args.optimizer == OptimizerKind::Sgd {
+    if matches!(args.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd) {
         eprintln!("  SFNN norm loss               = disabled for SGD");
     } else {
         eprintln!("  SFNN norm loss               = strength={}, target=1, per-tensor, FT weights excluded; L3 bias before RAdam, others after RAdam/before Lookahead", args.sfnn_norm_loss_strength);
@@ -6760,6 +6782,7 @@ fn ranger_params(args: &Args) -> optimiser::RangerParams {
     if let Some(beta2) = args.optimizer_beta2 {
         params.beta2 = beta2;
     }
+    if args.optimizer == OptimizerKind::RAdam { params.beta1 = 0.9; }
     params
 }
 
@@ -11133,8 +11156,8 @@ struct WorkerSfnnSession {
 #[cfg(feature = "cuda-cpp-backend")]
 impl WorkerSfnnSession {
     fn open(args: Args) -> Result<Self, String> {
-        if args.optimizer == OptimizerKind::Sgd {
-            return Err("SGD is not supported in worker mode; use standalone training/grid_search".into());
+        if args.optimizer != OptimizerKind::Ranger {
+            return Err("worker mode supports only Ranger; use standalone training/grid_search".into());
         }
         if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
             return Err("BN currently supports standalone training/grid_search, not worker mode".into());
@@ -11688,8 +11711,8 @@ impl WorkerSfnnSession {
         cache_dir: Option<std::path::PathBuf>,
         borda_dominators: Vec<WorkerBordaMetric>,
     ) -> Result<WorkerSfnnTrialOutcome, String> {
-        if trial_args.optimizer == OptimizerKind::Sgd {
-            return Err("SGD is not supported in worker trials; use standalone training/grid_search".into());
+        if trial_args.optimizer != OptimizerKind::Ranger {
+            return Err("worker trials support only Ranger; use standalone training/grid_search".into());
         }
         if trial_args.epoch_settings_json.is_some() {
             return Err("epoch schedules are supported by standalone SFNN training/grid_search, not worker trials".into());
@@ -11821,6 +11844,7 @@ impl WorkerSfnnSession {
             let learning_rate = schedule.lr_for_step(&trial_args, step_index, self.batch_size);
             let params = bulletou_cuda_cpp::RangerUpdateParams {
                 sgd_momentum: None,
+                tatara_sgd: false,
                 radam: bulletou_cuda_cpp::RAdamUpdateParams {
                     step: optimizer_step as u64,
                     gradient_factor: 1.0 / batches_per_update as f32,
@@ -13485,6 +13509,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
             device,
             RangerUpdateParams {
                 sgd_momentum: None,
+                tatara_sgd: false,
                 radam: RAdamUpdateParams {
                     step: 1,
                     learning_rate: 0.01,
@@ -13522,6 +13547,7 @@ fn run_cuda_cpp_backend(args: &Args) -> Result<(), String> {
             &ctx,
             RangerUpdateParams {
                 sgd_momentum: None,
+                tatara_sgd: false,
                 radam: RAdamUpdateParams {
                     step: 1,
                     learning_rate: 0.01,
@@ -14434,6 +14460,7 @@ fn run_cuda_cpp_kppt_component_direct_steps(
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
                 sgd_momentum: None,
+                tatara_sgd: false,
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     learning_rate,
@@ -15235,6 +15262,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
                         let ranger = ranger_params(args);
                         let params = RangerUpdateParams {
                             sgd_momentum: None,
+                            tatara_sgd: false,
                             radam: RAdamUpdateParams {
                                 step: optimizer_step as u64,
                                 learning_rate: plateau_state.current_lr,
@@ -15527,6 +15555,7 @@ fn run_cuda_cpp_nnue_direct_steps(args: &Args, feature_kind: CudaCppNnueFeatureK
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
                 sgd_momentum: None,
+                tatara_sgd: false,
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     learning_rate,
@@ -18367,9 +18396,11 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
         ),
         ConsoleColor::BoldGreen,
     );
-    if args.optimizer == OptimizerKind::Sgd {
-        print_startup_kv("optimizer", format!("SGD with momentum={}, decoupled weight decay={}",
-            args.optimizer_momentum, args.optimizer_weight_decay));
+    if matches!(args.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd) {
+        print_startup_kv("optimizer", format!("{} with momentum={}, decoupled weight decay={}",
+            args.optimizer.cli_name(), args.optimizer_momentum, args.optimizer_weight_decay));
+    } else if args.optimizer == OptimizerKind::RAdam {
+        print_startup_kv("optimizer", "radam with beta1=0.9 and no Lookahead");
     }
 
     if schedule.production {
@@ -19026,6 +19057,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     let ranger = ranger_params(args);
                     let params = RangerUpdateParams {
                         sgd_momentum: None,
+                        tatara_sgd: false,
                         radam: RAdamUpdateParams {
                             step: optimizer_step as u64,
                             learning_rate: plateau_state.current_lr,
@@ -19520,7 +19552,8 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
             };
             let learning_rate = schedule.lr_for_step(args, step_index, batch_size);
             RangerUpdateParams {
-                sgd_momentum: (args.optimizer == OptimizerKind::Sgd).then_some(args.optimizer_momentum),
+                sgd_momentum: matches!(args.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd).then_some(args.optimizer_momentum),
+                tatara_sgd: args.optimizer == OptimizerKind::TataraSgd,
                 radam: RAdamUpdateParams {
                     step: optimizer_step as u64,
                     gradient_factor: 1.0 / batches_per_update as f32,
@@ -19534,7 +19567,7 @@ fn run_cuda_cpp_sfnn_direct_steps(args: &Args, feature_kind: CudaCppSfnnFeatureK
                     ..RAdamUpdateParams::default()
                 },
                 lookahead_alpha: ranger.alpha,
-                lookahead_period: ranger.k as u64,
+                lookahead_period: if args.optimizer == OptimizerKind::RAdam { u64::MAX } else { ranger.k as u64 },
                 norm_loss_strength: 0.0,
                 norm_loss_before: false,
                 clip_after_lookahead: true,
@@ -23435,6 +23468,8 @@ fn sfnn_checkpoint_optimizer(train: &BTreeMap<String, Vec<f32>>) -> Result<Optim
     match train.get("optimizer_kind").map(Vec::as_slice) {
         Some([0.0]) | None => Ok(OptimizerKind::Ranger), // Legacy checkpoints predate SGD.
         Some([1.0]) => Ok(OptimizerKind::Sgd),
+        Some([2.0]) => Ok(OptimizerKind::TataraSgd),
+        Some([3.0]) => Ok(OptimizerKind::RAdam),
         Some(_) => Err("invalid checkpoint optimizer kind".into()),
     }
 }
@@ -23596,9 +23631,21 @@ fn load_cuda_cpp_sfnn_initial_state(
     let train = initial_sections.remove("train").unwrap_or_default();
     let checkpoint_optimizer = sfnn_checkpoint_optimizer(&train)?;
     let optimizer_changed = checkpoint_optimizer != args.optimizer;
+    let transfer = args.transfer_radam_momentum;
+    if optimizer_changed && !transfer && (args.optimizer == OptimizerKind::TataraSgd
+        || checkpoint_optimizer == OptimizerKind::TataraSgd) {
+        return Err("tatara-sgd requires a matching checkpoint; use --transfer-radam-momentum with a RAdam --initial-state".into());
+    }
+    if transfer && (checkpoint_optimizer != OptimizerKind::RAdam || args.optimizer != OptimizerKind::TataraSgd
+        || args.optimizer_momentum != 0.9 || created_factorizers.any() || progress_axis_appended) {
+        return Err("RAdam momentum transfer requires a RAdam checkpoint, tatara-sgd momentum 0.9, and unchanged factorizer layout".into());
+    }
+    if transfer && !train.contains_key("shared_coefficients") {
+        return Err("RAdam momentum transfer requires saved factorizer coefficients".into());
+    }
     // New factorizer coordinates reset the optimizer during migration; do not
     // load incompatible or incomplete optimizer state just to discard it afterwards.
-    let mut pre_migration_optimizer_states = if optimizer_changed || created_factorizers.any() || progress_axis_appended {
+    let mut pre_migration_optimizer_states = if (optimizer_changed && !transfer) || created_factorizers.any() || progress_axis_appended {
         None
     } else {
         load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?
@@ -23606,6 +23653,9 @@ fn load_cuda_cpp_sfnn_initial_state(
     let target_counts = WorkerSfnnSession::compute_count_settings(args, weights.shape)?;
     let old_gates = if source_has_factorizer { train.get("residual_count_gates").map(Vec::as_slice) } else { None };
     let new_gates = if effective_sfnn_factorizer_spec(args).any() { target_counts.residual_count_gates.as_deref() } else { None };
+    if transfer && old_gates != new_gates {
+        return Err("RAdam momentum transfer requires unchanged residual count gates".into());
+    }
     rebase_loaded_sfnn_residual_gates(&mut weights, &mut pre_migration_optimizer_states, old_gates, new_gates,
         args.optimizer == OptimizerKind::Sgd)?;
     let new_shared_coefficients = shared_coefficients_for_args(args);
@@ -23641,6 +23691,9 @@ fn load_cuda_cpp_sfnn_initial_state(
             [1.0, new_shared_coefficients[1]]
         }
     };
+    if transfer && old_shared_coefficients != new_shared_coefficients {
+        return Err("RAdam momentum transfer requires unchanged FT and shared factorizer coefficients".into());
+    }
     rebase_loaded_sfnn_shared(
         &mut weights,
         &mut pre_migration_optimizer_states,
@@ -23690,10 +23743,14 @@ fn load_cuda_cpp_sfnn_initial_state(
             Some(old) => old,
             None => return Err(format!("{} lacks saved L1 axis coefficients and its original settings cannot be reconstructed; cannot safely load active axis weights", path.display())),
         };
+        if transfer && old != new.as_slice() {
+            return Err("RAdam momentum transfer requires unchanged axis coefficients".into());
+        }
         rebase_loaded_sfnn_axes(&mut weights, &mut pre_migration_optimizer_states, active, old, &new,
             args.optimizer == OptimizerKind::Sgd)?;
     }
     if inactive_nonzero {
+        if transfer { return Err("RAdam momentum transfer requires unchanged active factorizer axes".into()); }
         let coefficients = source_axis_coefficients.ok_or_else(|| format!(
             "{} lacks saved axis coefficients; cannot safely fold inactive L1 axes. Resume with the original factorizer and use an epoch schedule to switch it.", path.display()
         ))?;
@@ -23727,7 +23784,12 @@ fn load_cuda_cpp_sfnn_initial_state(
     let step_ranger = initial_sections.remove("step_ranger").unwrap_or_default();
     let completed_steps = load_cuda_cpp_sfnn_completed_steps_from_sections(&train, &step_ranger, &weights)?;
     let stored_optimizer_steps = load_cuda_cpp_sfnn_optimizer_steps_from_sections(&train, &step_ranger, &weights)?;
-    let optimizer_states = if optimizer_changed {
+    let optimizer_states = if transfer {
+        let mut state = pre_migration_optimizer_states.take().ok_or_else(|| "RAdam checkpoint has no complete optimizer state to transfer".to_string())?;
+        reset_sfnn_radam_variance_and_slow(&mut state);
+        eprintln!("  initial optimizer state = RAdam gradient EMA transferred; variance, slow weights and step counters reset");
+        Some(state)
+    } else if optimizer_changed {
         eprintln!("  initial optimizer state = reset when switching {} -> {}", checkpoint_optimizer.cli_name(), args.optimizer.cli_name());
         None
     } else if created_factorizers.any() || folded_inactive_factorizers || progress_axis_appended {
@@ -23783,7 +23845,12 @@ fn load_cuda_cpp_sfnn_initial_state(
             None => load_cuda_cpp_sfnn_optimizer_state_from_path(path, &weights)?,
         }
     };
-    let optimizer_steps = if optimizer_states.is_some() {
+    let optimizer_steps = if transfer {
+        if let Some(progress) = progress.as_mut() {
+            progress.optimizer = CudaCppRangerGroupState::zero_from_weights(&progress.params);
+        }
+        0
+    } else if optimizer_states.is_some() {
         stored_optimizer_steps
     } else {
         if completed_steps > 0 && stored_optimizer_steps > 0 {
@@ -23795,7 +23862,20 @@ fn load_cuda_cpp_sfnn_initial_state(
         0
     };
 
-    Ok(CudaCppSfnnInitialState { weights, optimizer_states, progress, completed_steps, optimizer_steps })
+    Ok(CudaCppSfnnInitialState { weights, optimizer_states, progress, completed_steps: if transfer { 0 } else { completed_steps }, optimizer_steps })
+}
+
+#[cfg(feature = "cuda-cpp-backend")]
+fn reset_sfnn_radam_variance_and_slow(state: &mut CudaCppSfnnOptimizerState) {
+    for group in [&mut state.l0w, &mut state.l0b, &mut state.l1w, &mut state.l1b,
+        &mut state.l2w, &mut state.l2b, &mut state.l3w, &mut state.l3b] {
+        group.velocity.fill(0.0); group.slow_params.fill(0.0);
+    }
+    for group in [&mut state.l1fw, &mut state.l1fb, &mut state.l1axw, &mut state.l1axb,
+        &mut state.l2fw, &mut state.l2fb, &mut state.l2axw, &mut state.l2axb,
+        &mut state.l3fw, &mut state.l3fb, &mut state.l3axw, &mut state.l3axb].into_iter().flatten() {
+        group.velocity.fill(0.0); group.slow_params.fill(0.0);
+    }
 }
 
 #[cfg(feature = "cuda-cpp-backend")]
@@ -25909,7 +25989,7 @@ fn write_cuda_cpp_sfnn_weights_bin(
     let l2_revival_record = [weights.l2_revival_flags as f32];
     let revival_rng_record = weights.revival_rng.encode();
     let completed_steps_record = [completed_steps as f32];
-    let optimizer_kind_record = [if optimizer == OptimizerKind::Sgd { 1.0 } else { 0.0 }];
+    let optimizer_kind_record = [match optimizer { OptimizerKind::Ranger => 0.0, OptimizerKind::Sgd => 1.0, OptimizerKind::TataraSgd => 2.0, OptimizerKind::RAdam => 3.0 }];
     let optimizer_steps_record = [optimizer_steps as f32];
     let completed_steps_exact = encode_sfnn_exact_step(completed_steps);
     let optimizer_steps_exact = encode_sfnn_exact_step(optimizer_steps);
@@ -27890,7 +27970,7 @@ fn resume_signature_values(args: &Args) -> String {
     ]
     .join("\n")
         + "\n"
-        + &if args.optimizer == OptimizerKind::Sgd {
+        + &if matches!(args.optimizer, OptimizerKind::Sgd | OptimizerKind::TataraSgd) {
             format!("optimizer_momentum={:.9}\n", args.optimizer_momentum)
         } else { String::new() }
         + &if args.sfnn_bn_ft || args.sfnn_bn_l1 || args.sfnn_bn_l2 {
@@ -29898,10 +29978,31 @@ mod tests {
         assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::Sgd);
         records.insert("optimizer_kind".to_owned(), vec![0.0]);
         assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::Ranger);
-        for value in [vec![], vec![2.0], vec![f32::NAN], vec![1.0, 0.0]] {
+        records.insert("optimizer_kind".to_owned(), vec![2.0]);
+        assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::TataraSgd);
+        records.insert("optimizer_kind".to_owned(), vec![3.0]);
+        assert_eq!(sfnn_checkpoint_optimizer(&records).unwrap(), OptimizerKind::RAdam);
+        for value in [vec![], vec![4.0], vec![f32::NAN], vec![1.0, 0.0]] {
             records.insert("optimizer_kind".to_owned(), value);
             assert!(sfnn_checkpoint_optimizer(&records).is_err());
         }
+    }
+
+    #[test]
+    fn tatara_optimizer_options_reject_unsafe_combinations() {
+        let base = ["bulletou", "--backend", "cuda-cpp", "--teacher", "unused",
+            "--arch", "SFNN_halfkahm2_2304_15_64_k21k21_progress8",
+            "--superbatches", "1", "--max-epochs", "1"];
+        for name in ["tatara-sgd", "radam"] {
+            let mut args = Args::try_parse_from(base.into_iter().chain(["--optimizer", name, "--all-optim"])).unwrap();
+            args.apply_all_optim();
+            args.validate_backend_flags().unwrap();
+            assert!(args.sfnn_ft_fp16_moments);
+        }
+        let args = Args::try_parse_from(base.into_iter().chain(["--optimizer", "radam", "--optimizer-beta1", "0.8"])).unwrap();
+        assert!(args.validate_backend_flags().is_err());
+        let args = Args::try_parse_from(base.into_iter().chain(["--optimizer", "ranger", "--initial-state", "state.bin", "--transfer-radam-momentum"])).unwrap();
+        assert!(args.validate_backend_flags().is_err());
     }
 
     #[cfg(feature = "cuda-cpp-backend")]
@@ -30073,6 +30174,43 @@ mod tests {
         assert!(l1_lr_suppressed_with_history(&args,2,36,Some(3),Some(after_second)).unwrap());
         assert!(!l1_lr_suppressed_with_history(&args,2,37,Some(3),Some(after_second)).unwrap());
     }
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
+    fn tatara_sgd_transfer_preserves_radam_ema_and_rejects_incompatible_sources() {
+        let mut args = Args::try_parse_from(["bulletou", "--backend", "cuda-cpp", "--teacher", "teacher.bin",
+            "--arch", "SFNN_ka2_32_8_32_k3k3", "--sfnn-l1-factorizer", "shared", "--optimizer", "tatara-sgd"]).unwrap();
+        args.transfer_radam_momentum = true;
+        let kind = CudaCppSfnnFeatureKind::Ka2;
+        let w = build_sfnn_initial_weights_for_cuda_cpp(&args, kind).unwrap();
+        let fields = [("l0w", w.l0w.as_slice()), ("l0b", w.l0b.as_slice()), ("l1w", w.l1w.as_slice()),
+            ("l1b", w.l1b.as_slice()), ("l1fw", w.l1fw.as_deref().unwrap()), ("l1fb", w.l1fb.as_deref().unwrap()),
+            ("l2w", w.l2w.as_slice()), ("l2b", w.l2b.as_slice()), ("l3w", w.l3w.as_slice()), ("l3b", w.l3b.as_slice())];
+        let mut records = vec![("nnue/train/optimizer_kind".to_string(), vec![3.0]),
+            ("nnue/train/shared_coefficients".to_string(), vec![1.0, 1.0]),
+            ("nnue/train/completed_steps".to_string(), vec![10.0])];
+        for (name, weights) in fields {
+            records.push((format!("nnue/weights/{name}"), weights.to_vec()));
+            records.push((format!("nnue/momentum/{name}"), vec![0.25; weights.len()]));
+            records.push((format!("nnue/velocity/{name}"), vec![0.5; weights.len()]));
+            records.push((format!("nnue/slow/{name}"), vec![0.75; weights.len()]));
+        }
+        let path = std::env::temp_dir().join(format!("bulletou-radam-transfer-{}.bin", std::process::id()));
+        write_cuda_cpp_state_records_atomic(&path, records.iter().map(|(k,v)| (k.as_str(),v.as_slice())).collect()).unwrap();
+        let loaded = load_cuda_cpp_sfnn_initial_state(&path, &args, kind).unwrap();
+        let state = loaded.optimizer_states.unwrap();
+        assert_eq!((loaded.completed_steps, loaded.optimizer_steps), (0, 0));
+        assert!(state.l0w.momentum.iter().all(|&v| v == 0.25));
+        assert!(state.l0w.velocity.iter().all(|&v| v == 0.0));
+        assert!(state.l0w.slow_params.iter().all(|&v| v == 0.0));
+        assert!(state.l1fw.unwrap().momentum.iter().all(|&v| v == 0.25));
+        args.optimizer_momentum = 0.95;
+        assert!(load_cuda_cpp_sfnn_initial_state(&path, &args, kind).is_err());
+        args.optimizer_momentum = 0.9;
+        args.transfer_radam_momentum = false;
+        assert!(load_cuda_cpp_sfnn_initial_state(&path, &args, kind).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
     fn sgd_checkpoint_preserves_remainders_without_rebase_and_clears_affected_on_rebase() {

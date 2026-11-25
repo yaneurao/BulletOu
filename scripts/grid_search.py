@@ -1075,7 +1075,7 @@ def resume_settings(settings: dict) -> dict:
     # BulletOu rejects explicit initial-state plus --resume. The trial's own
     # resume-config/checkpoints now own both weights and dataloader position.
     return {key: value for key, value in settings.items()
-            if key not in {"initial_state", "initial_dataloader_pos"}}
+            if key not in {"initial_state", "initial_dataloader_pos", "transfer_radam_momentum"}}
 
 
 def record_settings_launch(directory: Path, trial: dict, resume: bool) -> None:

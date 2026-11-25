@@ -9,6 +9,11 @@ import grid_search
 
 
 class FtCheckpointResumeTests(unittest.TestCase):
+    def test_resume_does_not_repeat_radam_momentum_transfer(self):
+        settings = {"optimizer": "tatara-sgd", "initial_state": "source.bin",
+                    "initial_dataloader_pos": "position.txt", "transfer_radam_momentum": True}
+        self.assertEqual(grid_search.resume_settings(settings), {"optimizer": "tatara-sgd"})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)

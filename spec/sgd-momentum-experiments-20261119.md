@@ -163,3 +163,19 @@ FT QAT無効の再実行では通常lossが5 sbの0.69303316から8 sbの0.69594
 lr 0.0044のlossは3 sbの0.69307739から8 sbの0.69848061、qlossは0.69385415から0.69723797に上昇した。FT unitの上限飽和率の最大は検証時点で71.8575%、8 sbで62.4870%。精度は改善したがlossの継続的な低下は未達。
 
 同じlr 0.0044でL1更新倍率を0.92にすると、8 sbのaccは57.00893%、qaccは56.99300%、lossは0.69682044、qlossは0.69714397。L1倍率1.0の2実行より精度は低く、通常lossは低い。1実行の結果。
+
+## 2026-11-26 tatara互換SGD 8 sb
+
+tatara `origin/main` 3eda6c1（SGD導入 d0c9711）の更新方式をBulletOuに追加し、ゼロ開始で検証。共通条件は `SFNN_halfkahm2_2304_15_64_k21k21_progress8`、momentum 0.9、lr 0.0044・step gamma 0.8・下限0.0005、L1倍率0.5、FT factorizer on、L1 pair、FT QAT off、L1/L2/L3 QAT on、lambda 1.0。1 sb=610 batch、batch=65,536、検証921,060局面。FP16 moment試行はall_optim=true。FP32 moment試行はall_optim=falseとし、FT重み・活性・一時勾配のみ個別にFP16有効、momentはFP32。他は同じ設定で、順番に各1回実行。
+
+| 8 sb | tatara SGD・FP16 moment | tatara SGD・FP32 moment | 従来SGD基準 |
+|---|---:|---:|---:|
+| acc | 54.60537% | 54.89548% | 56.51811% |
+| qacc | 54.55815% | 54.86488% | 56.54642% |
+| loss | 0.70122397 | 0.69757915 | 0.69214004 |
+| qloss | 0.70127082 | 0.69759583 | 0.69232368 |
+| 学習時間 | 328.665秒 | 285.631秒 | 未集計 |
+
+従来SGD基準はmomentum 0.95、16 sb設定の8 sb時点。optimizer方式・momentum・総sb数が異なり、差を方式だけの効果と断定しない。FP16 momentではsb 1〜8のクリップ回数が順に26,943、766,545、2,390,483、2,151,067、1,587,191、1,348,813、1,267,569、1,195,072。重複する同一要素を含む更新時の発生回数で、重みの個数ではない。FP32 momentではこのクリップはない。両条件の初回・各sb末batch全要素と各batchの約128局面の累積指紋の9組は一致。全入力の完全一致を保証しない。単回比較のため再現性は未確認。
+
+同じ実行ファイルの小型モデルでRAdam checkpoint→tatara SGDへの一次moment移行→SGD checkpoint再開を確認。GPUでFP32・FP16 momentの更新をEMA参照と照合し、factorizer軸経路も個別更新と照合。2304幅k21k21 progress8でall_optim=true/falseを各3更新し正常終了。8 sbの精度は上記のとおりで、tatara互換化による学習改善は確認できていない。実験データは `C:\shogi\codex-tatara-sgd-8sb-20261126` にあり、最終direct出力は各約7.38 GB。本来の学習、対局、E:使用、lambda変更は行っていない。

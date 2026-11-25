@@ -8452,7 +8452,7 @@ impl SfnnTrainStepRunner {
         }
         if self.ft_half_moments_enabled && !self.ft_half_moments_defer_once && self.ft_half_moments.is_none() &&
             lr_multipliers.param_multiplier(SfnnUpdateLayer::L0, SfnnUpdateParamKind::Weight) > 0.0 {
-            self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w, params.sgd_momentum.is_some())?);
+            self.ft_half_moments = Some(FtHalfMoments::new(ctx, &self.optimizer_states.l0w, params.sgd_momentum.is_some() && !params.tatara_sgd)?);
         }
         let dirty_update = self.prepare_dirty_buckets(ctx, dirty_buckets)?;
         self.add_saturation_penalty_gradients(ctx, lr_multipliers, dirty_update)?;
@@ -8730,7 +8730,7 @@ impl SfnnTrainStepRunner {
         self.output_center_batches = 0;
         self.l1_center_batches = 0;
         if lr_multipliers.l1_effective_weight_clip && lr_multipliers.l1 > 0.0 {
-            l1_center::clip_effective_weights(self, ctx, params.sgd_momentum.is_some())?;
+            l1_center::clip_effective_weights(self, ctx, params.sgd_momentum.is_some() && !params.tatara_sgd)?;
         }
         if let Some(bn)=&self.batch_norm {bn.update_with_lr_multiplier(ctx,params,lr_multipliers.bn_affine)?;}
         if l0w_lr > 0.0 { self.ft_half_moments_defer_once = false; }
@@ -8821,16 +8821,16 @@ fn update_axis_group_with_lr_multiplier(
         || state.velocity.len() != len || state.slow_params.len() != len {
         return Err(CudaCppError::message("invalid factorizer axis optimizer state"));
     }
-    let scale = if p.sgd_momentum.is_some() { RAdamStepScale { step_size: 0.0, use_denom: false } }
-        else { p.radam.step_scale()? };
+    let scale = if p.sgd_momentum.is_some() && !p.tatara_sgd { RAdamStepScale { step_size: 0.0, use_denom: false } }
+        else { p.update_scale()? };
     let king_end = shape.factorizer_king_axis_dim * 2;
     let hand_end = king_end + shape.factorizer_hand_axis_dim * 2;
     let pair_end = axis_count - shape.factorizer_progress_axis_count();
     check(unsafe { ffi::bulletou_factor_axis_update_device(ctx.as_ptr(), len, len / axis_count,
         king_end, hand_end, pair_end, alpha.king_axis, alpha.hand_axis, alpha.pair, alpha.progress_axis,
         confidence.map_or(std::ptr::null_mut(), F32Buffer::as_ptr), p.radam.gradient_factor,
-        p.radam.learning_rate, p.radam.decay, p.sgd_momentum.unwrap_or(p.radam.beta1), p.radam.beta2,
-        p.radam.epsilon, scale.step_size, i32::from(scale.use_denom), i32::from(p.sgd_momentum.is_some()),
+        p.radam.learning_rate, p.kernel_decay(), if p.tatara_sgd { p.kernel_beta1() } else { p.sgd_momentum.unwrap_or(p.radam.beta1) }, p.kernel_beta2(),
+        p.radam.epsilon, scale.step_size, i32::from(scale.use_denom), i32::from(p.sgd_momentum.is_some() && !p.tatara_sgd),
         p.radam.min_weight, p.radam.max_weight, p.norm_loss_rate(), i32::from(p.norm_loss_before),
         i32::from(p.sgd_momentum.is_none() && p.should_lookahead()?), p.lookahead_alpha,
         i32::from(p.clip_after_lookahead), gradients.as_ptr(), weights.as_ptr(), state.momentum.as_ptr(),
@@ -9301,6 +9301,8 @@ impl RAdamUpdateParams {
 pub struct RangerUpdateParams {
     /// SGD momentum coefficient; None selects the existing Ranger update.
     pub sgd_momentum: Option<f32>,
+    /// Tatara SGD stores the gradient EMA and uses the RAdam update kernel.
+    pub tatara_sgd: bool,
     pub norm_loss_strength: f32,
     pub norm_loss_before: bool,
     pub radam: RAdamUpdateParams,
@@ -9314,6 +9316,7 @@ impl Default for RangerUpdateParams {
     fn default() -> Self {
         Self {
             sgd_momentum: None,
+            tatara_sgd: false,
             norm_loss_strength: 0.0,
             norm_loss_before: false,
             radam: RAdamUpdateParams { decay: 0.0, ..RAdamUpdateParams::default() },
@@ -9337,6 +9340,9 @@ impl RangerUpdateParams {
         2.0 * self.norm_loss_strength * lr
     }
     pub fn validate(self) -> Result<()> {
+        if self.tatara_sgd && self.sgd_momentum.is_none() {
+            return Err(CudaCppError::message("tatara SGD requires a momentum coefficient"));
+        }
         if self.sgd_momentum.is_some_and(|v| !v.is_finite() || !(0.0..1.0).contains(&v)) {
             return Err(CudaCppError::message("SGD momentum must be finite and in [0, 1)"));
         }
@@ -9355,7 +9361,22 @@ impl RangerUpdateParams {
 
     pub fn should_lookahead(self) -> Result<bool> {
         self.validate()?;
-        Ok(self.radam.step.is_multiple_of(self.lookahead_period))
+        Ok(!self.tatara_sgd && self.radam.step.is_multiple_of(self.lookahead_period))
+    }
+
+    fn update_scale(self) -> Result<RAdamStepScale> {
+        if self.tatara_sgd {
+            self.validate()?;
+            Ok(RAdamStepScale { step_size: 1.0 / (1.0 - self.sgd_momentum.unwrap()), use_denom: false })
+        } else {
+            self.radam.step_scale()
+        }
+    }
+
+    fn kernel_beta1(self) -> f32 { if self.tatara_sgd { self.sgd_momentum.unwrap() } else { self.radam.beta1 } }
+    fn kernel_beta2(self) -> f32 { if self.tatara_sgd { 1.0 } else { self.radam.beta2 } }
+    fn kernel_decay(self) -> f32 {
+        if self.tatara_sgd { self.radam.decay * (1.0 - self.sgd_momentum.unwrap()) } else { self.radam.decay }
     }
 }
 
@@ -9512,7 +9533,7 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
     state: RangerDeviceStateMut<'_>, half: Option<&FtHalfMoments>) -> Result<()> {
     params.validate()?;
     let len = state.validate()?;
-    if let Some(momentum) = params.sgd_momentum {
+    if let Some(momentum) = params.sgd_momentum.filter(|_| !params.tatara_sgd) {
         if params.norm_loss_strength != 0.0 {
             return Err(CudaCppError::message("SGD does not support norm loss"));
         }
@@ -9522,7 +9543,7 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
             state.weights.as_ptr(), state.momentum.as_ptr(), state.velocity.as_ptr(),
             half.map_or(std::ptr::null_mut(), |h| h.raw.as_ptr())) });
     }
-    let scale = params.radam.step_scale()?;
+    let scale = params.update_scale()?;
     let do_lookahead = params.should_lookahead()?;
 
     // SAFETY: backend validates device ownership and lengths.
@@ -9536,9 +9557,9 @@ fn ranger_update_device_with_half_moments(ctx: &Context, params: RangerUpdatePar
             params.radam.learning_rate,
             scale.step_size,
             i32::from(scale.use_denom),
-            params.radam.decay,
-            params.radam.beta1,
-            params.radam.beta2,
+            params.kernel_decay(),
+            params.kernel_beta1(),
+            params.kernel_beta2(),
             params.radam.epsilon,
             params.radam.min_weight,
             params.radam.max_weight,
@@ -10818,13 +10839,13 @@ mod tests {
         let confidence = F32Buffer::from_host(&ctx, &[1.0, 0.5, 1.0, 0.5, 1.0, 0.5]).unwrap();
         let values = [1.0, -4.0, 0.4, 2.0, 3.0, -9.0];
         let grads = [0.2, -0.1, 0.3, -0.4, 0.01, 0.5];
-        for sgd in [false, true] {
+        for (sgd, tatara) in [(false, false), (true, false), (true, true)] {
             let weights = F32Buffer::from_host(&ctx, &values).unwrap();
             let gradients = F32Buffer::from_host(&ctx, &grads).unwrap();
             let state = RangerParamState::from_host_weights(&ctx, &values).unwrap();
             state.momentum.fill(&ctx, 0.2).unwrap();
             if !sgd { state.velocity.fill(&ctx, 0.04).unwrap(); }
-            let mut p = RangerUpdateParams { sgd_momentum: sgd.then_some(0.9), ..Default::default() };
+            let mut p = RangerUpdateParams { sgd_momentum: sgd.then_some(0.9), tatara_sgd: tatara, ..Default::default() };
             p.radam.step = 6; p.radam.min_weight = -1.0; p.radam.max_weight = 1.0;
             p.radam.learning_rate = 0.01; p.radam.decay = 0.001;
             update_axis_group_with_lr_multiplier(&ctx, p, &gradients, &weights, &state, 1.0,
@@ -11019,6 +11040,44 @@ mod tests {
         assert!((actual[0] - expected).abs() <= f32::EPSILON);
         assert_eq!(actual[1], 1.0);
         assert_eq!(state.velocity.download(&ctx).unwrap()[1], 0.0);
+    }
+    #[test]
+    #[ignore = "requires a CUDA-capable NVIDIA GPU"]
+    fn tatara_sgd_matches_ema_reference_with_fp32_and_fp16_state() {
+        use super::*;
+        let ctx = Context::new(0).unwrap();
+        for half_mode in [false, true] {
+            let initial = [0.4f32, -0.8, 0.1, 0.0];
+            let w = F32Buffer::from_host(&ctx, &initial).unwrap();
+            let g = F32Buffer::new(&ctx, initial.len()).unwrap();
+            let state = RangerParamState::from_host_weights(&ctx, &initial).unwrap();
+            let half = half_mode.then(|| FtHalfMoments::new(&ctx, &state, false).unwrap());
+            let mut expected = initial;
+            let mut ema = [0.0f32; 4];
+            for step in 1..=8 {
+                let grad = [0.0001f32, -0.0002, step as f32 * 0.00001, -0.0003];
+                g.upload(&ctx, &grad).unwrap();
+                let p = RangerUpdateParams { sgd_momentum: Some(0.9), tatara_sgd: true,
+                    radam: RAdamUpdateParams { step, gradient_factor: 0.5, learning_rate: 0.05,
+                        decay: 0.01, min_weight: -1.0, max_weight: 1.0, ..Default::default() },
+                    ..Default::default() };
+                ranger_update_device_with_half_moments(&ctx, p, RangerDeviceStateMut {
+                    gradients: &g, weights: &w, momentum: &state.momentum,
+                    velocity: &state.velocity, slow_params: &state.slow_params,
+                }, half.as_ref()).unwrap();
+                for i in 0..4 {
+                    ema[i] = 0.9 * ema[i] + (1.0 - 0.9) * (0.5 * grad[i]);
+                    expected[i] = (expected[i] * (1.0 - 0.05 * 0.01) - 0.5 * ema[i]).clamp(-1.0, 1.0);
+                }
+                if let Some(half) = &half {
+                    half.decode(&ctx, &state).unwrap();
+                    ema.copy_from_slice(&state.momentum.download(&ctx).unwrap());
+                }
+            }
+            for (a,b) in w.download(&ctx).unwrap().iter().zip(expected) { assert!((a-b).abs() < 1e-6, "half={half_mode}: {a} != {b}"); }
+            assert!(state.velocity.download(&ctx).unwrap().iter().all(|&v| v == 0.0));
+            assert!(g.download(&ctx).unwrap().iter().all(|&v| v == 0.0));
+        }
     }
     #[test]
     #[ignore = "requires a CUDA-capable NVIDIA GPU"]
