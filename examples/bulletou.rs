@@ -4749,9 +4749,9 @@ struct Args {
     #[arg(long, default_value = "0")]
     cuda_cpp_diagnostics_rate: usize,
 
-    /// In C++/CUDA direct-step mode, skip the final numbered checkpoint and
-    /// `cuda-cpp-direct` full-state output. Useful for throughput/validation
-    /// probes where writing multi-GB optimizer state would dominate disk use.
+    /// Skip the final `cuda-cpp-direct` full-state output; direct-step mode
+    /// also skips its final checkpoint. Production mode requires save-rate 0
+    /// and save-epoch-end false. Useful for disposable validation probes.
     #[arg(long)]
     cuda_cpp_skip_final_output: bool,
 
@@ -6330,9 +6330,10 @@ impl Args {
             }
             _ => {}
         }
-        if self.cuda_cpp_skip_final_output && self.cuda_cpp_train_steps.is_none() {
+        if self.cuda_cpp_skip_final_output && self.cuda_cpp_train_steps.is_none()
+            && (!production_schedule || effective_save_rate(self) != 0 || self.save_epoch_end) {
             return Err(
-                "--cuda-cpp-skip-final-output is only valid with --cuda-cpp-train-steps direct-step mode".to_string()
+                "--cuda-cpp-skip-final-output requires direct steps, or production mode with save_rate=0 and save_epoch_end=false".to_string()
             );
         }
         if matches!(eval_type, EvalType::Kppt | EvalType::KppKkpt) && self.cuda_cpp_skip_final_output {
@@ -34736,6 +34737,24 @@ mod tests {
             assert_eq!(args.cuda_cpp_profile_steps, 2);
         } else {
             assert!(result.unwrap_err().contains("cuda-cpp-backend"));
+        }
+    }
+
+    #[test]
+    fn cuda_cpp_skip_final_output_requires_explicitly_unsaved_production() {
+        use clap::Parser as _;
+        let mut args = Args::try_parse_from([
+            "bulletou", "--arch", "SFNN_halfka2_1024_7_64_k3k3", "--teacher", "/dev/null",
+            "--backend", "cuda-cpp", "--superbatches", "2", "--max-epochs", "1",
+            "--save-rate", "0", "--save-epoch-end", "false", "--cuda-cpp-skip-final-output",
+        ]).unwrap();
+        if cfg!(feature = "cuda-cpp-backend") {
+            assert!(args.validate_backend_flags().is_ok());
+            args.save_epoch_end = true;
+            assert!(args.validate_backend_flags().unwrap_err().contains("skip-final-output"));
+            args.save_epoch_end = false;
+            args.save_rate = Some(1);
+            assert!(args.validate_backend_flags().unwrap_err().contains("skip-final-output"));
         }
     }
 
