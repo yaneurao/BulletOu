@@ -37967,6 +37967,33 @@ mod tests {
 
     #[cfg(feature = "cuda-cpp-backend")]
     #[test]
+    fn step_lr_mid_epoch_start_can_continue_across_epoch_boundary() {
+        let args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
+            "--arch", "SFNN_halfkahm2_2304_15_64_k21k21_progress8",
+            "--superbatches", "1296", "--max-epochs", "6",
+            "--batch-size", "65536", "--positions-per-superbatch", "40000000",
+            "--lr-min", "0.0001", "--lr-step-gamma", "0.999", "--lr-step-positions", "40000000"])
+            .unwrap();
+        let mut scheduled = args;
+        scheduled.epoch_settings_json = Some(serde_json::json!({"lr": {
+            "epoch1": 0.0005, "epoch3": 0.0006907442960629669,
+            "epoch4": 0.00018907084274721157, "epoch5": 0.0001
+        }}).to_string());
+        let period = 1296_u64 * 610 * 65536;
+        let e3 = args_at_epoch(&scheduled, 3).unwrap();
+        let e4 = args_at_epoch(&scheduled, 4).unwrap();
+        let e5 = args_at_epoch(&scheduled, 5).unwrap();
+        let rate = |a: &Args, epoch, step| cuda_cpp_epoch_lr(a, epoch, step, 65536, period, 0.999, 40000000, 610);
+        assert!((rate(&e3, 3, 324 * 610) - 0.0005).abs() < 1e-8);
+        let end3 = rate(&e3, 3, 1296 * 610 - 1);
+        assert!((end3 - 0.00018907084).abs() < 1e-8);
+        assert!((end3 - rate(&e4, 4, 0)).abs() < 1e-8);
+        assert_eq!(rate(&e4, 4, 1296 * 610 - 1), e4.lr_min);
+        assert_eq!(rate(&e5, 5, 0), e5.lr_min);
+    }
+
+    #[cfg(feature = "cuda-cpp-backend")]
+    #[test]
     fn warmup_sb_lr_boundaries_bpu_and_epoch_resume() {
         let mut args = Args::try_parse_from(["bulletou", "--teacher", "/dev/null",
             "--arch", "SFNN_halfka2_1024_8_64_k3k3",
